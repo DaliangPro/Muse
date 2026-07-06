@@ -58,3 +58,10 @@ task_plan.md
 # 签名私钥（绝不入库）
 *.p12
 *.cer
+
+# AI 助手配置（个人工作规则，不公开开源；本地保留自用）
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.codex/
+.github/copilot-instructions.md
