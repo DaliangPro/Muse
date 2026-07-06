@@ -59,9 +59,10 @@ task_plan.md
 *.p12
 *.cer
 
-# AI 助手配置（个人工作规则，不公开开源；本地保留自用）
+# AI 助手配置与内部文档（不公开开源；本地保留自用）
 CLAUDE.md
 AGENTS.md
 GEMINI.md
 .codex/
 .github/copilot-instructions.md
+REPAIR_PLAN.md
