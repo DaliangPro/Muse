@@ -1,0 +1,58 @@
+Third-Party Software Licenses
+==============================
+
+Muse includes the following open-source software:
+
+---
+
+SenseVoice
+Copyright (c) FunAudioLLM, Alibaba Group
+License: MIT
+Source: https://github.com/FunAudioLLM/SenseVoice
+
+---
+
+streaming-sensevoice
+Copyright (c) pengzhendong
+License: Apache License 2.0
+Source: https://github.com/pengzhendong/streaming-sensevoice
+
+---
+
+asr-decoder
+Copyright (c) pengzhendong
+License: Apache License 2.0
+Source: https://github.com/pengzhendong/asr-decoder
+
+---
+
+FunASR
+Copyright (c) Alibaba DAMO Academy
+License: MIT
+Source: https://github.com/modelscope/FunASR
+
+---
+
+sherpa-onnx
+Copyright (c) k2-fsa
+License: Apache License 2.0
+Source: https://github.com/k2-fsa/sherpa-onnx
+
+---
+
+Silero VAD
+Copyright (c) Silero Team
+License: MIT
+Source: https://github.com/snakers4/silero-vad
+
+---
+
+Noto Sans CJK SC
+Copyright (c) 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+Portions copyright (c) 2014-2021 Google.
+License: SIL Open Font License 1.1
+Source: https://github.com/notofonts/noto-cjk
+
+---
+
+Full license texts are available at the respective source repositories.

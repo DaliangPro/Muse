@@ -1,0 +1,60 @@
+# Build
+.build/
+AECTest/.build/
+dist/
+*.dmg
+
+# IDE / Editor
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+.vscode/
+.claude/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+.env.local
+credentials.json
+
+# Internal docs
+docs/plans/
+.git-backup
+
+# SherpaOnnx binary (built locally via scripts/build-sherpa.sh)
+Frameworks/
+.build-sherpa/
+.worktrees/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+sensevoice-server/build/
+sensevoice-server/dist/
+qwen3-asr-server/build/
+qwen3-asr-server/dist/
+qwen3-asr-server/.venv/
+sensevoice-server/.venv/
+
+# Large model files
+sensevoice-server/models/
+
+# Test artifacts
+test-audio/
+test*.txt
+
+# Local design / validation artifacts
+.playwright-cli/
+backups/
+prototypes/
+tmp/
+findings.md
+progress.md
+task_plan.md
+
+# 签名私钥（绝不入库）
+*.p12
+*.cer

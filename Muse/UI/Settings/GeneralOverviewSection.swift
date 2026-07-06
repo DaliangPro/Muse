@@ -1,0 +1,185 @@
+import AppKit
+import SwiftUI
+
+struct GeneralOverviewSection: View {
+    let stats: HistoryStore.Statistics
+    let hasMicrophonePermission: Bool
+    let hasAccessibilityPermission: Bool
+    let languageAssetCount: Int
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            introBanner
+            metricsCard
+                .padding(.top, GeneralSettingsStyle.overviewTopSpacing)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private extension GeneralOverviewSection {
+    var introBanner: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(
+                cornerRadius: GeneralSettingsStyle.museBannerCornerRadius,
+                style: .continuous
+            )
+            .fill(GeneralSettingsStyle.sectionCardFillColor)
+
+            VStack(alignment: .leading, spacing: 0) {
+                SettingsBrandLogo(
+                    width: 128,
+                    lightOpacity: 0.62,
+                    darkOpacity: 0.52
+                )
+                .rotationEffect(.degrees(-3))
+                .offset(x: 2, y: 4)
+
+                Spacer(minLength: 0)
+
+                Text(L("你的灵感缪斯", "Your muse for inspiration"))
+                    .font(TF.settingsFontReading)
+                    .foregroundStyle(TF.settingsTextSecondary.opacity(colorScheme == .dark ? 0.62 : 0.58))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .padding(.horizontal, GeneralSettingsStyle.museBannerHorizontalPadding)
+            .padding(.top, GeneralSettingsStyle.museBannerVerticalPadding)
+            .padding(.bottom, GeneralSettingsStyle.museBannerVerticalPadding)
+        }
+        .frame(maxWidth: .infinity, minHeight: GeneralSettingsStyle.museBannerHeight, maxHeight: GeneralSettingsStyle.museBannerHeight)
+        .overlay(alignment: .topTrailing) {
+            introStatusStrip
+                .padding(.top, GeneralSettingsStyle.museBannerStatusTopPadding)
+                .padding(.trailing, GeneralSettingsStyle.museBannerStatusTrailingPadding)
+        }
+    }
+
+    var introStatusStrip: some View {
+        HStack(alignment: .center, spacing: 12) {
+            IntroStatusChip(
+                title: L("麦克风", "Microphone"),
+                color: hasMicrophonePermission ? TF.settingsAccentGreen : TF.settingsAccentRed
+            ) {
+                PermissionManager.openMicrophoneSettings()
+            }
+            IntroStatusChip(
+                title: L("辅助功能", "Accessibility"),
+                color: hasAccessibilityPermission ? TF.settingsAccentGreen : TF.settingsAccentRed
+            ) {
+                PermissionManager.openAccessibilitySettings()
+            }
+            IntroStatusChip(
+                title: L("语料资产 \(languageAssetCount) 条", "\(languageAssetCount) Assets"),
+                color: TF.settingsAccentGreen
+            ) {
+                NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.assetLibrary)
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    var metricsCard: some View {
+        HStack(alignment: .top, spacing: GeneralSettingsStyle.componentSpacing) {
+            statCard(
+                label: L("累计字数", "Total Chars"),
+                main: GeneralSettingsFormatters.compactCharacterCount(stats.totalCharacters).main,
+                unit: GeneralSettingsFormatters.compactCharacterCount(stats.totalCharacters).unit,
+                color: TF.settingsAccentGreen
+            )
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+
+            statCard(
+                label: L("平均速度", "Avg Speed"),
+                main: String(format: "%.0f", stats.averageSpeed),
+                unit: "token/min",
+                color: TF.settingsAccentBlue,
+                compactUnit: true
+            )
+
+            statCard(
+                label: L("节约时间", "Time Saved"),
+                main: GeneralSettingsFormatters.compactSavedTime(stats.timeSavedSeconds).main,
+                unit: GeneralSettingsFormatters.compactSavedTime(stats.timeSavedSeconds).unit,
+                color: TF.settingsAccentAmber
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    func statCard(
+        label: String,
+        main: String,
+        unit: String,
+        color: Color,
+        compactUnit: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(label)
+                .font(TF.settingsFontMetadata)
+                .foregroundStyle(TF.settingsTextTertiary)
+
+            Spacer(minLength: 0)
+
+            HStack(alignment: .lastTextBaseline, spacing: 4) {
+                Text(main)
+                    .font(TF.settingsFontMetric)
+                    .monospacedDigit()
+                    .foregroundStyle(color)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+
+                if !unit.isEmpty {
+                    Text(unit)
+                        .font(TF.settingsFontBody)
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(GeneralSettingsStyle.surfaceSpacing)
+        .frame(maxWidth: .infinity, minHeight: 76, maxHeight: 76, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: GeneralSettingsStyle.statCardCornerRadius, style: .continuous)
+                .fill(TF.settingsStatCardBase)
+                .overlay(
+                    RoundedRectangle(cornerRadius: GeneralSettingsStyle.statCardCornerRadius, style: .continuous)
+                        .fill(color.opacity(0.10))
+                )
+                // 明暗分层打底 + 一层柔到几乎无形的环境投影补足「浮起」体积（2026-06-14 大梁老师）：
+                // 大模糊 + 极低浓度,不是贴上去的硬影;仅浅色,深色不投影
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0 : 0.08), radius: 10, x: 0, y: 2)
+        )
+    }
+}
+
+/// 概览页右上角可点击状态角标：麦克风/辅助功能跳系统授权页、语料资产跳应用内 tab（2026-06-22）
+private struct IntroStatusChip: View {
+    let title: String
+    let color: Color
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(color)
+                    .frame(width: TF.settingsStatusDotSize, height: TF.settingsStatusDotSize)
+                Text(title)
+                    .font(GeneralSettingsStyle.museBannerStatusFont)
+                    .foregroundStyle(isHovered ? TF.settingsTextSecondary : TF.settingsTextTertiary)
+                    .lineLimit(1)
+            }
+            .frame(height: TF.settingsCompactControlHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+}

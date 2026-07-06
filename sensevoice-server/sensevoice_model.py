@@ -1,0 +1,1288 @@
+# Copyright (c) 2024, Zhendong Peng (pzd17@tsinghua.org.cn)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Combined from streaming-sensevoice project:
+#   https://github.com/pengzhendong/streaming-sensevoice
+#
+# Part 1: sensevoice.py - SenseVoice model definition (FunASR SenseVoiceSmall)
+# Part 2: streaming_sensevoice.py - Streaming inference wrapper
+
+import time
+import torch
+from torch import nn
+import torch.nn.functional as F
+from typing import Optional
+
+# Patch FunASR's register decorator to work with PyInstaller.
+# inspect.getsourcelines() fails when source is frozen in a binary.
+import inspect
+_orig_getsourcelines = inspect.getsourcelines
+def _safe_getsourcelines(obj):
+    try:
+        return _orig_getsourcelines(obj)
+    except OSError:
+        return ([""], 0)
+inspect.getsourcelines = _safe_getsourcelines
+
+from funasr.register import tables
+from funasr.models.ctc.ctc import CTC
+from funasr.utils.datadir_writer import DatadirWriter
+from funasr.train_utils.device_funcs import force_gatherable
+from funasr.losses.label_smoothing_loss import LabelSmoothingLoss
+from funasr.metrics.compute_acc import th_accuracy
+from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
+
+
+class SinusoidalPositionEncoder(torch.nn.Module):
+    """ """
+
+    def encode(
+        self,
+        positions: torch.Tensor = None,
+        depth: int = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        batch_size = positions.size(0)
+        positions = positions.type(dtype)
+        device = positions.device
+        log_timescale_increment = torch.log(
+            torch.tensor([10000], dtype=dtype, device=device)
+        ) / (depth / 2 - 1)
+        inv_timescales = torch.exp(
+            torch.arange(depth / 2, device=device).type(dtype)
+            * (-log_timescale_increment)
+        )
+        inv_timescales = torch.reshape(inv_timescales, [batch_size, -1])
+        scaled_time = torch.reshape(positions, [1, -1, 1]) * torch.reshape(
+            inv_timescales, [1, 1, -1]
+        )
+        encoding = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=2)
+        return encoding.type(dtype)
+
+    def forward(self, x):
+        batch_size, timesteps, input_dim = x.size()
+        positions = torch.arange(1, timesteps + 1, device=x.device)[None, :]
+        position_encoding = self.encode(positions, input_dim, x.dtype).to(x.device)
+
+        return x + position_encoding
+
+
+class PositionwiseFeedForward(torch.nn.Module):
+    """Positionwise feed forward layer.
+
+    Args:
+        idim (int): Input dimenstion.
+        hidden_units (int): The number of hidden units.
+        dropout_rate (float): Dropout rate.
+
+    """
+
+    def __init__(self, idim, hidden_units, dropout_rate, activation=torch.nn.ReLU()):
+        """Construct an PositionwiseFeedForward object."""
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = torch.nn.Linear(idim, hidden_units)
+        self.w_2 = torch.nn.Linear(hidden_units, idim)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.activation = activation
+
+    def forward(self, x):
+        """Forward function."""
+        return self.w_2(self.dropout(self.activation(self.w_1(x))))
+
+
+class MultiHeadedAttentionSANM(nn.Module):
+    """Multi-Head Attention layer.
+
+    Args:
+        n_head (int): The number of heads.
+        n_feat (int): The number of features.
+        dropout_rate (float): Dropout rate.
+
+    """
+
+    def __init__(
+        self,
+        n_head,
+        in_feat,
+        n_feat,
+        dropout_rate,
+        kernel_size,
+        sanm_shfit=0,
+        lora_list=None,
+        lora_rank=8,
+        lora_alpha=16,
+        lora_dropout=0.1,
+    ):
+        """Construct an MultiHeadedAttention object."""
+        super().__init__()
+        assert n_feat % n_head == 0
+        # We assume d_v always equals d_k
+        self.d_k = n_feat // n_head
+        self.h = n_head
+        # self.linear_q = nn.Linear(n_feat, n_feat)
+        # self.linear_k = nn.Linear(n_feat, n_feat)
+        # self.linear_v = nn.Linear(n_feat, n_feat)
+
+        self.linear_out = nn.Linear(n_feat, n_feat)
+        self.linear_q_k_v = nn.Linear(in_feat, n_feat * 3)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout_rate)
+
+        self.fsmn_block = nn.Conv1d(
+            n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
+        )
+        # padding
+        left_padding = (kernel_size - 1) // 2
+        if sanm_shfit > 0:
+            left_padding = left_padding + sanm_shfit
+        right_padding = kernel_size - 1 - left_padding
+        self.pad_fn = nn.ConstantPad1d((left_padding, right_padding), 0.0)
+
+    def forward_fsmn(self, inputs, mask, mask_shfit_chunk=None):
+        b, t, d = inputs.size()
+        if mask is not None:
+            mask = torch.reshape(mask, (b, -1, 1))
+            if mask_shfit_chunk is not None:
+                mask = mask * mask_shfit_chunk
+            inputs = inputs * mask
+
+        x = inputs.transpose(1, 2)
+        x = self.pad_fn(x)
+        x = self.fsmn_block(x)
+        x = x.transpose(1, 2)
+        x += inputs
+        x = self.dropout(x)
+        if mask is not None:
+            x = x * mask
+        return x
+
+    def forward_qkv(self, x):
+        """Transform query, key and value.
+
+        Args:
+            query (torch.Tensor): Query tensor (#batch, time1, size).
+            key (torch.Tensor): Key tensor (#batch, time2, size).
+            value (torch.Tensor): Value tensor (#batch, time2, size).
+
+        Returns:
+            torch.Tensor: Transformed query tensor (#batch, n_head, time1, d_k).
+            torch.Tensor: Transformed key tensor (#batch, n_head, time2, d_k).
+            torch.Tensor: Transformed value tensor (#batch, n_head, time2, d_k).
+
+        """
+        b, t, d = x.size()
+        q_k_v = self.linear_q_k_v(x)
+        q, k, v = torch.split(q_k_v, int(self.h * self.d_k), dim=-1)
+        q_h = torch.reshape(q, (b, t, self.h, self.d_k)).transpose(
+            1, 2
+        )  # (batch, head, time1, d_k)
+        k_h = torch.reshape(k, (b, t, self.h, self.d_k)).transpose(
+            1, 2
+        )  # (batch, head, time2, d_k)
+        v_h = torch.reshape(v, (b, t, self.h, self.d_k)).transpose(
+            1, 2
+        )  # (batch, head, time2, d_k)
+
+        return q_h, k_h, v_h, v
+
+    def forward_attention(self, value, scores, mask, mask_att_chunk_encoder=None):
+        """Compute attention context vector.
+
+        Args:
+            value (torch.Tensor): Transformed value (#batch, n_head, time2, d_k).
+            scores (torch.Tensor): Attention score (#batch, n_head, time1, time2).
+            mask (torch.Tensor): Mask (#batch, 1, time2) or (#batch, time1, time2).
+
+        Returns:
+            torch.Tensor: Transformed value (#batch, time1, d_model)
+                weighted by the attention score (#batch, time1, time2).
+
+        """
+        n_batch = value.size(0)
+        if mask is not None:
+            if mask_att_chunk_encoder is not None:
+                mask = mask * mask_att_chunk_encoder
+
+            mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
+
+            min_value = -float(
+                "inf"
+            )  # float(numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min)
+            scores = scores.masked_fill(mask, min_value)
+            attn = torch.softmax(scores, dim=-1).masked_fill(
+                mask, 0.0
+            )  # (batch, head, time1, time2)
+        else:
+            attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+
+        p_attn = self.dropout(attn)
+        x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+        x = (
+            x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
+        )  # (batch, time1, d_model)
+
+        return self.linear_out(x)  # (batch, time1, d_model)
+
+    def forward(self, x, mask, mask_shfit_chunk=None, mask_att_chunk_encoder=None):
+        """Compute scaled dot product attention.
+
+        Args:
+            query (torch.Tensor): Query tensor (#batch, time1, size).
+            key (torch.Tensor): Key tensor (#batch, time2, size).
+            value (torch.Tensor): Value tensor (#batch, time2, size).
+            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
+                (#batch, time1, time2).
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time1, d_model).
+
+        """
+        q_h, k_h, v_h, v = self.forward_qkv(x)
+        fsmn_memory = self.forward_fsmn(v, mask, mask_shfit_chunk)
+        q_h = q_h * self.d_k ** (-0.5)
+        scores = torch.matmul(q_h, k_h.transpose(-2, -1))
+        att_outs = self.forward_attention(v_h, scores, mask, mask_att_chunk_encoder)
+        return att_outs + fsmn_memory
+
+    def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
+        """Compute scaled dot product attention.
+
+        Args:
+            query (torch.Tensor): Query tensor (#batch, time1, size).
+            key (torch.Tensor): Key tensor (#batch, time2, size).
+            value (torch.Tensor): Value tensor (#batch, time2, size).
+            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
+                (#batch, time1, time2).
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time1, d_model).
+
+        """
+        q_h, k_h, v_h, v = self.forward_qkv(x)
+        if chunk_size is not None and look_back > 0 or look_back == -1:
+            if cache is not None:
+                k_h_stride = k_h[:, :, : -(chunk_size[2]), :]
+                v_h_stride = v_h[:, :, : -(chunk_size[2]), :]
+                k_h = torch.cat((cache["k"], k_h), dim=2)
+                v_h = torch.cat((cache["v"], v_h), dim=2)
+
+                cache["k"] = torch.cat((cache["k"], k_h_stride), dim=2)
+                cache["v"] = torch.cat((cache["v"], v_h_stride), dim=2)
+                if look_back != -1:
+                    cache["k"] = cache["k"][:, :, -(look_back * chunk_size[1]) :, :]
+                    cache["v"] = cache["v"][:, :, -(look_back * chunk_size[1]) :, :]
+            else:
+                cache_tmp = {
+                    "k": k_h[:, :, : -(chunk_size[2]), :],
+                    "v": v_h[:, :, : -(chunk_size[2]), :],
+                }
+                cache = cache_tmp
+        fsmn_memory = self.forward_fsmn(v, None)
+        q_h = q_h * self.d_k ** (-0.5)
+        scores = torch.matmul(q_h, k_h.transpose(-2, -1))
+        att_outs = self.forward_attention(v_h, scores, None)
+        return att_outs + fsmn_memory, cache
+
+
+class LayerNorm(nn.LayerNorm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, input):
+        output = F.layer_norm(
+            input.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return output.type_as(input)
+
+
+def sequence_mask(lengths, maxlen=None, dtype=torch.float32, device=None):
+    if maxlen is None:
+        maxlen = lengths.max()
+    row_vector = torch.arange(0, maxlen, 1).to(lengths.device)
+    matrix = torch.unsqueeze(lengths, dim=-1)
+    mask = row_vector < matrix
+    mask = mask.detach()
+
+    return mask.type(dtype).to(device) if device is not None else mask.type(dtype)
+
+
+class EncoderLayerSANM(nn.Module):
+    def __init__(
+        self,
+        in_size,
+        size,
+        self_attn,
+        feed_forward,
+        dropout_rate,
+        normalize_before=True,
+        concat_after=False,
+        stochastic_depth_rate=0.0,
+    ):
+        """Construct an EncoderLayer object."""
+        super(EncoderLayerSANM, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.norm1 = LayerNorm(in_size)
+        self.norm2 = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.in_size = in_size
+        self.size = size
+        self.normalize_before = normalize_before
+        self.concat_after = concat_after
+        if self.concat_after:
+            self.concat_linear = nn.Linear(size + size, size)
+        self.stochastic_depth_rate = stochastic_depth_rate
+        self.dropout_rate = dropout_rate
+
+    def forward(
+        self, x, mask, cache=None, mask_shfit_chunk=None, mask_att_chunk_encoder=None
+    ):
+        """Compute encoded features.
+
+        Args:
+            x_input (torch.Tensor): Input tensor (#batch, time, size).
+            mask (torch.Tensor): Mask tensor for the input (#batch, time).
+            cache (torch.Tensor): Cache tensor of the input (#batch, time - 1, size).
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, size).
+            torch.Tensor: Mask tensor (#batch, time).
+
+        """
+        skip_layer = False
+        # with stochastic depth, residual connection `x + f(x)` becomes
+        # `x <- x + 1 / (1 - p) * f(x)` at training time.
+        stoch_layer_coeff = 1.0
+        if self.training and self.stochastic_depth_rate > 0:
+            skip_layer = torch.rand(1).item() < self.stochastic_depth_rate
+            stoch_layer_coeff = 1.0 / (1 - self.stochastic_depth_rate)
+
+        if skip_layer:
+            if cache is not None:
+                x = torch.cat([cache, x], dim=1)
+            return x, mask
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm1(x)
+
+        if self.concat_after:
+            x_concat = torch.cat(
+                (
+                    x,
+                    self.self_attn(
+                        x,
+                        mask,
+                        mask_shfit_chunk=mask_shfit_chunk,
+                        mask_att_chunk_encoder=mask_att_chunk_encoder,
+                    ),
+                ),
+                dim=-1,
+            )
+            if self.in_size == self.size:
+                x = residual + stoch_layer_coeff * self.concat_linear(x_concat)
+            else:
+                x = stoch_layer_coeff * self.concat_linear(x_concat)
+        else:
+            if self.in_size == self.size:
+                x = residual + stoch_layer_coeff * self.dropout(
+                    self.self_attn(
+                        x,
+                        mask,
+                        mask_shfit_chunk=mask_shfit_chunk,
+                        mask_att_chunk_encoder=mask_att_chunk_encoder,
+                    )
+                )
+            else:
+                x = stoch_layer_coeff * self.dropout(
+                    self.self_attn(
+                        x,
+                        mask,
+                        mask_shfit_chunk=mask_shfit_chunk,
+                        mask_att_chunk_encoder=mask_att_chunk_encoder,
+                    )
+                )
+        if not self.normalize_before:
+            x = self.norm1(x)
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm2(x)
+        x = residual + stoch_layer_coeff * self.dropout(self.feed_forward(x))
+        if not self.normalize_before:
+            x = self.norm2(x)
+
+        return x, mask, cache, mask_shfit_chunk, mask_att_chunk_encoder
+
+    def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
+        """Compute encoded features.
+
+        Args:
+            x_input (torch.Tensor): Input tensor (#batch, time, size).
+            mask (torch.Tensor): Mask tensor for the input (#batch, time).
+            cache (torch.Tensor): Cache tensor of the input (#batch, time - 1, size).
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, size).
+            torch.Tensor: Mask tensor (#batch, time).
+
+        """
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm1(x)
+
+        if self.in_size == self.size:
+            attn, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
+            x = residual + attn
+        else:
+            x, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
+
+        if not self.normalize_before:
+            x = self.norm1(x)
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm2(x)
+        x = residual + self.feed_forward(x)
+        if not self.normalize_before:
+            x = self.norm2(x)
+
+        return x, cache
+
+
+@tables.register("encoder_classes", "SenseVoiceEncoderSmall")
+class SenseVoiceEncoderSmall(nn.Module):
+    """
+    Author: Speech Lab of DAMO Academy, Alibaba Group
+    SCAMA: Streaming chunk-aware multihead attention for online end-to-end speech recognition
+    https://arxiv.org/abs/2006.01713
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int = 256,
+        attention_heads: int = 4,
+        linear_units: int = 2048,
+        num_blocks: int = 6,
+        tp_blocks: int = 0,
+        dropout_rate: float = 0.1,
+        positional_dropout_rate: float = 0.1,
+        attention_dropout_rate: float = 0.0,
+        stochastic_depth_rate: float = 0.0,
+        input_layer: Optional[str] = "conv2d",
+        pos_enc_class=SinusoidalPositionEncoder,
+        normalize_before: bool = True,
+        concat_after: bool = False,
+        positionwise_layer_type: str = "linear",
+        positionwise_conv_kernel_size: int = 1,
+        padding_idx: int = -1,
+        kernel_size: int = 11,
+        sanm_shfit: int = 0,
+        selfattention_layer_type: str = "sanm",
+        **kwargs,
+    ):
+        super().__init__()
+        self._output_size = output_size
+
+        self.embed = SinusoidalPositionEncoder()
+
+        self.normalize_before = normalize_before
+
+        positionwise_layer = PositionwiseFeedForward
+        positionwise_layer_args = (
+            output_size,
+            linear_units,
+            dropout_rate,
+        )
+
+        encoder_selfattn_layer = MultiHeadedAttentionSANM
+        encoder_selfattn_layer_args0 = (
+            attention_heads,
+            input_size,
+            output_size,
+            attention_dropout_rate,
+            kernel_size,
+            sanm_shfit,
+        )
+        encoder_selfattn_layer_args = (
+            attention_heads,
+            output_size,
+            output_size,
+            attention_dropout_rate,
+            kernel_size,
+            sanm_shfit,
+        )
+
+        self.encoders0 = nn.ModuleList(
+            [
+                EncoderLayerSANM(
+                    input_size,
+                    output_size,
+                    encoder_selfattn_layer(*encoder_selfattn_layer_args0),
+                    positionwise_layer(*positionwise_layer_args),
+                    dropout_rate,
+                )
+                for i in range(1)
+            ]
+        )
+        self.encoders = nn.ModuleList(
+            [
+                EncoderLayerSANM(
+                    output_size,
+                    output_size,
+                    encoder_selfattn_layer(*encoder_selfattn_layer_args),
+                    positionwise_layer(*positionwise_layer_args),
+                    dropout_rate,
+                )
+                for i in range(num_blocks - 1)
+            ]
+        )
+
+        self.tp_encoders = nn.ModuleList(
+            [
+                EncoderLayerSANM(
+                    output_size,
+                    output_size,
+                    encoder_selfattn_layer(*encoder_selfattn_layer_args),
+                    positionwise_layer(*positionwise_layer_args),
+                    dropout_rate,
+                )
+                for i in range(tp_blocks)
+            ]
+        )
+
+        self.after_norm = LayerNorm(output_size)
+
+        self.tp_norm = LayerNorm(output_size)
+
+    def output_size(self) -> int:
+        return self._output_size
+
+    def forward(
+        self,
+        xs_pad: torch.Tensor,
+        ilens: torch.Tensor,
+    ):
+        """Embed positions in tensor."""
+        masks = sequence_mask(ilens, device=ilens.device)[:, None, :]
+
+        xs_pad *= self.output_size() ** 0.5
+
+        xs_pad = self.embed(xs_pad)
+
+        # forward encoder1
+        for layer_idx, encoder_layer in enumerate(self.encoders0):
+            encoder_outs = encoder_layer(xs_pad, masks)
+            xs_pad, masks = encoder_outs[0], encoder_outs[1]
+
+        for layer_idx, encoder_layer in enumerate(self.encoders):
+            encoder_outs = encoder_layer(xs_pad, masks)
+            xs_pad, masks = encoder_outs[0], encoder_outs[1]
+
+        xs_pad = self.after_norm(xs_pad)
+
+        # forward encoder2
+        olens = masks.squeeze(1).sum(1).int()
+
+        for layer_idx, encoder_layer in enumerate(self.tp_encoders):
+            encoder_outs = encoder_layer(xs_pad, masks)
+            xs_pad, masks = encoder_outs[0], encoder_outs[1]
+
+        xs_pad = self.tp_norm(xs_pad)
+        return xs_pad, olens
+
+
+@tables.register("model_classes", "SenseVoiceSmall")
+class SenseVoiceSmall(nn.Module):
+    """CTC-attention hybrid Encoder-Decoder model"""
+
+    def __init__(
+        self,
+        specaug: str = None,
+        specaug_conf: dict = None,
+        normalize: str = None,
+        normalize_conf: dict = None,
+        encoder: str = None,
+        encoder_conf: dict = None,
+        ctc_conf: dict = None,
+        input_size: int = 80,
+        vocab_size: int = -1,
+        ignore_id: int = -1,
+        blank_id: int = 0,
+        sos: int = 1,
+        eos: int = 2,
+        length_normalized_loss: bool = False,
+        **kwargs,
+    ):
+
+        super().__init__()
+
+        if specaug is not None:
+            specaug_class = tables.specaug_classes.get(specaug)
+            specaug = specaug_class(**specaug_conf)
+        if normalize is not None:
+            normalize_class = tables.normalize_classes.get(normalize)
+            normalize = normalize_class(**normalize_conf)
+        encoder_class = tables.encoder_classes.get(encoder)
+        encoder = encoder_class(input_size=input_size, **encoder_conf)
+        encoder_output_size = encoder.output_size()
+
+        if ctc_conf is None:
+            ctc_conf = {}
+        ctc = CTC(odim=vocab_size, encoder_output_size=encoder_output_size, **ctc_conf)
+
+        self.blank_id = blank_id
+        self.sos = sos if sos is not None else vocab_size - 1
+        self.eos = eos if eos is not None else vocab_size - 1
+        self.vocab_size = vocab_size
+        self.ignore_id = ignore_id
+        self.specaug = specaug
+        self.normalize = normalize
+        self.encoder = encoder
+        self.error_calculator = None
+
+        self.ctc = ctc
+
+        self.length_normalized_loss = length_normalized_loss
+        self.encoder_output_size = encoder_output_size
+
+        self.lid_dict = {
+            "auto": 0,
+            "zh": 3,
+            "en": 4,
+            "yue": 7,
+            "ja": 11,
+            "ko": 12,
+            "nospeech": 13,
+        }
+        self.lid_int_dict = {
+            24884: 3,
+            24885: 4,
+            24888: 7,
+            24892: 11,
+            24896: 12,
+            24992: 13,
+        }
+        self.textnorm_dict = {"withitn": 14, "woitn": 15}
+        self.textnorm_int_dict = {25016: 14, 25017: 15}
+        self.embed = torch.nn.Embedding(
+            7 + len(self.lid_dict) + len(self.textnorm_dict), input_size
+        )
+        self.emo_dict = {
+            "unk": 25009,
+            "happy": 25001,
+            "sad": 25002,
+            "angry": 25003,
+            "neutral": 25004,
+        }
+
+        self.criterion_att = LabelSmoothingLoss(
+            size=self.vocab_size,
+            padding_idx=self.ignore_id,
+            smoothing=kwargs.get("lsm_weight", 0.0),
+            normalize_length=self.length_normalized_loss,
+        )
+
+    @staticmethod
+    def from_pretrained(model: str = None, **kwargs):
+        from funasr import AutoModel
+
+        model, kwargs = AutoModel.build_model(
+            model=model, trust_remote_code=True, **kwargs
+        )
+
+        return model, kwargs
+
+    def forward(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        text: torch.Tensor,
+        text_lengths: torch.Tensor,
+        **kwargs,
+    ):
+        """Encoder + Decoder + Calc loss
+        Args:
+                speech: (Batch, Length, ...)
+                speech_lengths: (Batch, )
+                text: (Batch, Length)
+                text_lengths: (Batch,)
+        """
+        # import pdb;
+        # pdb.set_trace()
+        if len(text_lengths.size()) > 1:
+            text_lengths = text_lengths[:, 0]
+        if len(speech_lengths.size()) > 1:
+            speech_lengths = speech_lengths[:, 0]
+
+        batch_size = speech.shape[0]
+
+        # 1. Encoder
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths, text)
+
+        loss_ctc, cer_ctc = None, None
+        loss_rich, acc_rich = None, None
+        stats = dict()
+
+        loss_ctc, cer_ctc = self._calc_ctc_loss(
+            encoder_out[:, 4:, :], encoder_out_lens - 4, text[:, 4:], text_lengths - 4
+        )
+
+        loss_rich, acc_rich = self._calc_rich_ce_loss(
+            encoder_out[:, :4, :], text[:, :4]
+        )
+
+        loss = loss_ctc + loss_rich
+        # Collect total loss stats
+        stats["loss_ctc"] = (
+            torch.clone(loss_ctc.detach()) if loss_ctc is not None else None
+        )
+        stats["loss_rich"] = (
+            torch.clone(loss_rich.detach()) if loss_rich is not None else None
+        )
+        stats["loss"] = torch.clone(loss.detach()) if loss is not None else None
+        stats["acc_rich"] = acc_rich
+
+        # force_gatherable: to-device and to-tensor if scalar for DataParallel
+        if self.length_normalized_loss:
+            batch_size = int((text_lengths + 1).sum())
+        loss, stats, weight = force_gatherable((loss, stats, batch_size), loss.device)
+        return loss, stats, weight
+
+    def encode(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        text: torch.Tensor,
+        **kwargs,
+    ):
+        """Frontend + Encoder. Note that this method is used by asr_inference.py
+        Args:
+                speech: (Batch, Length, ...)
+                speech_lengths: (Batch, )
+                ind: int
+        """
+
+        # Data augmentation
+        if self.specaug is not None and self.training:
+            speech, speech_lengths = self.specaug(speech, speech_lengths)
+
+        # Normalization for feature: e.g. Global-CMVN, Utterance-CMVN
+        if self.normalize is not None:
+            speech, speech_lengths = self.normalize(speech, speech_lengths)
+
+        lids = torch.LongTensor(
+            [
+                [
+                    (
+                        self.lid_int_dict[int(lid)]
+                        if torch.rand(1) > 0.2 and int(lid) in self.lid_int_dict
+                        else 0
+                    )
+                ]
+                for lid in text[:, 0]
+            ]
+        ).to(speech.device)
+        language_query = self.embed(lids)
+
+        styles = torch.LongTensor(
+            [[self.textnorm_int_dict[int(style)]] for style in text[:, 3]]
+        ).to(speech.device)
+        style_query = self.embed(styles)
+        speech = torch.cat((style_query, speech), dim=1)
+        speech_lengths += 1
+
+        event_emo_query = self.embed(
+            torch.LongTensor([[1, 2]]).to(speech.device)
+        ).repeat(speech.size(0), 1, 1)
+        input_query = torch.cat((language_query, event_emo_query), dim=1)
+        speech = torch.cat((input_query, speech), dim=1)
+        speech_lengths += 3
+
+        encoder_out, encoder_out_lens = self.encoder(speech, speech_lengths)
+
+        return encoder_out, encoder_out_lens
+
+    def _calc_ctc_loss(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        ys_pad: torch.Tensor,
+        ys_pad_lens: torch.Tensor,
+    ):
+        # Calc CTC loss
+        loss_ctc = self.ctc(encoder_out, encoder_out_lens, ys_pad, ys_pad_lens)
+
+        # Calc CER using CTC
+        cer_ctc = None
+        if not self.training and self.error_calculator is not None:
+            ys_hat = self.ctc.argmax(encoder_out).data
+            cer_ctc = self.error_calculator(ys_hat.cpu(), ys_pad.cpu(), is_ctc=True)
+        return loss_ctc, cer_ctc
+
+    def _calc_rich_ce_loss(
+        self,
+        encoder_out: torch.Tensor,
+        ys_pad: torch.Tensor,
+    ):
+        decoder_out = self.ctc.ctc_lo(encoder_out)
+        # 2. Compute attention loss
+        loss_rich = self.criterion_att(decoder_out, ys_pad.contiguous())
+        acc_rich = th_accuracy(
+            decoder_out.view(-1, self.vocab_size),
+            ys_pad.contiguous(),
+            ignore_label=self.ignore_id,
+        )
+
+        return loss_rich, acc_rich
+
+    def inference(
+        self,
+        data_in,
+        data_lengths=None,
+        key: list = ["wav_file_tmp_name"],
+        tokenizer=None,
+        frontend=None,
+        **kwargs,
+    ):
+
+        meta_data = {}
+        if (
+            isinstance(data_in, torch.Tensor)
+            and kwargs.get("data_type", "sound") == "fbank"
+        ):  # fbank
+            speech, speech_lengths = data_in, data_lengths
+            if len(speech.shape) < 3:
+                speech = speech[None, :, :]
+            if speech_lengths is None:
+                speech_lengths = speech.shape[1]
+        else:
+            # extract fbank feats
+            time1 = time.perf_counter()
+            audio_sample_list = load_audio_text_image_video(
+                data_in,
+                fs=frontend.fs,
+                audio_fs=kwargs.get("fs", 16000),
+                data_type=kwargs.get("data_type", "sound"),
+                tokenizer=tokenizer,
+            )
+            time2 = time.perf_counter()
+            meta_data["load_data"] = f"{time2 - time1:0.3f}"
+            speech, speech_lengths = extract_fbank(
+                audio_sample_list,
+                data_type=kwargs.get("data_type", "sound"),
+                frontend=frontend,
+            )
+            time3 = time.perf_counter()
+            meta_data["extract_feat"] = f"{time3 - time2:0.3f}"
+            meta_data["batch_data_time"] = (
+                speech_lengths.sum().item()
+                * frontend.frame_shift
+                * frontend.lfr_n
+                / 1000
+            )
+
+        speech = speech.to(device=kwargs["device"])
+        speech_lengths = speech_lengths.to(device=kwargs["device"])
+
+        language = kwargs.get("language", "auto")
+        language_query = self.embed(
+            torch.LongTensor(
+                [[self.lid_dict[language] if language in self.lid_dict else 0]]
+            ).to(speech.device)
+        ).repeat(speech.size(0), 1, 1)
+
+        use_itn = kwargs.get("use_itn", False)
+        textnorm = kwargs.get("text_norm", None)
+        if textnorm is None:
+            textnorm = "withitn" if use_itn else "woitn"
+        textnorm_query = self.embed(
+            torch.LongTensor([[self.textnorm_dict[textnorm]]]).to(speech.device)
+        ).repeat(speech.size(0), 1, 1)
+        speech = torch.cat((textnorm_query, speech), dim=1)
+        speech_lengths += 1
+
+        event_emo_query = self.embed(
+            torch.LongTensor([[1, 2]]).to(speech.device)
+        ).repeat(speech.size(0), 1, 1)
+        input_query = torch.cat((language_query, event_emo_query), dim=1)
+        speech = torch.cat((input_query, speech), dim=1)
+        speech_lengths += 3
+
+        # Encoder
+        encoder_out, encoder_out_lens = self.encoder(speech, speech_lengths)
+        if isinstance(encoder_out, tuple):
+            encoder_out = encoder_out[0]
+
+        # c. Passed the encoder result and the beam search
+        ctc_logits = self.ctc.log_softmax(encoder_out)
+        if kwargs.get("ban_emo_unk", False):
+            ctc_logits[:, :, self.emo_dict["unk"]] = -float("inf")
+
+        results = []
+        b, n, d = encoder_out.size()
+        if isinstance(key[0], (list, tuple)):
+            key = key[0]
+        if len(key) < b:
+            key = key * b
+        for i in range(b):
+            x = ctc_logits[i, : encoder_out_lens[i].item(), :]
+            yseq = x.argmax(dim=-1)
+            yseq = torch.unique_consecutive(yseq, dim=-1)
+
+            ibest_writer = None
+            if kwargs.get("output_dir") is not None:
+                if not hasattr(self, "writer"):
+                    self.writer = DatadirWriter(kwargs.get("output_dir"))
+                ibest_writer = self.writer[f"1best_recog"]
+
+            mask = yseq != self.blank_id
+            token_int = yseq[mask].tolist()
+
+            # Change integer-ids to tokens
+            text = tokenizer.decode(token_int)
+
+            result_i = {"key": key[i], "text": text}
+            results.append(result_i)
+
+            if ibest_writer is not None:
+                ibest_writer["text"][key[i]] = text
+
+        return results, meta_data
+
+    def export(self, **kwargs):
+        from export_meta import export_rebuild_model
+
+        if "max_seq_len" not in kwargs:
+            kwargs["max_seq_len"] = 512
+        models = export_rebuild_model(model=self, **kwargs)
+        return models
+
+
+# ---------------------------------------------------------------------------
+# StreamingSenseVoice - streaming inference wrapper
+# ---------------------------------------------------------------------------
+
+from typing import List
+from asr_decoder import CTCDecoder
+from funasr.frontends.wav_frontend import load_cmvn
+from online_fbank import OnlineFbank
+import os
+import numpy as np
+
+sensevoice_models = {}
+
+
+class StreamingSenseVoice:
+    def __init__(
+        self,
+        chunk_size: int = 10,
+        padding: int = 8,
+        beam_size: int = 3,
+        contexts: List[str] = None,
+        context_score: float = 6.0,
+        language: str = "zh",
+        textnorm: bool = False,
+        device: str = "cpu",
+        onnx_model_path: str = "",
+        model: str = "iic/SenseVoiceSmall",
+    ):
+        """
+        Args:
+        language:
+            If not empty, then valid values are: auto, zh, en, ja, ko, yue
+        textnorm:
+            True to enable inverse text normalization; False to disable it.
+        """
+        self.device = device
+        self.model, kwargs = self.load_model(model=model, device=device)
+        # language query
+        self._language_id = self.model.lid_dict[language]  # for ONNX path
+        self._textnorm_id = self.model.textnorm_dict["withitn" if textnorm else "woitn"]
+        language = self._language_id
+        language = torch.LongTensor([[language]]).to(self.device)
+        language = self.model.embed(language).repeat(1, 1, 1)
+        # text normalization query
+        textnorm = self.model.textnorm_dict["withitn" if textnorm else "woitn"]
+        textnorm = torch.LongTensor([[textnorm]]).to(self.device)
+        textnorm = self.model.embed(textnorm).repeat(1, 1, 1)
+        # event and emotion query
+        event_emo = self.model.embed(torch.LongTensor([[1, 2]]).to(self.device)).repeat(
+            1, 1, 1
+        )
+        self.query = torch.cat((language, event_emo, textnorm), dim=1)
+        # features
+        cmvn = load_cmvn(kwargs["frontend_conf"]["cmvn_file"]).detach().numpy()
+        self.neg_mean, self.inv_stddev = cmvn[0, :], cmvn[1, :]
+        self.fbank = OnlineFbank(window_type="hamming")
+        # decoder
+        self.tokenizer = kwargs["tokenizer"]
+        bpe_model = kwargs["tokenizer_conf"]["bpemodel"]
+        symbol_table = {}
+        for i in range(self.tokenizer.get_vocab_size()):
+            symbol_table[self.tokenizer.decode(i)] = i
+        if beam_size > 1 and contexts is not None:
+            self.beam_size = beam_size
+            self.decoder = CTCDecoder(contexts, symbol_table, bpe_model, context_score=context_score)
+        else:
+            self.beam_size = 1
+            self.decoder = CTCDecoder()
+
+        self.chunk_size = chunk_size
+        self.padding = padding
+        self.cur_idx = -1
+        self.caches_shape = (chunk_size + 2 * padding, kwargs["input_size"])
+        self.caches = torch.zeros(self.caches_shape)
+        self.zeros = np.zeros((1, kwargs["input_size"]), dtype=float)
+
+        # Load ONNX model for fast full_inference (int8, ~13x faster than PyTorch)
+        self._onnx_session = None
+        if onnx_model_path and os.path.exists(onnx_model_path):
+            import onnxruntime as ort
+            self._onnx_session = ort.InferenceSession(
+                onnx_model_path, providers=["CPUExecutionProvider"]
+            )
+            print(f"ONNX model loaded: {onnx_model_path}", flush=True)
+
+    @staticmethod
+    def load_model(model: str, device: str) -> tuple:
+        key = f"{model}-{device}"
+        if key not in sensevoice_models:
+            model, kwargs = SenseVoiceSmall.from_pretrained(model=model, device=device)
+            model = model.to(device)
+            model.eval()
+            sensevoice_models[key] = (model, kwargs)
+        return sensevoice_models[key]
+
+    def reset(self):
+        self.cur_idx = -1
+        self.decoder.reset()
+        self.fbank = OnlineFbank(window_type="hamming")
+        self.caches = torch.zeros(self.caches_shape)
+
+    def full_inference(self, samples) -> str:
+        """Non-streaming inference on complete audio for highest accuracy.
+
+        Uses ONNX Runtime int8 model (~13x faster than PyTorch float32).
+        Falls back to PyTorch if ONNX model not available.
+        ~0.06s for 8s audio on CPU.
+        """
+        if not samples:
+            return ""
+
+        # Extract full fbank features from raw audio
+        fbank = OnlineFbank(window_type="hamming")
+        fbank.accept_waveform(samples, is_last=True)
+        features = fbank.get_lfr_frames(
+            neg_mean=self.neg_mean, inv_stddev=self.inv_stddev
+        )
+        if len(features) == 0:
+            return ""
+
+        x = np.array(features, dtype=np.float32)[np.newaxis, :, :]
+
+        if self._onnx_session is not None:
+            # ONNX path: int8 quantized, ~13x faster
+            x_length = np.array([x.shape[1]], dtype=np.int32)
+            language = np.array([self._language_id], dtype=np.int32)
+            text_norm = np.array([self._textnorm_id], dtype=np.int32)
+            result = self._onnx_session.run(
+                None,
+                {"x": x, "x_length": x_length, "language": language, "text_norm": text_norm},
+            )
+            logits = result[0][0, 4:]  # (T, vocab_size), skip first 4 query tokens
+        else:
+            # PyTorch fallback
+            speech = torch.tensor(features).unsqueeze(0).to(self.device)
+            speech_lengths = torch.tensor([speech.shape[1]]).to(self.device)
+            speech = torch.cat((self.query, speech), dim=1)
+            speech_lengths += 4
+            with torch.no_grad():
+                encoder_out, _ = self.model.encoder(speech, speech_lengths)
+            logits = self.model.ctc.log_softmax(encoder_out)[0, 4:].detach().numpy()
+
+        # Decode: beam search (with hotword biasing) or greedy
+        if self.beam_size > 1:
+            probs = torch.tensor(logits, dtype=torch.float32)
+            self.decoder.reset()
+            res = self.decoder.ctc_prefix_beam_search(
+                probs, beam_size=self.beam_size, is_last=True
+            )
+            _, text = self.decode(res["times"][0], res["tokens"][0])
+            return text
+        else:
+            token_ids = logits.argmax(axis=-1).tolist()
+            prev = -1
+            filtered = []
+            for t in token_ids:
+                if t != 0 and t != prev:  # 0 = blank
+                    filtered.append(t)
+                prev = t
+            if not filtered:
+                return ""
+            text = self.tokenizer.decode(filtered)
+            return _clean_text(text)
+
+    def get_size(self):
+        effective_size = self.cur_idx + 1 - self.padding
+        if effective_size <= 0:
+            return 0
+        return effective_size % self.chunk_size or self.chunk_size
+
+    def inference(self, speech):
+        if self._onnx_session is not None:
+            x = speech.detach().numpy()[np.newaxis, :, :]
+            x_length = np.array([x.shape[1]], dtype=np.int32)
+            language = np.array([self._language_id], dtype=np.int32)
+            text_norm = np.array([self._textnorm_id], dtype=np.int32)
+            result = self._onnx_session.run(
+                None,
+                {"x": x, "x_length": x_length, "language": language, "text_norm": text_norm},
+            )
+            # ONNX outputs raw logits, CTC decoder needs log_softmax
+            logits = torch.from_numpy(result[0][0, 4:])
+            return torch.nn.functional.log_softmax(logits, dim=-1)
+
+        speech = speech[None, :, :]
+        speech_lengths = torch.tensor([speech.shape[1]])
+        speech = speech.to(self.device)
+        speech_lengths = speech_lengths.to(self.device)
+        speech = torch.cat((self.query, speech), dim=1)
+        speech_lengths += 4
+        encoder_out, _ = self.model.encoder(speech, speech_lengths)
+        return self.model.ctc.log_softmax(encoder_out)[0, 4:].detach()
+
+    def decode(self, times, tokens):
+        times_ms = []
+        for step, token in zip(times, tokens):
+            if len(self.tokenizer.decode(token).strip()) == 0:
+                continue
+            times_ms.append(step * 60)
+        return times_ms, _clean_text(self.tokenizer.decode(tokens))
+
+    def streaming_inference(self, audio, is_last):
+        self.fbank.accept_waveform(audio, is_last)
+        features = self.fbank.get_lfr_frames(
+            neg_mean=self.neg_mean, inv_stddev=self.inv_stddev
+        )
+        if is_last and len(features) == 0:
+            features = self.zeros
+        for idx, feature in enumerate(torch.unbind(torch.tensor(features), dim=0)):
+            is_last = is_last and idx == features.shape[0] - 1
+            self.caches = torch.roll(self.caches, -1, dims=0)
+            self.caches[-1, :] = feature
+            self.cur_idx += 1
+            cur_size = self.get_size()
+            if cur_size != self.chunk_size and not is_last:
+                continue
+            probs = self.inference(self.caches)[self.padding :]
+            if cur_size != self.chunk_size:
+                probs = probs[self.chunk_size - cur_size :]
+            if not is_last:
+                probs = probs[: self.chunk_size]
+            if self.beam_size > 1:
+                res = self.decoder.ctc_prefix_beam_search(
+                    probs, beam_size=self.beam_size, is_last=is_last
+                )
+                times_ms, text = self.decode(res["times"][0], res["tokens"][0])
+            else:
+                res = self.decoder.ctc_greedy_search(probs, is_last=is_last)
+                times_ms, text = self.decode(res["times"], res["tokens"])
+            yield {"timestamps": times_ms, "text": text}
+
+
+import re
+
+# Punctuation marks (Chinese + English)
+_PUNCT = set('，。！？、；：""''（）…—,。!?;:\'"().-')
+
+def _clean_text(text: str) -> str:
+    """Clean up recognition artifacts: tags, Korean/Japanese chars, duplicate punctuation."""
+    if not text:
+        return text
+    # Strip SenseVoice tags like <|zh|><|NEUTRAL|><|Speech|><|withitn|>
+    text = re.sub(r'<\|[^|]+\|>', '', text).strip()
+    # Remove Korean Hangul (U+AC00-U+D7AF, U+1100-U+11FF, U+3130-U+318F)
+    text = re.sub(r'[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]', '', text)
+    # Remove Japanese Hiragana (U+3040-U+309F) and Katakana (U+30A0-U+30FF)
+    text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)
+    # Remove consecutive punctuation where first is a comma-like and second is a period-like
+    # e.g. "，。" → "。"  "，！" → "！"  ",." → "."
+    text = re.sub(r'[,，、;；][。.!！?？]', lambda m: m.group()[-1], text)
+    # Remove exact duplicate punctuation: "。。" → "。", "，，" → "，"
+    text = re.sub(r'([，。！？、；：,\.!?;:])\1+', r'\1', text)
+    return text
+
+
+def load_model(
+    model_dir: str,
+    contexts=None,
+    beam_size=3,
+    context_score=6.0,
+    device="auto",
+    language="auto",
+    textnorm=True,
+    padding=8,
+    chunk_size=10,
+):
+    """Load SenseVoice model and create a StreamingSenseVoice wrapper.
+
+    Args:
+        device: "auto" detects MPS (Apple GPU) availability, falls back to CPU.
+    """
+    if device == "auto":
+        # SenseVoice-Small (~244M params) runs faster on CPU than MPS.
+        # MPS data transfer overhead exceeds compute savings for this model size.
+        device = "cpu"
+        print(f"Device: {device} (CPU is faster than MPS for this model size)", flush=True)
+
+    # Auto-detect ONNX model for fast full_inference
+    onnx_model_path = ""
+    # Check common locations
+    for candidate in [
+        os.path.expanduser("~/Library/Application Support/Muse/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx"),
+        os.path.join(model_dir, "model.int8.onnx") if os.path.isdir(model_dir) else "",
+    ]:
+        if candidate and os.path.exists(candidate):
+            onnx_model_path = candidate
+            break
+
+    model = StreamingSenseVoice(
+        model=model_dir,
+        device=device,
+        contexts=contexts,
+        beam_size=beam_size,
+        context_score=context_score,
+        language=language,
+        textnorm=textnorm,
+        padding=padding,
+        chunk_size=chunk_size,
+        onnx_model_path=onnx_model_path,
+    )
+
+    # Warmup: run one dummy inference to eliminate PyTorch JIT cold start
+    print("Warming up encoder...", flush=True)
+    dummy_samples = [0] * 16000  # 1 second of silence
+    for _ in model.streaming_inference(dummy_samples, is_last=True):
+        pass
+    model.reset()
+    print("Warmup complete.", flush=True)
+
+    return model

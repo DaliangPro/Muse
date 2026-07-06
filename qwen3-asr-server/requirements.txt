@@ -1,0 +1,8 @@
+mlx>=0.22.0
+mlx-qwen3-asr>=0.1.0
+fastapi>=0.115.0
+uvicorn>=0.34.0
+websockets>=14.0
+soundfile>=0.12.0
+numpy>=1.26.0
+llama-cpp-python>=0.3.0

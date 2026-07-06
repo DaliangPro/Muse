@@ -1,0 +1,35 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_PATH="${1:-${APP_PATH:-/Applications/Muse.app}}"
+INFO_PLIST="$APP_PATH/Contents/Info.plist"
+
+fail() {
+    echo "FAIL: $1" >&2
+    exit 1
+}
+
+read_plist() {
+    local key="$1"
+    /usr/libexec/PlistBuddy -c "Print :$key" "$INFO_PLIST" 2>/dev/null
+}
+
+[ -d "$APP_PATH" ] || fail "app bundle not found at $APP_PATH"
+[ -f "$INFO_PLIST" ] || fail "Info.plist missing at $INFO_PLIST"
+[ -f "$APP_PATH/Contents/MacOS/Muse" ] || fail "app executable missing"
+[ -f "$APP_PATH/Contents/Resources/AppIcon.icns" ] || fail "app icon missing"
+
+[ "$(read_plist CFBundleExecutable)" = "Muse" ] || fail "CFBundleExecutable should be Muse"
+[ "$(read_plist CFBundleIdentifier)" = "pro.daliang.muse" ] || fail "CFBundleIdentifier should be pro.daliang.muse"
+[ "$(read_plist CFBundleName)" = "Muse" ] || fail "CFBundleName should be Muse"
+[ "$(read_plist CFBundleDisplayName)" = "Muse" ] || fail "CFBundleDisplayName should be Muse"
+[ "$(read_plist CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType should be APPL"
+[ "$(read_plist CFBundleShortVersionString)" = "1.6.1" ] || fail "CFBundleShortVersionString should be 1.6.1"
+[ "$(read_plist CFBundleVersion)" = "1" ] || fail "CFBundleVersion should be 1"
+[ "$(read_plist CFBundleIconFile)" = "AppIcon" ] || fail "CFBundleIconFile should be AppIcon"
+[ "$(read_plist LSMinimumSystemVersion)" = "14.0" ] || fail "LSMinimumSystemVersion should be 14.0"
+[ -n "$(read_plist NSMicrophoneUsageDescription)" ] || fail "NSMicrophoneUsageDescription should be present"
+[ -n "$(read_plist NSAppleEventsUsageDescription)" ] || fail "NSAppleEventsUsageDescription should be present"
+[ "$(read_plist LSUIElement)" = "true" ] || fail "LSUIElement should be true"
+
+echo "PASS: app bundle metadata looks correct"

@@ -1,0 +1,11 @@
+torch
+torchaudio
+funasr
+asr-decoder
+online-fbank
+pysilero
+soundfile
+fastapi[standard]
+uvicorn[standard]
+numpy<2
+llama-cpp-python

@@ -1,0 +1,110 @@
+import Foundation
+@preconcurrency import AVFoundation
+
+struct ASRRequestOptions: Sendable, Equatable {
+    var enablePunc: Bool = true
+    var hotwords: [String] = []
+    /// hotwords 中前 N 个是用户手动添加的词,给更高 boosting 权重(其余为内置通用词)
+    var userHotwordCount: Int = 0
+    var boostingTableID: String?
+    var contextHistoryLength: Int = 0
+
+    var urlSessionConfiguration: URLSessionConfiguration {
+        URLSessionConfiguration.default
+    }
+}
+
+struct RecognitionTranscript: Sendable, Equatable {
+    let confirmedSegments: [String]
+    let partialText: String
+    let authoritativeText: String
+    let isFinal: Bool
+
+    static let empty = RecognitionTranscript(
+        confirmedSegments: [],
+        partialText: "",
+        authoritativeText: "",
+        isFinal: false
+    )
+
+    var composedText: String {
+        let pieces = confirmedSegments + (partialText.isEmpty ? [] : [partialText])
+        return pieces.joined()
+    }
+
+    var displayText: String {
+        authoritativeText.isEmpty ? composedText : authoritativeText
+    }
+}
+
+enum InjectionOutcome: Sendable, Equatable {
+    case inserted
+    case copiedToClipboard
+    case noFocusedInput(copiedToClipboard: Bool)
+    /// 自动粘贴所需的辅助功能权限未授予，文本已留在剪贴板等待手动粘贴（REPAIR_PLAN B1）
+    case copiedToClipboardPermissionMissing
+
+    var completionMessage: String {
+        switch self {
+        case .inserted:
+            return L("已完成", "Done")
+        case .copiedToClipboard:
+            return L("已粘贴到剪贴板", "Copied to clipboard")
+        case .noFocusedInput(let copiedToClipboard):
+            return copiedToClipboard
+                ? L("未找到输入位置，已复制", "No input target — copied")
+                : L("未找到输入位置", "No input target")
+        case .copiedToClipboardPermissionMissing:
+            return L("已复制，请手动粘贴（开启辅助功能权限后可自动输入）",
+                     "Copied — paste manually (grant Accessibility to auto-insert)")
+        }
+    }
+
+    var needsManualCopyCard: Bool {
+        if case .noFocusedInput = self { return true }
+        return false
+    }
+}
+
+enum RecognitionEvent: Sendable {
+    case ready
+    case transcript(RecognitionTranscript)
+    case error(Error)
+    case completed
+    case processingResult(text: String)
+    case finalized(text: String, injection: InjectionOutcome)
+    /// 流式上传中断（REPAIR_PLAN B7a）：录音仍在继续，最终文本由停止后的
+    /// 批量兜底重识别保证；UI 据此提示用户不必因字幕停更而中断说话
+    case streamingInterrupted
+}
+
+struct LLMConfig: Sendable {
+    let apiKey: String
+    let model: String
+    let baseURL: String
+
+    init(apiKey: String, model: String, baseURL: String = "") {
+        self.apiKey = apiKey
+        self.model = model
+        self.baseURL = baseURL
+    }
+}
+
+protocol SpeechRecognizer: Sendable {
+    func connect(config: any ASRProviderConfig, options: ASRRequestOptions) async throws
+    func sendAudio(_ data: Data) async throws
+    func sendAudioBuffer(_ buffer: AVAudioPCMBuffer) async throws
+    func endAudio() async throws
+    func disconnect() async
+    var events: AsyncStream<RecognitionEvent> { get async }
+}
+
+extension SpeechRecognizer {
+    func sendAudio(_ data: Data) async throws {
+        _ = data
+    }
+
+    func sendAudioBuffer(_ buffer: AVAudioPCMBuffer) async throws {
+        _ = buffer
+    }
+}
