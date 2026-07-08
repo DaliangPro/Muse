@@ -192,17 +192,9 @@ final class TextInjectionEngine: @unchecked Sendable {
         if boolAttribute(element, "AXEditable" as CFString) == true {
             return true
         }
-        // 微信等自绘/网页输入框不暴露标准角色，但文本输入场景普遍支持「选区」属性
-        // （2026-07 修：焦点在微信时被误判为无输入框而拒绝注入）
-        if role == "AXWebArea" {
-            return true
-        }
-        var selectedRange: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selectedRange) == .success,
-           selectedRange != nil {
-            return true
-        }
-
+        // 注意：不要在这里加「AXWebArea 即输入框」「支持选区属性即输入框」这类宽松启发式——
+        // 浏览器页面/PDF/只读文本视图都会命中，导致无输入框场景被误判、复制兜底界面永不出现
+        // （2026-07-08 修：微信等自绘 app 的注入由 isAXOpaqueApp 直通名单负责，不靠此处放宽）
         guard depth < 3,
               let parent = elementAttribute(element, kAXParentAttribute as CFString)
         else { return false }
