@@ -564,10 +564,14 @@ actor SenseVoiceServerManager {
                 return candidate
             }
         }
+        // 安装到 /Applications 时向上遍历到不了工程目录，靠家目录常见位置兜底
+        // （工程实际在 ~/muse；曾只写死 ~/projects/muse 导致本地引擎 serverNotFound）
         let home = NSHomeDirectory()
-        let fallback = (home as NSString).appendingPathComponent("projects/muse/\(name)")
-        if FileManager.default.fileExists(atPath: (fallback as NSString).appendingPathComponent("server.py")) {
-            return fallback
+        for relative in ["muse/\(name)", "projects/muse/\(name)"] {
+            let fallback = (home as NSString).appendingPathComponent(relative)
+            if FileManager.default.fileExists(atPath: (fallback as NSString).appendingPathComponent("server.py")) {
+                return fallback
+            }
         }
         return nil
     }
