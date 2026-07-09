@@ -156,7 +156,61 @@ final class TextInjectionEngine: @unchecked Sendable {
             }
             return .noFocusedInput(copiedToClipboard: false)
         }
+        // REPAIR_PLAN J16：标准输入框优先 AX 直插（kAXSelectedText），全程不碰剪贴板；
+        // 元素不支持 / 设置失败 / 读回验证不过，回落剪贴板通道（微信等不透明 app
+        // 在上方直通名单已分流）。
+        if injectViaAccessibility(text) {
+            DebugFileLogger.log("inject: via AX selectedText len=\(text.count) frontmost=\(frontmostBundleID ?? "unknown")")
+            return .inserted
+        }
+        DebugFileLogger.log("inject: AX declined, falling back to clipboard")
         return injectViaClipboard(text)
+    }
+
+    // MARK: - Accessibility injection (REPAIR_PLAN J16)
+
+    /// 经 AXSelectedText 在焦点输入框光标处直插文本（零剪贴板占用）。
+    /// 三重防护：① 元素显式声明该属性可写 ② set 返回 success ③ 光标位置前进验证。
+    /// 验证不用「读回内容比对」——智能引号/自动格式化会造成已插入却比对不过 →
+    /// 回落剪贴板重复插入；光标前进与否不受格式化影响：假成功时光标不动（回落
+    /// 安全无重复），真插入必前进。任一环节不满足返回 false 走剪贴板通道。
+    private func injectViaAccessibility(_ text: String) -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focused = Self.elementAttribute(appElement, kAXFocusedUIElementAttribute as CFString) else {
+            return false
+        }
+
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(focused, kAXSelectedTextAttribute as CFString, &settable) == .success,
+              settable.boolValue else {
+            return false
+        }
+
+        // 光标基线读不到则无法验证插入是否真实发生——保守走剪贴板，宁可短占用不可丢字
+        guard let locationBefore = Self.selectedRangeLocation(focused) else {
+            DebugFileLogger.log("inject: AX no selectedRange baseline, fallback")
+            return false
+        }
+
+        guard AXUIElementSetAttributeValue(focused, kAXSelectedTextAttribute as CFString, text as CFString) == .success else {
+            return false
+        }
+
+        guard let locationAfter = Self.selectedRangeLocation(focused), locationAfter > locationBefore else {
+            DebugFileLogger.log("inject: AX set ok but caret did not advance, fallback")
+            return false
+        }
+        return true
+    }
+
+    private static func selectedRangeLocation(_ element: AXUIElement) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue((value as! AXValue), .cfRange, &range) else { return nil }
+        return range.location
     }
 
     func copyToClipboard(_ text: String) {

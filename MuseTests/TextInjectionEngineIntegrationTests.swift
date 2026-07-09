@@ -18,6 +18,10 @@ final class TextInjectionEngineIntegrationTests: XCTestCase {
 
         try activateTextEdit()
 
+        // REPAIR_PLAN J16：AX 直插零剪贴板占用——注入全程剪贴板保持原内容
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("剪贴板原有内容", forType: .string)
+
         let engine = TextInjectionEngine()
         engine.preserveClipboard = false
 
@@ -32,8 +36,8 @@ final class TextInjectionEngineIntegrationTests: XCTestCase {
         let clipboardText = NSPasteboard.general.string(forType: .string) ?? ""
         XCTAssertEqual(
             clipboardText,
-            marker,
-            "Expected clipboard to keep injected marker when preserveClipboard is false."
+            "剪贴板原有内容",
+            "AX direct insertion must not touch the clipboard at all (REPAIR_PLAN J16)."
         )
     }
 
