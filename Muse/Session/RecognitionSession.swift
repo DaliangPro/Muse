@@ -906,6 +906,21 @@ actor RecognitionSession {
             markReadyIfNeeded()
             return  // markReadyIfNeeded calls onASREvent(.ready) internally
 
+        case .completed:
+            // J15 状态回跳：流关闭只在录音中才有语义（服务端主动收播 → UI 进处理态）。
+            // 用户已发起停止后的正常关流若照转发，UI 会提前复位热键 processing 标志，
+            // 间隙按键可打断在途收尾管线；收尾自身的终态事件由 stop 管线直接发出。
+            logger.info("ASR stream completed")
+            if state == .recording {
+                AppLogger.log("[Session] Server closed ASR while recording, initiating stop")
+                DebugFileLogger.log("server-initiated stop from recording state")
+                onASREvent?(.completed)
+                Task { await self.stopRecording() }
+            } else {
+                DebugFileLogger.log("ASR stream closed in state=\(state); completed not forwarded")
+            }
+            return
+
         default:
             break
         }
@@ -914,7 +929,7 @@ actor RecognitionSession {
         onASREvent?(event)
 
         switch event {
-        case .ready:
+        case .ready, .completed:
             break  // handled above
 
         case .transcript(let transcript):
@@ -929,14 +944,6 @@ actor RecognitionSession {
             if state == .recording || state == .starting {
                 let generation = sessionGeneration
                 Task { await self.failActiveSessionAfterASRError(expectedGeneration: generation) }
-            }
-
-        case .completed:
-            logger.info("ASR stream completed")
-            if state == .recording {
-                AppLogger.log("[Session] Server closed ASR while recording, initiating stop")
-                DebugFileLogger.log("server-initiated stop from recording state")
-                Task { await self.stopRecording() }
             }
 
         case .streamingInterrupted:
