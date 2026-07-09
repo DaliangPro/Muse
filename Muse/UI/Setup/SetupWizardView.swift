@@ -130,7 +130,9 @@ struct SetupWizardView: View {
                     .font(TF.settingsFontMetric)
                     .foregroundStyle(TF.settingsText)
                     .multilineTextAlignment(.center)
-                Text(L("按住说话、松手成文的语音输入法，也是帮你随手留住灵感、随时取用的工作台。",
+                // REPAIR_PLAN J4：默认触发是 toggle（单击开始、再单击结束），
+                // 文案不得写「按住/松手」——与就绪页矛盾会让新用户卡在第一步
+                Text(L("一键开口、说完成文的语音输入法，也是帮你随手留住灵感、随时取用的工作台。",
                        "A voice keyboard that turns speech into text — and a workbench that keeps every idea within reach."))
                     .font(TF.settingsFontBody)
                     .foregroundStyle(TF.settingsTextTertiary)

@@ -8,7 +8,8 @@ struct SetupFeatureSlide: View {
 
     private var titles: [(label: String, hint: String)] {
         [
-            (L("语音输入", "Voice input"), L("按住说话，文字落到光标处", "Hold, speak — text lands at the cursor")),
+            // REPAIR_PLAN J4：默认触发是 toggle（单击开始、再单击结束），不得写「按住」
+            (L("语音输入", "Voice input"), L("单击快捷键说话，文字落到光标处", "Tap the hotkey, speak — text lands at the cursor")),
             (L("AI 润色", "AI polish"), L("说口语，出干净文本", "Speak casually, get clean text")),
             (L("语料资产", "Language assets"), L("说过的话自动沉淀成资产", "Your words become reusable assets")),
         ]
