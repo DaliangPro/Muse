@@ -550,20 +550,10 @@ actor AssetExtractionService {
             let sourceRecords = inputOutcome.records
             loadedSourceRecordCount = sourceRecords.count
 
-            let runningRun = ExtractionRun(
-                id: createdRun.id,
-                recipeID: createdRun.recipeID,
-                recipeName: createdRun.recipeName,
-                createdAt: createdRun.createdAt,
+            let runningRun = createdRun.advanced(
                 startedAt: Date(),
-                finishedAt: nil,
-                rangeType: createdRun.rangeType,
-                rangePayload: createdRun.rangePayload,
                 sourceRecordCount: sourceRecords.count,
-                status: .running,
-                resultCount: 0,
-                summary: nil,
-                errorMessage: nil
+                status: .running
             )
             await assetStore.insert(run: runningRun)
             await assetStore.logAction(
@@ -577,20 +567,10 @@ actor AssetExtractionService {
             )
 
             guard !sourceRecords.isEmpty else {
-                let finishedRun = ExtractionRun(
-                    id: runningRun.id,
-                    recipeID: runningRun.recipeID,
-                    recipeName: runningRun.recipeName,
-                    createdAt: runningRun.createdAt,
-                    startedAt: runningRun.startedAt,
+                let finishedRun = runningRun.advanced(
                     finishedAt: Date(),
-                    rangeType: runningRun.rangeType,
-                    rangePayload: runningRun.rangePayload,
-                    sourceRecordCount: runningRun.sourceRecordCount,
                     status: .succeeded,
-                    resultCount: 0,
-                    summary: L("本次范围内没有可用于提炼的语料", "No source material found in this range"),
-                    errorMessage: nil
+                    summary: L("本次范围内没有可用于提炼的语料", "No source material found in this range")
                 )
                 await assetStore.insert(run: finishedRun)
                 return RecipeExtractionRunResult(run: finishedRun, results: [])
@@ -627,20 +607,11 @@ actor AssetExtractionService {
                 reviewDroppedCount: reviewOutcome.droppedCount,
                 reviewSkipped: reviewOutcome.skipped
             )
-            let finishedRun = ExtractionRun(
-                id: runningRun.id,
-                recipeID: runningRun.recipeID,
-                recipeName: runningRun.recipeName,
-                createdAt: runningRun.createdAt,
-                startedAt: runningRun.startedAt,
+            let finishedRun = runningRun.advanced(
                 finishedAt: Date(),
-                rangeType: runningRun.rangeType,
-                rangePayload: runningRun.rangePayload,
-                sourceRecordCount: runningRun.sourceRecordCount,
                 status: .succeeded,
                 resultCount: results.count,
-                summary: summary,
-                errorMessage: nil
+                summary: summary
             )
             await assetStore.insert(run: finishedRun)
             await assetStore.logAction(
@@ -653,19 +624,11 @@ actor AssetExtractionService {
             let message = error is CancellationError
                 ? L("已取消", "Cancelled")
                 : error.localizedDescription
-            let failedRun = ExtractionRun(
-                id: createdRun.id,
-                recipeID: recipe.id,
-                recipeName: recipe.name,
-                createdAt: createdRun.createdAt,
+            let failedRun = createdRun.advanced(
                 startedAt: Date(),
                 finishedAt: Date(),
-                rangeType: configuration.rangeType,
-                rangePayload: configuration.rangePayload,
                 sourceRecordCount: loadedSourceRecordCount,
                 status: .failed,
-                resultCount: 0,
-                summary: nil,
                 errorMessage: message
             )
             await assetStore.insert(run: failedRun)
@@ -1204,6 +1167,36 @@ actor AssetExtractionService {
         return L(
             "开始提炼：方案 \(recipe.name)，范围 \(rangeTitle)，源记录 \(sourceCount) 条，输入 \(inputCount) 条，模型 \(providerName)",
             "Extraction started: recipe \(recipe.name), \(rangeTitle), \(sourceCount) source records, \(inputCount) inputs, provider \(providerName)"
+        )
+    }
+}
+
+// MARK: - Run 状态推进（J15：五处全字段重建收敛，未给字段默认值即沿用当前值）
+
+private extension ExtractionRun {
+    func advanced(
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        sourceRecordCount: Int? = nil,
+        status: ExtractionRunStatus,
+        resultCount: Int = 0,
+        summary: String? = nil,
+        errorMessage: String? = nil
+    ) -> ExtractionRun {
+        ExtractionRun(
+            id: id,
+            recipeID: recipeID,
+            recipeName: recipeName,
+            createdAt: createdAt,
+            startedAt: startedAt ?? self.startedAt,
+            finishedAt: finishedAt,
+            rangeType: rangeType,
+            rangePayload: rangePayload,
+            sourceRecordCount: sourceRecordCount ?? self.sourceRecordCount,
+            status: status,
+            resultCount: resultCount,
+            summary: summary,
+            errorMessage: errorMessage
         )
     }
 }
