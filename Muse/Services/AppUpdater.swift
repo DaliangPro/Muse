@@ -328,12 +328,111 @@ final class AppUpdater {
 
     /// 纯常量脚本：全部参数经环境变量传入（J15 收口——原先 stagingDir 以字符串
     /// 插值写进脚本文本，路径含引号/特殊字符时会破坏脚本语法）
-    private static let updaterScript = """
+    private nonisolated static let updaterScript = """
         #!/bin/bash
         set -euo pipefail
+
+        die() {
+            echo "ERROR: $*" >&2
+            exit 1
+        }
+
+        require_env() {
+            local name="$1"
+            local value="${!name:-}"
+            [ -n "$value" ] || die "$name is required"
+        }
+
+        require_absolute_path() {
+            local name="$1"
+            local value="$2"
+            case "$value" in
+                /*) ;;
+                *) die "$name must be an absolute path: $value" ;;
+            esac
+        }
+
+        reject_dangerous_root() {
+            local name="$1"
+            local value="$2"
+            case "$value" in
+                "/"|"/Applications"|"/Users"|"${HOME:-__muse_no_home__}"|"/tmp"|"/private/tmp")
+                    die "$name points at an unsafe root: $value"
+                    ;;
+            esac
+        }
+
+        require_env APP_PID
+        require_env APP_PATH
+        require_env DMG_PATH
+        require_env IS_LOCAL
+        require_env SIGNING_IDENTITY
+        require_env STAGING_DIR
+
+        require_absolute_path STAGING_DIR "$STAGING_DIR"
+        reject_dangerous_root STAGING_DIR "$STAGING_DIR"
+        mkdir -p "$STAGING_DIR"
+
         LOG="$STAGING_DIR/update.log"
         exec > "$LOG" 2>&1
         echo "Muse updater started at $(date)"
+
+        require_absolute_path APP_PATH "$APP_PATH"
+        require_absolute_path DMG_PATH "$DMG_PATH"
+        reject_dangerous_root APP_PATH "$APP_PATH"
+        reject_dangerous_root DMG_PATH "$DMG_PATH"
+        case "$APP_PID" in
+            ''|*[!0-9]*) die "APP_PID must be numeric: $APP_PID" ;;
+        esac
+        case "$APP_PATH" in
+            *.app) ;;
+            *) die "APP_PATH must point to an .app bundle: $APP_PATH" ;;
+        esac
+        [ -d "$APP_PATH/Contents" ] || die "APP_PATH is not an app bundle: $APP_PATH"
+        case "$DMG_PATH" in
+            "$STAGING_DIR"/*.dmg) ;;
+            *) die "DMG_PATH must be a .dmg inside STAGING_DIR: $DMG_PATH" ;;
+        esac
+        case "$IS_LOCAL" in
+            0|1) ;;
+            *) die "IS_LOCAL must be 0 or 1: $IS_LOCAL" ;;
+        esac
+
+        BACKUP_PATH="$STAGING_DIR/Muse-backup.app"
+
+        safe_rm_rf() {
+            local target="$1"
+            [ -n "$target" ] || die "refusing rm -rf on empty path"
+            require_absolute_path "rm target" "$target"
+            reject_dangerous_root "rm target" "$target"
+            case "$target" in
+                "$APP_PATH"|"$BACKUP_PATH"|"${TEMP_LOCAL:-__muse_no_temp__}"|"${SERVER_TEMP:-__muse_no_server_temp__}"|"$STAGING_DIR"/*)
+                    rm -rf "$target"
+                    ;;
+                *)
+                    die "refusing rm -rf outside updater-owned paths: $target"
+                    ;;
+            esac
+        }
+
+        safe_rm_file() {
+            local target="$1"
+            [ -n "$target" ] || die "refusing rm -f on empty path"
+            require_absolute_path "rm file target" "$target"
+            case "$target" in
+                "$STAGING_DIR"/*.dmg)
+                    rm -f "$target"
+                    ;;
+                *)
+                    die "refusing rm -f outside updater-owned files: $target"
+                    ;;
+            esac
+        }
+
+        if [ "${MUSE_UPDATER_DRY_RUN:-0}" = "1" ]; then
+            echo "DRY_RUN: updater environment validated"
+            exit 0
+        fi
 
         # Wait for app to exit
         while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.2; done
@@ -343,11 +442,12 @@ final class AppUpdater {
         # Mount DMG
         echo "Mounting DMG..."
         MOUNT_OUTPUT=$(hdiutil attach -nobrowse -noverify -mountrandom /tmp "$DMG_PATH" 2>&1)
-        MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | grep '/tmp/' | awk '{print $NF}')
+        MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | awk '/\\/tmp\\// {print $NF; exit}')
+        [ -n "$MOUNT_POINT" ] || die "failed to resolve DMG mount point"
         echo "Mounted at $MOUNT_POINT"
 
         cleanup_mount() {
-            hdiutil detach "$MOUNT_POINT" 2>/dev/null || true
+            [ -n "${MOUNT_POINT:-}" ] && hdiutil detach "$MOUNT_POINT" 2>/dev/null || true
         }
         trap cleanup_mount EXIT
 
@@ -386,16 +486,16 @@ final class AppUpdater {
         echo "New app passed identity checks."
 
         # Backup current app
-        BACKUP_PATH="$STAGING_DIR/Muse-backup.app"
-        rm -rf "$BACKUP_PATH"
+        safe_rm_rf "$BACKUP_PATH"
         echo "Backing up $APP_PATH..."
         cp -R "$APP_PATH" "$BACKUP_PATH"
 
         # Rollback on error
         rollback() {
+            set +e
             echo "ERROR: Update failed, rolling back..."
             if [ -d "$BACKUP_PATH" ]; then
-                rm -rf "$APP_PATH" 2>/dev/null || true
+                safe_rm_rf "$APP_PATH" 2>/dev/null || true
                 mv "$BACKUP_PATH" "$APP_PATH"
                 echo "Rolled back to backup."
             fi
@@ -417,7 +517,7 @@ final class AppUpdater {
 
         # Replace app
         echo "Replacing app bundle..."
-        rm -rf "$APP_PATH"
+        safe_rm_rf "$APP_PATH"
         cp -R "$NEW_APP" "$APP_PATH"
 
         # Restore local components
@@ -427,7 +527,7 @@ final class AppUpdater {
                 [ -e "$TEMP_LOCAL/$item" ] && mv "$TEMP_LOCAL/$item" "$APP_PATH/Contents/MacOS/"
             done
             [ -d "$TEMP_LOCAL/Models" ] && mv "$TEMP_LOCAL/Models" "$APP_PATH/Contents/Resources/"
-            rm -rf "$TEMP_LOCAL"
+            safe_rm_rf "$TEMP_LOCAL"
         fi
 
         # Code sign only if a real signing identity is available (not ad-hoc).
@@ -449,7 +549,7 @@ final class AppUpdater {
                 for item in sensevoice-server-dist sensevoice-server qwen3-asr-server-dist qwen3-asr-server; do
                     [ -e "$SERVER_TEMP/$item" ] && mv "$SERVER_TEMP/$item" "$APP_PATH/Contents/MacOS/"
                 done
-                rm -rf "$SERVER_TEMP"
+                safe_rm_rf "$SERVER_TEMP"
             fi
         else
             echo "Skipping code signing (no developer identity, preserving original signature)"
@@ -460,8 +560,8 @@ final class AppUpdater {
 
         # Cleanup
         echo "Cleaning up..."
-        rm -f "$DMG_PATH"
-        rm -rf "$BACKUP_PATH"
+        safe_rm_file "$DMG_PATH"
+        safe_rm_rf "$BACKUP_PATH"
 
         # Relaunch
         echo "Relaunching..."
@@ -470,6 +570,8 @@ final class AppUpdater {
         echo "Update completed successfully at $(date)"
         echo "SUCCESS"
         """
+
+    nonisolated static var updaterScriptForTesting: String { updaterScript }
 
     // MARK: - Cleanup
 

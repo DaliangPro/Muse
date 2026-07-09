@@ -22,6 +22,7 @@ enum LanguageAssetStoreError: Error, LocalizedError {
 actor LanguageAssetStore {
     /// ISO8601 编解码器复用（J15：原先查询/写入每次新分配，行级 decode 循环内尤其浪费）
     private let iso = ISO8601DateFormatter()
+    private let codec = LanguageAssetStoreCodec()
 
     private var db: OpaquePointer?
 
@@ -39,8 +40,8 @@ actor LanguageAssetStore {
             // WAL 允许读写并行，busy_timeout 让撞锁的写入等待而非立刻失败被静默吞掉
             sqlite3_busy_timeout(db, 3000)
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
-            Self.createTables(in: db)
-            Self.seedBuiltInRecipes(in: db)
+            LanguageAssetStoreSchema.createTables(in: db)
+            LanguageAssetStoreSchema.seedBuiltInRecipes(in: db)
         } else {
             AppLogger.log("[LanguageAssetStore] 打开数据库失败: \(dbPath)，资产读写将不可用")
             sqlite3_close(db)
@@ -92,7 +93,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return decodeJob(from: stmt)
+        return codec.decodeJob(from: stmt)
     }
 
     // MARK: - Recipe Architecture
@@ -159,7 +160,7 @@ actor LanguageAssetStore {
 
         var recipes: [ExtractionRecipe] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let recipe = decodeRecipe(from: stmt) {
+            if let recipe = codec.decodeRecipe(from: stmt) {
                 recipes.append(recipe)
             }
         }
@@ -179,7 +180,7 @@ actor LanguageAssetStore {
 
         SQL.bind(stmt, 1, id)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return decodeRecipe(from: stmt)
+        return codec.decodeRecipe(from: stmt)
     }
 
     func archiveRecipe(id: String) {
@@ -269,7 +270,7 @@ actor LanguageAssetStore {
 
         var runs: [ExtractionRun] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let run = decodeRun(from: stmt) {
+            if let run = codec.decodeRun(from: stmt) {
                 runs.append(run)
             }
         }
@@ -288,7 +289,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return decodeRun(from: stmt)
+        return codec.decodeRun(from: stmt)
     }
 
     func saveResultsOrThrow(_ results: [ExtractionResult]) throws {
@@ -326,7 +327,7 @@ actor LanguageAssetStore {
             SQL.bind(stmt, 8, result.content)
             SQL.bindOptional(stmt, 9, result.summary)
             SQL.bind(stmt, 10, result.payloadJSON)
-            SQL.bind(stmt, 11, encodeJSONString(result.sourceRecordIDs, encoder: encoder))
+            SQL.bind(stmt, 11, codec.encodeJSONString(result.sourceRecordIDs, encoder: encoder))
             sqlite3_bind_int(stmt, 12, Int32(result.sourceRecordCount))
             SQL.bind(stmt, 13, result.status.rawValue)
             if let score = result.score {
@@ -376,7 +377,7 @@ actor LanguageAssetStore {
 
         var results: [ExtractionResult] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let result = decodeResult(from: stmt) {
+            if let result = codec.decodeResult(from: stmt) {
                 results.append(result)
             }
         }
@@ -509,11 +510,11 @@ actor LanguageAssetStore {
             SQL.bind(stmt, 7, asset.content)
             SQL.bindOptional(stmt, 8, asset.summary)
             SQL.bindOptional(stmt, 9, asset.reason)
-            SQL.bind(stmt, 10, encodeJSONString(asset.scenes, encoder: encoder))
-            SQL.bind(stmt, 11, encodeJSONString(asset.audiences, encoder: encoder))
+            SQL.bind(stmt, 10, codec.encodeJSONString(asset.scenes, encoder: encoder))
+            SQL.bind(stmt, 11, codec.encodeJSONString(asset.audiences, encoder: encoder))
             SQL.bindOptional(stmt, 12, asset.ruleHit)
-            SQL.bind(stmt, 13, encodeJSONString(asset.keywords, encoder: encoder))
-            SQL.bind(stmt, 14, encodeJSONString(asset.sourceRecordIDs, encoder: encoder))
+            SQL.bind(stmt, 13, codec.encodeJSONString(asset.keywords, encoder: encoder))
+            SQL.bind(stmt, 14, codec.encodeJSONString(asset.sourceRecordIDs, encoder: encoder))
             sqlite3_bind_int(stmt, 15, Int32(asset.sourceRecordCount))
             SQL.bindOptional(stmt, 16, asset.extractionJobID)
             sqlite3_bind_int(stmt, 17, asset.isFavorite ? 1 : 0)
@@ -542,7 +543,7 @@ actor LanguageAssetStore {
 
         var assets: [LanguageAsset] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let asset = decodeAsset(from: stmt) {
+            if let asset = codec.decodeAsset(from: stmt) {
                 assets.append(asset)
             }
         }
@@ -632,10 +633,10 @@ actor LanguageAssetStore {
             SQL.bind(stmt, 7, candidate.content)
             SQL.bindOptional(stmt, 8, candidate.summary)
             SQL.bind(stmt, 9, candidate.reason)
-            SQL.bind(stmt, 10, encodeJSONString(candidate.scenes, encoder: encoder))
-            SQL.bind(stmt, 11, encodeJSONString(candidate.audiences, encoder: encoder))
+            SQL.bind(stmt, 10, codec.encodeJSONString(candidate.scenes, encoder: encoder))
+            SQL.bind(stmt, 11, codec.encodeJSONString(candidate.audiences, encoder: encoder))
             SQL.bindOptional(stmt, 12, candidate.ruleHit)
-            SQL.bind(stmt, 13, encodeJSONString(candidate.sourceRecordIDs, encoder: encoder))
+            SQL.bind(stmt, 13, codec.encodeJSONString(candidate.sourceRecordIDs, encoder: encoder))
             sqlite3_bind_int(stmt, 14, Int32(candidate.sourceRecordCount))
             SQL.bindOptional(stmt, 15, candidate.extractionJobID)
             SQL.bind(stmt, 16, candidate.status.rawValue)
@@ -663,7 +664,7 @@ actor LanguageAssetStore {
 
         var candidates: [LanguageAssetCandidateRecord] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let candidate = decodeCandidate(from: stmt) {
+            if let candidate = codec.decodeCandidate(from: stmt) {
                 candidates.append(candidate)
             }
         }
@@ -714,7 +715,7 @@ actor LanguageAssetStore {
             scenes: candidate.scenes,
             audiences: candidate.audiences,
             ruleHit: candidate.ruleHit,
-            keywords: unique(candidate.scenes + candidate.audiences),
+            keywords: codec.unique(candidate.scenes + candidate.audiences),
             sourceRecordIDs: candidate.sourceRecordIDs,
             sourceRecordCount: candidate.sourceRecordCount,
             extractionJobID: candidate.extractionJobID,
@@ -841,7 +842,7 @@ actor LanguageAssetStore {
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { continue }
             defer { sqlite3_finalize(stmt) }
             while sqlite3_step(stmt) == SQLITE_ROW {
-                if let parsed = decodeJSONString([String].self, from: SQL.column(stmt, 0)) {
+                if let parsed = codec.decodeJSONString([String].self, from: SQL.column(stmt, 0)) {
                     ids.formUnion(parsed)
                 }
             }
@@ -881,7 +882,7 @@ actor LanguageAssetStore {
 
         SQL.bind(stmt, 1, id)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return decodeCandidate(from: stmt)
+        return codec.decodeCandidate(from: stmt)
     }
 
     // MARK: - Testing Helpers
@@ -925,407 +926,6 @@ actor LanguageAssetStore {
 
     private func sqliteMessage(in db: OpaquePointer) -> String {
         sqlite3_errmsg(db).map { String(cString: $0) } ?? L("SQLite 操作失败", "SQLite operation failed")
-    }
-
-    private static func createTables(in db: OpaquePointer?) {
-        let jobSQL = """
-        CREATE TABLE IF NOT EXISTS asset_extraction_job (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            started_at TEXT,
-            finished_at TEXT,
-            range_type TEXT NOT NULL,
-            range_payload TEXT,
-            source_record_count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL,
-            summary TEXT,
-            error_message TEXT
-        );
-        """
-
-        let assetSQL = """
-        CREATE TABLE IF NOT EXISTS language_asset (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            asset_type TEXT NOT NULL,
-            grade TEXT,
-            title TEXT,
-            content TEXT NOT NULL,
-            summary TEXT,
-            reason TEXT,
-            scenes_json TEXT NOT NULL DEFAULT '[]',
-            audiences_json TEXT NOT NULL DEFAULT '[]',
-            rule_hit TEXT,
-            keywords_json TEXT NOT NULL,
-            source_record_ids_json TEXT NOT NULL,
-            source_record_count INTEGER NOT NULL DEFAULT 0,
-            extraction_job_id TEXT,
-            is_favorite INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active'
-        );
-        """
-
-        let candidateSQL = """
-        CREATE TABLE IF NOT EXISTS language_asset_candidate (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            asset_type TEXT NOT NULL,
-            grade TEXT NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            summary TEXT,
-            reason TEXT NOT NULL,
-            scenes_json TEXT NOT NULL DEFAULT '[]',
-            audiences_json TEXT NOT NULL DEFAULT '[]',
-            rule_hit TEXT,
-            source_record_ids_json TEXT NOT NULL,
-            source_record_count INTEGER NOT NULL DEFAULT 0,
-            extraction_job_id TEXT,
-            status TEXT NOT NULL DEFAULT 'pending'
-        );
-        """
-
-        let actionLogSQL = """
-        CREATE TABLE IF NOT EXISTS language_asset_action_log (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            asset_id TEXT,
-            action_type TEXT NOT NULL,
-            detail TEXT
-        );
-        """
-
-        let recipeSQL = """
-        CREATE TABLE IF NOT EXISTS extraction_recipe (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL,
-            goal_prompt TEXT NOT NULL,
-            output_kind TEXT NOT NULL,
-            processing_strategy TEXT NOT NULL,
-            source_policy TEXT NOT NULL,
-            output_schema TEXT NOT NULL,
-            quality_rules TEXT NOT NULL,
-            save_rule TEXT NOT NULL DEFAULT '',
-            ignore_rule TEXT NOT NULL DEFAULT '',
-            destination TEXT NOT NULL,
-            is_built_in INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active'
-        );
-        """
-
-        let runSQL = """
-        CREATE TABLE IF NOT EXISTS extraction_run (
-            id TEXT PRIMARY KEY,
-            recipe_id TEXT NOT NULL,
-            recipe_name TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            started_at TEXT,
-            finished_at TEXT,
-            range_type TEXT NOT NULL,
-            range_payload TEXT,
-            source_record_count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL,
-            result_count INTEGER NOT NULL DEFAULT 0,
-            summary TEXT,
-            error_message TEXT
-        );
-        """
-
-        let resultSQL = """
-        CREATE TABLE IF NOT EXISTS extraction_result (
-            id TEXT PRIMARY KEY,
-            run_id TEXT NOT NULL,
-            recipe_id TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            output_kind TEXT NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            summary TEXT,
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            source_record_ids_json TEXT NOT NULL DEFAULT '[]',
-            source_record_count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active',
-            score REAL,
-            review_reason TEXT,
-            is_favorite INTEGER NOT NULL DEFAULT 0
-        );
-        """
-
-        sqlite3_exec(db, jobSQL, nil, nil, nil)
-        sqlite3_exec(db, assetSQL, nil, nil, nil)
-        sqlite3_exec(db, candidateSQL, nil, nil, nil)
-        sqlite3_exec(db, actionLogSQL, nil, nil, nil)
-        sqlite3_exec(db, recipeSQL, nil, nil, nil)
-        sqlite3_exec(db, runSQL, nil, nil, nil)
-        sqlite3_exec(db, resultSQL, nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_asset_status_created ON language_asset(status, created_at);", nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_candidate_status_created ON language_asset_candidate(status, created_at);", nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_action_log_created ON language_asset_action_log(created_at);", nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_extraction_recipe_status ON extraction_recipe(status, is_built_in);", nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_extraction_run_created ON extraction_run(created_at);", nil, nil, nil)
-        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_extraction_result_run ON extraction_result(run_id, status);", nil, nil, nil)
-        addColumnIfNeeded(db, table: "language_asset", column: "grade", definition: "TEXT")
-        addColumnIfNeeded(db, table: "language_asset", column: "reason", definition: "TEXT")
-        addColumnIfNeeded(db, table: "language_asset", column: "scenes_json", definition: "TEXT NOT NULL DEFAULT '[]'")
-        addColumnIfNeeded(db, table: "language_asset", column: "audiences_json", definition: "TEXT NOT NULL DEFAULT '[]'")
-        addColumnIfNeeded(db, table: "language_asset", column: "rule_hit", definition: "TEXT")
-        // 2026-07 语料资产重构：配方吸收入库/忽略标准；产物带评审信息与收藏
-        addColumnIfNeeded(db, table: "extraction_recipe", column: "save_rule", definition: "TEXT NOT NULL DEFAULT ''")
-        addColumnIfNeeded(db, table: "extraction_recipe", column: "ignore_rule", definition: "TEXT NOT NULL DEFAULT ''")
-        addColumnIfNeeded(db, table: "extraction_result", column: "score", definition: "REAL")
-        addColumnIfNeeded(db, table: "extraction_result", column: "review_reason", definition: "TEXT")
-        addColumnIfNeeded(db, table: "extraction_result", column: "is_favorite", definition: "INTEGER NOT NULL DEFAULT 0")
-    }
-
-    private static func seedBuiltInRecipes(in db: OpaquePointer?) {
-        let sql = """
-        INSERT OR IGNORE INTO extraction_recipe
-        (id, created_at, updated_at, name, description, goal_prompt, output_kind, processing_strategy, source_policy, output_schema, quality_rules, save_rule, ignore_rule, destination, is_built_in, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """
-        // 旧库升级回填：已 seed 过的内置配方新列为空时补默认标准；用户改过则不覆盖
-        let backfillSQL = """
-        UPDATE extraction_recipe
-        SET save_rule = ?, ignore_rule = ?
-        WHERE id = ? AND is_built_in = 1
-          AND (save_rule IS NULL OR save_rule = '')
-          AND (ignore_rule IS NULL OR ignore_rule = '');
-        """
-        // 内置配方旧名去「今日」（提炼范围用户自选，不限当天）；仅旧名未被用户改过时更新
-        sqlite3_exec(db, "UPDATE extraction_recipe SET name = '待办' WHERE id = 'builtin.today_todos' AND name = '今日待办';", nil, nil, nil)
-        let iso = ISO8601DateFormatter()
-        for recipe in ExtractionRecipe.builtInRecipes() {
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { continue }
-            defer { sqlite3_finalize(stmt) }
-
-            SQL.bind(stmt, 1, recipe.id)
-            SQL.bind(stmt, 2, iso.string(from: recipe.createdAt))
-            SQL.bind(stmt, 3, iso.string(from: recipe.updatedAt))
-            SQL.bind(stmt, 4, recipe.name)
-            SQL.bind(stmt, 5, recipe.recipeDescription)
-            SQL.bind(stmt, 6, recipe.goalPrompt)
-            SQL.bind(stmt, 7, recipe.outputKind.rawValue)
-            SQL.bind(stmt, 8, recipe.processingStrategy.rawValue)
-            SQL.bind(stmt, 9, recipe.sourcePolicy.rawValue)
-            SQL.bind(stmt, 10, recipe.outputSchema)
-            SQL.bind(stmt, 11, recipe.qualityRules)
-            SQL.bind(stmt, 12, recipe.saveRule)
-            SQL.bind(stmt, 13, recipe.ignoreRule)
-            SQL.bind(stmt, 14, recipe.destination.rawValue)
-            sqlite3_bind_int(stmt, 15, recipe.isBuiltIn ? 1 : 0)
-            SQL.bind(stmt, 16, recipe.status.rawValue)
-            sqlite3_step(stmt)
-
-            var backfillStmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, backfillSQL, -1, &backfillStmt, nil) == SQLITE_OK else { continue }
-            defer { sqlite3_finalize(backfillStmt) }
-            SQL.bind(backfillStmt, 1, recipe.saveRule)
-            SQL.bind(backfillStmt, 2, recipe.ignoreRule)
-            SQL.bind(backfillStmt, 3, recipe.id)
-            sqlite3_step(backfillStmt)
-        }
-    }
-
-    private static func addColumnIfNeeded(
-        _ db: OpaquePointer?,
-        table: String,
-        column: String,
-        definition: String
-    ) {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else {
-            return
-        }
-        defer { sqlite3_finalize(stmt) }
-
-        var existingColumns = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let text = sqlite3_column_text(stmt, 1) {
-                existingColumns.insert(String(cString: text))
-            }
-        }
-
-        guard !existingColumns.contains(column) else { return }
-        sqlite3_exec(db, "ALTER TABLE \(table) ADD COLUMN \(column) \(definition);", nil, nil, nil)
-    }
-
-    private func decodeJob(from stmt: OpaquePointer?) -> AssetExtractionJob? {
-        guard let rangeType = AssetExtractionRangeType(rawValue: SQL.column(stmt, 4)),
-              let status = AssetExtractionJobStatus(rawValue: SQL.column(stmt, 7))
-        else { return nil }
-
-        return AssetExtractionJob(
-            id: SQL.column(stmt, 0),
-            createdAt: iso.date(from: SQL.column(stmt, 1)) ?? Date(),
-            startedAt: SQL.optionalColumn(stmt, 2).flatMap { iso.date(from: $0) },
-            finishedAt: SQL.optionalColumn(stmt, 3).flatMap { iso.date(from: $0) },
-            rangeType: rangeType,
-            rangePayload: SQL.optionalColumn(stmt, 5),
-            sourceRecordCount: Int(sqlite3_column_int(stmt, 6)),
-            status: status,
-            summary: SQL.optionalColumn(stmt, 8),
-            errorMessage: SQL.optionalColumn(stmt, 9)
-        )
-    }
-
-    private func decodeRecipe(from stmt: OpaquePointer?) -> ExtractionRecipe? {
-        guard let outputKind = ExtractionOutputKind(rawValue: SQL.column(stmt, 6)),
-              let processingStrategy = ExtractionProcessingStrategy(rawValue: SQL.column(stmt, 7)),
-              let sourcePolicy = ExtractionSourcePolicy(rawValue: SQL.column(stmt, 8)),
-              let destination = ExtractionDestination(rawValue: SQL.column(stmt, 11)),
-              let status = ExtractionRecipeStatus(rawValue: SQL.column(stmt, 13))
-        else { return nil }
-
-        return ExtractionRecipe(
-            id: SQL.column(stmt, 0),
-            createdAt: iso.date(from: SQL.column(stmt, 1)) ?? Date(),
-            updatedAt: iso.date(from: SQL.column(stmt, 2)) ?? Date(),
-            name: SQL.column(stmt, 3),
-            recipeDescription: SQL.column(stmt, 4),
-            goalPrompt: SQL.column(stmt, 5),
-            outputKind: outputKind,
-            processingStrategy: processingStrategy,
-            sourcePolicy: sourcePolicy,
-            outputSchema: SQL.column(stmt, 9),
-            qualityRules: SQL.column(stmt, 10),
-            saveRule: SQL.optionalColumn(stmt, 14) ?? "",
-            ignoreRule: SQL.optionalColumn(stmt, 15) ?? "",
-            destination: destination,
-            isBuiltIn: sqlite3_column_int(stmt, 12) == 1,
-            status: status
-        )
-    }
-
-    private func decodeRun(from stmt: OpaquePointer?) -> ExtractionRun? {
-        guard let rangeType = AssetExtractionRangeType(rawValue: SQL.column(stmt, 6)),
-              let status = ExtractionRunStatus(rawValue: SQL.column(stmt, 9))
-        else { return nil }
-
-        return ExtractionRun(
-            id: SQL.column(stmt, 0),
-            recipeID: SQL.column(stmt, 1),
-            recipeName: SQL.column(stmt, 2),
-            createdAt: iso.date(from: SQL.column(stmt, 3)) ?? Date(),
-            startedAt: SQL.optionalColumn(stmt, 4).flatMap { iso.date(from: $0) },
-            finishedAt: SQL.optionalColumn(stmt, 5).flatMap { iso.date(from: $0) },
-            rangeType: rangeType,
-            rangePayload: SQL.optionalColumn(stmt, 7),
-            sourceRecordCount: Int(sqlite3_column_int(stmt, 8)),
-            status: status,
-            resultCount: Int(sqlite3_column_int(stmt, 10)),
-            summary: SQL.optionalColumn(stmt, 11),
-            errorMessage: SQL.optionalColumn(stmt, 12)
-        )
-    }
-
-    private func decodeResult(from stmt: OpaquePointer?) -> ExtractionResult? {
-        guard let outputKind = ExtractionOutputKind(rawValue: SQL.column(stmt, 5)),
-              let sourceRecordIDs = decodeJSONString([String].self, from: SQL.column(stmt, 10)),
-              let status = ExtractionResultStatus(rawValue: SQL.column(stmt, 12))
-        else { return nil }
-
-        return ExtractionResult(
-            id: SQL.column(stmt, 0),
-            runID: SQL.column(stmt, 1),
-            recipeID: SQL.column(stmt, 2),
-            createdAt: iso.date(from: SQL.column(stmt, 3)) ?? Date(),
-            updatedAt: iso.date(from: SQL.column(stmt, 4)) ?? Date(),
-            outputKind: outputKind,
-            title: SQL.column(stmt, 6),
-            content: SQL.column(stmt, 7),
-            summary: SQL.optionalColumn(stmt, 8),
-            payloadJSON: SQL.column(stmt, 9),
-            sourceRecordIDs: sourceRecordIDs,
-            sourceRecordCount: Int(sqlite3_column_int(stmt, 11)),
-            status: status,
-            score: sqlite3_column_type(stmt, 13) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 13),
-            reviewReason: SQL.optionalColumn(stmt, 14),
-            isFavorite: sqlite3_column_int(stmt, 15) == 1
-        )
-    }
-
-    private func decodeAsset(from stmt: OpaquePointer?) -> LanguageAsset? {
-        guard let assetType = LanguageAssetType(rawValue: SQL.column(stmt, 3)),
-              let status = LanguageAssetStatus(rawValue: SQL.column(stmt, 17)),
-              let scenes = decodeJSONString([String].self, from: SQL.column(stmt, 9)),
-              let audiences = decodeJSONString([String].self, from: SQL.column(stmt, 10)),
-              let keywords = decodeJSONString([String].self, from: SQL.column(stmt, 12)),
-              let sourceRecordIDs = decodeJSONString([String].self, from: SQL.column(stmt, 13))
-        else { return nil }
-
-        return LanguageAsset(
-            id: SQL.column(stmt, 0),
-            createdAt: iso.date(from: SQL.column(stmt, 1)) ?? Date(),
-            updatedAt: iso.date(from: SQL.column(stmt, 2)) ?? Date(),
-            assetType: assetType,
-            grade: SQL.optionalColumn(stmt, 4).flatMap { LanguageAssetGrade(rawValue: $0) },
-            title: SQL.optionalColumn(stmt, 5),
-            content: SQL.column(stmt, 6),
-            summary: SQL.optionalColumn(stmt, 7),
-            reason: SQL.optionalColumn(stmt, 8),
-            scenes: scenes,
-            audiences: audiences,
-            ruleHit: SQL.optionalColumn(stmt, 11),
-            keywords: keywords,
-            sourceRecordIDs: sourceRecordIDs,
-            sourceRecordCount: Int(sqlite3_column_int(stmt, 14)),
-            extractionJobID: SQL.optionalColumn(stmt, 15),
-            isFavorite: sqlite3_column_int(stmt, 16) == 1,
-            status: status
-        )
-    }
-
-    private func decodeCandidate(from stmt: OpaquePointer?) -> LanguageAssetCandidateRecord? {
-        guard let assetType = LanguageAssetType(rawValue: SQL.column(stmt, 3)),
-              let grade = LanguageAssetGrade(rawValue: SQL.column(stmt, 4)),
-              let scenes = decodeJSONString([String].self, from: SQL.column(stmt, 9)),
-              let audiences = decodeJSONString([String].self, from: SQL.column(stmt, 10)),
-              let sourceRecordIDs = decodeJSONString([String].self, from: SQL.column(stmt, 12)),
-              let status = LanguageAssetCandidateStatus(rawValue: SQL.column(stmt, 15))
-        else { return nil }
-
-        return LanguageAssetCandidateRecord(
-            id: SQL.column(stmt, 0),
-            createdAt: iso.date(from: SQL.column(stmt, 1)) ?? Date(),
-            updatedAt: iso.date(from: SQL.column(stmt, 2)) ?? Date(),
-            assetType: assetType,
-            grade: grade,
-            title: SQL.column(stmt, 5),
-            content: SQL.column(stmt, 6),
-            summary: SQL.optionalColumn(stmt, 7),
-            reason: SQL.column(stmt, 8),
-            scenes: scenes,
-            audiences: audiences,
-            ruleHit: SQL.optionalColumn(stmt, 11),
-            sourceRecordIDs: sourceRecordIDs,
-            sourceRecordCount: Int(sqlite3_column_int(stmt, 13)),
-            extractionJobID: SQL.optionalColumn(stmt, 14),
-            status: status
-        )
-    }
-
-    private func encodeJSONString<T: Encodable>(_ value: T, encoder: JSONEncoder) -> String {
-        guard let data = try? encoder.encode(value),
-              let string = String(data: data, encoding: .utf8)
-        else { return "[]" }
-        return string
-    }
-
-    private func decodeJSONString<T: Decodable>(_ type: T.Type, from value: String) -> T? {
-        guard let data = value.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(type, from: data)
-    }
-
-    private func unique(_ values: [String]) -> [String] {
-        var seen = Set<String>()
-        return values.filter { seen.insert($0).inserted }
     }
 
     /// REPAIR_PLAN J3：单行写不再静默失败——busy_timeout(3s) 超时仍 BUSY、磁盘满等

@@ -17,29 +17,34 @@ struct SetupFeatureSlide: View {
 
     var body: some View {
         let item = titles[index]
-        // 2026-07-09 大梁老师：演示动画钉在页面垂直中轴——与左右箭头同一水平线；
-        // 标题组固定在上部（无图标，纯文字），与其余页面的标题同高
-        ZStack {
-            VStack(spacing: 6) {
-                Text(item.label)
-                    .font(TF.settingsFontMetric)
-                    .foregroundStyle(TF.settingsText)
-                Text(item.hint)
-                    .font(TF.settingsFontBody)
-                    .foregroundStyle(TF.settingsTextTertiary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .padding(.top, 52)
+        let demoHeight: CGFloat = 168
 
-            Group {
-                switch index {
-                case 0: VoiceInputDemo()
-                case 1: PolishDemo()
-                default: AssetDemo()
+        GeometryReader { proxy in
+            let topBandHeight = max(0, (proxy.size.height - demoHeight) / 2)
+
+            ZStack(alignment: .top) {
+                VStack(spacing: 6) {
+                    Text(item.label)
+                        .font(TF.settingsFontMetric)
+                        .foregroundStyle(TF.settingsText)
+                    Text(item.hint)
+                        .font(TF.settingsFontBody)
+                        .foregroundStyle(TF.settingsTextTertiary)
                 }
+                .frame(maxWidth: .infinity)
+                .frame(height: topBandHeight, alignment: .center)
+
+                Group {
+                    switch index {
+                    case 0: VoiceInputDemo()
+                    case 1: PolishDemo()
+                    default: AssetDemo()
+                    }
+                }
+                .frame(maxWidth: 420)
+                .frame(height: demoHeight)
+                .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
             }
-            .frame(maxWidth: 420)
-            .frame(height: 168)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

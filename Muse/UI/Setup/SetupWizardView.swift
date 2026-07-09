@@ -9,6 +9,7 @@ struct SetupWizardView: View {
 
     @Environment(AppState.self) private var appState
     @State private var step = 0
+    @State private var keyMonitor: Any?
     // 初始即读真实授权态：避免进授权页时 false→true 的跳变被切页动画捕捉（每次进入动画不一）
     @State private var hasMic = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     @State private var hasAccessibility = AXIsProcessTrusted()
@@ -16,6 +17,9 @@ struct SetupWizardView: View {
     @AppStorage("tf_settingsAppearance") private var appearanceSelection = SettingsAppearanceMode.system.rawValue
 
     private let lastStep = 6
+    private let permissionsContentHeight: CGFloat = 132
+    private let enginesContentHeight: CGFloat = 158
+    private let readyDescriptionHeight: CGFloat = 58
 
     var body: some View {
         rightContent
@@ -29,6 +33,8 @@ struct SetupWizardView: View {
                     .padding(.leading, 20)
                     .padding(.bottom, 16)
             }
+            .onAppear { installKeyboardMonitor() }
+            .onDisappear { removeKeyboardMonitor() }
             .id(language)
     }
 
@@ -86,35 +92,75 @@ struct SetupWizardView: View {
         SetupEdgeArrow(icon: icon, label: label, action: action)
     }
 
-    /// 统一幻灯片模板（2026-07-09 大梁老师）：标题组固定在上部（与功能三页同高 52pt），
-    /// 内容块垂直居中——与两侧箭头同一水平轴线
+    /// 统一幻灯片模板：内容块垂直居中；需要时标题组在「顶部 → 内容上缘」之间垂直居中。
     @ViewBuilder
     private func scaffold<C: View>(
         title: String,
         subtitle: String? = nil,
-        @ViewBuilder content: () -> C
+        titlePlacement: SetupTitlePlacement = .fixedTop,
+        @ViewBuilder content: @escaping () -> C
     ) -> some View {
-        ZStack {
-            VStack(spacing: 6) {
-                Text(title)
-                    .font(TF.settingsFontMetric)
-                    .foregroundStyle(TF.settingsText)
-                    .multilineTextAlignment(.center)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(TF.settingsFontBody)
-                        .foregroundStyle(TF.settingsTextTertiary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
+        switch titlePlacement {
+        case .fixedTop:
+            ZStack {
+                setupTitleBlock(title: title, subtitle: subtitle)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 52)
+
+                content()
+            }
+            .padding(.horizontal, 64)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+        case .centeredAboveContent(let contentHeight):
+            GeometryReader { proxy in
+                let topBandHeight = max(0, (proxy.size.height - contentHeight) / 2)
+
+                ZStack(alignment: .top) {
+                    setupTitleBlock(title: title, subtitle: subtitle)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: topBandHeight, alignment: .center)
+
+                    content()
+                        .frame(maxWidth: .infinity)
+                        .frame(height: contentHeight)
+                        .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .padding(.top, 52)
-
-            content()
+            .padding(.horizontal, 64)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .padding(.horizontal, 64)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func setupTitleBlock(title: String, subtitle: String?) -> some View {
+        VStack(spacing: 6) {
+            Text(title)
+                .font(TF.settingsFontMetric)
+                .foregroundStyle(TF.settingsText)
+                .multilineTextAlignment(.center)
+            if let subtitle {
+                Text(subtitle)
+                    .font(TF.settingsFontBody)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func alignedTitleBandHeight(for pageHeight: CGFloat) -> CGFloat {
+        SetupWizardLayout.centeredTitleBandHeight(
+            pageHeight: pageHeight,
+            referenceContentHeight: permissionsContentHeight
+        )
+    }
+
+    private func lowerBandCenterY(pageHeight: CGFloat, centeredContentHeight: CGFloat) -> CGFloat {
+        SetupWizardLayout.lowerBandCenterY(
+            pageHeight: pageHeight,
+            centeredContentHeight: centeredContentHeight
+        )
     }
 
     // MARK: - Screen 0 · Welcome
@@ -122,29 +168,36 @@ struct SetupWizardView: View {
     /// 欢迎页保持整体居中的原布局（2026-07-09 大梁老师：第一页标题位置不动，
     /// 「标题固定上部」模板只用于其余页面）
     private var welcomeScreen: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 20)
+        ZStack(alignment: .top) {
+            SettingsBrandLogo(width: 124, lightOpacity: 0.58, darkOpacity: 0.66)
+                .rotationEffect(.degrees(-3))
+                .padding(.top, 78)
+                .allowsHitTesting(false)
 
-            VStack(spacing: 8) {
-                Text(L("你的灵感缪斯", "Your creative Muse"))
-                    .font(TF.settingsFontMetric)
-                    .foregroundStyle(TF.settingsText)
-                    .multilineTextAlignment(.center)
-                // REPAIR_PLAN J4：默认触发是 toggle（单击开始、再单击结束），
-                // 文案不得写「按住/松手」——与就绪页矛盾会让新用户卡在第一步
-                Text(L("一键开口、说完成文的语音输入法，也是帮你随手留住灵感、随时取用的工作台。",
-                       "A voice keyboard that turns speech into text — and a workbench that keeps every idea within reach."))
-                    .font(TF.settingsFontBody)
-                    .foregroundStyle(TF.settingsTextTertiary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+            VStack(spacing: 0) {
+                Spacer(minLength: 20)
+
+                VStack(spacing: 8) {
+                    Text(L("你的灵感缪斯", "Your creative Muse"))
+                        .font(TF.settingsFontMetric)
+                        .foregroundStyle(TF.settingsText)
+                        .multilineTextAlignment(.center)
+                    // REPAIR_PLAN J4：默认触发是 toggle（单击开始、再单击结束），
+                    // 文案不得写「按住/松手」——与就绪页矛盾会让新用户卡在第一步
+                    Text(L("一键开口、说完成文的语音输入法，也是帮你随手留住灵感、随时取用的工作台。",
+                           "A voice keyboard that turns speech into text — and a workbench that keeps every idea within reach."))
+                        .font(TF.settingsFontBody)
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity)
+
+                welcomeLanguageChips
+                    .padding(.top, 26)
+
+                Spacer(minLength: 20)
             }
-            .frame(maxWidth: .infinity)
-
-            welcomeLanguageChips
-                .padding(.top, 26)
-
-            Spacer(minLength: 20)
         }
         .padding(.horizontal, 64)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -173,7 +226,8 @@ struct SetupWizardView: View {
     private var permissionsScreen: some View {
         scaffold(
             title: L("授予权限", "Grant permissions"),
-            subtitle: L("两项系统权限，缺一不可", "Two system permissions, both required")
+            subtitle: L("两项系统权限，缺一不可", "Two system permissions, both required"),
+            titlePlacement: .centeredAboveContent(permissionsContentHeight)
         ) {
             VStack(spacing: 18) {
                 // 两个权限横排一行：图标 · 名称 · 状态胶囊 全在同一行（2026-07-09 大梁老师）
@@ -249,86 +303,125 @@ struct SetupWizardView: View {
     // MARK: - Screen 3 · Recognition Engines (介绍，不配置)
 
     private var enginesScreen: some View {
-        scaffold(
-            title: L("三种识别引擎", "Recognition engines"),
-            subtitle: L("先开箱即用，后自由配置", "Ready out of the box, configure freely later")
-        ) {
-            VStack(spacing: 16) {
-                engineRow(L("Apple 本机", "Apple on-device"),
-                          L("零配置、隐私、开箱即用", "Zero setup, private, ready to go"),
-                          recommended: true)
-                engineRow(L("火山云端", "Volcano cloud"),
-                          L("高精度，需填 API 凭据", "High accuracy, needs an API key"),
-                          recommended: false)
-                engineRow(L("本地离线（SenseVoice + Qwen3）", "Local (SenseVoice + Qwen3)"),
-                          L("离线、Apple Silicon，需下载模型", "Offline, Apple Silicon, model download"),
-                          recommended: false)
+        GeometryReader { proxy in
+            let titleBandHeight = alignedTitleBandHeight(for: proxy.size.height)
+            let footerCenterY = lowerBandCenterY(
+                pageHeight: proxy.size.height,
+                centeredContentHeight: enginesContentHeight
+            )
 
-                // 注脚无图标、与选项拉开距离（2026-07-09 大梁老师）
+            ZStack(alignment: .top) {
+                setupTitleBlock(
+                    title: L("三种识别引擎", "Recognition engines"),
+                    subtitle: L("先开箱即用，后自由配置", "Ready out of the box, configure freely later")
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: titleBandHeight, alignment: .center)
+
+                engineRows
+                    .frame(width: 420, height: enginesContentHeight)
+                    .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+
                 Text(L("以上可在 设置 → 模型配置 里切换与配置", "Switch and configure in Settings → Model Config"))
                     .font(TF.settingsFontCaption)
                     .foregroundStyle(TF.settingsTextTertiary)
-                    .padding(.top, 18)
+                    .multilineTextAlignment(.center)
+                    .frame(width: 420)
+                    .position(x: proxy.size.width / 2, y: footerCenterY)
             }
+        }
+        .padding(.horizontal, 64)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var engineRows: some View {
+        VStack(spacing: 16) {
+            engineRow(L("Apple 本机", "Apple on-device"),
+                      L("零配置、隐私、开箱即用", "Zero setup, private, ready to go"),
+                      recommended: true)
+            engineRow(L("火山云端", "Volcano cloud"),
+                      L("高精度，需填 API 凭据", "High accuracy, needs an API key"),
+                      recommended: false)
+            engineRow(L("本地离线", "Local offline"),
+                      L("支持 SenseVoice + Qwen3 本地离线识别",
+                        "Supports SenseVoice + Qwen3 local offline recognition"),
+                      recommended: false)
         }
     }
 
-    /// 引擎条目（2026-07-09 大梁老师：无图标、整条居中）：名称（+角标）一行居中，说明居中在下
+    /// 引擎条目：两行文字保持居中；默认角标贴近文字组，并用隐形对称占位避免文字组偏轴。
     private func engineRow(_ name: String, _ detail: String, recommended: Bool) -> some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 8) {
+        HStack(spacing: 8) {
+            defaultBadge
+                .hidden()
+                .accessibilityHidden(true)
+
+            VStack(spacing: 3) {
                 Text(name)
                     .font(TF.settingsFontBodyLarge)
                     .foregroundStyle(TF.settingsText)
-                if recommended {
-                    Text(L("默认", "Default"))
-                        .font(TF.settingsFontMetadata)
-                        .foregroundStyle(TF.amber)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1.5)
-                        .background(Capsule().fill(TF.amber.opacity(0.14)))
-                }
+                Text(detail)
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .lineLimit(1)
             }
-            Text(detail)
-                .font(TF.settingsFontCaption)
-                .foregroundStyle(TF.settingsTextTertiary)
+
+            defaultBadge
+                .opacity(recommended ? 1 : 0)
+                .accessibilityHidden(!recommended)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .center)
+    }
+
+    private var defaultBadge: some View {
+        Text(L("默认", "Default"))
+            .font(TF.settingsFontMetadata)
+            .foregroundStyle(TF.amber)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1.5)
+            .background(Capsule().fill(TF.amber.opacity(0.14)))
     }
 
     // MARK: - Screen 4 · Ready
 
     private var readyScreen: some View {
-        scaffold(
-            title: L("准备就绪", "All set")
-        ) {
-            VStack(spacing: 12) {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(TF.settingsFontIconControl)
-                        .foregroundStyle(TF.success)
-                    Text(L("设置完成，可以开始了", "Setup complete"))
-                        .font(TF.settingsFontBodyLarge)
-                        .foregroundStyle(TF.settingsText)
-                }
-                Text(usageText)
-                    .font(TF.settingsFontBody)
-                    .foregroundStyle(TF.settingsTextSecondary)
-                    .lineSpacing(3)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(L("更多设置在菜单栏 Muse 图标 → 设置", "More options: menu bar Muse → Settings"))
-                    .font(TF.settingsFontCaption)
-                    .foregroundStyle(TF.settingsTextTertiary)
+        GeometryReader { proxy in
+            let titleBandHeight = alignedTitleBandHeight(for: proxy.size.height)
+            let buttonCenterY = lowerBandCenterY(
+                pageHeight: proxy.size.height,
+                centeredContentHeight: readyDescriptionHeight
+            )
 
-                // 完成是显式动作，留在页内（2026-07-09 大梁老师拍板）；就绪页无右箭头
+            ZStack(alignment: .top) {
+                setupTitleBlock(
+                    title: L("准备就绪", "All set"),
+                    subtitle: L("设置完成，可以开始了", "Setup complete")
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: titleBandHeight, alignment: .center)
+
+                VStack(spacing: 8) {
+                    Text(usageText)
+                        .font(TF.settingsFontBody)
+                        .foregroundStyle(TF.settingsTextSecondary)
+                    Text(L("更多设置在菜单栏 Muse 图标 → 设置", "More options: menu bar Muse → Settings"))
+                        .font(TF.settingsFontCaption)
+                        .foregroundStyle(TF.settingsTextTertiary)
+                }
+                .lineSpacing(3)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 420, height: readyDescriptionHeight)
+                .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+
                 SettingsTextButton(L("开始使用", "Start Using"), variant: .primary, minWidth: 88) {
                     finishSetup()
                 }
-                .padding(.top, 14)
+                .position(x: proxy.size.width / 2, y: buttonCenterY)
             }
-            .frame(maxWidth: 420)
         }
+        .padding(.horizontal, 64)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Navigation & Logic
@@ -341,6 +434,33 @@ struct SetupWizardView: View {
     private func back() {
         guard step > 0 else { return }
         withAnimation(.easeInOut(duration: 0.25)) { step -= 1 }
+    }
+
+    private func installKeyboardMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else {
+                return event
+            }
+
+            switch event.keyCode {
+            case 123 where canGoBack:
+                back()
+                return nil
+            case 124 where canGoForward:
+                advance()
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeKeyboardMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
     }
 
     private func refreshPermissions() {
@@ -377,6 +497,22 @@ struct SetupWizardView: View {
         if !hasVolcanoCreds {
             KeychainService.selectedASRProvider = .apple
         }
+    }
+}
+
+private enum SetupTitlePlacement {
+    case fixedTop
+    case centeredAboveContent(CGFloat)
+}
+
+enum SetupWizardLayout {
+    static func centeredTitleBandHeight(pageHeight: CGFloat, referenceContentHeight: CGFloat) -> CGFloat {
+        max(0, (pageHeight - referenceContentHeight) / 2)
+    }
+
+    static func lowerBandCenterY(pageHeight: CGFloat, centeredContentHeight: CGFloat) -> CGFloat {
+        let centeredContentBottom = pageHeight / 2 + centeredContentHeight / 2
+        return centeredContentBottom + max(0, pageHeight - centeredContentBottom) / 2
     }
 }
 
