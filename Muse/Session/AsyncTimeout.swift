@@ -37,6 +37,30 @@ enum AsyncTimeout {
         }
     }
 
+    /// Run an async value producer with a hard deadline（REPAIR_PLAN J12）。
+    /// 超时返回 `TimedValue(value: nil, timedOut: true)` 并取消底层任务。
+    static func asyncValue<T: Sendable>(
+        _ duration: Duration,
+        operation: @Sendable @escaping () async -> T?
+    ) async -> TimedValue<T> {
+        await withCheckedContinuation { (continuation: CheckedContinuation<TimedValue<T>, Never>) in
+            let finished = OSAllocatedUnfairLock(initialState: false)
+            let operationTask = Task.detached {
+                let value = await operation()
+                if finished.withLock({ let old = $0; $0 = true; return !old }) {
+                    continuation.resume(returning: TimedValue(value: value, timedOut: false))
+                }
+            }
+            Task.detached {
+                try? await Task.sleep(for: duration)
+                if finished.withLock({ let old = $0; $0 = true; return !old }) {
+                    operationTask.cancel()
+                    continuation.resume(returning: TimedValue(value: nil, timedOut: true))
+                }
+            }
+        }
+    }
+
     /// Run a synchronous value loader off-actor with a hard deadline.
     static func value<T: Sendable>(
         _ duration: Duration,

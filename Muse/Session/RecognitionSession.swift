@@ -51,6 +51,11 @@ actor RecognitionSession {
         category: "RecognitionSession"
     )
 
+    /// REPAIR_PLAN J12：LLM 后处理的会话级硬超时。底层 request timeout(30s) 是
+    /// 「无数据间隔」语义，流式慢速涓流可无限拖延；45s 高于底层正常超时（不抢跑），
+    /// 超时按 LLM 失败处理回退原文，HUD 不再卡死在 postProcessing。
+    static let llmPostProcessTimeout: Duration = .seconds(45)
+
     /// Return the appropriate LLM client for the currently selected provider.
     private func currentLLMClient() -> any LLMClient {
         LLMProviderRegistry.makeClient(for: KeychainService.selectedLLMProvider)
@@ -640,7 +645,16 @@ actor RecognitionSession {
         if let earlyTask = earlyLLMTask {
             state = .postProcessing
             DebugFileLogger.log("stop: awaiting early LLM result +\(ContinuousClock.now - stopT0)")
-            let earlyResult = await earlyTask.value
+            // REPAIR_PLAN J12：stop 链路上 LLM 是唯一无会话级硬超时的阻塞点——底层
+            // 30s request timeout 是「无数据间隔」语义，流式慢速涓流可拖过；超时按
+            // LLM 失败处理（下方 else 分支回退原文），HUD 不再无限卡 postProcessing。
+            let timedEarly = await AsyncTimeout.asyncValue(Self.llmPostProcessTimeout) {
+                await earlyTask.value
+            }
+            if timedEarly.timedOut {
+                DebugFileLogger.log("stop: early LLM timed out at session level")
+            }
+            let earlyResult = timedEarly.value.flatMap { $0 }
             guard sessionGeneration == expectedGeneration else {
                 DebugFileLogger.log("stopRecording: superseded during early llm, bailing")
                 return nil
@@ -672,11 +686,24 @@ actor RecognitionSession {
                 DebugFileLogger.log("stop: sync LLM firing mode=\(mode.name) model=\(llmConfig.model) with \(finalText.count) chars")
                 do {
                     let client = currentLLMClient()
-                    let result = try await client.process(
-                        text: finalText,
-                        prompt: prompt,
-                        config: llmConfig
-                    )
+                    // REPAIR_PLAN J12：同 early 路径，包会话级硬超时防涓流拖死
+                    let textForLLM = finalText
+                    let timed = await AsyncTimeout.asyncValue(Self.llmPostProcessTimeout) {
+                        () -> Result<String, Error> in
+                        do {
+                            return .success(try await client.process(
+                                text: textForLLM,
+                                prompt: prompt,
+                                config: llmConfig
+                            ))
+                        } catch {
+                            return .failure(error)
+                        }
+                    }
+                    guard let outcome = timed.value else {
+                        throw LLMError.timedOut
+                    }
+                    let result = try outcome.get()
                     let cleanedResult = mode.applyingLLMResultCleanup(to: result)
                     guard sessionGeneration == expectedGeneration else {
                         DebugFileLogger.log("stopRecording: superseded during sync llm, bailing")

@@ -189,11 +189,15 @@ enum LLMError: Error, LocalizedError {
     case invalidURL
     case requestFailed(Int)
     case emptyResponse(String?)
+    /// REPAIR_PLAN J12：会话级硬超时（底层 30s 是无数据间隔语义，慢速涓流可绕过）
+    case timedOut
 
     var errorDescription: String? {
         switch self {
         case .invalidURL:
             return L("LLM 地址无效", "Invalid LLM URL")
+        case .timedOut:
+            return L("LLM 处理超时", "LLM processing timed out")
         case .requestFailed(let code):
             switch code {
             case 401: return L("LLM 鉴权失败，请检查 API Key", "LLM auth failed, check API Key")
