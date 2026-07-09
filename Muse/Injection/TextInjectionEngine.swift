@@ -28,11 +28,15 @@ final class TextInjectionEngine: @unchecked Sendable {
                 guard !types.isEmpty else { continue }
 
                 var data: [NSPasteboard.PasteboardType: Data] = [:]
+                var readableTypes: [NSPasteboard.PasteboardType] = []
                 for type in types {
                     guard let itemData = pasteboardItem.data(forType: type) else {
-                        // 懒加载/promise 类型（文件、部分截图工具）取不到数据即放弃快照
-                        DebugFileLogger.log("clipboard capture FAIL: type=\(type.rawValue) has no data")
-                        return ClipboardSnapshot(items: [], changeCount: changeCount, canRestore: false)
+                        // 懒加载/promise 类型取不到数据：跳过该类型、保留其余可取表示。
+                        // 2026-07-09 大梁老师实测：微信复制后剪贴板带自家懒加载格式
+                        // （com.trolltech.anymime.WeChat_RichEdit_Format data=nil），
+                        // 此前一个类型失败即放弃整个快照 → 微信场景恢复永不发生。
+                        DebugFileLogger.log("clipboard capture: skip unreadable type=\(type.rawValue)")
+                        continue
                     }
                     totalBytes += itemData.count
                     guard totalBytes <= maxSnapshotBytes else {
@@ -40,8 +44,11 @@ final class TextInjectionEngine: @unchecked Sendable {
                         return ClipboardSnapshot(items: [], changeCount: changeCount, canRestore: false)
                     }
                     data[type] = itemData
+                    readableTypes.append(type)
                 }
-                items.append(Item(types: types, data: data))
+                if !readableTypes.isEmpty {
+                    items.append(Item(types: readableTypes, data: data))
+                }
             }
 
             return ClipboardSnapshot(items: items, changeCount: changeCount, canRestore: true)
