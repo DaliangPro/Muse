@@ -405,29 +405,9 @@ actor SenseVoiceServerManager {
     // MARK: - Qwen3-ASR (Apple Silicon)
 
     private func configureQwen3Server(proc: Process, args: inout [String]) throws {
-        let serverScript: String
-        let executable: String
-
-        // Dev mode: qwen3-asr-server/.venv/bin/python + server.py
-        // Production: bundled binary at Contents/MacOS/qwen3-asr-server
-        let devDir = findDevServerDir(name: "qwen3-asr-server")
-        if let dir = devDir {
-            executable = (dir as NSString).appendingPathComponent(".venv/bin/python")
-            serverScript = (dir as NSString).appendingPathComponent("server.py")
-            guard FileManager.default.fileExists(atPath: executable) else {
-                throw ServerError.venvNotFound
-            }
-        } else {
-            let bundledBinary = Bundle.main.executableURL?
-                .deletingLastPathComponent()
-                .appendingPathComponent("qwen3-asr-server")
-                .path
-            guard let bin = bundledBinary, FileManager.default.fileExists(atPath: bin) else {
-                throw ServerError.serverNotFound
-            }
-            executable = bin
-            serverScript = ""
-        }
+        let resolved = try resolveServerExecutable(name: "qwen3-asr-server")
+        let executable = resolved.executable
+        let serverScript = resolved.serverScript
 
         // ASR 模型可选：缺省时让 server 进入 LLM-only 模式（本地 LLM 不依赖 Qwen3-ASR 独立运行）。
         // 但 ASR 与 LLM 至少要有一个，否则这个 server 没什么可服务。
@@ -482,27 +462,9 @@ actor SenseVoiceServerManager {
     // MARK: - SenseVoice (Intel fallback)
 
     private func configureSenseVoiceServer(proc: Process, args: inout [String]) throws {
-        let serverScript: String
-        let executable: String
-
-        let devDir = findDevServerDir(name: "sensevoice-server")
-        if let dir = devDir {
-            executable = (dir as NSString).appendingPathComponent(".venv/bin/python")
-            serverScript = (dir as NSString).appendingPathComponent("server.py")
-            guard FileManager.default.fileExists(atPath: executable) else {
-                throw ServerError.venvNotFound
-            }
-        } else {
-            let bundledBinary = Bundle.main.executableURL?
-                .deletingLastPathComponent()
-                .appendingPathComponent("sensevoice-server")
-                .path
-            guard let bin = bundledBinary, FileManager.default.fileExists(atPath: bin) else {
-                throw ServerError.serverNotFound
-            }
-            executable = bin
-            serverScript = ""
-        }
+        let resolved = try resolveServerExecutable(name: "sensevoice-server")
+        let executable = resolved.executable
+        let serverScript = resolved.serverScript
 
         let bundledModel = Bundle.main.resourceURL?
             .appendingPathComponent("Models")
@@ -553,6 +515,40 @@ actor SenseVoiceServerManager {
     }
 
     // MARK: - Dev server discovery
+
+    private struct ServerExecutable {
+        let executable: String
+        /// 空字符串 = bundle 内 PyInstaller 二进制（自带入口，无需脚本参数）
+        let serverScript: String
+    }
+
+    /// REPAIR_PLAN J5：解析顺序为 bundle 内打包二进制优先、开发目录兜底。
+    /// 此前 dev 目录优先且无门控——正式签名 App 会执行家目录同名工程里
+    /// 用户可写的 Python（植入面）。调换后：完整分发包（BUNDLE_LOCAL_ASR=1
+    /// 打包了服务二进制）不再看家目录；仅开发构建（bundle 无二进制，
+    /// 本机日用 swift build 即此形态，B10 场景）才回落 findDevServerDir，
+    /// 且选中 dev 路径时记警示日志留痕，异常植入可审计。
+    private func resolveServerExecutable(name: String) throws -> ServerExecutable {
+        let bundledBinary = Bundle.main.executableURL?
+            .deletingLastPathComponent()
+            .appendingPathComponent(name)
+            .path
+        if let bin = bundledBinary, FileManager.default.fileExists(atPath: bin) {
+            return ServerExecutable(executable: bin, serverScript: "")
+        }
+        guard let dir = findDevServerDir(name: name) else {
+            throw ServerError.serverNotFound
+        }
+        let python = (dir as NSString).appendingPathComponent(".venv/bin/python")
+        guard FileManager.default.fileExists(atPath: python) else {
+            throw ServerError.venvNotFound
+        }
+        logger.warning("\(name) resolved to dev directory (bundle has no packaged binary): \(dir)")
+        return ServerExecutable(
+            executable: python,
+            serverScript: (dir as NSString).appendingPathComponent("server.py")
+        )
+    }
 
     private func findDevServerDir(name: String) -> String? {
         // Walk up from binary location to find server directory
