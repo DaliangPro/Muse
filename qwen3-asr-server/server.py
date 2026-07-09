@@ -159,8 +159,11 @@ async def _send_partial(ws: WebSocket, sess, samples: list[int],
                 "text": text,
                 "is_final": False,
             })
-    except Exception:
-        pass
+    except Exception as e:
+        # REPAIR_PLAN J8：不再静默吞掉——持续报错（如 Metal OOM）时用户只见
+        # 「无中间结果」，服务端必须留痕可排障。取消走 CancelToken 协作标志
+        # 不经异常；客户端停录瞬间的发送失败会落到这里，属正常竞态，偶发单条无害。
+        print(f"[qwen3-asr] partial failed: {type(e).__name__}: {e}", flush=True)
 
 
 # Punctuation characters to strip from partial results
