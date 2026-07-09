@@ -182,13 +182,16 @@ enum TF {
         light: (0.145, 0.123, 0.098),
         dark:  (0.937, 0.929, 0.912)
     )
+    // 深色主按钮提亮（2026-07-08 大梁老师：原深藏青底发闷）：字色用与统计卡数字
+    // 同款的浅蓝（settingsAccentBlue 深色值），底色为同一浅蓝的低透明度晕染；浅色不变
     static let settingsPrimaryActionFill = adaptiveColor(
         light: (0.875, 0.915, 0.990),
-        dark:  (0.063, 0.133, 0.247)
+        dark:  (0.470, 0.620, 0.900),
+        darkAlpha: 0.16
     )
     static let settingsPrimaryActionText = adaptiveColor(
         light: (0.180, 0.340, 0.650),
-        dark:  (0.560, 0.720, 1.000)
+        dark:  (0.470, 0.620, 0.900)
     )
     static let settingsSecondaryActionFill = adaptiveColor(
         light: (0.923, 0.919, 0.911),

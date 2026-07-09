@@ -20,41 +20,39 @@ struct GeneralOverviewSection: View {
 }
 
 private extension GeneralOverviewSection {
+    /// 紧凑横幅（2026-07-08 大梁老师：与语料资产工具栏同高 66）：
+    /// 标志缩小垂直居中，右侧角标+标语纵向叠放，替代原 92 高的「标志顶置+标语沉底」布局
     var introBanner: some View {
-        ZStack(alignment: .topLeading) {
+        ZStack(alignment: .leading) {
             RoundedRectangle(
                 cornerRadius: GeneralSettingsStyle.museBannerCornerRadius,
                 style: .continuous
             )
             .fill(GeneralSettingsStyle.sectionCardFillColor)
 
-            VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 12) {
                 SettingsBrandLogo(
-                    width: 128,
+                    width: 90,
                     lightOpacity: 0.62,
                     darkOpacity: 0.52
                 )
                 .rotationEffect(.degrees(-3))
-                .offset(x: 2, y: 4)
+                .offset(y: 1)
 
-                Spacer(minLength: 0)
+                Spacer(minLength: 8)
 
-                Text(L("你的灵感缪斯", "Your muse for inspiration"))
-                    .font(TF.settingsFontReading)
-                    .foregroundStyle(TF.settingsTextSecondary.opacity(colorScheme == .dark ? 0.62 : 0.58))
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                VStack(alignment: .trailing, spacing: 3) {
+                    introStatusStrip
+
+                    Text(L("你的灵感缪斯", "Your muse for inspiration"))
+                        .font(TF.settingsFontCaption)
+                        .foregroundStyle(TF.settingsTextSecondary.opacity(colorScheme == .dark ? 0.62 : 0.58))
+                        .lineLimit(1)
+                }
             }
             .padding(.horizontal, GeneralSettingsStyle.museBannerHorizontalPadding)
-            .padding(.top, GeneralSettingsStyle.museBannerVerticalPadding)
-            .padding(.bottom, GeneralSettingsStyle.museBannerVerticalPadding)
         }
         .frame(maxWidth: .infinity, minHeight: GeneralSettingsStyle.museBannerHeight, maxHeight: GeneralSettingsStyle.museBannerHeight)
-        .overlay(alignment: .topTrailing) {
-            introStatusStrip
-                .padding(.top, GeneralSettingsStyle.museBannerStatusTopPadding)
-                .padding(.trailing, GeneralSettingsStyle.museBannerStatusTrailingPadding)
-        }
     }
 
     var introStatusStrip: some View {

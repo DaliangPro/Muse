@@ -4,7 +4,9 @@ enum ModeSettingsLayout {
     static let inspectorLabelWidth: CGFloat = ModelSettingsStyle.inspectorLabelWidth
     static let inspectorRowHeight: CGFloat = ModelSettingsStyle.inspectorRowHeight
     static let inspectorControlWidth: CGFloat = ModelSettingsStyle.inspectorControlWidth
-    static let modeWorkspaceWidth: CGFloat = 560
+    /// 铺满可用宽（600 − 左右页边距 16×2 = 568）：四边留白统一 16（2026-07-09 大梁老师）
+    static let modeWorkspaceWidth: CGFloat =
+        SettingsLayout.functionalAreaWidth - SettingsLayout.pageLeadingInset - SettingsLayout.pageTrailingInset
     static let modeWorkspaceMinHeight: CGFloat =
         SettingsLayout.windowContentHeight - SettingsLayout.pageTopInset - SettingsLayout.pageBottomInset
     static let modeGutter: CGFloat = 18
@@ -28,13 +30,9 @@ enum ModeSettingsLayout {
     static let modePromptSaveButtonWidth: CGFloat = 72
     static let modePromptVerticalPadding: CGFloat = 16
     static let modeSampleVerticalPadding: CGFloat = 14
-    static let modeWorkbenchHeight: CGFloat =
-        modeWorkspaceMinHeight - modeToolbarHeight - modeWorkbenchGap
-    /// Prompt 块定高 = 工作区 50%（2026-06-25 大梁老师：去掉块内横线后把 Prompt 输入框上拉、占高提到一半）；
-    /// 剩余 50% 留给下方测试区（输入/输出左右对照、各撑满）
-    static let modePromptBlockHeight: CGFloat = modeWorkbenchHeight * 0.5
-    static let modeTrialBlockHeight: CGFloat =
-        modeWorkbenchHeight - modePromptBlockHeight - modeWorkbenchGap
+    // Prompt/测试区高度不再用窗口常量预算——由 ModesSettingsTab 现场几何计算后传入
+    // （2026-07-08 大梁老师：写死常量在隐藏标题栏窗口下会产生页尾死白）；
+    // 比例仍为 Prompt 50% / 测试区拿剩余（2026-06-25 拍板），见 ModeDetailInner
 }
 
 enum ModeSettingsStyle {

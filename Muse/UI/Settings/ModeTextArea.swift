@@ -4,14 +4,9 @@ import SwiftUI
 struct ModeTextArea: NSViewRepresentable {
     @Binding var text: String
     let isEditable: Bool
-
-    /// 打字区底色：比卡片(settingsCardAlt)深约 0.05，对齐 settingsDropdownTriggerFill，深浅自适应
-    static let inputFieldBackground = NSColor(name: nil, dynamicProvider: { appearance in
-        if appearance.isDark {
-            return NSColor(srgbRed: 0.123, green: 0.123, blue: 0.123, alpha: 1)
-        }
-        return NSColor(srgbRed: 0.938, green: 0.935, blue: 0.928, alpha: 1)
-    })
+    /// 上/下方是否还有被裁掉的内容——驱动外层渐隐只在需要时出现
+    /// （2026-07-08 大梁老师：未滚动时顶部渐隐不得盖住第一行字）
+    var onScrollEdges: ((_ hasContentAbove: Bool, _ hasContentBelow: Bool) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -19,12 +14,8 @@ struct ModeTextArea: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
-        // 打字区底色比卡片深一档、让用户一眼看出可输入区域；卡片背景保持不动（2026-06-25 大梁老师）
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = ModeTextArea.inputFieldBackground
-        scrollView.wantsLayer = true
-        scrollView.layer?.cornerRadius = 7
-        scrollView.layer?.masksToBounds = true
+        // 打字区不带底色、与卡片融为一体（2026-07-08 大梁老师：输入框去掉变色背景）
+        scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
@@ -38,7 +29,8 @@ struct ModeTextArea: NSViewRepresentable {
         textView.isSelectable = true
         textView.allowsUndo = isEditable
         textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 10, height: 8)
+        // 无底色后文字与标题/横线左对齐（水平 inset 归零，光标留 1pt 防贴边裁切）
+        textView.textContainerInset = NSSize(width: 1, height: 8)
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.heightTracksTextView = false
@@ -55,6 +47,28 @@ struct ModeTextArea: NSViewRepresentable {
         scrollView.documentView = textView
         applyStyle(to: textView)
         context.coordinator.lastAppliedStyleKey = currentStyleKey(for: textView)
+
+        // 滚动位置/内容高度变化时上报「上下是否有被裁内容」，外层据此开关渐隐
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        textView.postsFrameChangedNotifications = true
+        context.coordinator.observedScrollView = scrollView
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.scrollGeometryChanged),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.scrollGeometryChanged),
+            name: NSView.frameDidChangeNotification,
+            object: textView
+        )
+        let coordinator = context.coordinator
+        DispatchQueue.main.async { [weak scrollView] in
+            guard let scrollView else { return }
+            coordinator.reportScrollEdges(for: scrollView)
+        }
 
         return scrollView
     }
@@ -128,6 +142,14 @@ struct ModeTextArea: NSViewRepresentable {
 
         restoreSelectedRanges(selectedRanges, in: textView)
         restoreScrollOrigin(visibleOrigin, in: scrollView)
+        // 程序性替换文本后，AppKit 会在下一拍把光标行 autoscroll 到可视区顶端，
+        // 恰好把顶部 8pt 文本 inset 卷出去（探针实测停在 y=8）——首行出界、顶部渐隐误现。
+        // 下一循环再把滚动位置钉回原位一次（2026-07-09 修：初始状态不得有顶部渐隐）
+        let pin = self
+        DispatchQueue.main.async { [weak scrollView] in
+            guard let scrollView else { return }
+            pin.restoreScrollOrigin(visibleOrigin, in: scrollView)
+        }
     }
 
     private func preserveScrollPosition(
@@ -183,15 +205,40 @@ struct ModeTextArea: NSViewRepresentable {
         var parent: ModeTextArea
         var isApplyingProgrammaticTextUpdate = false
         var lastAppliedStyleKey: StyleKey?
+        weak var observedScrollView: NSScrollView?
+        private var lastReportedEdges: (above: Bool, below: Bool)?
 
         init(_ parent: ModeTextArea) {
             self.parent = parent
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
         }
 
         func textDidChange(_ notification: Notification) {
             guard !isApplyingProgrammaticTextUpdate else { return }
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
+        }
+
+        @objc func scrollGeometryChanged() {
+            guard let observedScrollView else { return }
+            reportScrollEdges(for: observedScrollView)
+        }
+
+        /// 只在边缘状态变化时上报；异步派发避免在 AppKit 布局回调里改 SwiftUI 状态
+        func reportScrollEdges(for scrollView: NSScrollView) {
+            guard let onScrollEdges = parent.onScrollEdges else { return }
+            let visible = scrollView.contentView.bounds
+            let documentHeight = scrollView.documentView?.frame.height ?? 0
+            let above = visible.origin.y > 0.5
+            let below = (visible.origin.y + visible.height) < (documentHeight - 0.5)
+            if let last = lastReportedEdges, last.above == above, last.below == below { return }
+            lastReportedEdges = (above, below)
+            DispatchQueue.main.async {
+                onScrollEdges(above, below)
+            }
         }
     }
 }

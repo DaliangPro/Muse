@@ -3,9 +3,30 @@ import SwiftUI
 
 struct ModeDetailInner: View, SettingsCardHelpers {
     let mode: ProcessingMode
+    /// 工作区实际可用高度（由 ModesSettingsTab 现场几何计算传入，2026-07-08：
+    /// 不再用窗口常量预算，消除隐藏标题栏窗口下的页尾死白）
+    let workbenchHeight: CGFloat
     let onSave: (ProcessingMode) -> Void
 
+    /// Prompt 块占工作区一半（2026-06-13 拍板比例不变），测试区拿剩余
+    private var promptBlockHeight: CGFloat {
+        (workbenchHeight * 0.5).rounded()
+    }
+
+    private var trialBlockHeight: CGFloat {
+        max(workbenchHeight - promptBlockHeight - ModeSettingsLayout.modeWorkbenchGap, 0)
+    }
+
     @State private var prompt = ""
+
+    // 输入即保存（2026-07-08 大梁老师）：停顿 0.6s 落盘；切模式/离开页面前兜底 flush
+    @State private var pendingSaveTask: Task<Void, Never>?
+    @State private var pendingPrompt: String?
+    @State private var pendingMode: ProcessingMode?
+
+    // 渐隐只在对应方向真有被裁内容时出现（未滚动时不得盖住第一行字）
+    @State private var promptHasContentAbove = false
+    @State private var promptHasContentBelow = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: ModeSettingsLayout.modeWorkbenchGap) {
@@ -21,15 +42,23 @@ struct ModeDetailInner: View, SettingsCardHelpers {
                     name: mode.name,
                     processingLabel: mode.processingLabel,
                     prompt: prompt,
-                    hotkeyStyle: mode.hotkeyStyle
+                    hotkeyStyle: mode.hotkeyStyle,
+                    blockHeight: trialBlockHeight
                 )
             }
         }
         .frame(width: ModeSettingsLayout.modeWorkspaceWidth, alignment: .topLeading)
-        .frame(minHeight: ModeSettingsLayout.modeWorkbenchHeight, alignment: .topLeading)
+        .frame(minHeight: workbenchHeight, alignment: .topLeading)
         .onAppear(perform: syncFields)
         .onChange(of: mode.id) { _, _ in
+            flushPendingSave()
             syncFields()
+        }
+        .onChange(of: prompt) { _, newPrompt in
+            scheduleAutoSave(newPrompt)
+        }
+        .onDisappear {
+            flushPendingSave()
         }
     }
 
@@ -73,13 +102,20 @@ private extension ModeDetailInner {
         VStack(alignment: .leading, spacing: 0) {
             modePromptHeader
 
+            // 标题与内容只用一条横线区分（2026-07-08 大梁老师）
+            Rectangle()
+                .fill(modeFieldStroke)
+                .frame(height: 1)
+                .padding(.horizontal, ModeSettingsLayout.modeGutter)
+
             modePromptEditor
+                .padding(.top, 10)
         }
-        // Prompt 块定高 40%（2026-06-13 用户拍板重构）：配置低频、克制占高,
-        // 剩余 60% 归下方测试区(输入/输出左右对照、各撑满)
+        // Prompt 块占工作区一半（2026-06-13 用户拍板重构；高度改由实际几何现场计算），
+        // 剩余归下方测试区(输入/输出左右对照、各撑满)
         .frame(
             width: ModeSettingsLayout.modeWorkspaceWidth,
-            height: ModeSettingsLayout.modePromptBlockHeight,
+            height: promptBlockHeight,
             alignment: .topLeading
         )
         .background {
@@ -98,6 +134,7 @@ private extension ModeDetailInner {
         }
     }
 
+    /// 标题行：Prompt + 恢复默认（靠右）。保存按钮已撤——输入即自动保存（2026-07-08 大梁老师）
     var modePromptHeader: some View {
         HStack(spacing: ModeSettingsLayout.modePromptActionSpacing) {
             Text("Prompt")
@@ -115,22 +152,30 @@ private extension ModeDetailInner {
             ) {
                 restoreDefaults()
             }
-
-            modeHeaderButton(L("保存修改", "Save"), isPrimary: true) {
-                saveChanges()
-            }
+            .help(L("恢复默认 Prompt", "Restore the default prompt"))
         }
         .padding(.horizontal, ModeSettingsLayout.modeGutter)
-        .padding(.vertical, 12)
+        .padding(.vertical, 8)
     }
 
     var modePromptEditor: some View {
         ZStack(alignment: .topLeading) {
             ModeTextArea(
                 text: $prompt,
-                isEditable: true
+                isEditable: true,
+                onScrollEdges: { above, below in
+                    promptHasContentAbove = above
+                    promptHasContentBelow = below
+                }
             )
-            .settingsVerticalScrollFade(color: modeInputAreaFill)
+            .settingsVerticalScrollFade(
+                color: modeInputAreaFill,
+                // 12pt 浅渐隐：只作「下面还有内容」的提示，不吞掉折叠处整行文字
+                // （2026-07-08 大梁老师：默认状态最后一行被晕影盖住必须下拉才能读）
+                height: 12,
+                showsTop: promptHasContentAbove,
+                showsBottom: promptHasContentBelow
+            )
 
             if shouldShowPromptPlaceholder {
                 Text(L("在这里编辑当前模式的 Prompt...", "Edit the current mode prompt here..."))
@@ -139,11 +184,10 @@ private extension ModeDetailInner {
                     .lineLimit(1)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
-                    .padding(.leading, 10)
+                    .padding(.leading, 1)
                     .padding(.top, 8)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .padding(.horizontal, ModeSettingsLayout.modeGutter)
         .padding(.bottom, ModeSettingsLayout.modePromptVerticalPadding)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -153,9 +197,9 @@ private extension ModeDetailInner {
         TF.settingsCardAlt
     }
 
-    /// Prompt 输入框上下渐隐用的底色（与灰块填充一致，渐变到它即"文字淡出"）
+    /// Prompt 输入框上下渐隐用的底色（输入区已无自身色块，渐变到卡片底色即"文字淡出"）
     var modeInputAreaFill: Color {
-        TF.settingsDropdownTriggerFill
+        TF.settingsCardAlt
     }
 
     var modeFieldStroke: Color {
@@ -183,19 +227,6 @@ private extension ModeDetailInner {
             && mode.prompt.trimmingCharacters(in: .whitespacesAndNewlines) == "{text}"
     }
 
-    func modeHeaderButton(
-        _ title: String,
-        isPrimary: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
-        SettingsTextButton(
-            title,
-            variant: isPrimary ? .primary : .secondary,
-            width: ModeSettingsLayout.modePromptSaveButtonWidth,
-            action: action
-        )
-    }
-
     func restoreDefaults() {
         guard let defaultMode = ProcessingMode.defaults.first(where: { $0.id == mode.id })
             ?? ProcessingMode.defaults.first(where: { $0.name == mode.name })
@@ -206,9 +237,34 @@ private extension ModeDetailInner {
         prompt = defaultMode.prompt
     }
 
-    func saveChanges() {
-        var updated = mode
-        updated.prompt = prompt
+    /// 输入停顿 0.6s 自动落盘；编辑归属的模式在此刻捕获，防抖期间切模式也不会存错对象
+    func scheduleAutoSave(_ newPrompt: String) {
+        guard newPrompt != mode.prompt else {
+            // 与已保存内容一致（含 syncFields 的程序性赋值）：撤销未落盘任务
+            pendingSaveTask?.cancel()
+            pendingSaveTask = nil
+            pendingPrompt = nil
+            pendingMode = nil
+            return
+        }
+        pendingPrompt = newPrompt
+        pendingMode = mode
+        pendingSaveTask?.cancel()
+        pendingSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(0.6))
+            guard !Task.isCancelled else { return }
+            flushPendingSave()
+        }
+    }
+
+    /// 把未落盘的编辑立即保存（防抖到点、切换模式、离开页面三处调用）
+    func flushPendingSave() {
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
+        guard var updated = pendingMode, let newPrompt = pendingPrompt else { return }
+        pendingPrompt = nil
+        pendingMode = nil
+        updated.prompt = newPrompt
         onSave(updated)
     }
 

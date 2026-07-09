@@ -9,6 +9,8 @@ struct ModeTrialCard: View {
     let processingLabel: String
     let prompt: String
     let hotkeyStyle: ProcessingMode.HotkeyStyle
+    /// 测试区高度（由 ModeDetailInner 按实际工作区几何传入）
+    let blockHeight: CGFloat
 
     @State private var trialInput = ""
     @State private var trialOutput = ""
@@ -56,25 +58,17 @@ struct ModeTrialCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            trialHeader
-
-            Rectangle()
-                .fill(fieldStroke)
-                .frame(height: 1)
-                .padding(.horizontal, ModeSettingsLayout.modeGutter)
-
-            // 左右对照：左输入原文、右输出结果，各占一半宽、撑满剩余高度。
-            // 中间用间隙分栏（不画竖线，沿用「不靠线条勾勒」的设计语言）
-            HStack(alignment: .top, spacing: 0) {
-                trialInputColumn
-                trialOutputColumn
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // 无标题行（2026-07-08 大梁老师）：左右两列各自「标签 → 横线 → 内容」，
+        // 两条横线随列间距在中间断开；测试按钮在输出列右下角。
+        // 中间用间隙分栏（不画竖线，沿用「不靠线条勾勒」的设计语言）
+        HStack(alignment: .top, spacing: 0) {
+            trialInputColumn
+            trialOutputColumn
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(
             width: ModeSettingsLayout.modeWorkspaceWidth,
-            height: ModeSettingsLayout.modeTrialBlockHeight,
+            height: blockHeight,
             alignment: .topLeading
         )
         .background {
@@ -102,29 +96,11 @@ struct ModeTrialCard: View {
 }
 
 private extension ModeTrialCard {
-    /// 顶部工具行：标题「测试 Prompt」+ 测试按钮（保存样例/恢复已挪到输入框左下角）
-    var trialHeader: some View {
-        HStack(spacing: ModeSettingsLayout.modePromptActionSpacing) {
-            Text(L("测试 Prompt", "Test Prompt"))
-                .font(TF.settingsFontBodyLarge)
-                .foregroundStyle(TF.settingsTextTertiary)
-                .lineLimit(1)
-                .fixedSize()
-
-            Spacer(minLength: 12)
-
-            SettingsTextButton(
-                isRunningTrial ? L("测试中", "Testing") : L("测试", "Test"),
-                variant: .primary,
-                width: ModeSettingsLayout.modePromptSaveButtonWidth
-            ) {
-                Task { await runTrial() }
-            }
-            .disabled(!canRunTrial || isRunningTrial)
-            .opacity((canRunTrial && !isRunningTrial) ? 1 : 0.62)
-        }
-        .padding(.horizontal, ModeSettingsLayout.modeGutter)
-        .padding(.vertical, 12)
+    /// 列内「标签 → 横线」，与 Prompt 块同款分隔语言
+    func columnDivider() -> some View {
+        Rectangle()
+            .fill(fieldStroke)
+            .frame(height: 1)
     }
 
     /// 左列：输入原文（可编辑），与 Prompt 编辑器同组件同字号
@@ -133,6 +109,9 @@ private extension ModeTrialCard {
             Text(L("输入", "Input"))
                 .font(TF.settingsFontBodyLarge)
                 .foregroundStyle(TF.settingsTextTertiary)
+                .padding(.bottom, 2)
+
+            columnDivider()
 
             ZStack(alignment: .topLeading) {
                 ModeTextArea(
@@ -148,7 +127,7 @@ private extension ModeTrialCard {
                         .lineLimit(1)
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
-                        .padding(.leading, 10)
+                        .padding(.leading, 1)
                         .padding(.top, 8)
                 }
             }
@@ -207,6 +186,9 @@ private extension ModeTrialCard {
                     trialStatusLine
                 }
             }
+            .padding(.bottom, 2)
+
+            columnDivider()
 
             ZStack(alignment: .topLeading) {
                 ModeTextArea(
@@ -221,23 +203,36 @@ private extension ModeTrialCard {
                         .lineLimit(1)
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
-                        .padding(.leading, 10)
+                        .padding(.leading, 1)
                         .padding(.top, 8)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .layoutPriority(1)
 
-            // 清空输出（与左列「保存样例」按钮行对称，让输入/输出框等高）
+            // 测试 + ✕清空 靠左，与左列「保存样例 + ↺」同构；测试与其他按钮同色
+            // （2026-07-08 大梁老师）
             HStack(spacing: 8) {
                 SettingsTextButton(
-                    L("清空", "Clear"),
+                    isRunningTrial ? L("测试中", "Testing") : L("测试", "Test"),
                     variant: .secondary,
                     width: ModeSettingsLayout.modePromptSaveButtonWidth
+                ) {
+                    Task { await runTrial() }
+                }
+                .disabled(!canRunTrial || isRunningTrial)
+                .opacity((canRunTrial && !isRunningTrial) ? 1 : 0.62)
+
+                SettingsIconButton(
+                    systemName: "xmark",
+                    accessibilityLabel: L("清空输出", "Clear output"),
+                    variant: .ghost,
+                    size: ModeSettingsLayout.modePromptRestoreButtonSize
                 ) {
                     clearResult()
                 }
                 .disabled(trialOutput.isEmpty && trialError.isEmpty)
+                .help(L("清空输出", "Clear the output"))
 
                 Spacer(minLength: 0)
             }

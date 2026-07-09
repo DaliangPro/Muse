@@ -4,10 +4,14 @@ struct AssetLibrarySavedAssetsView: View {
     @Binding var libraryQuery: String
     @Binding var selectedLibraryType: LanguageAssetType?
     @Binding var selectedLibraryAssetID: String?
-    @Binding var selectedResultKind: ExtractionOutputKind?
+    @Binding var selectedResultRecipeID: String?
     @Binding var selectedResultID: String?
     let creatorAssets: [LanguageAsset]
     let extractionResults: [ExtractionResult]
+    /// 配方 ID → 展示名/点色。资产库按配方分类分组（2026-07-08 大梁老师：
+    /// 「候选资产」只属于待确认阶段，入库后按分类展示，不再挂候选名）
+    let recipeName: (String) -> String
+    let recipeAccent: (String) -> Color
     let selectedLibraryAsset: LanguageAsset?
     let selectedExtractionResult: ExtractionResult?
     let copiedAssetID: String?
@@ -21,6 +25,10 @@ struct AssetLibrarySavedAssetsView: View {
 
     @State private var assetPendingDeletion: LanguageAsset?
     @State private var resultPendingDeletion: ExtractionResult?
+
+    /// 各分类的展开状态（可自由单击收起/展开，2026-07-08 大梁老师）。
+    /// nil = 初始态：只展开当前详情所属分类
+    @State private var expandedRecipeIDs: Set<String>?
 
     var body: some View {
         AssetLibrarySplitPanel {
@@ -82,7 +90,7 @@ struct AssetLibrarySavedAssetsView: View {
 
         return visibleResults.filter { result in
             [
-                result.outputKind.settingsDisplayTitle,
+                recipeName(result.recipeID),
                 result.recipeID,
                 result.title,
                 result.content,
@@ -98,13 +106,15 @@ struct AssetLibrarySavedAssetsView: View {
         }
     }
 
-    private var resultGroups: [(kind: ExtractionOutputKind, results: [ExtractionResult])] {
-        // 2026-07 修：金句/创作素材(assetCandidates)入库后也要在资产库分组显示——
-        // 此处第二道过滤曾导致「点了入库、资产库里不显示」
-        ExtractionOutputKind.allCases.compactMap { kind in
-            let results = searchedExtractionResults.filter { $0.outputKind == kind }
-            return results.isEmpty ? nil : (kind, results)
+    /// 按配方分类分组（组序 = 结果列表中的首现顺序，即最近有产出的分类靠前）
+    private var resultGroups: [(recipeID: String, results: [ExtractionResult])] {
+        var order: [String] = []
+        var buckets: [String: [ExtractionResult]] = [:]
+        for result in searchedExtractionResults {
+            if buckets[result.recipeID] == nil { order.append(result.recipeID) }
+            buckets[result.recipeID, default: []].append(result)
         }
+        return order.map { ($0, buckets[$0] ?? []) }
     }
 
     private var expandedLibraryType: LanguageAssetType? {
@@ -159,8 +169,8 @@ struct AssetLibrarySavedAssetsView: View {
                 ForEach(libraryGroups, id: \.type) { group in
                     libraryTypeGroup(type: group.type, items: group.assets)
                 }
-                ForEach(resultGroups, id: \.kind) { group in
-                    resultKindGroup(kind: group.kind, items: group.results)
+                ForEach(resultGroups, id: \.recipeID) { group in
+                    resultRecipeGroup(recipeID: group.recipeID, items: group.results)
                 }
             }
         }
@@ -205,13 +215,20 @@ struct AssetLibrarySavedAssetsView: View {
                 selectedLibraryAssetID = asset.id
                 selectedLibraryType = asset.assetType
                 selectedResultID = nil
-                selectedResultKind = nil
+                selectedResultRecipeID = nil
             }
         )
     }
 
-    private func resultKindGroup(kind: ExtractionOutputKind, items: [ExtractionResult]) -> some View {
-        let isExpanded = selectedResultKind == kind || (selectedResultKind == nil && displayedExtractionResult?.outputKind == kind)
+    /// 生效的展开集合：用户动过手就用记忆值，否则默认只展开当前详情所属分类
+    private var effectiveExpandedRecipeIDs: Set<String> {
+        if let expandedRecipeIDs { return expandedRecipeIDs }
+        if let recipeID = displayedExtractionResult?.recipeID { return [recipeID] }
+        return []
+    }
+
+    private func resultRecipeGroup(recipeID: String, items: [ExtractionResult]) -> some View {
+        let isExpanded = effectiveExpandedRecipeIDs.contains(recipeID)
 
         return VStack(alignment: .leading, spacing: 5) {
             SettingsSelectableRow(
@@ -219,20 +236,23 @@ struct AssetLibrarySavedAssetsView: View {
                 minHeight: 34,
                 verticalPadding: 6
             ) {
+                var ids = effectiveExpandedRecipeIDs
                 if isExpanded {
-                    selectedResultKind = nil
+                    ids.remove(recipeID)
                 } else {
-                    selectedResultKind = kind
+                    ids.insert(recipeID)
+                    selectedResultRecipeID = recipeID
                     selectedResultID = items.first?.id
                     selectedLibraryType = nil
                     selectedLibraryAssetID = nil
                 }
+                expandedRecipeIDs = ids
             } label: {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(kind.settingsAccentColor)
+                        .fill(recipeAccent(recipeID))
                         .frame(width: 6, height: 6)
-                    Text(kind.settingsDisplayTitle)
+                    Text(recipeName(recipeID))
                         .font(TF.settingsFontBodyStrong)
                         .foregroundStyle(TF.settingsText)
                         .lineLimit(1)
@@ -263,7 +283,7 @@ struct AssetLibrarySavedAssetsView: View {
             isSelected: isSelected,
             action: {
                 selectedResultID = result.id
-                selectedResultKind = result.outputKind
+                selectedResultRecipeID = result.recipeID
                 selectedLibraryType = nil
                 selectedLibraryAssetID = nil
             }
@@ -325,10 +345,10 @@ struct AssetLibrarySavedAssetsView: View {
             }
         } else if let result = displayedExtractionResult {
             AssetLibraryDetailPane(
-                accentColor: result.outputKind.settingsAccentColor,
-                metadata: "\(result.outputKind.settingsDisplayTitle) · \(formattedDate(result.createdAt))",
+                accentColor: recipeAccent(result.recipeID),
+                metadata: "\(recipeName(result.recipeID)) · \(formattedDate(result.createdAt))",
                 grade: nil,
-                title: result.title.isEmpty ? result.outputKind.settingsDisplayTitle : result.title,
+                title: result.title.isEmpty ? recipeName(result.recipeID) : result.title,
                 bodyText: result.content,
                 tags: result.summary.map { [$0] } ?? []
             ) {

@@ -2,10 +2,17 @@ import AppKit
 import SwiftUI
 
 // 2026-07 重设计：提炼弹窗 = 勾选配方(可多选) + 选范围。
-// 不再金句专属；Prompt 属于配方(配方页编辑)，提炼时不再改
+// 不再金句专属；Prompt 属于配方(配方页编辑)，提炼时不再改。
+// 2026-07-08 大梁老师：点开始后弹窗不关闭，原地切换为「提炼中」形态（窗体收拢 +
+// 旋转光环 + 阶段进度），页面不再显示进度横幅；完成后由外层关弹窗并跳待确认。
 struct AssetExtractionRangeSelectionSheet: View {
     let recipes: [ExtractionRecipe]
+    let isExtracting: Bool
+    let progressPhase: AssetExtractionProgressStage
+    /// 范围内无可提炼内容时的就地提示（不弹错、不关窗，让用户直接换范围）
+    let emptyNotice: String?
     let onConfirm: (Set<String>, AssetExtractionRangeOption) -> Void
+    let onCancelExtraction: () -> Void
     let onCancel: () -> Void
 
     @State private var selectedRange: AssetExtractionRangeOption
@@ -15,11 +22,19 @@ struct AssetExtractionRangeSelectionSheet: View {
         recipes: [ExtractionRecipe],
         selectedRecipeIDs: Set<String>,
         selectedRange: AssetExtractionRangeOption,
+        isExtracting: Bool,
+        progressPhase: AssetExtractionProgressStage,
+        emptyNotice: String?,
         onConfirm: @escaping (Set<String>, AssetExtractionRangeOption) -> Void,
+        onCancelExtraction: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
         self.recipes = recipes
+        self.isExtracting = isExtracting
+        self.progressPhase = progressPhase
+        self.emptyNotice = emptyNotice
         self.onConfirm = onConfirm
+        self.onCancelExtraction = onCancelExtraction
         self.onCancel = onCancel
         let validIDs = Set(recipes.map(\.id))
         let initial = selectedRecipeIDs.intersection(validIDs)
@@ -28,6 +43,25 @@ struct AssetExtractionRangeSelectionSheet: View {
     }
 
     var body: some View {
+        ZStack {
+            if isExtracting {
+                extractingContent
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            } else {
+                selectionContent
+                    .transition(.opacity)
+            }
+        }
+        .frame(
+            width: isExtracting ? 380 : 488,
+            height: isExtracting ? 316 : 560
+        )
+        .background(TF.settingsCanvas)
+        .animation(.spring(response: 0.42, dampingFraction: 0.86), value: isExtracting)
+        .interactiveDismissDisabled(isExtracting)
+    }
+
+    private var selectionContent: some View {
         VStack(alignment: .leading, spacing: 0) {
             content
 
@@ -35,8 +69,78 @@ struct AssetExtractionRangeSelectionSheet: View {
 
             footer
         }
-        .frame(width: 488, height: 560, alignment: .topLeading)
-        .background(TF.settingsCanvas)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: - 提炼中形态：旋转光环 + 阶段文字 + 分段进度点，安静优雅不打扰
+
+    private var extractingContent: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+
+            // 旋转用 TimelineView 按时间算角度，不走 repeatForever 动画事务——
+            // 后者会把弹窗收拢的布局位移一并捕获进无限重放（2026-07-08 修：内容反复从右下漂移）
+            TimelineView(.animation) { context in
+                let period: Double = 1.05
+                let progress = context.date.timeIntervalSinceReferenceDate
+                    .truncatingRemainder(dividingBy: period) / period
+                ZStack {
+                    Circle()
+                        .stroke(TF.settingsStroke.opacity(0.45), lineWidth: 3)
+                    Circle()
+                        .trim(from: 0, to: 0.32)
+                        .stroke(
+                            AngularGradient(
+                                gradient: Gradient(colors: [
+                                    TF.settingsAccentGreen.opacity(0),
+                                    TF.settingsAccentGreen,
+                                ]),
+                                center: .center
+                            ),
+                            style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(progress * 360))
+                }
+            }
+            .frame(width: 54, height: 54)
+            .padding(.bottom, 18)
+
+            Text(progressPhase.title)
+                .font(TF.settingsFontBodyLarge)
+                .foregroundStyle(TF.settingsText)
+                .contentTransition(.opacity)
+                .animation(.easeInOut(duration: 0.22), value: progressPhase)
+                .padding(.bottom, 5)
+
+            Text(L("\(selectedRecipeIDs.count) 个配方 · \(selectedRange.title)", "\(selectedRecipeIDs.count) recipes · \(selectedRange.title)"))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                .padding(.bottom, 18)
+
+            stageDots
+
+            Spacer(minLength: 0)
+
+            SettingsTextButton(L("取消", "Cancel"), variant: .secondary, onCanvas: true, action: onCancelExtraction)
+                .padding(.bottom, 18)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// 七段管线进度点：走到的点亮绿、当前段拉长为胶囊，一眼看出进行到哪
+    private var stageDots: some View {
+        HStack(spacing: 7) {
+            ForEach(AssetExtractionProgressStage.allCases, id: \.rawValue) { stage in
+                Capsule()
+                    .fill(
+                        stage.rawValue <= progressPhase.rawValue
+                            ? TF.settingsAccentGreen
+                            : TF.settingsStroke.opacity(0.55)
+                    )
+                    .frame(width: stage == progressPhase ? 16 : 6, height: 6)
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: progressPhase)
     }
 
     private var content: some View {
@@ -93,7 +197,13 @@ struct AssetExtractionRangeSelectionSheet: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 8) {
+            if let emptyNotice {
+                Text(emptyNotice)
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsAccentAmber)
+                    .lineLimit(2)
+            }
             Spacer()
             SettingsTextButton(L("取消", "Cancel"), variant: .secondary, onCanvas: true, action: onCancel)
             SettingsTextButton(L("开始提炼", "Start extraction"), variant: .primary, minWidth: 82) {

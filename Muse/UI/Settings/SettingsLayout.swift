@@ -1,7 +1,9 @@
 import SwiftUI
 
 enum SettingsLayout {
-    static let windowContentHeight: CGFloat = 690
+    /// 2026-07-08 大梁老师拍板：整体高度定 560；
+    /// 各页自适应——概览/语料/常用词缩底部撑满区，输入模式 Prompt 与测试区等比缩
+    static let windowContentHeight: CGFloat = 560
     static let windowMinimumContentWidth: CGFloat = 240
     static let windowMinimumContentHeight: CGFloat = windowContentHeight
 
@@ -19,7 +21,8 @@ enum SettingsLayout {
     static let windowContentWidth: CGFloat = sidebarWidth + dividerWidth + functionalAreaWidth
 
     static let pageTopInset: CGFloat = TF.settingsPagePadding
-    static let pageBottomInset: CGFloat = TF.settingsPagePadding
+    /// 2026-07-09 大梁老师拍板：所有页面底部留白 20（试过 25 偏高；其余三边保持 16）
+    static let pageBottomInset: CGFloat = 20
     static let pageLeadingInset: CGFloat = TF.settingsPagePadding
     static let pageTrailingInset: CGFloat = TF.settingsPagePadding
 

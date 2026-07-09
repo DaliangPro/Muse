@@ -9,18 +9,21 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
     @State private var testTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: ModelSettingsStyle.cardSpacing) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: ModelSettingsStyle.cardSpacing) {
-                    modelCards
-                }
-
-                VStack(alignment: .leading, spacing: ModelSettingsStyle.cardSpacing) {
-                    modelCards
-                }
-            }
-
+        // 2026-07-08 大梁老师拍板：四块矩形之间用弹性 Spacer 均分页面剩余高度，
+        // 页尾留白恒等于页边距、与其他页一致；间距随窗口高度自动均分，不再写死。
+        // （页宽恒定 600，三卡横排永远放不下，原 ViewThatFits 恒走纵排，故直接纵排）
+        VStack(alignment: .leading, spacing: 0) {
+            asrCard
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: ModelSettingsStyle.cardSpacing)
+            llmCard
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: ModelSettingsStyle.cardSpacing)
+            assetCard
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: ModelSettingsStyle.cardSpacing)
             LocalModelResourceStrip()
+                .fixedSize(horizontal: false, vertical: true)
         }
         .id(refreshID)
         .onReceive(NotificationCenter.default.publisher(for: .modelConnectivityProbed)) { _ in
@@ -37,15 +40,11 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
         }
     }
 
-    @ViewBuilder
-    private var modelCards: some View {
+    // 色点 = 手动测试优先，否则探测缓存；按钮状态只跟手动点击走，
+    // 启动自动探测不会让「测试连接」按钮出现被点击的状态（2026-06-12 用户拍板）
+    private var asrCard: some View {
         let asrSummary = ModelSettingsSummary.asr()
-        let llmSummary = ModelSettingsSummary.llm()
-        let assetSummary = ModelSettingsSummary.asset()
-
-        // 色点 = 手动测试优先，否则探测缓存；按钮状态只跟手动点击走，
-        // 启动自动探测不会让「测试连接」按钮出现被点击的状态（2026-06-12 用户拍板）
-        ModelCapabilityCard(
+        return ModelCapabilityCard(
             title: L("语音识别", "Speech Recognition"),
             provider: asrSummary.provider,
             model: asrSummary.model,
@@ -55,8 +54,11 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
             onTest: { testASRConnection() },
             onEdit: { activeEditor = .asr }
         )
+    }
 
-        ModelCapabilityCard(
+    private var llmCard: some View {
+        let llmSummary = ModelSettingsSummary.llm()
+        return ModelCapabilityCard(
             title: L("文本处理", "Text Processing"),
             provider: llmSummary.provider,
             model: llmSummary.model,
@@ -66,8 +68,11 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
             onTest: { testLLMConnection(forAssetExtraction: false) },
             onEdit: { activeEditor = .llm }
         )
+    }
 
-        ModelCapabilityCard(
+    private var assetCard: some View {
+        let assetSummary = ModelSettingsSummary.asset()
+        return ModelCapabilityCard(
             title: L("语料沉淀", "Corpus Extraction"),
             provider: assetSummary.provider,
             model: assetSummary.model,

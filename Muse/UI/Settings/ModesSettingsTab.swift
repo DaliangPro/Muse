@@ -13,8 +13,16 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
     @State private var configuringModeId: UUID?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            modeWorkspace
+        // 2026-07-08 大梁老师：工作区高度改按实际几何现场计算（隐藏标题栏窗口的
+        // 真实内容高比窗口常量多一截，写死常量会在页尾留出死白）
+        GeometryReader { proxy in
+            let workbenchHeight = max(
+                proxy.size.height - ModeSettingsLayout.modeToolbarHeight - ModeSettingsLayout.modeWorkbenchGap,
+                0
+            )
+            VStack(alignment: .leading, spacing: 0) {
+                modeWorkspace(workbenchHeight: workbenchHeight)
+            }
         }
         .onAppear {
             if selectedModeId == nil {
@@ -56,7 +64,7 @@ private extension ModesSettingsTab {
         modes.first { $0.id == selectedModeId }
     }
 
-    var modeWorkspace: some View {
+    func modeWorkspace(workbenchHeight: CGFloat) -> some View {
         ZStack(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: ModeSettingsLayout.modeWorkbenchGap) {
                 Color.clear
@@ -66,7 +74,7 @@ private extension ModesSettingsTab {
                     )
                     .allowsHitTesting(false)
 
-                modeWorkspaceDetail
+                modeWorkspaceDetail(workbenchHeight: workbenchHeight)
             }
 
             modeWorkspaceToolbar
@@ -92,7 +100,6 @@ private extension ModesSettingsTab {
             }
         }
         .frame(width: ModeSettingsLayout.modeWorkspaceWidth, alignment: .topLeading)
-        .frame(minHeight: ModeSettingsLayout.modeWorkspaceMinHeight, alignment: .topLeading)
         .settingsDismissOnOutsideClick(
             isActive: isModePickerOpen,
             allowedFrames: modePickerAllowedFrames
@@ -107,10 +114,11 @@ private extension ModesSettingsTab {
     }
 
     @ViewBuilder
-    var modeWorkspaceDetail: some View {
+    func modeWorkspaceDetail(workbenchHeight: CGFloat) -> some View {
         if let mode = selectedMode {
             ModeDetailInner(
                 mode: mode,
+                workbenchHeight: workbenchHeight,
                 onSave: { updated in
                     updateMode(updated)
                 }

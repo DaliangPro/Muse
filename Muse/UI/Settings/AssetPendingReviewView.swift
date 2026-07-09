@@ -1,15 +1,18 @@
 import SwiftUI
 
 /// 待确认页（2026-07 重构批三）：所有配方产物统一在此拍板——入库或抛弃。
-/// 左栏按提炼批次分组，右栏详情带严审评分与判决理由（可审计「为什么留」）。
+/// 左栏按配方分类分组（与资产库同款导航，2026-07-08 大梁老师：多类型产物混批时
+/// 批次平铺没有分类收纳），右栏详情带严审评分与判决理由（可审计「为什么留」）。
 struct AssetPendingReviewView: View {
     @Binding var query: String
     @Binding var selectedResultID: String?
     let pendingResults: [ExtractionResult]
-    /// 严审砍掉的产物：按批可翻砍单，可捞回（防错杀防黑箱，2026-07）
+    /// 严审砍掉的产物：按分类可翻砍单，可捞回（防错杀防黑箱，2026-07）
     let rejectedResults: [ExtractionResult]
-    let runs: [ExtractionRun]
     let formattedDate: (Date) -> String
+    /// 配方 ID → 展示名/点色（与资产库共用同一解析）
+    let recipeName: (String) -> String
+    let recipeAccent: (String) -> Color
     let onShowSources: (ExtractionResult) -> Void
     let onSave: (ExtractionResult) -> Void
     let onDiscard: (ExtractionResult) -> Void
@@ -17,7 +20,9 @@ struct AssetPendingReviewView: View {
     let onRestore: (ExtractionResult) -> Void
     let onDiscardAll: ([ExtractionResult]) -> Void
 
-    @State private var expandedRejectedRunIDs: Set<String> = []
+    /// 各分类的展开状态（可自由单击收起/展开）。nil = 初始态：只展开当前详情所属分类
+    @State private var expandedRecipeIDs: Set<String>?
+    @State private var expandedRejectedRecipeIDs: Set<String> = []
     @State private var isClearAllConfirmPresented = false
 
     var body: some View {
@@ -42,10 +47,8 @@ struct AssetPendingReviewView: View {
 }
 
 private extension AssetPendingReviewView {
-    struct RunGroup: Identifiable {
-        let id: String
-        let title: String
-        let subtitle: String
+    struct RecipeGroup: Identifiable {
+        let id: String  // recipeID
         let results: [ExtractionResult]
         let rejected: [ExtractionResult]
     }
@@ -67,25 +70,19 @@ private extension AssetPendingReviewView {
         return rejectedResults.filter { matchesQuery($0, trimmed) }
     }
 
-    var runGroups: [RunGroup] {
-        let runByID = Dictionary(uniqueKeysWithValues: runs.map { ($0.id, $0) })
-        let rejectedByRun = Dictionary(grouping: searchedRejected, by: \.runID)
-        var grouped = Dictionary(grouping: searchedResults, by: \.runID)
-        // 只有砍单没有留存的批次也要显示(比如 30 天金句全砍那种)——否则用户只看到 0 条黑箱
-        for runID in rejectedByRun.keys where grouped[runID] == nil {
-            grouped[runID] = []
+    var recipeGroups: [RecipeGroup] {
+        let rejectedByRecipe = Dictionary(grouping: searchedRejected, by: \.recipeID)
+        var grouped = Dictionary(grouping: searchedResults, by: \.recipeID)
+        // 只有砍单没有留存的分类也要显示(比如 30 天金句全砍那种)——否则用户只看到 0 条黑箱
+        for recipeID in rejectedByRecipe.keys where grouped[recipeID] == nil {
+            grouped[recipeID] = []
         }
         return grouped
-            .map { runID, results -> RunGroup in
-                let run = runByID[runID]
-                let rejected = rejectedByRun[runID] ?? []
-                let latest = (results + rejected).map(\.createdAt).max() ?? Date.distantPast
-                return RunGroup(
-                    id: runID,
-                    title: run?.recipeName ?? L("提炼批次", "Run"),
-                    subtitle: "\(formattedDate(run?.createdAt ?? latest)) · \(results.count)",
+            .map { recipeID, results -> RecipeGroup in
+                RecipeGroup(
+                    id: recipeID,
                     results: results.sorted { ($0.score ?? 0) > ($1.score ?? 0) },
-                    rejected: rejected.sorted { ($0.score ?? 0) > ($1.score ?? 0) }
+                    rejected: (rejectedByRecipe[recipeID] ?? []).sorted { ($0.score ?? 0) > ($1.score ?? 0) }
                 )
             }
             .sorted { lhs, rhs in
@@ -104,7 +101,14 @@ private extension AssetPendingReviewView {
                 return rejectedMatch
             }
         }
-        return runGroups.first?.results.first
+        return recipeGroups.first?.results.first
+    }
+
+    /// 生效的展开集合：用户动过手就用记忆值，否则默认只展开当前详情所属分类
+    var effectiveExpandedRecipeIDs: Set<String> {
+        if let expandedRecipeIDs { return expandedRecipeIDs }
+        if let recipeID = displayedResult?.recipeID { return [recipeID] }
+        return []
     }
 
     var navigationPanel: some View {
@@ -114,15 +118,15 @@ private extension AssetPendingReviewView {
             searchPosition: .hidden,
             bottomAccessory: pendingResults.isEmpty ? nil : AnyView(clearAllRow)
         ) {
-            if runGroups.isEmpty {
+            if recipeGroups.isEmpty {
                 Text(L("没有待确认的产物", "Nothing to review"))
                     .font(TF.settingsFontBody)
                     .foregroundStyle(TF.settingsTextTertiary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
             } else {
-                ForEach(runGroups) { group in
-                    runGroupSection(group)
+                ForEach(recipeGroups) { group in
+                    recipeGroupSection(group)
                 }
             }
         }
@@ -139,41 +143,65 @@ private extension AssetPendingReviewView {
         .frame(maxWidth: .infinity)
     }
 
-    func runGroupSection(_ group: RunGroup) -> some View {
-        VStack(alignment: .leading, spacing: AssetLibraryStyle.navigationItemSpacing) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(group.title)
-                    .font(TF.settingsFontBody)
-                    .foregroundStyle(TF.settingsText)
-                    .lineLimit(1)
-                Text(group.subtitle)
-                    .font(TF.settingsFontMetadata)
-                    .foregroundStyle(TF.settingsTextTertiary)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 8)
-            .padding(.top, 7)
+    /// 分类组：与资产库同款——点色 + 配方名 + 数量；单击自由收起/展开，各组独立记忆
+    func recipeGroupSection(_ group: RecipeGroup) -> some View {
+        let isExpanded = effectiveExpandedRecipeIDs.contains(group.id)
 
-            ForEach(group.results) { result in
-                AssetLibraryCompactItemRow(
-                    title: scorePrefixedTitle(result),
-                    grade: nil,
-                    isSelected: displayedResult?.id == result.id
-                ) {
-                    selectedResultID = result.id
+        return VStack(alignment: .leading, spacing: 5) {
+            SettingsSelectableRow(
+                isSelected: isExpanded,
+                minHeight: 34,
+                verticalPadding: 6
+            ) {
+                var ids = effectiveExpandedRecipeIDs
+                if isExpanded {
+                    ids.remove(group.id)
+                } else {
+                    ids.insert(group.id)
+                    selectedResultID = group.results.first?.id ?? group.rejected.first?.id
+                }
+                expandedRecipeIDs = ids
+            } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(recipeAccent(group.id))
+                        .frame(width: 6, height: 6)
+                    Text(recipeName(group.id))
+                        .font(TF.settingsFontBodyStrong)
+                        .foregroundStyle(TF.settingsText)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text("\(group.results.count)")
+                        .font(TF.settingsFontMetadata)
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .monospacedDigit()
                 }
             }
 
-            if !group.rejected.isEmpty {
-                rejectedSection(group)
+            if isExpanded {
+                VStack(alignment: .leading, spacing: AssetLibraryStyle.navigationItemSpacing) {
+                    ForEach(group.results) { result in
+                        AssetLibraryCompactItemRow(
+                            title: scorePrefixedTitle(result),
+                            grade: nil,
+                            isSelected: displayedResult?.id == result.id
+                        ) {
+                            selectedResultID = result.id
+                        }
+                    }
+
+                    if !group.rejected.isEmpty {
+                        rejectedSection(group)
+                    }
+                }
             }
         }
     }
 
-    /// 砍单折叠区：严审砍掉的产物按批可翻、可捞回
+    /// 砍单折叠区：严审砍掉的产物按分类可翻、可捞回
     @ViewBuilder
-    func rejectedSection(_ group: RunGroup) -> some View {
-        let isExpanded = expandedRejectedRunIDs.contains(group.id)
+    func rejectedSection(_ group: RecipeGroup) -> some View {
+        let isExpanded = expandedRejectedRecipeIDs.contains(group.id)
 
         SettingsSelectableRow(
             isSelected: false,
@@ -181,9 +209,9 @@ private extension AssetPendingReviewView {
             verticalPadding: 4
         ) {
             if isExpanded {
-                expandedRejectedRunIDs.remove(group.id)
+                expandedRejectedRecipeIDs.remove(group.id)
             } else {
-                expandedRejectedRunIDs.insert(group.id)
+                expandedRejectedRecipeIDs.insert(group.id)
             }
         } label: {
             HStack(spacing: 5) {
@@ -232,7 +260,7 @@ private extension AssetPendingReviewView {
     func pendingDetail(_ result: ExtractionResult) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             AssetLibraryDetailHeader(
-                accentColor: result.outputKind.settingsAccentColor,
+                accentColor: recipeAccent(result.recipeID),
                 metadata: detailMetadata(for: result),
                 grade: nil
             )
@@ -279,7 +307,7 @@ private extension AssetPendingReviewView {
     }
 
     func detailMetadata(for result: ExtractionResult) -> String {
-        var parts = [result.outputKind.settingsDisplayTitle, formattedDate(result.createdAt)]
+        var parts = [recipeName(result.recipeID), formattedDate(result.createdAt)]
         if let score = result.score {
             parts.append(L("严审 \(Int(score)) 分", "Review \(Int(score))"))
         }
@@ -320,7 +348,7 @@ private extension AssetPendingReviewView {
     }
 
     func detailFooter(_ result: ExtractionResult) -> some View {
-        let groupResults = runGroups.first { $0.id == result.runID }?.results ?? []
+        let groupResults = recipeGroups.first { $0.id == result.recipeID }?.results ?? []
         let isRejected = result.status == .rejected
 
         return HStack(spacing: 8) {
@@ -344,7 +372,7 @@ private extension AssetPendingReviewView {
             } else {
                 if groupResults.count > 1 {
                     SettingsTextButton(
-                        L("本批全入库(\(groupResults.count))", "Save all (\(groupResults.count))"),
+                        L("该类全入库(\(groupResults.count))", "Save all (\(groupResults.count))"),
                         variant: .secondary
                     ) {
                         onSaveAll(groupResults)

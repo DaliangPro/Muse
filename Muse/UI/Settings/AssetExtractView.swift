@@ -6,8 +6,6 @@ struct AssetExtractView: View {
     let totalRecordCount: Int
     let savedCount: Int
     let pendingCount: Int
-    let isExtracting: Bool
-    let extractionProgressPhase: AssetExtractionProgressStage
     let recentRuns: [ExtractionRun]
     let formattedDate: (Date) -> String
     let onOpenPending: () -> Void
@@ -31,18 +29,7 @@ private extension AssetExtractView {
 
     var corpusCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // 提炼进行中才显示阶段指示；平时不占行
-            if isExtracting {
-                HStack(spacing: 7) {
-                    Spacer(minLength: 0)
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.68)
-                    Text(extractionProgressPhase.title)
-                        .font(TF.settingsFontCaption)
-                        .foregroundStyle(TF.settingsTextTertiary)
-                }
-            }
+            // 提炼进度改在提炼弹窗内呈现（2026-07-08 大梁老师），页面不再显示横幅
 
             // 与「概览与记录」完全同构：三张彩卡直接并排裸放（无外层白卡容器），
             // 宽度天然与下方卡片对齐（2026-07 大梁老师）

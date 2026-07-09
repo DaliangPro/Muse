@@ -22,16 +22,12 @@ struct ExtractionRecipesView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // 搜索与新建同一行；搜索框底色深一档与卡片背景区分（2026-07 大梁老师 8 条修正）
-            HStack(alignment: .center, spacing: 8) {
-                AssetLibrarySearchField(
-                    text: $recipeQuery,
-                    prompt: L("搜索配方", "Search recipes"),
-                    fill: TF.settingsDropdownTriggerFill
-                )
-
-                SettingsTextButton(L("新建", "New"), variant: .primary, action: onCreate)
-            }
+            // 搜索框独占一行铺满；新建挪到页面右下角（2026-07-08 大梁老师）
+            AssetLibrarySearchField(
+                text: $recipeQuery,
+                prompt: L("搜索配方", "Search recipes"),
+                fill: TF.settingsDropdownTriggerFill
+            )
 
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
@@ -61,6 +57,11 @@ struct ExtractionRecipesView: View {
             }
             .settingsThinScrollIndicators()
             .settingsBottomScrollFade(color: AssetLibraryStyle.shellFill)
+
+            HStack {
+                Spacer(minLength: 0)
+                SettingsTextButton(L("新建", "New"), variant: .primary, action: onCreate)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

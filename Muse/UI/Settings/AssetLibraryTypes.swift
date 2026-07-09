@@ -234,7 +234,8 @@ enum AssetLibrarySheet: Identifiable {
 
 enum AssetLibraryStyle {
     static let sectionSpacing: CGFloat = TF.settingsCardSpacing
-    static let toolbarHeight: CGFloat = 66
+    /// 顶栏去壳后 = 控件高（2026-07-08 大梁老师：与常用词页顶部开关同款裸排）
+    static let toolbarHeight: CGFloat = SettingsControlSpec.actionHeight
     static let discoverPanelPadding: CGFloat = TF.settingsInnerCardPadding
     static let navigationWidth: CGFloat = 170
     static let navigationHorizontalPadding: CGFloat = 11

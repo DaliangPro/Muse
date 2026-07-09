@@ -2,10 +2,9 @@ import SwiftUI
 import AVFoundation
 import ApplicationServices
 
-/// 使用引导（2026-07-06 大梁老师重构 · 方向 A 侧栏式，严格复用项目设计系统）：
-/// 侧栏复刻 SettingsSidebarView 的「墨色一体 + 纯文字 + 琥珀竖线选中」语言，
-/// 内容区全用 TF token 与项目字号档（最大 24pt light），克制间距。
-/// 5 屏：欢迎 → 功能速览 → 授权 → 识别引擎介绍 → 就绪。引擎只介绍不配置，触发键随模式动态。
+/// 使用引导（2026-07-09 大梁老师改版 · 无侧栏幻灯片式）：
+/// 全宽画布，7 页线性流——欢迎 → 语音输入 → AI 润色 → 语料资产 → 授权 → 识别引擎 → 就绪；
+/// 两侧纯线条箭头翻页，左下角保留深浅色开关。引擎只介绍不配置，触发键随模式动态。
 struct SetupWizardView: View {
 
     @Environment(AppState.self) private var appState
@@ -13,103 +12,24 @@ struct SetupWizardView: View {
     // 初始即读真实授权态：避免进授权页时 false→true 的跳变被切页动画捕捉（每次进入动画不一）
     @State private var hasMic = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     @State private var hasAccessibility = AXIsProcessTrusted()
-    @State private var overviewCanProceed = false
     @AppStorage(DefaultsKeys.language) private var language = AppLanguage.systemSelection
     @AppStorage("tf_settingsAppearance") private var appearanceSelection = SettingsAppearanceMode.system.rawValue
 
-    private let sidebarWidth = SettingsLayout.sidebarWidth        // 136
-    private let navControlWidth = SettingsSidebarLayout.controlWidth  // 112
-    private let leadingInset = SettingsSidebarLayout.leadingInset     // 12
-
-    private var stepTitles: [String] {
-        [
-            L("欢迎", "Welcome"),
-            L("功能速览", "Overview"),
-            L("授权", "Permissions"),
-            L("识别引擎", "Engines"),
-            L("就绪", "Ready"),
-        ]
-    }
+    private let lastStep = 6
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-            rightContent
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .ignoresSafeArea()
-        .background(fullBleedBackground)
-        .background(SetupWindowChrome())
-        .id(language)
-    }
-
-    /// 左右分色的满溢背景：铺到窗口所有边缘（含标题栏与底部）。无论窗口尺寸是否与内容
-    /// 完全吻合，露出的边缘都是该列本该有的底色（左=侧栏色，右=画布色），杜绝异色边条。
-    private var fullBleedBackground: some View {
-        HStack(spacing: 0) {
-            TF.settingsSidebarTint
-                .frame(width: sidebarWidth)
-            TF.settingsCanvas
-        }
-        .ignoresSafeArea()
-    }
-
-    // MARK: - 左侧步骤栏（复刻墨色一体 · 纯文字 · 琥珀竖线）
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("Muse")
-                .font(TF.settingsFontBodyStrong)
-                .foregroundStyle(TF.settingsSidebarSelectionText)
-                .padding(.leading, leadingInset + SettingsSidebarLayout.navTextLeadingInset)
-                .padding(.top, SettingsSidebarLayout.navTopInset)
-
-            VStack(spacing: SettingsSidebarLayout.navItemSpacing) {
-                ForEach(Array(stepTitles.enumerated()), id: \.offset) { index, title in
-                    stepRow(index: index, title: title)
-                }
+        rightContent
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()
+            .background(TF.settingsCanvas.ignoresSafeArea())
+            .background(SetupWindowChrome())
+            // 侧栏已砍（2026-07-09 大梁老师）；深浅色开关保留在整页左下角
+            .overlay(alignment: .bottomLeading) {
+                SetupAppearanceToggle(selection: $appearanceSelection)
+                    .padding(.leading, 20)
+                    .padding(.bottom, 16)
             }
-            .padding(.leading, leadingInset)
-            .padding(.top, 20)
-
-            Spacer(minLength: 0)
-
-            SetupAppearanceToggle(selection: $appearanceSelection)
-                .padding(.leading, leadingInset + SettingsSidebarLayout.navTextLeadingInset)
-                .padding(.bottom, 18)
-        }
-        .frame(width: sidebarWidth, alignment: .leading)
-        .frame(maxHeight: .infinity)
-        .background(TF.settingsSidebarTint)
-    }
-
-    private func stepRow(index: Int, title: String) -> some View {
-        let isCurrent = index == step
-        let isDone = index < step
-        let foreground: Color = isCurrent
-            ? TF.settingsSidebarSelectionText
-            : (isDone ? TF.settingsSidebarText : TF.settingsSidebarText.opacity(0.5))
-        let shape = RoundedRectangle(cornerRadius: SettingsSidebarLayout.navItemCornerRadius, style: .continuous)
-
-        return HStack(spacing: 0) {
-            Text(title)
-                .font(TF.settingsFontNavigation)
-                .foregroundStyle(foreground)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-        }
-        .padding(.leading, SettingsSidebarLayout.navTextLeadingInset)
-        .padding(.trailing, 12)
-        .frame(width: navControlWidth, height: SettingsSidebarLayout.navItemHeight, alignment: .leading)
-        .background(shape.fill(isCurrent ? TF.settingsSidebarActiveFill : Color.clear))
-        .overlay(alignment: .leading) {
-            if isCurrent {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(TF.amber)
-                    .frame(width: 2, height: 14)
-                    .offset(x: -leadingInset)
-            }
-        }
+            .id(language)
     }
 
     // MARK: - 右侧内容区
@@ -120,9 +40,13 @@ struct SetupWizardView: View {
             Group {
                 switch step {
                 case 0: welcomeScreen
-                case 1: overviewScreen
-                case 2: permissionsScreen
-                case 3: enginesScreen
+                case 1, 2, 3:
+                    // 三个功能页各自独立成页（2026-07-09 大梁老师：不再是速览的子页）
+                    SetupFeatureSlide(index: step - 1)
+                        .padding(.horizontal, 64)
+                        .id(step)
+                case 4: permissionsScreen
+                case 5: enginesScreen
                 default: readyScreen
                 }
             }
@@ -131,59 +55,101 @@ struct SetupWizardView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.easeInOut(duration: 0.25), value: step)
         .clipped()
+        // 2026-07-09 大梁老师改版：底部按钮行撤掉，改为两侧纯线条箭头翻页
+        // （功能速览的 3 个子页也由同一对箭头依次接管；就绪页无右箭头，页内「开始使用」收尾）
+        // 箭头是浮在内容上层的「灵动按钮」（2026-07-09 大梁老师：加大、内收，与 UI 重叠无妨）
+        .overlay(alignment: .leading) {
+            if canGoBack {
+                edgeArrow("chevron.left", label: L("上一步", "Back"), action: back)
+                    .padding(.leading, 22)
+            }
+        }
+        .overlay(alignment: .trailing) {
+            if canGoForward {
+                edgeArrow("chevron.right", label: L("下一步", "Next"), action: advance)
+                    .padding(.trailing, 22)
+            }
+        }
     }
 
+    private var canGoBack: Bool {
+        step > 0
+    }
+
+    private var canGoForward: Bool {
+        step < lastStep
+    }
+
+    /// 纯线条侧边箭头（大梁老师拍板：只要 ＜ ＞ 线条，不带圆底）：
+    /// 默认淡灰、悬停提亮，热区比图形大一圈方便点按
+    private func edgeArrow(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+        SetupEdgeArrow(icon: icon, label: label, action: action)
+    }
+
+    /// 统一幻灯片模板（2026-07-09 大梁老师）：标题组固定在上部（与功能三页同高 52pt），
+    /// 内容块垂直居中——与两侧箭头同一水平轴线
     @ViewBuilder
     private func scaffold<C: View>(
         title: String,
         subtitle: String? = nil,
-        primaryTitle: String,
-        primaryDisabled: Bool = false,
         @ViewBuilder content: () -> C
     ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
+        ZStack {
+            VStack(spacing: 6) {
                 Text(title)
                     .font(TF.settingsFontMetric)
                     .foregroundStyle(TF.settingsText)
+                    .multilineTextAlignment(.center)
                 if let subtitle {
                     Text(subtitle)
                         .font(TF.settingsFontBody)
                         .foregroundStyle(TF.settingsTextTertiary)
+                        .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .padding(.top, 52)
 
             content()
-                .padding(.top, 22)
-
-            Spacer(minLength: 16)
-
-            HStack(spacing: 8) {
-                if step > 0 {
-                    SettingsTextButton(L("上一步", "Back"), variant: .secondary, onCanvas: true, action: back)
-                }
-                Spacer()
-                SettingsTextButton(primaryTitle, variant: .primary, minWidth: 72, action: advance)
-                    .disabled(primaryDisabled)
-                    .opacity(primaryDisabled ? 0.45 : 1)
-            }
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 34)
-        .padding(.bottom, 22)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.horizontal, 64)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Screen 0 · Welcome
 
+    /// 欢迎页保持整体居中的原布局（2026-07-09 大梁老师：第一页标题位置不动，
+    /// 「标题固定上部」模板只用于其余页面）
     private var welcomeScreen: some View {
-        scaffold(
-            title: L("你的灵感缪斯", "Your creative Muse"),
-            subtitle: L("按住说话、松手成文的语音输入法，也是帮你随手留住灵感、随时取用的工作台。",
-                        "A voice keyboard that turns speech into text — and a workbench that keeps every idea within reach."),
-            primaryTitle: L("开始", "Get Started")
-        ) {
+        VStack(spacing: 0) {
+            Spacer(minLength: 20)
+
+            VStack(spacing: 8) {
+                Text(L("你的灵感缪斯", "Your creative Muse"))
+                    .font(TF.settingsFontMetric)
+                    .foregroundStyle(TF.settingsText)
+                    .multilineTextAlignment(.center)
+                Text(L("按住说话、松手成文的语音输入法，也是帮你随手留住灵感、随时取用的工作台。",
+                       "A voice keyboard that turns speech into text — and a workbench that keeps every idea within reach."))
+                    .font(TF.settingsFontBody)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity)
+
+            welcomeLanguageChips
+                .padding(.top, 26)
+
+            Spacer(minLength: 20)
+        }
+        .padding(.horizontal, 64)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var welcomeLanguageChips: some View {
+        Group {
             HStack(spacing: 6) {
                 ForEach(["中文", "English", "粤语", "日本語", "한국어"], id: \.self) { lang in
                     Text(lang)
@@ -199,42 +165,34 @@ struct SetupWizardView: View {
 
     // MARK: - Screen 1 · Feature Overview
 
-    private var overviewScreen: some View {
-        scaffold(
-            title: L("Muse 能帮你做什么", "What Muse can do"),
-            subtitle: L("Muse 的三大核心功能", "The three core features of Muse"),
-            primaryTitle: L("下一步", "Next"),
-            primaryDisabled: !overviewCanProceed
-        ) {
-            SetupFeatureShowcase(canProceed: $overviewCanProceed)
-        }
-    }
 
     // MARK: - Screen 2 · Permissions
 
     private var permissionsScreen: some View {
         scaffold(
             title: L("授予权限", "Grant permissions"),
-            subtitle: L("两项系统权限，缺一不可", "Two system permissions, both required"),
-            primaryTitle: L("下一步", "Next")
+            subtitle: L("两项系统权限，缺一不可", "Two system permissions, both required")
         ) {
-            VStack(spacing: TF.settingsCardSpacing) {
-                permissionRow(
-                    icon: "mic",
-                    title: L("麦克风", "Microphone"),
-                    granted: hasMic
-                ) {
-                    AVCaptureDevice.requestAccess(for: .audio) { granted in
-                        Task { @MainActor in hasMic = granted }
+            VStack(spacing: 18) {
+                // 两个权限横排一行：图标 · 名称 · 状态胶囊 全在同一行（2026-07-09 大梁老师）
+                HStack(alignment: .center, spacing: 48) {
+                    permissionInline(
+                        icon: "mic",
+                        title: L("麦克风", "Microphone"),
+                        granted: hasMic
+                    ) {
+                        AVCaptureDevice.requestAccess(for: .audio) { granted in
+                            Task { @MainActor in hasMic = granted }
+                        }
                     }
-                }
-                permissionRow(
-                    icon: "keyboard",
-                    title: L("辅助功能", "Accessibility"),
-                    granted: hasAccessibility
-                ) {
-                    PermissionManager.promptAccessibilityPermission()
-                    PermissionManager.openAccessibilitySettings()
+                    permissionInline(
+                        icon: "keyboard",
+                        title: L("辅助功能", "Accessibility"),
+                        granted: hasAccessibility
+                    ) {
+                        PermissionManager.promptAccessibilityPermission()
+                        PermissionManager.openAccessibilitySettings()
+                    }
                 }
 
                 if !hasAccessibility {
@@ -242,8 +200,9 @@ struct SetupWizardView: View {
                            "Toggle Muse ON in System Settings. If hotkeys still fail after enabling, restart the app."))
                         .font(TF.settingsFontCaption)
                         .foregroundStyle(TF.settingsTextTertiary)
+                        .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 2)
+                        .frame(maxWidth: 400)
                 }
             }
         }
@@ -253,18 +212,16 @@ struct SetupWizardView: View {
         }
     }
 
-    private func permissionRow(icon: String, title: String, granted: Bool, action: @escaping () -> Void) -> some View {
-        HStack(spacing: 12) {
+    /// 权限条目（2026-07-09 大梁老师：无背景、单行横排）：图标 · 名称 · 状态胶囊同一行
+    private func permissionInline(icon: String, title: String, granted: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 10) {
             Image(systemName: icon)
-                .font(TF.settingsFontIconControl)
+                .font(.system(size: 17, weight: .light))
                 .foregroundStyle(TF.settingsTextSecondary)
-                .frame(width: 20)
 
             Text(title)
-                .font(TF.settingsFontBody)
+                .font(TF.settingsFontBodyLarge)
                 .foregroundStyle(TF.settingsText)
-
-            Spacer(minLength: 8)
 
             if granted {
                 Text(L("已授权", "Granted"))
@@ -285,12 +242,6 @@ struct SetupWizardView: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        .background(
-            RoundedRectangle(cornerRadius: TF.settingsInnerCardCornerRadius, style: .continuous)
-                .fill(TF.settingsCard)
-        )
     }
 
     // MARK: - Screen 3 · Recognition Engines (介绍，不配置)
@@ -298,72 +249,58 @@ struct SetupWizardView: View {
     private var enginesScreen: some View {
         scaffold(
             title: L("三种识别引擎", "Recognition engines"),
-            subtitle: L("先用开箱即用的，之后随时换", "Start with the zero-setup one, switch anytime"),
-            primaryTitle: L("下一步", "Next")
+            subtitle: L("先开箱即用，后自由配置", "Ready out of the box, configure freely later")
         ) {
-            VStack(alignment: .leading, spacing: 14) {
-                engineRow("laptopcomputer",
-                          L("Apple 本机", "Apple on-device"),
+            VStack(spacing: 16) {
+                engineRow(L("Apple 本机", "Apple on-device"),
                           L("零配置、隐私、开箱即用", "Zero setup, private, ready to go"),
                           recommended: true)
-                engineRow("cloud",
-                          L("火山云端", "Volcano cloud"),
+                engineRow(L("火山云端", "Volcano cloud"),
                           L("高精度，需填 API 凭据", "High accuracy, needs an API key"),
                           recommended: false)
-                engineRow("internaldrive",
-                          L("本地离线（SenseVoice + Qwen3）", "Local (SenseVoice + Qwen3)"),
+                engineRow(L("本地离线（SenseVoice + Qwen3）", "Local (SenseVoice + Qwen3)"),
                           L("离线、Apple Silicon，需下载模型", "Offline, Apple Silicon, model download"),
                           recommended: false)
 
-                HStack(spacing: 5) {
-                    Image(systemName: "info.circle")
-                        .font(TF.settingsFontIconBody)
-                        .foregroundStyle(TF.settingsTextTertiary)
-                    Text(L("以上可在 设置 → 模型配置 里切换与配置", "Switch and configure in Settings → Model Config"))
-                        .font(TF.settingsFontCaption)
-                        .foregroundStyle(TF.settingsTextTertiary)
-                }
-                .padding(.top, 2)
+                // 注脚无图标、与选项拉开距离（2026-07-09 大梁老师）
+                Text(L("以上可在 设置 → 模型配置 里切换与配置", "Switch and configure in Settings → Model Config"))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .padding(.top, 18)
             }
         }
     }
 
-    private func engineRow(_ icon: String, _ name: String, _ detail: String, recommended: Bool) -> some View {
-        HStack(alignment: .center, spacing: 11) {
-            Image(systemName: icon)
-                .font(TF.settingsFontIconControl)
-                .foregroundStyle(recommended ? TF.amber : TF.settingsTextSecondary)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(name)
-                        .font(TF.settingsFontBodyLarge)
-                        .foregroundStyle(TF.settingsText)
-                    if recommended {
-                        Text(L("新手推荐", "Recommended"))
-                            .font(TF.settingsFontMetadata)
-                            .foregroundStyle(TF.amber)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
-                            .background(Capsule().fill(TF.amber.opacity(0.14)))
-                    }
+    /// 引擎条目（2026-07-09 大梁老师：无图标、整条居中）：名称（+角标）一行居中，说明居中在下
+    private func engineRow(_ name: String, _ detail: String, recommended: Bool) -> some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 8) {
+                Text(name)
+                    .font(TF.settingsFontBodyLarge)
+                    .foregroundStyle(TF.settingsText)
+                if recommended {
+                    Text(L("默认", "Default"))
+                        .font(TF.settingsFontMetadata)
+                        .foregroundStyle(TF.amber)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(TF.amber.opacity(0.14)))
                 }
-                Text(detail)
-                    .font(TF.settingsFontCaption)
-                    .foregroundStyle(TF.settingsTextTertiary)
             }
-            Spacer(minLength: 0)
+            Text(detail)
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
         }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Screen 4 · Ready
 
     private var readyScreen: some View {
         scaffold(
-            title: L("准备就绪", "All set"),
-            primaryTitle: L("开始使用", "Start Using")
+            title: L("准备就绪", "All set")
         ) {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(TF.settingsFontIconControl)
@@ -376,22 +313,27 @@ struct SetupWizardView: View {
                     .font(TF.settingsFontBody)
                     .foregroundStyle(TF.settingsTextSecondary)
                     .lineSpacing(3)
+                    .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(L("更多设置在菜单栏 Muse 图标 → 设置", "More options: menu bar Muse → Settings"))
                     .font(TF.settingsFontCaption)
                     .foregroundStyle(TF.settingsTextTertiary)
+
+                // 完成是显式动作，留在页内（2026-07-09 大梁老师拍板）；就绪页无右箭头
+                SettingsTextButton(L("开始使用", "Start Using"), variant: .primary, minWidth: 88) {
+                    finishSetup()
+                }
+                .padding(.top, 14)
             }
+            .frame(maxWidth: 420)
         }
     }
 
     // MARK: - Navigation & Logic
 
     private func advance() {
-        if step < 4 {
-            withAnimation(.easeInOut(duration: 0.25)) { step += 1 }
-        } else {
-            finishSetup()
-        }
+        guard step < lastStep else { return }
+        withAnimation(.easeInOut(duration: 0.25)) { step += 1 }
     }
 
     private func back() {
@@ -433,6 +375,35 @@ struct SetupWizardView: View {
         if !hasVolcanoCreds {
             KeychainService.selectedASRProvider = .apple
         }
+    }
+}
+
+// MARK: - 侧边翻页箭头（2026-07-09 大梁老师拍板：纯 ＜ ＞ 线条，无圆底）
+
+private struct SetupEdgeArrow: View {
+    let icon: String
+    let label: String
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 27, weight: .light))
+                .foregroundStyle(isHovered ? TF.settingsText : TF.settingsTextTertiary.opacity(0.75))
+                // 热区比线条大一圈；悬停微放大，给「灵动」的活性
+                .frame(width: 44, height: 88)
+                .contentShape(Rectangle())
+                .scaleEffect(isHovered ? 1.12 : 1)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .accessibilityLabel(label)
+        .animation(.easeInOut(duration: 0.12), value: isHovered)
     }
 }
 

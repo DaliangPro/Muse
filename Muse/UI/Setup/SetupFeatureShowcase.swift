@@ -1,87 +1,46 @@
 import SwiftUI
 
-/// 功能速览三子页（2026-07-06 大梁老师）：语音输入（真实 HUD 悬浮条）/ AI 润色 / 语料资产，
-/// 左右箭头 + 圆点切换，每页一个真实动画演示。三页都看过后才通过 allViewed 放行「下一步」。
-struct SetupFeatureShowcase: View {
-    @Binding var canProceed: Bool
+/// 功能页（2026-07-09 大梁老师改版）：语音输入 / AI 润色 / 语料资产各自是引导流程里的
+/// 独立一页（不再是「功能速览」的子页，无圆点指示器）。
+/// 版式：图标 + 大标题同一行，下一行小标题，演示区限宽定高居中。
+struct SetupFeatureSlide: View {
+    let index: Int
 
-    @State private var page = 0
-
-    private var titles: [(label: String, hint: String, icon: String)] {
+    private var titles: [(label: String, hint: String)] {
         [
-            (L("语音输入", "Voice input"), L("按住说话，文字落到光标处", "Hold, speak — text lands at the cursor"), "waveform"),
-            (L("AI 润色", "AI polish"), L("说口语，出干净文本", "Speak casually, get clean text"), "wand.and.stars"),
-            (L("语料资产", "Language assets"), L("说过的话自动沉淀成资产", "Your words become reusable assets"), "tray.full"),
+            (L("语音输入", "Voice input"), L("按住说话，文字落到光标处", "Hold, speak — text lands at the cursor")),
+            (L("AI 润色", "AI polish"), L("说口语，出干净文本", "Speak casually, get clean text")),
+            (L("语料资产", "Language assets"), L("说过的话自动沉淀成资产", "Your words become reusable assets")),
         ]
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            let item = titles[page]
-            HStack(alignment: .firstTextBaseline, spacing: 9) {
+        let item = titles[index]
+        // 2026-07-09 大梁老师：演示动画钉在页面垂直中轴——与左右箭头同一水平线；
+        // 标题组固定在上部（无图标，纯文字），与其余页面的标题同高
+        ZStack {
+            VStack(spacing: 6) {
                 Text(item.label)
-                    .font(TF.settingsFontBodyLarge)
+                    .font(TF.settingsFontMetric)
                     .foregroundStyle(TF.settingsText)
                 Text(item.hint)
-                    .font(TF.settingsFontCaption)
+                    .font(TF.settingsFontBody)
                     .foregroundStyle(TF.settingsTextTertiary)
-                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .padding(.top, 52)
 
-            ZStack {
-                switch page {
+            Group {
+                switch index {
                 case 0: VoiceInputDemo()
                 case 1: PolishDemo()
                 default: AssetDemo()
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            HStack(spacing: 14) {
-                Spacer()
-                pagerButton("chevron.left") { move(-1) }
-                    .disabled(page == 0)
-                    .opacity(page == 0 ? 0.3 : 1)
-                HStack(spacing: 6) {
-                    ForEach(0..<3, id: \.self) { i in
-                        Circle()
-                            .fill(i == page ? TF.amber : TF.settingsTextTertiary.opacity(0.4))
-                            .frame(width: 6, height: 6)
-                    }
-                }
-                pagerButton("chevron.right") { move(1) }
-                    .disabled(page == 2)
-                    .opacity(page == 2 ? 0.3 : 1)
-                Spacer()
-            }
+            .frame(maxWidth: 420)
+            .frame(height: 168)
         }
-        .onAppear { updateProceed() }
-    }
-
-    private func pagerButton(_ icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(TF.settingsFontIconControl)
-                .foregroundStyle(TF.settingsTextSecondary)
-                .frame(width: 26, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(TF.settingsCard)
-                )
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func move(_ delta: Int) {
-        let next = max(0, min(2, page + delta))
-        guard next != page else { return }
-        withAnimation(.easeInOut(duration: 0.22)) { page = next }
-        updateProceed()
-    }
-
-    /// 大梁老师明确：只有停在第三个子页时「下一步」才可点，前两页一律不可点。
-    private func updateProceed() {
-        canProceed = (page == 2)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -89,16 +48,21 @@ struct SetupFeatureShowcase: View {
 
 private struct VoiceInputDemo: View {
     @State private var demoState = DemoState()
-    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
+        // 无底板（2026-07-09 大梁老师）：HUD 条直接浮在画布上。
+        // 注意 Color.clear 垫底不可省：悬浮条在演示未启动时 body 为空，SwiftUI 不给
+        // 空视图触发 onAppear，而启动演示恰恰靠 onAppear——没有实体视图垫底会死锁
+        // （2026-07-09 探针实锤：删掉底板矩形后动画从未启动）。
+        // 环境投影补足与画布的明暗分离（深色下深条贴深底否则近乎隐形）
         ZStack {
-            // 模拟桌面：随明暗切深/浅底，HUD 悬浮条真身跑在上面
-            RoundedRectangle(cornerRadius: TF.settingsInnerCardCornerRadius, style: .continuous)
-                .fill(colorScheme == .dark ? Color(white: 0.12) : Color(white: 0.86))
+            Color.clear
             FloatingBarView<DemoState>(state: demoState)
                 .frame(maxWidth: 380)
         }
+        .frame(height: TF.barHeight + TF.barOuterInset + 16)
+        // 不加任何额外阴影（2026-07-09 大梁老师：要与真实一模一样）——真实悬浮窗
+        // hasShadow=false，悬浮条自带内置阴影，组件本体即真实观感
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { demoState.startQuickModeDemo() }
         .onDisappear { demoState.stop() }
@@ -131,8 +95,6 @@ private struct PolishDemo: View {
                  text: String(polished.prefix(polishedReveal)),
                  textColor: TF.settingsText, accent: showPolished)
                 .opacity(showPolished ? 1 : 0.45)
-
-            Spacer(minLength: 0)
         }
         .onAppear { start() }
         .onDisappear { task?.cancel() }
@@ -216,8 +178,6 @@ private struct AssetDemo: View {
 
             assetChip(tag: L("金句", "Quote"), text: L("增长的关键不是拉新，而是留存", "Growth is retention, not acquisition"), visible: showQuote)
             assetChip(tag: L("待办", "To-do"), text: L("整理一份留存提升清单", "Draft a retention-boost checklist"), visible: showTodo)
-
-            Spacer(minLength: 0)
         }
         .onAppear { start() }
         .onDisappear { task?.cancel() }

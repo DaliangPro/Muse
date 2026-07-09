@@ -42,12 +42,16 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
     @State private var libraryQuery = ""
     @State private var extractionResults: [ExtractionResult] = []
     @State private var selectedResultKind: ExtractionOutputKind?
+    /// 资产库侧栏的分组选中态（按配方分类；提炼结果页仍按产物类型用 selectedResultKind）
+    @State private var selectedResultRecipeID: String?
     @State private var selectedResultID: String?
     @State private var resultQuery = ""
     @State private var ruleConfig: AssetExtractionRuleConfig = AssetExtractionRuleConfigStore.load()
     @State private var selectedRuleType: LanguageAssetType?
     @State private var copiedAssetID: String?
     @State private var activeSheet: AssetLibrarySheet?
+    /// 提炼范围无新内容时在弹窗内就地提示（2026-07-08：弹窗承载全部提炼状态）
+    @State private var extractionEmptyNotice: String?
     @State private var isClearPendingConfirmationPresented = false
 
     private let assetStore = LanguageAssetStore()
@@ -135,26 +139,30 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
                     }
                 )
             case .extractionRangeSelection:
-                // 2026-07 重设计：任意配方多选提炼，不再金句专属
+                // 2026-07 重设计：任意配方多选提炼，不再金句专属。
+                // 2026-07-08 大梁老师：开始后弹窗不关、原地显示提炼中；完成后关窗跳待确认
                 AssetExtractionRangeSelectionSheet(
                     recipes: recipes,
                     selectedRecipeIDs: extractionRecipeIDs,
                     selectedRange: extractionRange,
+                    isExtracting: isExtracting,
+                    progressPhase: extractionProgressPhase,
+                    emptyNotice: extractionEmptyNotice,
                     onConfirm: { recipeIDs, range in
                         extractionRecipeIDs = recipeIDs
                         extractionRecipeID = orderedRecipeIDs(from: recipeIDs).first ?? ExtractionRecipe.quoteAssetsID
                         extractionRange = range
                         extractionIncludesProcessedRecords = false
+                        extractionEmptyNotice = nil
                         range.save()
                         Task { @MainActor in
-                            activeSheet = nil
-                            try? await Task.sleep(for: .milliseconds(120))
                             await startRecipesExtraction(
                                 recipeIDs: orderedRecipeIDs(from: recipeIDs),
                                 range: range
                             )
                         }
                     },
+                    onCancelExtraction: { extractionTask?.cancel() },
                     onCancel: { activeSheet = nil }
                 )
             case .extractionPreview(let preview, let context):
@@ -325,6 +333,22 @@ private extension AssetLibraryTab {
         recipes.first(where: { $0.id == id }) ?? ExtractionRecipe.quoteAssets()
     }
 
+    /// 配方展示名（含已删除配方兜底）：资产库分组/详情按配方分类展示
+    /// （2026-07-08 大梁老师：「候选资产」只是待确认阶段的叫法，入库后不再出现）
+    func recipeDisplayName(_ recipeID: String) -> String {
+        if let recipe = recipes.first(where: { $0.id == recipeID })
+            ?? archivedRecipes.first(where: { $0.id == recipeID }) {
+            return recipe.name
+        }
+        return L("已删除配方", "Deleted recipe")
+    }
+
+    func recipeAccentColor(_ recipeID: String) -> Color {
+        let recipe = recipes.first(where: { $0.id == recipeID })
+            ?? archivedRecipes.first(where: { $0.id == recipeID })
+        return recipe?.outputKind.settingsAccentColor ?? TF.settingsTextTertiary
+    }
+
     func orderedRecipeIDs(from ids: Set<String>) -> [String] {
         recipes.map(\.id).filter { ids.contains($0) }
     }
@@ -348,8 +372,6 @@ private extension AssetLibraryTab {
             totalRecordCount: totalRecordCount,
             savedCount: savedResults.count,
             pendingCount: pendingResults.count,
-            isExtracting: isExtracting,
-            extractionProgressPhase: extractionProgressPhase,
             recentRuns: recentRuns,
             formattedDate: { AssetLibraryDateFormatters.displayDateTime($0) },
             onOpenPending: {
@@ -376,8 +398,9 @@ private extension AssetLibraryTab {
             selectedResultID: $selectedPendingResultID,
             pendingResults: pendingResults,
             rejectedResults: rejectedResults,
-            runs: recentRuns,
             formattedDate: { AssetLibraryDateFormatters.displayDateTime($0) },
+            recipeName: { recipeDisplayName($0) },
+            recipeAccent: { recipeAccentColor($0) },
             onShowSources: { activeSheet = .resultSources($0) },
             onSave: { savePendingResult($0) },
             onDiscard: { discardPendingResult($0) },
@@ -435,10 +458,12 @@ private extension AssetLibraryTab {
             libraryQuery: $libraryQuery,
             selectedLibraryType: $selectedLibraryType,
             selectedLibraryAssetID: $selectedLibraryAssetID,
-            selectedResultKind: $selectedResultKind,
+            selectedResultRecipeID: $selectedResultRecipeID,
             selectedResultID: $selectedResultID,
             creatorAssets: [],
             extractionResults: savedResults,
+            recipeName: { recipeDisplayName($0) },
+            recipeAccent: { recipeAccentColor($0) },
             selectedLibraryAsset: nil,
             selectedExtractionResult: selectedSavedResult,
             copiedAssetID: copiedAssetID,
@@ -589,7 +614,7 @@ private extension AssetLibraryTab {
         logAction(
             assetID: nil,
             actionType: .copied,
-            detail: L("复制了 1 条 \(result.outputKind.settingsDisplayTitle)", "Copied 1 \(result.outputKind.settingsDisplayTitle)")
+            detail: L("复制了 1 条「\(recipeDisplayName(result.recipeID))」产物", "Copied 1 \(recipeDisplayName(result.recipeID)) result")
         )
 
         Task { @MainActor in
@@ -665,6 +690,12 @@ private extension AssetLibraryTab {
         if let selectedResultKind,
            !searchedExtractionResults.contains(where: { $0.outputKind == selectedResultKind }) {
             self.selectedResultKind = nil
+        }
+
+        // 资产库按配方分组的选中态：该分类下已无入库产物时清空
+        if let selectedResultRecipeID,
+           !savedResults.contains(where: { $0.recipeID == selectedResultRecipeID }) {
+            self.selectedResultRecipeID = nil
         }
 
         let visibleResults = filteredExtractionResults
@@ -833,6 +864,10 @@ private extension AssetLibraryTab {
     @MainActor
     func startRecipesExtraction(recipeIDs: [String], range: AssetExtractionRangeOption) async {
         guard !isExtracting, hasLLMConfig, !recipeIDs.isEmpty else { return }
+        // 立即进提炼态：弹窗原地切「提炼中」（预览阶段也算准备中，同时防按钮连点重复发起）
+        isExtracting = true
+        extractionProgressPhase = .preparing
+        errorMessage = nil
 
         var configurations: [AssetExtractionConfiguration] = []
         for recipeID in recipeIDs {
@@ -856,10 +891,12 @@ private extension AssetLibraryTab {
         }
 
         guard !configurations.isEmpty else {
-            errorMessage = L("范围内没有可提炼的新内容。", "No new records to extract in this range.")
+            // 弹窗内就地提示并退回选择态，让用户直接换范围重试
+            isExtracting = false
+            extractionEmptyNotice = L("范围内没有可提炼的新内容，换个范围试试。", "No new records in this range — try another.")
             return
         }
-        startExtractions(configurations: configurations)
+        runExtractions(configurations: configurations)
     }
 
     /// 提炼入口（改造方案 #3/#7）：手动范围先弹记录勾选，
@@ -1002,7 +1039,13 @@ private extension AssetLibraryTab {
         isExtracting = true
         extractionProgressPhase = .preparing
         errorMessage = nil
+        runExtractions(configurations: configurations)
+    }
 
+    /// 执行提炼（调用前须已置 isExtracting = true）：进度在提炼弹窗内呈现，
+    /// 结束（成功/取消/失败）一律关弹窗，成功跳待确认（2026-07-08 大梁老师）
+    @MainActor
+    private func runExtractions(configurations: [AssetExtractionConfiguration]) {
         extractionTask = Task { @MainActor in
             defer {
                 isExtracting = false
@@ -1029,13 +1072,16 @@ private extension AssetLibraryTab {
 
                 latestRun = latestGenericRun ?? latestRun
                 await reloadData()
+                activeSheet = nil
                 withAnimation(.easeInOut(duration: 0.16)) {
                     selectedView = .pending
                 }
             } catch is CancellationError {
+                activeSheet = nil
                 await reloadData()
             } catch {
                 errorMessage = error.localizedDescription
+                activeSheet = nil
                 await reloadData()
             }
         }
