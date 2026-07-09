@@ -16,7 +16,7 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Muse"
 APP_BUNDLE_ID="pro.daliang.muse"
-APP_PATH="$ROOT_DIR/dist/Muse.app"
+APP_PATH="${MUSE_APP_PATH:-/Applications/Muse.app}"
 PREVIEW_APP_PATH="$ROOT_DIR/dist/Muse-Preview.app"
 
 quit_app() {
