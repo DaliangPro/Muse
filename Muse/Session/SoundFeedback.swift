@@ -1,4 +1,5 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
 import os
 
@@ -11,16 +12,15 @@ enum SoundFeedback {
         let label: String
     }
 
-    /// REPAIR_PLAN J11（D3 收口）：当前所有入口都 hop 到主线程（play 的 isMainThread
-    /// 分支、warmUp 的 main.async），实际无竞争——但该约定靠每个入口记得 hop 维持，
-    /// nonisolated(unsafe) 让编译器放弃检查。收进 unfair lock 把约定变机制（主线程
-    /// 无争用锁 ~纳秒级，不影响开始音时延——不用 @MainActor+Task 正是为避免调度延迟，
-    /// D3 历史教训是开始音慢半拍）。uncheckedState：AVAudioPlayer 无 Sendable 标注。
+    /// REPAIR_PLAN J11（D3 收口）：AVAudioPlayer 无 Sendable 标注，缓存收进锁。
+    /// J21 回归教训：系统音频栈可能让 play()/beep 阻塞数秒，入口必须只入队，
+    /// 不能在主线程同步播放，否则菜单栏点击与热键事件会一起卡住。
     private struct Cache {
         var hasWarmedUp = false
         var players: [String: AVAudioPlayer] = [:]
     }
     private static let cache = OSAllocatedUnfairLock(uncheckedState: Cache())
+    private static let playbackQueue = DispatchQueue(label: "pro.daliang.muse.sound-feedback")
 
     private static let startSpec = ToneSpec(
         tones: [
@@ -52,7 +52,7 @@ enum SoundFeedback {
     // MARK: - Public API
 
     static func warmUp() {
-        DispatchQueue.main.async {
+        playbackQueue.async {
             let firstWarmUp = cache.withLock { state -> Bool in
                 guard !state.hasWarmedUp else { return false }
                 state.hasWarmedUp = true
@@ -92,37 +92,38 @@ enum SoundFeedback {
         spec: ToneSpec,
         retryCount: Int = 0
     ) {
-        let perform = {
-            do {
-                let didPlay = try playWithCachedPlayer(spec: spec)
-
-                AppLogger.log("[SoundFeedback] \(spec.label) play() => \(didPlay ? "true" : "false")")
-                DebugFileLogger.log("sound \(spec.label) play() => \(didPlay)")
-                guard didPlay else {
-                    if retryCount > 0 {
-                        AppLogger.log("[SoundFeedback] \(spec.label) retry scheduled (\(retryCount) left)")
-                        DebugFileLogger.log("sound \(spec.label) retry scheduled, remaining=\(retryCount)")
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                            play(spec: spec, retryCount: retryCount - 1)
-                        }
-                    } else {
-                        AppLogger.log("[SoundFeedback] \(spec.label) falling back to NSSound.beep()")
-                        DebugFileLogger.log("sound \(spec.label) fallback to NSSound.beep()")
-                        NSSound.beep()
-                    }
-                    return
-                }
-            } catch {
-                AppLogger.log("[SoundFeedback] \(spec.label) init failed: \(String(describing: error))")
-                DebugFileLogger.log("sound \(spec.label) init failed: \(String(describing: error))")
-                NSSound.beep()
-            }
+        playbackQueue.async {
+            playNow(spec: spec, retryCount: retryCount)
         }
+    }
 
-        if Thread.isMainThread {
-            perform()
-        } else {
-            DispatchQueue.main.async(execute: perform)
+    private static func playNow(
+        spec: ToneSpec,
+        retryCount: Int
+    ) {
+        do {
+            let didPlay = try playWithCachedPlayer(spec: spec)
+
+            AppLogger.log("[SoundFeedback] \(spec.label) play() => \(didPlay ? "true" : "false")")
+            DebugFileLogger.log("sound \(spec.label) play() => \(didPlay)")
+            guard didPlay else {
+                if retryCount > 0 {
+                    AppLogger.log("[SoundFeedback] \(spec.label) retry scheduled (\(retryCount) left)")
+                    DebugFileLogger.log("sound \(spec.label) retry scheduled, remaining=\(retryCount)")
+                    playbackQueue.asyncAfter(deadline: .now() + 0.12) {
+                        play(spec: spec, retryCount: retryCount - 1)
+                    }
+                } else {
+                    AppLogger.log("[SoundFeedback] \(spec.label) falling back to system alert")
+                    DebugFileLogger.log("sound \(spec.label) fallback to system alert")
+                    AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_UserPreferredAlert))
+                }
+                return
+            }
+        } catch {
+            AppLogger.log("[SoundFeedback] \(spec.label) init failed: \(String(describing: error))")
+            DebugFileLogger.log("sound \(spec.label) init failed: \(String(describing: error))")
+            AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_UserPreferredAlert))
         }
     }
 
