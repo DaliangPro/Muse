@@ -62,4 +62,18 @@ final class AudioCaptureEngineTests: XCTestCase {
         XCTAssertTrue(state.isCurrent(second))
         XCTAssertFalse(state.isCurrent(first))
     }
+
+    func testIdleStateInvalidatesExpiredParkingTokens() {
+        var state = AudioCaptureIdleState()
+
+        let first = state.nextToken()
+        XCTAssertTrue(state.isCurrent(first))
+
+        let second = state.nextToken()
+        XCTAssertFalse(state.isCurrent(first))
+        XCTAssertTrue(state.isCurrent(second))
+
+        state.invalidate()
+        XCTAssertFalse(state.isCurrent(second))
+    }
 }
