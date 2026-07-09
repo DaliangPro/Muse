@@ -4,7 +4,8 @@ import Carbon.HIToolbox
 
 final class TextInjectionEngine: @unchecked Sendable {
 
-    private struct ClipboardSnapshot {
+    /// internal（非 private）：REPAIR_PLAN J2 后 capture/restore 的守卫语义由单测背书。
+    struct ClipboardSnapshot {
         private static let maxSnapshotBytes = 32 * 1024 * 1024
 
         struct Item {
@@ -117,8 +118,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         if Self.isAXOpaqueApp(frontmostBundleID) {
             DebugFileLogger.log("inject: axOpaqueApp bypass frontmost=\(frontmostBundleID ?? "unknown")")
-            // 微信等重客户端处理 Cmd+V 慢，恢复剪贴板多等一拍防竞态
-            return injectViaClipboard(text, generousRestoreDelay: true)
+            return injectViaClipboard(text)
         }
 
         guard Self.frontmostApplicationHasFocusedEditableElement() else {
@@ -140,7 +140,14 @@ final class TextInjectionEngine: @unchecked Sendable {
 
     // MARK: - Clipboard injection
 
-    private func injectViaClipboard(_ text: String, generousRestoreDelay: Bool = false) -> InjectionOutcome {
+    /// REPAIR_PLAN J2：剪贴板恢复延迟。Cmd+V 是异步事件，目标 app 何时消费不可控——
+    /// 此前粘贴后 150ms 即同步恢复，慢 app（微信等重客户端）晚于 150ms 读剪贴板会粘到
+    /// 恢复后的旧内容，听写文本静默丢失；微信 300ms 特例正是该竞态的点状补丁。
+    /// 恢复改为异步调度后不再阻塞注入手感（2026-07 全局同步加长到 350ms 曾拖慢手感被回退），
+    /// 余量放到已知最慢客户端实测值（300ms）的两倍，统一覆盖未知慢 app，微信特例并入。
+    static let clipboardRestoreDelay: TimeInterval = 0.6
+
+    private func injectViaClipboard(_ text: String) -> InjectionOutcome {
         let savedClipboard = preserveClipboard ? ClipboardSnapshot.capture() : nil
         let hasFrontmostApplication = NSWorkspace.shared.frontmostApplication != nil
 
@@ -154,10 +161,12 @@ final class TextInjectionEngine: @unchecked Sendable {
         let outcome: InjectionOutcome = hasFrontmostApplication ? .inserted : .copiedToClipboard
 
         if outcome == .inserted, let savedClipboard {
-            // 恢复延迟差异化（2026-07 修回归：全局 350ms 曾拖慢所有 app 的注入手感）——
-            // 仅微信等已知慢客户端多等防「粘贴到恢复后的旧剪贴板」竞态；普通 app 保持原节奏
-            usleep(generousRestoreDelay ? 300_000 : 50_000)
-            savedClipboard.restore(expectedChangeCount: postWriteChangeCount)
+            // 延迟异步恢复（REPAIR_PLAN J2）：不阻塞本方法返回。安全性由
+            // restore 的 changeCount 守卫背书——延迟期间用户/其他 app 写过剪贴板，
+            // 或下一次注入已写入新识别文本时，本次恢复自动放弃，不覆盖新内容。
+            DispatchQueue.global().asyncAfter(deadline: .now() + Self.clipboardRestoreDelay) {
+                savedClipboard.restore(expectedChangeCount: postWriteChangeCount)
+            }
         }
 
         return outcome
