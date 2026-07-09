@@ -30,10 +30,13 @@ final class TextInjectionEngine: @unchecked Sendable {
                 var data: [NSPasteboard.PasteboardType: Data] = [:]
                 for type in types {
                     guard let itemData = pasteboardItem.data(forType: type) else {
+                        // 懒加载/promise 类型（文件、部分截图工具）取不到数据即放弃快照
+                        DebugFileLogger.log("clipboard capture FAIL: type=\(type.rawValue) has no data")
                         return ClipboardSnapshot(items: [], changeCount: changeCount, canRestore: false)
                     }
                     totalBytes += itemData.count
                     guard totalBytes <= maxSnapshotBytes else {
+                        DebugFileLogger.log("clipboard capture FAIL: over \(maxSnapshotBytes) bytes")
                         return ClipboardSnapshot(items: [], changeCount: changeCount, canRestore: false)
                     }
                     data[type] = itemData
@@ -46,15 +49,25 @@ final class TextInjectionEngine: @unchecked Sendable {
 
         func restore(expectedChangeCount: Int, injectedText: String? = nil) {
             let pasteboard = NSPasteboard.general
-            if pasteboard.changeCount != expectedChangeCount {
+            let ccMatch = pasteboard.changeCount == expectedChangeCount
+            if !ccMatch {
                 // REPAIR_PLAN J2 回归修复（2026-07-09 大梁老师实测报告）：部分 app
                 // （微信等）粘贴时会改写剪贴板（富文本转自家格式），changeCount 前进但
                 // 内容仍是我们注入的识别文本——此时恢复依旧安全；只有内容已变成别的
                 // （用户/第三方真复制了新东西）才放弃恢复，避免识别文本残留覆盖旧剪贴板。
-                guard let injectedText,
-                      pasteboard.string(forType: .string) == injectedText else { return }
+                let current = pasteboard.string(forType: .string)
+                let textMatch = injectedText != nil && current == injectedText
+                guard textMatch else {
+                    DebugFileLogger.log("clipboard restore SKIP: ccDelta=\(pasteboard.changeCount - expectedChangeCount) currentIsNil=\(current == nil) textMatch=false")
+                    return
+                }
+                DebugFileLogger.log("clipboard restore: cc moved but text matches, proceeding")
             }
-            guard canRestore else { return }
+            guard canRestore else {
+                DebugFileLogger.log("clipboard restore SKIP: canRestore=false (snapshot capture had failed)")
+                return
+            }
+            DebugFileLogger.log("clipboard restore OK: items=\(items.count) ccMatch=\(ccMatch)")
 
             // 原剪贴板为空时 items 为空——此时仍需 clearContents 清掉刚写入的
             // 识别文本、恢复成「空」的原状；不能因 items 空就直接 return，否则识别文本残留（关了自动复制也留）。
