@@ -1,4 +1,5 @@
 import Foundation
+import os
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -288,11 +289,16 @@ enum SnippetStorage {
     }
 
     /// Cached compiled rules. Rebuilt only when snippets change.
-    private static var cachedRules: [CompiledRule]?
+    /// REPAIR_PLAN J1：写侧在主线程（设置页保存触发 invalidateCache），读侧在
+    /// RecognitionSession actor 线程（听写热路径 applyEffective），必须加锁，
+    /// 否则 COW 数组被并发重置/遍历会撕裂崩溃。
+    /// uncheckedState：CompiledRule 持有 NSRegularExpression（不可变、线程安全，
+    /// 但无 Sendable 标注），锁本身保证独占访问。
+    private static let cachedRules = OSAllocatedUnfairLock<[CompiledRule]?>(uncheckedState: nil)
 
     /// Call after saving either file to force recompilation on next apply.
     static func invalidateCache() {
-        cachedRules = nil
+        cachedRules.withLock { $0 = nil }
     }
 
     static func isDraftTrigger(_ trigger: String) -> Bool {
@@ -304,7 +310,9 @@ enum SnippetStorage {
     }
 
     private static func compiledRules() -> [CompiledRule] {
-        if let cached = cachedRules { return cached }
+        if let cached = cachedRules.withLock({ $0 }) { return cached }
+        // 编译在锁外进行（含文件 IO，不宜持 unfair lock）；
+        // 两个线程同时未命中会各编译一遍，结果幂等，后写覆盖无害。
         let builtinSnippets = loadBuiltin()
         let userSnippets = load()
         let userTriggers = Set(userSnippets.map { $0.trigger.lowercased() })
@@ -317,7 +325,7 @@ enum SnippetStorage {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
             return CompiledRule(regex: regex, template: NSRegularExpression.escapedTemplate(for: snippet.value))
         }
-        cachedRules = rules
+        cachedRules.withLock { $0 = rules }
         return rules
     }
 

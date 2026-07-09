@@ -1,0 +1,29 @@
+import XCTest
+@testable import Muse
+
+/// REPAIR_PLAN J1：cachedRules 静态缓存加锁后的并发冒烟。
+/// 场景还原：用户边口述（RecognitionSession actor 线程 applyEffective）
+/// 边在设置页改替换词（主线程 save → invalidateCache）。
+/// 无锁版本在此压力下 COW 数组并发重置/遍历会撕裂崩溃；加锁后必须恒稳。
+final class SnippetStorageConcurrencyTests: XCTestCase {
+
+    func testConcurrentApplyAndInvalidateDoesNotCrash() {
+        DispatchQueue.concurrentPerform(iterations: 500) { i in
+            if i % 5 == 0 {
+                SnippetStorage.invalidateCache()
+            } else {
+                _ = SnippetStorage.applyEffective(to: "cloud code 并发压力 \(i)")
+            }
+        }
+        // 收尾：缓存处于一致状态，apply 仍可正常工作（冒烟断言，不依赖用户目录文件内容）
+        let out = SnippetStorage.applyEffective(to: "并发收尾检查")
+        XCTAssertFalse(out.isEmpty)
+    }
+
+    func testInvalidateThenApplyRebuildsCache() {
+        SnippetStorage.invalidateCache()
+        let first = SnippetStorage.applyEffective(to: "重建检查")
+        let second = SnippetStorage.applyEffective(to: "重建检查")
+        XCTAssertEqual(first, second, "同一输入两次 apply（含缓存重建路径）结果必须一致")
+    }
+}
