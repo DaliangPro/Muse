@@ -70,6 +70,9 @@ _inference_lock = threading.Lock()  # Prevent concurrent Metal GPU access (threa
 SAMPLE_RATE = 16000
 PARTIAL_INTERVAL_SEC = 1.5  # Run partial transcribe every N seconds of new audio
 MAX_PARTIAL_AUDIO_SEC = 45  # Only use last N seconds for partial (full audio for final)
+# REPAIR_PLAN J10：final 缓冲封顶（对齐 Swift 侧 B8/J10 的 30 分钟）。qwen3 无独立
+# 流式兜底，超限后停止累积、保留前 30 分钟供 final，避免超长会话内存无界增长。
+MAX_TOTAL_AUDIO_SEC = 30 * 60
 
 
 def get_session():
@@ -110,6 +113,8 @@ async def websocket_endpoint(ws: WebSocket):
     all_samples: list[int] = []
     partial_threshold = int(PARTIAL_INTERVAL_SEC * SAMPLE_RATE)
     max_partial_samples = MAX_PARTIAL_AUDIO_SEC * SAMPLE_RATE
+    max_total_samples = MAX_TOTAL_AUDIO_SEC * SAMPLE_RATE
+    total_overflow_logged = False
     last_partial_at = 0  # sample count at last partial
     inflight_partial = None  # track running partial task
     cancel_token = CancelToken()  # shared cancellation for in-flight partials
@@ -138,7 +143,13 @@ async def websocket_endpoint(ws: WebSocket):
             # Accumulate PCM16 samples
             sample_count = len(data) // 2
             samples = list(struct.unpack(f"<{sample_count}h", data))
-            all_samples.extend(samples)
+            # REPAIR_PLAN J10：超上限停止累积（保留前 30 分钟供 final），留痕一次
+            if len(all_samples) < max_total_samples:
+                all_samples.extend(samples)
+            elif not total_overflow_logged:
+                total_overflow_logged = True
+                print("[qwen3-asr] audio buffer over limit; keeping first "
+                      f"{MAX_TOTAL_AUDIO_SEC // 60} min for final", flush=True)
 
             # Periodic partial: transcribe without punctuation
             new_audio = len(all_samples) - last_partial_at

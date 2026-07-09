@@ -71,6 +71,11 @@ async def websocket_endpoint(ws: WebSocket):
 
     # Accumulate all audio for final full inference
     all_samples: list[int] = []
+    # REPAIR_PLAN J10：final 缓冲 30 分钟封顶（对齐 Swift 侧 B8/J10）。超限即清空并
+    # 停止累积——流式结果已实时下发，final 走下方流式兜尾分支，不做半截全量推理
+    # （半截 final 会覆盖完整的流式文本，比不做更糟）。
+    max_total_samples = 30 * 60 * 16000
+    total_overflowed = False
 
     try:
         while True:
@@ -100,7 +105,15 @@ async def websocket_endpoint(ws: WebSocket):
             # Convert PCM16 little-endian bytes to int16-range float list
             sample_count = len(data) // 2
             samples = list(struct.unpack(f"<{sample_count}h", data))
-            all_samples.extend(samples)
+            # REPAIR_PLAN J10：超上限清空并停止累积，final 走流式兜尾
+            if not total_overflowed:
+                if len(all_samples) + sample_count > max_total_samples:
+                    total_overflowed = True
+                    all_samples.clear()
+                    print("[sensevoice] audio buffer over limit; "
+                          "final full inference disabled for this session", flush=True)
+                else:
+                    all_samples.extend(samples)
 
             # Run streaming inference (fast partial results)
             for result in model.streaming_inference(samples, is_last=False):

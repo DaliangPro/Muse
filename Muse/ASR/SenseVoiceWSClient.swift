@@ -28,6 +28,12 @@ actor SenseVoiceWSClient: SpeechRecognizer {
     private var qwen3ConfirmedSegments: [String] = []
     private var qwen3HasPendingAudio: Bool = false
 
+    /// REPAIR_PLAN J10：Qwen3 校准音频缓冲的内存软上限（镜像 B8 采集层的 30 分钟）。
+    /// 超限即丢弃整段并停止累积——半截音频做 final 校准会产出错误的半截文本
+    /// 覆盖流式结果，比不校准更糟；超长会话的文本由 SenseVoice 流式结果保证。可注入小值供测试。
+    var accumulatedAudioByteLimit = 30 * 60 * 16000 * MemoryLayout<Int16>.size
+    private var audioAccumulationOverflowed = false
+
     var events: AsyncStream<RecognitionEvent> {
         if let existing = _events { return existing }
         let (stream, continuation) = AsyncStream<RecognitionEvent>.makeStream()
@@ -108,6 +114,18 @@ actor SenseVoiceWSClient: SpeechRecognizer {
         }
 
         // Accumulate audio for Qwen3 (speculative or final-only)
+        // REPAIR_PLAN J10：超上限丢弃整段、停止累积并放弃本会话校准（含在途投机）
+        guard !audioAccumulationOverflowed else { return }
+        if allAudioData.count + data.count > accumulatedAudioByteLimit {
+            audioAccumulationOverflowed = true
+            qwen3DebounceTask?.cancel()
+            allAudioData = Data()
+            qwen3ConfirmedOffset = 0
+            qwen3ConfirmedSegments = []
+            qwen3HasPendingAudio = false
+            DebugFileLogger.log("Qwen3 audio buffer over limit; calibration disabled for this session")
+            return
+        }
         allAudioData.append(data)
         qwen3HasPendingAudio = true
         if !qwen3OnlyMode {
@@ -255,7 +273,9 @@ actor SenseVoiceWSClient: SpeechRecognizer {
     /// `endOffset` (= start + delta.count) exactly aligned with the bytes returned,
     /// so the confirmed offset can only advance by what was actually transcribed.
     private func snapshotQwen3Delta() -> (delta: Data, start: Int, endOffset: Int) {
-        let start = qwen3ConfirmedOffset
+        // clamp 防御（REPAIR_PLAN J10）：缓冲被超限清空等场景下 offset 可能大于
+        // 当前长度，suffix(from:) 越界会直接 precondition crash
+        let start = min(qwen3ConfirmedOffset, allAudioData.count)
         let delta = Data(allAudioData.suffix(from: start))
         return (delta, start, start + delta.count)
     }
@@ -272,6 +292,7 @@ actor SenseVoiceWSClient: SpeechRecognizer {
         qwen3ConfirmedOffset = 0
         qwen3ConfirmedSegments = []
         qwen3HasPendingAudio = false
+        audioAccumulationOverflowed = false
     }
 
     // MARK: - Text Cleaning
