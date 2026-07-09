@@ -376,11 +376,17 @@ final class AppUpdater {
 
         CURRENT_TEAM=$(codesign -dvvv "$APP_PATH" 2>&1 | awk -F= '/^TeamIdentifier=/ {print $2; exit}')
         NEW_TEAM=$(codesign -dvvv "$NEW_APP" 2>&1 | awk -F= '/^TeamIdentifier=/ {print $2; exit}')
-        if [ -n "$CURRENT_TEAM" ] && [ "$CURRENT_TEAM" != "not set" ]; then
-            if [ "$CURRENT_TEAM" != "$NEW_TEAM" ]; then
-                echo "ERROR: signing team mismatch: current=$CURRENT_TEAM new=$NEW_TEAM"
-                exit 1
-            fi
+        # REPAIR_PLAN J7：当前安装无 TeamIdentifier（ad-hoc/自签）时更新链没有身份锚点，
+        # 任何能过 codesign --verify 的自签 DMG 都会被接受——此前这里整体跳过比对即静默放行。
+        # 改为直接拒绝自动更新：ad-hoc 安装的用户须手动安装带真实开发者签名的版本后，
+        # 自动更新方可恢复（A1 重开更新通道的前置条件之一）。
+        if [ -z "$CURRENT_TEAM" ] || [ "$CURRENT_TEAM" = "not set" ]; then
+            echo "ERROR: current install has no TeamIdentifier (ad-hoc/self-signed); auto-update refused"
+            exit 1
+        fi
+        if [ "$CURRENT_TEAM" != "$NEW_TEAM" ]; then
+            echo "ERROR: signing team mismatch: current=$CURRENT_TEAM new=$NEW_TEAM"
+            exit 1
         fi
         echo "New app passed identity checks."
 
