@@ -88,7 +88,7 @@ final class RecognitionSessionTests: XCTestCase {
         await session.setOnASREvent { recorder.record($0) }
         let staleGeneration = await session.sessionGenerationForTesting
         await session.setState(.recording)
-        await session.cancelRecording()
+        await session.forceResetForTesting()
 
         await session.handleASREventForTesting(
             .transcript(RecognitionTranscript(

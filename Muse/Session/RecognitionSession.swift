@@ -141,8 +141,6 @@ actor RecognitionSession {
     private var speculativeDebounceTask: Task<Void, Never>?
     /// Stores the last LLM error from the early/fresh LLM task, consumed once by stopRecording().
     private var pendingLLMError: Error?
-    /// When true, skip text injection (paste) but still save to clipboard & history.
-    private var injectionAborted = false
 
     // MARK: - Toggle
 
@@ -176,7 +174,6 @@ actor RecognitionSession {
         self.currentMode = effectiveMode
         self.recordingStartTime = nil
         hasEmittedReadyForCurrentSession = false
-        injectionAborted = false
         pendingLLMError = nil
         streamingDegraded = false
         state = .starting
@@ -429,34 +426,17 @@ actor RecognitionSession {
 
     // MARK: - Stop
 
-    /// Cancel an in-progress recording: tear down all resources without injecting any text.
-    func cancelRecording() async {
-        guard state == .recording || state == .starting else {
-            logger.warning("cancelRecording called but state is \(String(describing: self.state))")
-            return
-        }
-        DebugFileLogger.log("cancelRecording: discarding session from state=\(state)")
-        await forceReset()
-    }
-
     /// ESC means interrupt immediately: no post-processing, no clipboard write, no injection.
+    /// 中断安全由代际守卫兜底：forceReset 换代后，在途 stop 管线在下一个 ensureCurrent 处退出。
     func abortCurrentSession() async {
         guard state != .idle else {
             DebugFileLogger.log("abortCurrentSession idle: emit completed for UI cleanup")
-            injectionAborted = true
             onASREvent?(.completed)
             return
         }
         DebugFileLogger.log("abortCurrentSession: force reset from state=\(state)")
-        injectionAborted = true
         await forceReset()
         onASREvent?(.completed)
-    }
-
-    /// Mark that injection should be skipped. Recognition, clipboard, and history still proceed.
-    func abortInjection() {
-        injectionAborted = true
-        DebugFileLogger.log("abortInjection: injection will be skipped")
     }
 
     func stopRecording() async {
@@ -763,14 +743,6 @@ actor RecognitionSession {
             ? defaults.bool(forKey: DefaultsKeys.preserveClipboard)
             : true
 
-        if injectionAborted {
-            // Manual injection abort: copy to clipboard for manual paste, skip injection.
-            // ESC interruption uses abortCurrentSession() and does not enter this path.
-            injectionEngine.copyToClipboard(finalText)
-            DebugFileLogger.log("stop: injection aborted by ESC, text saved to clipboard & history")
-            return .copiedToClipboard
-        }
-
         DebugFileLogger.log("stop: injecting method=clipboard len=\(finalText.count) +\(ContinuousClock.now - stopT0)")
         return injectionEngine.inject(finalText)
     }
@@ -781,8 +753,7 @@ actor RecognitionSession {
         streamingFailed: Bool
     ) async {
         let status: String
-        if injectionAborted { status = "aborted" }
-        else if llmResult.llmFailed { status = "llm_error" }
+        if llmResult.llmFailed { status = "llm_error" }
         else if streamingFailed { status = "stream_recovered" }
         else { status = "completed" }
 
@@ -1183,6 +1154,11 @@ actor RecognitionSession {
 extension RecognitionSession {
     func handleASREventForTesting(_ event: RecognitionEvent, expectedGeneration: Int? = nil) {
         handleASREvent(event, expectedGeneration: expectedGeneration ?? sessionGeneration)
+    }
+
+    /// 测试用：换代重置（原经由已删除的死代码 cancelRecording 触达）
+    func forceResetForTesting() async {
+        await forceReset()
     }
 
     var sessionGenerationForTesting: Int {
