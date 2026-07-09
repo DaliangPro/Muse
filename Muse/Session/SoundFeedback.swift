@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import os
 
 /// Synthesized and bundled audio feedback tones.
 enum SoundFeedback {
@@ -10,8 +11,16 @@ enum SoundFeedback {
         let label: String
     }
 
-    nonisolated(unsafe) private static var hasWarmedUp = false
-    nonisolated(unsafe) private static var cachedPlayers: [String: AVAudioPlayer] = [:]
+    /// REPAIR_PLAN J11（D3 收口）：当前所有入口都 hop 到主线程（play 的 isMainThread
+    /// 分支、warmUp 的 main.async），实际无竞争——但该约定靠每个入口记得 hop 维持，
+    /// nonisolated(unsafe) 让编译器放弃检查。收进 unfair lock 把约定变机制（主线程
+    /// 无争用锁 ~纳秒级，不影响开始音时延——不用 @MainActor+Task 正是为避免调度延迟，
+    /// D3 历史教训是开始音慢半拍）。uncheckedState：AVAudioPlayer 无 Sendable 标注。
+    private struct Cache {
+        var hasWarmedUp = false
+        var players: [String: AVAudioPlayer] = [:]
+    }
+    private static let cache = OSAllocatedUnfairLock(uncheckedState: Cache())
 
     private static let startSpec = ToneSpec(
         tones: [
@@ -44,8 +53,12 @@ enum SoundFeedback {
 
     static func warmUp() {
         DispatchQueue.main.async {
-            guard !hasWarmedUp else { return }
-            hasWarmedUp = true
+            let firstWarmUp = cache.withLock { state -> Bool in
+                guard !state.hasWarmedUp else { return false }
+                state.hasWarmedUp = true
+                return true
+            }
+            guard firstWarmUp else { return }
             AppLogger.log("[SoundFeedback] warmUp")
             DebugFileLogger.log("sound warmUp")
             preparePlayersIfNeeded()
@@ -124,13 +137,14 @@ enum SoundFeedback {
     }
 
     private static func preparedPlayer(for spec: ToneSpec) throws -> AVAudioPlayer {
-        if let player = cachedPlayers[spec.label] {
+        if let player = cache.withLock({ $0.players[spec.label] }) {
             return player
         }
 
+        // 构建在锁外（波形合成属 CPU 工作）；并发重复构建幂等，后写覆盖无害
         let player = try AVAudioPlayer(data: buildToneData(for: spec))
         player.prepareToPlay()
-        cachedPlayers[spec.label] = player
+        cache.withLock { $0.players[spec.label] = player }
         return player
     }
 

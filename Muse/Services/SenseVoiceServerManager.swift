@@ -68,11 +68,21 @@ actor SenseVoiceServerManager {
 
     /// Port of the running SenseVoice server (primary, streaming).
     /// Set by actor-isolated `start()`, read by sync callers like KeychainService.
-    nonisolated(unsafe) private(set) static var currentPort: Int?
+    // REPAIR_PLAN J11：actor 内启动/停止写、killAllServerProcesses（nonisolated）写、
+    // UI 与客户端多处跨线程读——裸静态量是 UB，收进 unfair lock，对外语法不变
+    private static let _currentPort = OSAllocatedUnfairLock<Int?>(initialState: nil)
+    private(set) static var currentPort: Int? {
+        get { _currentPort.withLock { $0 } }
+        set { _currentPort.withLock { $0 = newValue } }
+    }
 
     /// Port of the running Qwen3-ASR server (secondary, speculative final).
     /// Only set on Apple Silicon where both servers run.
-    nonisolated(unsafe) private(set) static var currentQwen3Port: Int?
+    private static let _currentQwen3Port = OSAllocatedUnfairLock<Int?>(initialState: nil)
+    private(set) static var currentQwen3Port: Int? {
+        get { _currentQwen3Port.withLock { $0 } }
+        set { _currentQwen3Port.withLock { $0 = newValue } }
+    }
 
     private let logger = Logger(subsystem: "pro.daliang.muse.sensevoice", category: "ServerManager")
 

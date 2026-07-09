@@ -101,6 +101,8 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
     // MARK: - Warm-up
 
+    /// REPAIR_PLAN J11：由 stateLock 保护——warmUp 的读（调用线程）、warm-up 完成写
+    /// （global queue）与 startWithAVCapture 写（actor 线程）三方并发，裸 Bool 是 UB
     private var isWarmedUp = false
 
     override init() {
@@ -110,7 +112,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
     /// Pre-initialize the audio capture pipeline so the first real recording starts instantly.
     func warmUp() {
-        guard !isWarmedUp else { return }
+        guard !stateLock.withLock({ isWarmedUp }) else { return }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             AppLogger.log("[Audio] Warm-up skipped: microphone permission not granted")
             return
@@ -130,7 +132,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
                 // Keep it alive briefly to fully initialize CoreAudio, then stop
                 Thread.sleep(forTimeInterval: 0.3)
                 session.stopRunning()
-                self.isWarmedUp = true
+                self.stateLock.withLock { self.isWarmedUp = true }
                 AppLogger.log("[Audio] Warm-up complete")
             } catch {
                 AppLogger.log("[Audio] Warm-up failed: \(String(describing: error))")
@@ -182,7 +184,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
         session.startRunning()
         captureSession = session
-        isWarmedUp = true
+        stateLock.withLock { isWarmedUp = true }
         AppLogger.log("[Audio] Capture session started (AVCapture), device: \(device.localizedName)")
     }
 
