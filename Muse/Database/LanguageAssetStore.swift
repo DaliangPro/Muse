@@ -74,7 +74,7 @@ actor LanguageAssetStore {
         SQL.bindOptional(stmt, 9, job.summary)
         SQL.bindOptional(stmt, 10, job.errorMessage)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -206,7 +206,7 @@ actor LanguageAssetStore {
         SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
         SQL.bind(stmt, 3, id)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -236,7 +236,7 @@ actor LanguageAssetStore {
         SQL.bindOptional(stmt, 12, run.summary)
         SQL.bindOptional(stmt, 13, run.errorMessage)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -249,7 +249,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, id)
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -400,7 +400,7 @@ actor LanguageAssetStore {
         SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
         SQL.bind(stmt, 3, id)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -419,7 +419,7 @@ actor LanguageAssetStore {
         SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
         SQL.bind(stmt, 3, id)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -464,7 +464,7 @@ actor LanguageAssetStore {
         SQL.bind(stmt, 4, log.actionType.rawValue)
         SQL.bindOptional(stmt, 5, log.detail)
 
-        _ = sqlite3_step(stmt)
+        stepSingleWrite(stmt)
     }
 
     // MARK: - Asset
@@ -567,7 +567,7 @@ actor LanguageAssetStore {
         SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
         SQL.bind(stmt, 3, id)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -586,7 +586,7 @@ actor LanguageAssetStore {
         SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
         SQL.bind(stmt, 3, id)
 
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -812,12 +812,15 @@ actor LanguageAssetStore {
     func pruneFinishedCandidates(olderThanDays: Int = 90, keepingAtMost: Int = 1000) {
         let cutoff = Calendar.current.date(byAdding: .day, value: -olderThanDays, to: Date()) ?? Date()
         let cutoffString = ISO8601DateFormatter().string(from: cutoff)
-        sqlite3_exec(
+        // REPAIR_PLAN J3：裁剪失败留痕——静默失败会让候选表无限增长且无迹可查
+        if sqlite3_exec(
             db,
             "DELETE FROM language_asset_candidate WHERE status != 'pending' AND created_at < '\(cutoffString)';",
             nil, nil, nil
-        )
-        sqlite3_exec(
+        ) != SQLITE_OK {
+            AppLogger.log("[LanguageAssetStore] 候选按时间裁剪失败: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        if sqlite3_exec(
             db,
             """
             DELETE FROM language_asset_candidate WHERE status != 'pending' AND id NOT IN (
@@ -826,7 +829,9 @@ actor LanguageAssetStore {
             );
             """,
             nil, nil, nil
-        )
+        ) != SQLITE_OK {
+            AppLogger.log("[LanguageAssetStore] 候选按数量裁剪失败: \(String(cString: sqlite3_errmsg(db)))")
+        }
     }
 
     // MARK: - 跨任务防重（2026-06-11 改造方案 #1）
@@ -1332,6 +1337,19 @@ actor LanguageAssetStore {
     private func unique(_ values: [String]) -> [String] {
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
+    }
+
+    /// REPAIR_PLAN J3：单行写不再静默失败——busy_timeout(3s) 超时仍 BUSY、磁盘满等
+    /// step 失败必须留痕，否则任务/结果/资产状态无声丢失、上层无感知。
+    /// 日志记 sqlite3_sql 模板（含 ? 占位符、不含绑定值），不泄漏用户文本。
+    @discardableResult
+    private func stepSingleWrite(_ stmt: OpaquePointer?) -> Bool {
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            let sql = sqlite3_sql(stmt).map { String(cString: $0) } ?? "unknown"
+            AppLogger.log("[LanguageAssetStore] 单行写失败: \(String(cString: sqlite3_errmsg(db))) — \(sql.prefix(80))")
+            return false
+        }
+        return true
     }
 
     private func postDidChangeNotification() {

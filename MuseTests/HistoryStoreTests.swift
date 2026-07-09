@@ -353,4 +353,33 @@ final class HistoryStoreTests: XCTestCase {
         let remaining = await store.fetchAll()
         XCTAssertEqual(remaining.count, 1)
     }
+
+    /// REPAIR_PLAN J3：库被第二连接短暂锁住（<busy_timeout 3s）时，
+    /// insert 必须等待锁释放后成功落库，而非静默丢记录。
+    /// 场景还原：语料提炼事务（LanguageAssetStore 连接）持写锁时来了一条识别记录。
+    func testInsertWaitsOutShortLockAndStillPersists() async throws {
+        // 第二连接锁库（模拟提炼事务持写锁）
+        var rival: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(testPath, &rival), SQLITE_OK)
+        defer { sqlite3_close(rival) }
+        XCTAssertEqual(sqlite3_exec(rival, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+
+        // 400ms 后释放锁（远小于 busy_timeout 3s）。
+        // 指针经 UInt 位模式跨任务传递以满足 Sendable 检查；rival 生命周期由本函数 defer 兜底。
+        let rivalAddress = UInt(bitPattern: UnsafeMutableRawPointer(rival))
+        Task.detached {
+            try? await Task.sleep(for: .milliseconds(400))
+            sqlite3_exec(OpaquePointer(bitPattern: rivalAddress), "COMMIT;", nil, nil, nil)
+        }
+
+        let record = HistoryRecord(
+            id: "busy-wait", createdAt: Date(), durationSeconds: 1,
+            rawText: "撞锁记录", processingMode: nil, processedText: nil,
+            finalText: "撞锁记录", status: "completed", characterCount: 4
+        )
+        await store.insert(record)
+
+        let all = await store.fetchAll()
+        XCTAssertEqual(all.map(\.id), ["busy-wait"], "撞锁 <3s 时记录必须最终落库（busy_timeout 生效）")
+    }
 }

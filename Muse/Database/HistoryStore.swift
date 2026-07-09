@@ -112,7 +112,7 @@ actor HistoryStore {
         } else {
             sqlite3_bind_null(stmt, 10)
         }
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -203,7 +203,7 @@ actor HistoryStore {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
         SQL.bind(stmt, 1, id)
-        if sqlite3_step(stmt) == SQLITE_DONE {
+        if stepSingleWrite(stmt) {
             postDidChangeNotification()
         }
     }
@@ -224,7 +224,7 @@ actor HistoryStore {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int(stmt, 1, Int32(limit))
-        if sqlite3_step(stmt) == SQLITE_DONE, sqlite3_changes(db) > 0 {
+        if stepSingleWrite(stmt), sqlite3_changes(db) > 0 {
             AppLogger.log("[HistoryStore] 已按上限 \(limit) 裁剪 \(sqlite3_changes(db)) 条旧记录")
             postDidChangeNotification()
         }
@@ -233,6 +233,8 @@ actor HistoryStore {
     func deleteAll() {
         if sqlite3_exec(db, "DELETE FROM recognition_history;", nil, nil, nil) == SQLITE_OK {
             postDidChangeNotification()
+        } else {
+            AppLogger.log("[HistoryStore] 清空历史失败: \(String(cString: sqlite3_errmsg(db)))")
         }
     }
 
@@ -260,6 +262,7 @@ actor HistoryStore {
         guard !updates.isEmpty else { return }
 
         sqlite3_exec(db, "BEGIN TRANSACTION", nil, nil, nil)
+        var stepFailed = false
         for update in updates {
             let updateSQL = """
             UPDATE recognition_history
@@ -280,9 +283,18 @@ actor HistoryStore {
                     sqlite3_bind_null(updateStmt, 2)
                 }
                 SQL.bind(updateStmt, 3, update.id)
-                sqlite3_step(updateStmt)
+                // REPAIR_PLAN J3：迁移事务不再忽略 step 结果——失败即回滚，下次启动重跑
+                if sqlite3_step(updateStmt) != SQLITE_DONE {
+                    stepFailed = true
+                }
                 sqlite3_finalize(updateStmt)
+                if stepFailed { break }
             }
+        }
+        if stepFailed {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            AppLogger.log("[HistoryStore] 文本指标迁移失败已回滚: \(String(cString: sqlite3_errmsg(db)))")
+            return
         }
         sqlite3_exec(db, "COMMIT", nil, nil, nil)
         AppLogger.log("[HistoryStore] Migrated \(updates.count) records with text metrics")
@@ -403,6 +415,19 @@ actor HistoryStore {
             characterCount: sqlite3_column_type(stmt, 8) == SQLITE_NULL ? nil : Int(sqlite3_column_int(stmt, 8)),
             tokenCount: sqlite3_column_type(stmt, 9) == SQLITE_NULL ? nil : Int(sqlite3_column_int(stmt, 9))
         )
+    }
+
+    /// REPAIR_PLAN J3：单行写不再静默失败——busy_timeout(3s) 超时仍 BUSY、磁盘满等
+    /// step 失败必须留痕，否则识别记录无声丢失、上层与用户均无感知。
+    /// 日志记 sqlite3_sql 模板（含 ? 占位符、不含绑定值），不泄漏用户文本。
+    @discardableResult
+    private func stepSingleWrite(_ stmt: OpaquePointer?) -> Bool {
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            let sql = sqlite3_sql(stmt).map { String(cString: $0) } ?? "unknown"
+            AppLogger.log("[HistoryStore] 单行写失败: \(String(cString: sqlite3_errmsg(db))) — \(sql.prefix(80))")
+            return false
+        }
+        return true
     }
 
     private func postDidChangeNotification() {
