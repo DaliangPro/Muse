@@ -61,6 +61,47 @@ final class TextInjectionClipboardRestoreTests: XCTestCase {
         )
     }
 
+    /// J2 回归修复：目标 app 粘贴时改写剪贴板（changeCount 前进）但内容仍是
+    /// 注入文本——必须照常恢复，否则识别文本残留、旧剪贴板丢失（2026-07-09 实测报告）。
+    func testRestoreProceedsWhenAppRewroteClipboardWithSameText() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString("用户的旧剪贴板", forType: .string)
+
+        let snapshot = TextInjectionEngine.ClipboardSnapshot.capture()
+
+        pasteboard.clearContents()
+        pasteboard.setString("识别文本", forType: .string)
+        let postWriteCount = pasteboard.changeCount
+
+        // 模拟目标 app 粘贴时的改写：changeCount 前进、字符串内容不变
+        pasteboard.clearContents()
+        pasteboard.setString("识别文本", forType: .string)
+
+        snapshot.restore(expectedChangeCount: postWriteCount, injectedText: "识别文本")
+        XCTAssertEqual(pasteboard.string(forType: .string), "用户的旧剪贴板",
+                       "app 改写但内容未变时必须照常恢复")
+    }
+
+    func testRestoreStillSkipsWhenContentTrulyChanged() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString("用户的旧剪贴板", forType: .string)
+
+        let snapshot = TextInjectionEngine.ClipboardSnapshot.capture()
+
+        pasteboard.clearContents()
+        pasteboard.setString("识别文本", forType: .string)
+        let postWriteCount = pasteboard.changeCount
+
+        pasteboard.clearContents()
+        pasteboard.setString("用户复制的新内容", forType: .string)
+
+        snapshot.restore(expectedChangeCount: postWriteCount, injectedText: "识别文本")
+        XCTAssertEqual(pasteboard.string(forType: .string), "用户复制的新内容",
+                       "内容真变时仍须放弃恢复")
+    }
+
     func testRestoreClearsClipboardWhenOriginalWasEmpty() {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()

@@ -44,9 +44,16 @@ final class TextInjectionEngine: @unchecked Sendable {
             return ClipboardSnapshot(items: items, changeCount: changeCount, canRestore: true)
         }
 
-        func restore(expectedChangeCount: Int) {
+        func restore(expectedChangeCount: Int, injectedText: String? = nil) {
             let pasteboard = NSPasteboard.general
-            guard pasteboard.changeCount == expectedChangeCount else { return }
+            if pasteboard.changeCount != expectedChangeCount {
+                // REPAIR_PLAN J2 回归修复（2026-07-09 大梁老师实测报告）：部分 app
+                // （微信等）粘贴时会改写剪贴板（富文本转自家格式），changeCount 前进但
+                // 内容仍是我们注入的识别文本——此时恢复依旧安全；只有内容已变成别的
+                // （用户/第三方真复制了新东西）才放弃恢复，避免识别文本残留覆盖旧剪贴板。
+                guard let injectedText,
+                      pasteboard.string(forType: .string) == injectedText else { return }
+            }
             guard canRestore else { return }
 
             // 原剪贴板为空时 items 为空——此时仍需 clearContents 清掉刚写入的
@@ -165,7 +172,7 @@ final class TextInjectionEngine: @unchecked Sendable {
             // restore 的 changeCount 守卫背书——延迟期间用户/其他 app 写过剪贴板，
             // 或下一次注入已写入新识别文本时，本次恢复自动放弃，不覆盖新内容。
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.clipboardRestoreDelay) {
-                savedClipboard.restore(expectedChangeCount: postWriteChangeCount)
+                savedClipboard.restore(expectedChangeCount: postWriteChangeCount, injectedText: text)
             }
         }
 
