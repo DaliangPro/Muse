@@ -1,8 +1,6 @@
 import Foundation
 
 struct AssetLibraryDataSnapshot {
-    let latestJob: AssetExtractionJob?
-    let latestRun: ExtractionRun?
     let recipes: [ExtractionRecipe]
     /// 已停用配方（可恢复）
     let archivedRecipes: [ExtractionRecipe]
@@ -18,15 +16,11 @@ struct AssetLibraryDataSnapshot {
     let rejectedResults: [ExtractionResult]
     let recentRuns: [ExtractionRun]
     let totalRecordCount: Int
-    let last1DayCount: Int
-    let last7DayCount: Int
 
     static func load(
         assetStore: LanguageAssetStore,
         historyStore: HistoryStore
     ) async -> AssetLibraryDataSnapshot {
-        let latestJob = await assetStore.latestJob()
-        let latestRun = await assetStore.latestRun()
         let recipes = await assetStore.fetchRecipes()
         let archivedRecipes = await assetStore.fetchRecipes(status: .archived)
         let assets = await assetStore.fetchAll()
@@ -38,14 +32,7 @@ struct AssetLibraryDataSnapshot {
         let rejectedResults = await assetStore.fetchResults(status: .rejected)
         let recentRuns = await assetStore.fetchRuns(limit: 20)
         // 语料池计数与提炼输入同口径(completed 且有正文)，COUNT 查询不拉全行
-        let now = Date()
         let totalExtractable = await historyStore.extractableRecordCount()
-        let last1DayCount = await historyStore.extractableRecordCount(
-            since: Calendar.current.date(byAdding: .day, value: -1, to: now)
-        )
-        let last7DayCount = await historyStore.extractableRecordCount(
-            since: Calendar.current.date(byAdding: .day, value: -7, to: now)
-        )
         var sourceIDSet = Set<String>()
         sourceIDSet.formUnion(assets.flatMap(\.sourceRecordIDs))
         sourceIDSet.formUnion(extractionResults.flatMap(\.sourceRecordIDs))
@@ -57,8 +44,6 @@ struct AssetLibraryDataSnapshot {
         let sourceRecords = sourceIDs.isEmpty ? [] : await historyStore.fetch(ids: sourceIDs)
 
         return AssetLibraryDataSnapshot(
-            latestJob: latestJob,
-            latestRun: latestRun,
             recipes: recipes,
             archivedRecipes: archivedRecipes,
             assets: assets,
@@ -70,9 +55,7 @@ struct AssetLibraryDataSnapshot {
             savedResults: savedResults,
             rejectedResults: rejectedResults,
             recentRuns: recentRuns,
-            totalRecordCount: totalExtractable,
-            last1DayCount: last1DayCount,
-            last7DayCount: last7DayCount
+            totalRecordCount: totalExtractable
         )
     }
 }

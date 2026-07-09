@@ -2,7 +2,6 @@ import AppKit
 import SwiftUI
 
 struct AssetLibraryTab: View, SettingsCardHelpers {
-    @State private var latestJob: AssetExtractionJob?
     @State private var assets: [LanguageAsset] = []
     @State private var pendingCandidates: [LanguageAssetCandidateRecord] = []
     @State private var ignoredCandidates: [LanguageAssetCandidateRecord] = []
@@ -13,7 +12,6 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
     @State private var extractionRecipeID: String = ExtractionRecipe.quoteAssetsID
     @State private var extractionRecipeIDs: Set<String> = [ExtractionRecipe.quoteAssetsID]
     @State private var extractionRange: AssetExtractionRangeOption = .loadSaved()
-    @State private var extractionIncludesProcessedRecords = false
     @State private var extractionTask: Task<Void, Never>?
     @State private var errorMessage: String?
     @State private var selectedView: PurifierView = .extract
@@ -25,9 +23,6 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
     @State private var pendingQuery = ""
     @State private var selectedPendingResultID: String?
     @State private var totalRecordCount = 0
-    @State private var last1DayCount = 0
-    @State private var last7DayCount = 0
-    @State private var latestRun: ExtractionRun?
     @State private var recipes: [ExtractionRecipe] = ExtractionRecipe.builtInRecipes()
     @State private var archivedRecipes: [ExtractionRecipe] = []
     @State private var selectedRecipeListID: String?
@@ -47,7 +42,6 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
     @State private var selectedResultID: String?
     @State private var resultQuery = ""
     @State private var ruleConfig: AssetExtractionRuleConfig = AssetExtractionRuleConfigStore.load()
-    @State private var selectedRuleType: LanguageAssetType?
     @State private var copiedAssetID: String?
     @State private var activeSheet: AssetLibrarySheet?
     /// 提炼范围无新内容时在弹窗内就地提示（2026-07-08：弹窗承载全部提炼状态）
@@ -152,7 +146,6 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
                         extractionRecipeIDs = recipeIDs
                         extractionRecipeID = orderedRecipeIDs(from: recipeIDs).first ?? ExtractionRecipe.quoteAssetsID
                         extractionRange = range
-                        extractionIncludesProcessedRecords = false
                         extractionEmptyNotice = nil
                         range.save()
                         Task { @MainActor in
@@ -491,23 +484,6 @@ private extension AssetLibraryTab {
 
 // MARK: - Results
 
-private extension AssetLibraryTab {
-    var resultsView: some View {
-        AssetExtractionResultsView(
-            resultQuery: $resultQuery,
-            selectedResultKind: $selectedResultKind,
-            selectedResultID: $selectedResultID,
-            results: searchedExtractionResults,
-            selectedResult: selectedExtractionResult,
-            latestRun: latestRun,
-            copiedResultID: copiedAssetID,
-            formattedDate: { AssetLibraryDateFormatters.displayDateTime($0) },
-            onShowSources: { activeSheet = .resultSources($0) },
-            onCopyResult: copyResult
-        )
-    }
-}
-
 // MARK: - Recipes
 
 private extension AssetLibraryTab {
@@ -528,17 +504,6 @@ private extension AssetLibraryTab {
                     await reloadData()
                 }
             }
-        )
-    }
-}
-
-// MARK: - Rules
-
-private extension AssetLibraryTab {
-    var rulesView: some View {
-        AssetLibraryRulesView(
-            ruleConfig: $ruleConfig,
-            selectedRuleType: $selectedRuleType
         )
     }
 }
@@ -634,8 +599,6 @@ private extension AssetLibraryTab {
             historyStore: historyStore
         )
 
-        self.latestJob = snapshot.latestJob
-        self.latestRun = snapshot.latestRun
         self.recipes = snapshot.recipes
         self.archivedRecipes = snapshot.archivedRecipes
         self.assets = snapshot.assets
@@ -648,8 +611,6 @@ private extension AssetLibraryTab {
         self.rejectedResults = snapshot.rejectedResults
         self.recentRuns = snapshot.recentRuns
         self.totalRecordCount = snapshot.totalRecordCount
-        self.last1DayCount = snapshot.last1DayCount
-        self.last7DayCount = snapshot.last7DayCount
 
         normalizeSelections()
     }
@@ -1052,13 +1013,11 @@ private extension AssetLibraryTab {
                 extractionTask = nil
             }
             do {
-                var latestGenericRun: ExtractionRun?
-
                 // 2026-07 重构批三：所有配方统一走两段式管线（宽提+严审），产物落待确认
                 for configuration in configurations {
                     try Task.checkCancellation()
                     let effectiveConfiguration = configuration.applying(ruleConfig: ruleConfig)
-                    let result = try await extractionService.extractRecipeResults(
+                    _ = try await extractionService.extractRecipeResults(
                         configuration: effectiveConfiguration
                     ) { stage in
                         await MainActor.run {
@@ -1067,10 +1026,8 @@ private extension AssetLibraryTab {
                             }
                         }
                     }
-                    latestGenericRun = result.run
                 }
 
-                latestRun = latestGenericRun ?? latestRun
                 await reloadData()
                 activeSheet = nil
                 withAnimation(.easeInOut(duration: 0.16)) {
