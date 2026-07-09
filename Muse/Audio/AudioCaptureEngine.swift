@@ -67,8 +67,8 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     static let sampleRate: Double = 16000
     static let channels: AVAudioChannelCount = 1
     static let chunkDurationMs: Int = 200
-    static let startTimeout: Duration = .seconds(8)
-    static let idleCaptureRetentionSeconds: TimeInterval = 8
+    static let startTimeout: Duration = .seconds(15)
+    static let idleCaptureRetentionSeconds: TimeInterval = 30
     static let samplesPerChunk: Int = Int(sampleRate * Double(chunkDurationMs) / 1000)
     static let chunkByteSize: Int = samplesPerChunk * MemoryLayout<Int16>.size
     static let targetFormat: AVAudioFormat = AVAudioFormat(

@@ -1,5 +1,4 @@
 import AppKit
-import AudioToolbox
 import AVFoundation
 import os
 
@@ -18,9 +17,12 @@ enum SoundFeedback {
     private struct Cache {
         var hasWarmedUp = false
         var players: [String: AVAudioPlayer] = [:]
+        var mutedUntil: Date?
     }
     private static let cache = OSAllocatedUnfairLock(uncheckedState: Cache())
     private static let playbackQueue = DispatchQueue(label: "pro.daliang.muse.sound-feedback")
+    private static let slowPlaybackThreshold: TimeInterval = 0.25
+    private static let muteAfterAudioStackIssue: TimeInterval = 60
 
     private static let startSpec = ToneSpec(
         tones: [
@@ -69,7 +71,7 @@ enum SoundFeedback {
     static func playStart() {
         AppLogger.log("[SoundFeedback] playStart")
         DebugFileLogger.log("sound playStart")
-        play(spec: startSpec, retryCount: 2)
+        play(spec: startSpec)
     }
 
     /// 固定播放默认结束提示音。
@@ -89,42 +91,56 @@ enum SoundFeedback {
     // MARK: - Synthesized Sound Playback
 
     private static func play(
-        spec: ToneSpec,
-        retryCount: Int = 0
+        spec: ToneSpec
     ) {
         playbackQueue.async {
-            playNow(spec: spec, retryCount: retryCount)
+            playNow(spec: spec)
         }
     }
 
-    private static func playNow(
-        spec: ToneSpec,
-        retryCount: Int
-    ) {
+    private static func playNow(spec: ToneSpec) {
+        if isMuted() {
+            DebugFileLogger.log("sound \(spec.label) skipped: muted after audio stack issue")
+            return
+        }
+
+        let startedAt = Date()
         do {
             let didPlay = try playWithCachedPlayer(spec: spec)
+            let elapsed = Date().timeIntervalSince(startedAt)
 
             AppLogger.log("[SoundFeedback] \(spec.label) play() => \(didPlay ? "true" : "false")")
-            DebugFileLogger.log("sound \(spec.label) play() => \(didPlay)")
+            DebugFileLogger.log("sound \(spec.label) play() => \(didPlay) +\(String(format: "%.3f", elapsed))s")
+            if elapsed > slowPlaybackThreshold {
+                mutePlayback(label: spec.label, reason: "slow \(String(format: "%.3f", elapsed))s")
+                return
+            }
             guard didPlay else {
-                if retryCount > 0 {
-                    AppLogger.log("[SoundFeedback] \(spec.label) retry scheduled (\(retryCount) left)")
-                    DebugFileLogger.log("sound \(spec.label) retry scheduled, remaining=\(retryCount)")
-                    playbackQueue.asyncAfter(deadline: .now() + 0.12) {
-                        play(spec: spec, retryCount: retryCount - 1)
-                    }
-                } else {
-                    AppLogger.log("[SoundFeedback] \(spec.label) falling back to system alert")
-                    DebugFileLogger.log("sound \(spec.label) fallback to system alert")
-                    AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_UserPreferredAlert))
-                }
+                mutePlayback(label: spec.label, reason: "play returned false")
                 return
             }
         } catch {
             AppLogger.log("[SoundFeedback] \(spec.label) init failed: \(String(describing: error))")
             DebugFileLogger.log("sound \(spec.label) init failed: \(String(describing: error))")
-            AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_UserPreferredAlert))
+            mutePlayback(label: spec.label, reason: "init failed")
         }
+    }
+
+    private static func isMuted(now: Date = Date()) -> Bool {
+        cache.withLock { state in
+            guard let mutedUntil = state.mutedUntil else { return false }
+            if mutedUntil > now { return true }
+            state.mutedUntil = nil
+            return false
+        }
+    }
+
+    private static func mutePlayback(label: String, reason: String) {
+        let until = Date().addingTimeInterval(muteAfterAudioStackIssue)
+        cache.withLock { state in
+            state.mutedUntil = until
+        }
+        DebugFileLogger.log("sound \(label) muted for \(Int(muteAfterAudioStackIssue))s: \(reason)")
     }
 
     private static func preparePlayersIfNeeded() {
