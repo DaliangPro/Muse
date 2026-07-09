@@ -101,14 +101,7 @@ final class AppUpdater {
         let scriptURL = stagingDir.appendingPathComponent("updater.sh")
 
         do {
-            let script = generateUpdaterScript(
-                dmgPath: dmgPath.path,
-                appPath: Bundle.main.bundlePath,
-                signingIdentity: signingIdentity,
-                isLocal: isLocalInstallation,
-                stagingDir: stagingDir.path
-            )
-            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try Self.updaterScript.write(to: scriptURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o755], ofItemAtPath: scriptURL.path
             )
@@ -333,17 +326,12 @@ final class AppUpdater {
 
     // MARK: - Updater Script
 
-    private func generateUpdaterScript(
-        dmgPath: String,
-        appPath: String,
-        signingIdentity: String,
-        isLocal: Bool,
-        stagingDir: String
-    ) -> String {
-        """
+    /// 纯常量脚本：全部参数经环境变量传入（J15 收口——原先 stagingDir 以字符串
+    /// 插值写进脚本文本，路径含引号/特殊字符时会破坏脚本语法）
+    private static let updaterScript = """
         #!/bin/bash
         set -euo pipefail
-        LOG="\(stagingDir)/update.log"
+        LOG="$STAGING_DIR/update.log"
         exec > "$LOG" 2>&1
         echo "Muse updater started at $(date)"
 
@@ -482,7 +470,6 @@ final class AppUpdater {
         echo "Update completed successfully at $(date)"
         echo "SUCCESS"
         """
-    }
 
     // MARK: - Cleanup
 

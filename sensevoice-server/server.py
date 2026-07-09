@@ -171,9 +171,35 @@ async def chat_completions(request: dict):
     if _llm is None and not _llm_model_path:
         return JSONResponse({"error": "LLM not configured"}, status_code=503)
 
+    # 入参校验（J15）：仅供本机 Swift 客户端调用，但畸形入参此前会直穿到
+    # llama 推理层抛 500 traceback；类型/边界不合法一律 400 明确拒绝
     messages = request.get("messages", [])
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(
+            isinstance(m, dict)
+            and isinstance(m.get("role"), str)
+            and isinstance(m.get("content"), str)
+            for m in messages
+        )
+    ):
+        return JSONResponse(
+            {"error": "messages must be a non-empty list of {role, content} strings"},
+            status_code=400,
+        )
+    if sum(len(m["content"]) for m in messages) > 200_000:
+        return JSONResponse({"error": "messages content too large"}, status_code=400)
+
     temperature = request.get("temperature", 0.7)
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+            or not (0 <= temperature <= 2):
+        return JSONResponse({"error": "temperature must be a number in [0, 2]"}, status_code=400)
+
     max_tokens = request.get("max_tokens", 1024)
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) \
+            or not (1 <= max_tokens <= 8192):
+        return JSONResponse({"error": "max_tokens must be an integer in [1, 8192]"}, status_code=400)
 
     # Lazy load LLM on first request
     async with _llm_lock:
