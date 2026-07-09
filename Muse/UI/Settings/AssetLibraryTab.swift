@@ -158,37 +158,6 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
                     onCancelExtraction: { extractionTask?.cancel() },
                     onCancel: { activeSheet = nil }
                 )
-            case .extractionPreview(let preview, let context):
-                let provider = KeychainService.selectedAssetExtractionLLMProvider
-                let promptMessages = promptPreviewMessages(
-                    preview: preview,
-                    context: context,
-                    provider: provider
-                )
-                ExtractionPreviewSheet(
-                    preview: preview,
-                    context: context,
-                    ruleConfig: ruleConfig,
-                    provider: provider,
-                    promptMessages: promptMessages,
-                    onConfirm: {
-                        activeSheet = nil
-                        startExtractions(configurations: makeExtractionConfigurations(context: context, preview: preview))
-                    },
-                    onCancel: { activeSheet = nil }
-                )
-            case .manualRecordSelection(let records):
-                ManualRecordSelectionSheet(
-                    records: records,
-                    onConfirm: { ids in
-                        activeSheet = nil
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(180))
-                            await prepareManualExtractionPreview(ids: ids)
-                        }
-                    },
-                    onCancel: { activeSheet = nil }
-                )
             }
         }
         .alert(L("清空待确认候选", "Clear pending candidates"), isPresented: $isClearPendingConfirmationPresented) {
@@ -320,10 +289,6 @@ private extension AssetLibraryTab {
             return recipe
         }
         return searchedRecipes.first
-    }
-
-    func extractionRecipe(for id: String) -> ExtractionRecipe {
-        recipes.first(where: { $0.id == id }) ?? ExtractionRecipe.quoteAssets()
     }
 
     /// 配方展示名（含已删除配方兜底）：资产库分组/详情按配方分类展示
@@ -860,58 +825,6 @@ private extension AssetLibraryTab {
         runExtractions(configurations: configurations)
     }
 
-    /// 提炼入口（改造方案 #3/#7）：手动范围先弹记录勾选，
-    /// 其余范围先本地预览（零模型成本）再确认
-    @MainActor
-    func prepareExtractionPreview(
-        recipeIDs: [String],
-        range: AssetExtractionRangeOption,
-        includesProcessedRecords: Bool
-    ) async {
-        guard !isExtracting, hasLLMConfig else { return }
-        let effectiveRecipeIDs = recipeIDs.isEmpty ? [extractionRecipeID] : recipeIDs
-
-        if range == .manual {
-            let records = await historyStore.fetchRecent(limit: 100)
-                .filter { $0.status == "completed" && !$0.finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            activeSheet = .manualRecordSelection(records)
-            return
-        }
-
-        guard let configuration = makeExtractionConfiguration(
-            recipeID: effectiveRecipeIDs.first ?? extractionRecipeID,
-            range: range,
-            includesProcessedRecords: includesProcessedRecords
-        ) else { return }
-        let preview = await extractionService.previewExtraction(
-            configuration: configuration.applying(ruleConfig: ruleConfig)
-        )
-        let context = AssetExtractionPreviewContext(
-            recipeIDs: effectiveRecipeIDs,
-            recipeNames: effectiveRecipeIDs.map { extractionRecipe(for: $0).name },
-            range: range,
-            includesProcessedRecords: includesProcessedRecords
-        )
-        activeSheet = .extractionPreview(preview, context)
-    }
-
-    @MainActor
-    func prepareManualExtractionPreview(ids: [String]) async {
-        guard !isExtracting, hasLLMConfig, !ids.isEmpty else { return }
-
-        let context = AssetExtractionPreviewContext(
-            recipeIDs: orderedRecipeIDs(from: extractionRecipeIDs),
-            recipeNames: orderedRecipeIDs(from: extractionRecipeIDs).map { extractionRecipe(for: $0).name },
-            range: .manual,
-            selectedRecordIDs: ids
-        )
-        guard let configuration = makeExtractionConfigurations(context: context).first else { return }
-        let preview = await extractionService.previewExtraction(
-            configuration: configuration.applying(ruleConfig: ruleConfig)
-        )
-        activeSheet = .extractionPreview(preview, context)
-    }
-
     func makeExtractionConfiguration(
         recipeID: String,
         range: AssetExtractionRangeOption,
@@ -921,86 +834,6 @@ private extension AssetLibraryTab {
             .includingProcessedRecords(includesProcessedRecords)
             .applying(recipeID: recipeID)
             .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-    }
-
-    func makeExtractionConfiguration(context: AssetExtractionPreviewContext) -> AssetExtractionConfiguration? {
-        context.makeConfigurations().first?
-            .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-    }
-
-    func makeExtractionConfigurations(context: AssetExtractionPreviewContext) -> [AssetExtractionConfiguration] {
-        context.makeConfigurations().map {
-            $0.adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-        }
-    }
-
-    func makeExtractionConfigurations(
-        context: AssetExtractionPreviewContext,
-        preview: AssetExtractionPreview
-    ) -> [AssetExtractionConfiguration] {
-        let recordIDs = preview.records.map(\.id)
-        guard !recordIDs.isEmpty else { return [] }
-
-        return context.recipeIDs.map { recipeID in
-            AssetExtractionConfiguration
-                .manualSelection(ids: recordIDs)
-                .applying(recipeID: recipeID)
-                .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-        }
-    }
-
-    func promptPreviewMessages(
-        preview: AssetExtractionPreview,
-        context: AssetExtractionPreviewContext,
-        provider: LLMProvider
-    ) -> AssetExtractionPromptMessages {
-        guard let configuration = makeExtractionConfiguration(context: context) else {
-            return AssetExtractionPromptMessages(system: nil, user: "")
-        }
-        let configurations = makeExtractionConfigurations(context: context)
-        // 2026-07 重构批三：预览统一按新管线宽提段的 prompt 展示
-        if configurations.count > 1 {
-            let sections = configurations.map { configuration in
-                let effectiveConfiguration = configuration.applying(ruleConfig: ruleConfig)
-                let recipe = extractionRecipe(for: effectiveConfiguration.recipeID)
-                let messages = RemoteRecipeExtractionProvider.promptMessages(
-                    from: preview.records,
-                    recipe: recipe,
-                    configuration: effectiveConfiguration,
-                    provider: provider
-                )
-                return """
-                ===== \(recipe.name) =====
-                \(messages.combinedForDisplay)
-                """
-            }
-            return AssetExtractionPromptMessages(
-                system: "本次会按所选资产定义分别调用模型，共 \(configurations.count) 次。",
-                user: sections.joined(separator: "\n\n")
-            )
-        }
-        let effectiveConfiguration = configuration.applying(ruleConfig: ruleConfig)
-        let recipe = extractionRecipe(for: effectiveConfiguration.recipeID)
-        return RemoteRecipeExtractionProvider.promptMessages(from: preview.records, recipe: recipe, configuration: effectiveConfiguration, provider: provider)
-    }
-
-    @MainActor
-    func startExtraction(configuration: AssetExtractionConfiguration) {
-        startExtractions(configurations: [configuration])
-    }
-
-    @MainActor
-    func startExtractions(configurations: [AssetExtractionConfiguration]) {
-        guard !isExtracting, hasLLMConfig else { return }
-        let configurations = configurations.filter { configuration in
-            recipes.contains(where: { $0.id == configuration.recipeID })
-        }
-        guard !configurations.isEmpty else { return }
-
-        isExtracting = true
-        extractionProgressPhase = .preparing
-        errorMessage = nil
-        runExtractions(configurations: configurations)
     }
 
     /// 执行提炼（调用前须已置 isExtracting = true）：进度在提炼弹窗内呈现，

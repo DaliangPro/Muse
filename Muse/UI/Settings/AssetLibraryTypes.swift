@@ -147,70 +147,12 @@ extension AssetExtractionProgressStage {
     }
 }
 
-struct AssetExtractionPreviewContext: Hashable {
-    let recipeIDs: [String]
-    let recipeNames: [String]
-    let range: AssetExtractionRangeOption
-    let includesProcessedRecords: Bool
-    let selectedRecordIDs: [String]
-
-    init(
-        recipeIDs: [String] = [ExtractionRecipe.quoteAssetsID],
-        recipeNames: [String] = ["金句"],
-        range: AssetExtractionRangeOption,
-        includesProcessedRecords: Bool = false,
-        selectedRecordIDs: [String] = []
-    ) {
-        self.recipeIDs = recipeIDs.isEmpty ? [ExtractionRecipe.quoteAssetsID] : recipeIDs
-        self.recipeNames = recipeNames.isEmpty ? ["金句"] : recipeNames
-        self.range = range
-        self.includesProcessedRecords = includesProcessedRecords
-        self.selectedRecordIDs = selectedRecordIDs
-    }
-
-    var primaryRecipeID: String {
-        recipeIDs.first ?? ExtractionRecipe.quoteAssetsID
-    }
-
-    var id: String {
-        let recipeKey = recipeIDs.joined(separator: "-")
-        switch range {
-        case .manual:
-            return "\(recipeKey)-manual-\(selectedRecordIDs.count)-\(selectedRecordIDs.hashValue)"
-        default:
-            return "\(recipeKey)-\(range.rawValue)-\(includesProcessedRecords)"
-        }
-    }
-
-    var recipeName: String {
-        if recipeNames.count <= 2 {
-            return recipeNames.joined(separator: "、")
-        }
-        let head = recipeNames.prefix(2).joined(separator: "、")
-        return "\(head) 等 \(recipeNames.count) 个"
-    }
-
-    func makeConfigurations() -> [AssetExtractionConfiguration] {
-        if range == .manual {
-            let base = AssetExtractionConfiguration
-                .manualSelection(ids: selectedRecordIDs)
-            return recipeIDs.map { base.applying(recipeID: $0) }
-        }
-        guard let base = range.makeConfiguration()?
-            .includingProcessedRecords(includesProcessedRecords)
-        else { return [] }
-        return recipeIDs.map { base.applying(recipeID: $0) }
-    }
-}
-
 enum AssetLibrarySheet: Identifiable {
     case candidateSources(LanguageAssetCandidateRecord)
     case resultSources(ExtractionResult)
     case candidateEditor(LanguageAssetCandidateRecord)
     case recipeEditor(ExtractionRecipe?)
     case extractionRangeSelection
-    case extractionPreview(AssetExtractionPreview, AssetExtractionPreviewContext)
-    case manualRecordSelection([HistoryRecord])
 
     var id: String {
         switch self {
@@ -224,10 +166,6 @@ enum AssetLibrarySheet: Identifiable {
             return "recipe-editor-\(recipe?.id ?? "new")"
         case .extractionRangeSelection:
             return "extraction-range-selection"
-        case .extractionPreview(_, let context):
-            return "extraction-preview-\(context.id)"
-        case .manualRecordSelection:
-            return "manual-record-selection"
         }
     }
 }
