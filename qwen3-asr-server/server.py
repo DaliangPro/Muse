@@ -48,6 +48,20 @@ class CancelToken:
 
 app = FastAPI()
 
+
+@app.middleware("http")
+async def _reject_non_local(request: Request, call_next):
+    # REPAIR_PLAN J6：本服务仅供本机 Muse 进程调用（URLSession 不带 Origin 头）。
+    # 浏览器跨站请求必带 Origin、DNS-rebinding 的 Host 非回环域——两类一律 403，
+    # 防恶意网页/本机第三方经 localhost 白嫖 GPU/LLM 推理。
+    if request.headers.get("origin") is not None:
+        return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+    host = (request.headers.get("host") or "").split(":")[0]
+    if host not in ("127.0.0.1", "localhost"):
+        return JSONResponse({"error": "invalid host"}, status_code=403)
+    return await call_next(request)
+
+
 _session = None
 _model_path = None
 _hotword_context = ""  # Hotwords as context string for transcribe()
@@ -72,6 +86,11 @@ _session_busy = False
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # REPAIR_PLAN J6：浏览器发起的 WebSocket 必带 Origin——accept 前拒绝（403 握手失败），
+    # 仅服务本机进程（HTTP middleware 不覆盖 WS，需单独设防）
+    if ws.headers.get("origin") is not None:
+        await ws.close(code=4003, reason="cross-origin rejected")
+        return
     # REPAIR_PLAN B3: 全局单 Session 不支持并发会话，同一时刻只服务一个连接
     global _session_busy
     await ws.accept()
