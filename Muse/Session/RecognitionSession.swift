@@ -179,70 +179,14 @@ actor RecognitionSession {
         state = .starting
 
         // Load credentials for selected provider
-        let config: any ASRProviderConfig
-
-        let savedConfig = await loadASRConfigOffActor(for: provider)
-        guard sessionGeneration == myGeneration, state == .starting else {
-            DebugFileLogger.log("startRecording: cancelled during ASR config load, bailing")
+        guard let config = await resolveASRConfig(provider: provider, myGeneration: myGeneration) else {
             return
         }
-
-        if provider.isLocal {
-            // Local providers: use default model directory if no saved config
-            if let savedConfig {
-                config = savedConfig
-                AppLogger.log("[Session] Loaded \(provider.rawValue) config from file store")
-            } else if let defaultConfig = SherpaASRConfig(credentials: ["modelDir": ModelManager.defaultModelsDir]) {
-                config = defaultConfig
-                AppLogger.log("[Session] Using default model directory for \(provider.rawValue)")
-            } else {
-                AppLogger.log("[Session] Failed to create default config for \(provider.rawValue)!")
-                SoundFeedback.playError()
-                state = .idle
-                onASREvent?(.error(NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("本地模型未配置", "Local model not configured")])))
-                onASREvent?(.completed)
-                return
-            }
-            // Verify required models are downloaded
-            if !ModelManager.shared.areRequiredModelsAvailable() {
-                AppLogger.log("[Session] Required local models not downloaded for \(provider.rawValue)")
-                SoundFeedback.playError()
-                state = .idle
-                onASREvent?(.error(NSError(domain: "Muse", code: -3, userInfo: [NSLocalizedDescriptionKey: L("请先下载识别模型", "Please download ASR models first")])))
-                onASREvent?(.completed)
-                return
-            }
-        } else if let savedConfig {
-            config = savedConfig
-            AppLogger.log("[Session] Loaded \(provider.rawValue) credentials from file store")
-        } else if provider == .volcano,
-                  let appKey = ProcessInfo.processInfo.environment["VOLC_APP_KEY"],
-                  let accessKey = ProcessInfo.processInfo.environment["VOLC_ACCESS_KEY"] {
-            // Env var fallback (volcano only, for dev convenience)
-            let resourceId = ProcessInfo.processInfo.environment["VOLC_RESOURCE_ID"] ?? VolcanoASRConfig.resourceIdSeedASR
-            let volcConfig = VolcanoASRConfig(credentials: [
-                "appKey": appKey, "accessKey": accessKey, "resourceId": resourceId,
-            ])!
-            try? KeychainService.saveASRCredentials(appKey: appKey, accessKey: accessKey, resourceId: resourceId)
-            config = volcConfig
-            AppLogger.log("[Session] Loaded credentials from env vars and persisted to file")
-        } else {
-            AppLogger.log("[Session] No ASR credentials found for provider=\(provider.rawValue)!")
-            SoundFeedback.playError()
-            state = .idle
-            onASREvent?(.error(NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")])))
-            onASREvent?(.completed)
-            return
-        }
-
         self.currentConfig = config
 
         guard let client = ASRProviderRegistry.createClient(for: provider) else {
             AppLogger.log("[Session] No client implementation for provider=\(provider.rawValue)")
-            SoundFeedback.playError()
-            state = .idle
-            onASREvent?(.error(NSError(domain: "Muse", code: -2, userInfo: [NSLocalizedDescriptionKey: L("\(provider.displayName) 暂不支持", "\(provider.displayName) not yet supported")])))
-            onASREvent?(.completed)
+            failStart(with: NSError(domain: "Muse", code: -2, userInfo: [NSLocalizedDescriptionKey: L("\(provider.displayName) 暂不支持", "\(provider.displayName) not yet supported")]))
             return
         }
         self.asrClient = client
@@ -295,20 +239,110 @@ actor RecognitionSession {
             }
         )
 
+        guard await startAudioCapture(client: client) else { return }
+
+        state = .recording
+        markReadyIfNeeded()
+        DebugFileLogger.log("session entered recording state (buffering, ASR connecting)")
+
+        // ── Phase 2: Connect ASR (audio is already recording) ──
+
+        guard await connectASR(
+            client: client,
+            config: config,
+            options: requestOptions,
+            hotwordCount: effectiveHotwords.words.count,
+            myGeneration: myGeneration
+        ) else { return }
+
+        // ── Phase 3: Flush buffer → switch to live pipeline ──
+
+        await activateLivePipeline(client: client, audioBuffer: audioBuffer)
+
+        await prewarmLLMIfNeeded(myGeneration: myGeneration)
+    }
+
+    // MARK: - Start Helpers（J15：startRecording ~260 行按既有三阶段拆分，纯代码搬移）
+
+    /// 启动失败共用收尾：错误音 + 回 idle + 通知 UI（error 后补 completed 收 HUD）
+    private func failStart(with error: Error) {
+        SoundFeedback.playError()
+        state = .idle
+        onASREvent?(.error(error))
+        onASREvent?(.completed)
+    }
+
+    /// 凭证/配置解析：本地引擎兜底默认模型目录并校验模型就绪；云端支持 env var 开发回退。
+    /// 返回 nil 表示已走 failStart 收尾（或代际失效静默退出）。
+    private func resolveASRConfig(
+        provider: ASRProvider,
+        myGeneration: Int
+    ) async -> (any ASRProviderConfig)? {
+        let savedConfig = await loadASRConfigOffActor(for: provider)
+        guard sessionGeneration == myGeneration, state == .starting else {
+            DebugFileLogger.log("startRecording: cancelled during ASR config load, bailing")
+            return nil
+        }
+
+        if provider.isLocal {
+            let config: any ASRProviderConfig
+            // Local providers: use default model directory if no saved config
+            if let savedConfig {
+                config = savedConfig
+                AppLogger.log("[Session] Loaded \(provider.rawValue) config from file store")
+            } else if let defaultConfig = SherpaASRConfig(credentials: ["modelDir": ModelManager.defaultModelsDir]) {
+                config = defaultConfig
+                AppLogger.log("[Session] Using default model directory for \(provider.rawValue)")
+            } else {
+                AppLogger.log("[Session] Failed to create default config for \(provider.rawValue)!")
+                failStart(with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("本地模型未配置", "Local model not configured")]))
+                return nil
+            }
+            // Verify required models are downloaded
+            if !ModelManager.shared.areRequiredModelsAvailable() {
+                AppLogger.log("[Session] Required local models not downloaded for \(provider.rawValue)")
+                failStart(with: NSError(domain: "Muse", code: -3, userInfo: [NSLocalizedDescriptionKey: L("请先下载识别模型", "Please download ASR models first")]))
+                return nil
+            }
+            return config
+        }
+
+        if let savedConfig {
+            AppLogger.log("[Session] Loaded \(provider.rawValue) credentials from file store")
+            return savedConfig
+        }
+
+        if provider == .volcano,
+           let appKey = ProcessInfo.processInfo.environment["VOLC_APP_KEY"],
+           let accessKey = ProcessInfo.processInfo.environment["VOLC_ACCESS_KEY"] {
+            // Env var fallback (volcano only, for dev convenience)
+            let resourceId = ProcessInfo.processInfo.environment["VOLC_RESOURCE_ID"] ?? VolcanoASRConfig.resourceIdSeedASR
+            let volcConfig = VolcanoASRConfig(credentials: [
+                "appKey": appKey, "accessKey": accessKey, "resourceId": resourceId,
+            ])!
+            try? KeychainService.saveASRCredentials(appKey: appKey, accessKey: accessKey, resourceId: resourceId)
+            AppLogger.log("[Session] Loaded credentials from env vars and persisted to file")
+            return volcConfig
+        }
+
+        AppLogger.log("[Session] No ASR credentials found for provider=\(provider.rawValue)!")
+        failStart(with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")]))
+        return nil
+    }
+
+    /// Phase 1 收尾：麦克风权限 + 音频引擎启动。失败时清理客户端并 failStart。
+    private func startAudioCapture(client: any SpeechRecognizer) async -> Bool {
         DebugFileLogger.log("microphone permission check start")
         if !PermissionManager.hasMicrophonePermission {
             let granted = await PermissionManager.requestMicrophonePermission()
             guard granted else {
                 AppLogger.log("[Session] Microphone permission denied")
                 DebugFileLogger.log("microphone permission denied before audio start")
-                SoundFeedback.playError()
                 await client.disconnect()
                 self.asrClient = nil
                 audioEngine.clearAudioHandlers()
-                state = .idle
-                onASREvent?(.error(AudioCaptureError.microphonePermissionDenied))
-                onASREvent?(.completed)
-                return
+                failStart(with: AudioCaptureError.microphonePermissionDenied)
+                return false
             }
         }
         DebugFileLogger.log("microphone permission check done")
@@ -317,28 +351,30 @@ actor RecognitionSession {
             try audioEngine.start()
             AppLogger.log("[Session] Audio engine started OK")
             DebugFileLogger.log("audio engine started OK")
+            return true
         } catch {
             AppLogger.log("[Session] Audio engine start FAILED: \(String(describing: error))")
             DebugFileLogger.log("audio engine start failed: \(String(describing: error))")
-            SoundFeedback.playError()
             await client.disconnect()
             self.asrClient = nil
-            state = .idle
-            onASREvent?(.error(error))
-            onASREvent?(.completed)
-            return
+            failStart(with: error)
+            return false
         }
+    }
 
-        state = .recording
-        markReadyIfNeeded()
-        DebugFileLogger.log("session entered recording state (buffering, ASR connecting)")
-
-        // ── Phase 2: Connect ASR (audio is already recording) ──
-
+    /// Phase 2：连接 ASR。失败时区分「用户已取消/被顶替」（静默清理）与真失败（报错收尾）。
+    private func connectASR(
+        client: any SpeechRecognizer,
+        config: any ASRProviderConfig,
+        options requestOptions: ASRRequestOptions,
+        hotwordCount: Int,
+        myGeneration: Int
+    ) async -> Bool {
+        let provider = activeProvider
         do {
             DebugFileLogger.log("ASR connecting provider=\(provider.rawValue)")
             try await client.connect(config: config, options: requestOptions)
-            AppLogger.log("[Session] ASR connected OK (streaming, hotwords=\(effectiveHotwords.words.count), history=\(requestOptions.contextHistoryLength))")
+            AppLogger.log("[Session] ASR connected OK (streaming, hotwords=\(hotwordCount), history=\(requestOptions.contextHistoryLength))")
             DebugFileLogger.log("ASR connected OK provider=\(provider.rawValue)")
         } catch {
             AppLogger.log("[Session] ASR connect FAILED provider=\(provider.rawValue) error=\(String(describing: error))")
@@ -354,14 +390,11 @@ actor RecognitionSession {
             guard sessionGeneration == myGeneration, state == .recording else {
                 DebugFileLogger.log("ASR connect failed after cancel/supersede, suppressed (gen=\(myGeneration) current=\(sessionGeneration) state=\(state))")
                 if state == .recording { state = .idle }
-                return
+                return false
             }
 
-            state = .idle
-            SoundFeedback.playError()
-            onASREvent?(.error(error))
-            onASREvent?(.completed)
-            return
+            failStart(with: error)
+            return false
         }
 
         // Bail out if session was superseded or user stopped while we were connecting
@@ -369,11 +402,16 @@ actor RecognitionSession {
             DebugFileLogger.log("startRecording: zombie or state change after connect (gen=\(myGeneration) current=\(sessionGeneration) state=\(state)), bailing")
             await client.disconnect()
             self.asrClient = nil
-            return
+            return false
         }
+        return true
+    }
 
-        // ── Phase 3: Flush buffer → switch to live pipeline ──
-
+    /// Phase 3：事件消费任务 + 缓冲冲刷 → 切换到实时上传管线
+    private func activateLivePipeline(
+        client: any SpeechRecognizer,
+        audioBuffer: AudioChunkBuffer
+    ) async {
         let events = await client.events
         let expectedGeneration = sessionGeneration
         eventConsumptionTask = Task { [weak self] in
@@ -404,18 +442,19 @@ actor RecognitionSession {
         }
 
         DebugFileLogger.log("ASR pipeline live, flushed \(bufferedChunks.count) buffered chunks")
+    }
 
-        // Pre-warm LLM connection for modes with post-processing
-        if !currentMode.prompt.isEmpty {
-            let llmConfig = await loadLLMConfigOffActor()
-            guard sessionGeneration == myGeneration, state == .recording else {
-                DebugFileLogger.log("startRecording: cancelled during LLM prewarm config load, bailing")
-                return
-            }
-            if let llmConfig {
-                let client = currentLLMClient()
-                Task { await client.warmUp(baseURL: llmConfig.baseURL) }
-            }
+    /// Pre-warm LLM connection for modes with post-processing
+    private func prewarmLLMIfNeeded(myGeneration: Int) async {
+        guard !currentMode.prompt.isEmpty else { return }
+        let llmConfig = await loadLLMConfigOffActor()
+        guard sessionGeneration == myGeneration, state == .recording else {
+            DebugFileLogger.log("startRecording: cancelled during LLM prewarm config load, bailing")
+            return
+        }
+        if let llmConfig {
+            let client = currentLLMClient()
+            Task { await client.warmUp(baseURL: llmConfig.baseURL) }
         }
     }
 
