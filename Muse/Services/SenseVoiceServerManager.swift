@@ -18,7 +18,10 @@ actor SenseVoiceServerManager {
     nonisolated static func killAllServerProcesses() {
         if let content = try? String(contentsOf: pidFileURL, encoding: .utf8) {
             for line in content.split(separator: "\n") {
-                if let pid = Int32(line.trimmingCharacters(in: .whitespaces)), pid > 0 {
+                // REPAIR_PLAN J9：kill 前 kill(pid,0) 探活（对齐 killOrphanedServers），
+                // 避免 PID 文件残留的号码被系统复用给无关进程后误杀
+                if let pid = Int32(line.trimmingCharacters(in: .whitespaces)), pid > 0,
+                   kill(pid, 0) == 0 {
                     kill(pid, SIGTERM)
                 }
             }
@@ -188,6 +191,9 @@ actor SenseVoiceServerManager {
             }
         }
         self.stdoutPipe = pipe
+        proc.terminationHandler = { [weak self] p in
+            Task { await self?.handleUnexpectedExit(of: p, label: "sensevoice-server") }
+        }
 
         logger.info("Starting SenseVoice server: \(proc.executableURL?.path ?? "?")")
 
@@ -202,6 +208,7 @@ actor SenseVoiceServerManager {
         // SenseVoice model loading via PyTorch/FunASR is slow (~2 min), needs generous timeout
         let portResult = await readPortFromStdout(pipe: pipe, timeout: 180)
         guard let discoveredPort = portResult else {
+            detachPipeHandlers(of: proc)
             proc.terminate()
             self.process = nil
             throw ServerError.portDiscoveryFailed
@@ -247,6 +254,9 @@ actor SenseVoiceServerManager {
             }
         }
         self.qwen3StdoutPipe = pipe
+        proc.terminationHandler = { [weak self] p in
+            Task { await self?.handleUnexpectedExit(of: p, label: "qwen3-asr-server") }
+        }
 
         logger.info("Starting Qwen3-ASR server: \(proc.executableURL?.path ?? "?")")
 
@@ -260,6 +270,7 @@ actor SenseVoiceServerManager {
 
         let portResult = await readPortFromStdout(pipe: pipe, timeout: 120)
         guard let discoveredPort = portResult else {
+            detachPipeHandlers(of: proc)
             proc.terminate()
             self.qwen3Process = nil
             throw ServerError.portDiscoveryFailed
@@ -296,6 +307,7 @@ actor SenseVoiceServerManager {
 
     /// Stop the SenseVoice server independently.
     func stopSenseVoice() {
+        detachPipeHandlers(of: process)
         if let proc = process, proc.isRunning {
             proc.terminate()
         }
@@ -316,6 +328,7 @@ actor SenseVoiceServerManager {
 
     /// Stop the Qwen3-ASR server independently (e.g. when user disables verification).
     func stopQwen3() {
+        detachPipeHandlers(of: qwen3Process)
         if let proc = qwen3Process, proc.isRunning {
             proc.terminate()
         }
@@ -330,6 +343,7 @@ actor SenseVoiceServerManager {
 
     /// Stop all server processes.
     func stop() {
+        detachPipeHandlers(of: process)
         if let proc = process, proc.isRunning {
             proc.terminate()
         }
@@ -338,6 +352,7 @@ actor SenseVoiceServerManager {
         Self.currentPort = nil
         stdoutPipe = nil
 
+        detachPipeHandlers(of: qwen3Process)
         if let proc = qwen3Process, proc.isRunning {
             proc.terminate()
         }
@@ -618,6 +633,39 @@ actor SenseVoiceServerManager {
     /// 端口发现完成后给 stdout 装持续排空 handler（与 stderr 一致），把运行期日志喂给
     /// DebugFileLogger。否则 Python server 运行期的 print 会写满管道缓冲（约 64KB），阻塞在
     /// print() 上而拖死 ASR/LLM 引擎。须在 readPortFromStdout 读循环退出后调用，避免两者争抢句柄。
+    /// REPAIR_PLAN J9：进程收尾时摘除管道读 handler——handler 挂着的 dispatch source
+    /// 会钉住已关闭的 FD，热词变更等频繁重启会累积泄漏句柄与 source。
+    private func detachPipeHandlers(of proc: Process?) {
+        (proc?.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        (proc?.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+    }
+
+    /// REPAIR_PLAN J9：感知服务进程意外退出——此前无 terminationHandler，Python 崩溃后
+    /// App 仍以为服务在运行，ASR/LLM 静默不可用。主动 stop/重启会先把属性换掉，
+    /// 回调进 actor 时进程已不在册即忽略；仍在册说明是意外退出，清理在册状态留痕。
+    /// 不做自动重启（避免崩溃风暴），下次识别/健康探测会走正常启动路径。
+    private func handleUnexpectedExit(of proc: Process, label: String) {
+        if proc === process {
+            logger.error("\(label) exited unexpectedly (status \(proc.terminationStatus))")
+            DebugFileLogger.log("\(label) exited unexpectedly status=\(proc.terminationStatus)")
+            detachPipeHandlers(of: proc)
+            process = nil
+            port = nil
+            Self.currentPort = nil
+            stdoutPipe = nil
+            savePidsToFile()
+        } else if proc === qwen3Process {
+            logger.error("\(label) exited unexpectedly (status \(proc.terminationStatus))")
+            DebugFileLogger.log("\(label) exited unexpectedly status=\(proc.terminationStatus)")
+            detachPipeHandlers(of: proc)
+            qwen3Process = nil
+            qwen3Port = nil
+            Self.currentQwen3Port = nil
+            qwen3StdoutPipe = nil
+            savePidsToFile()
+        }
+    }
+
     private func drainStdout(pipe: Pipe, label: String) {
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData

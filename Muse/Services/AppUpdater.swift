@@ -189,6 +189,13 @@ final class AppUpdater {
             onComplete: { [weak self] fileURL, _, error in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    // REPAIR_PLAN J9：下载生命周期终点统一回收会话——URLSession 强持
+                    // delegate 直到 invalidate，此前成功路径从不回收，每次下载泄漏一对
+                    // session+delegate（用户主动取消由 cancelDownload 的 invalidateAndCancel 负责，
+                    // 届时 downloadSession 已为 nil，这里的空调用无害）。
+                    self.downloadSession?.finishTasksAndInvalidate()
+                    self.downloadSession = nil
+                    self.downloadTask = nil
                     if let error {
                         self.handleDownloadError(error)
                         return
