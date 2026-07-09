@@ -20,6 +20,8 @@ enum LanguageAssetStoreError: Error, LocalizedError {
 }
 
 actor LanguageAssetStore {
+    /// ISO8601 编解码器复用（J15：原先查询/写入每次新分配，行级 decode 循环内尤其浪费）
+    private let iso = ISO8601DateFormatter()
 
     private var db: OpaquePointer?
 
@@ -62,7 +64,6 @@ actor LanguageAssetStore {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
 
-        let iso = ISO8601DateFormatter()
         SQL.bind(stmt, 1, job.id)
         SQL.bind(stmt, 2, iso.string(from: job.createdAt))
         SQL.bindOptional(stmt, 3, job.startedAt.map { iso.string(from: $0) })
@@ -113,7 +114,6 @@ actor LanguageAssetStore {
         (id, created_at, updated_at, name, description, goal_prompt, output_kind, processing_strategy, source_policy, output_schema, quality_rules, save_rule, ignore_rule, destination, is_built_in, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
-        let iso = ISO8601DateFormatter()
 
         for recipe in recipes {
             var stmt: OpaquePointer?
@@ -203,7 +203,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
-        SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
+        SQL.bind(stmt, 2, iso.string(from: Date()))
         SQL.bind(stmt, 3, id)
 
         if stepSingleWrite(stmt) {
@@ -221,7 +221,6 @@ actor LanguageAssetStore {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
 
-        let iso = ISO8601DateFormatter()
         SQL.bind(stmt, 1, run.id)
         SQL.bind(stmt, 2, run.recipeID)
         SQL.bind(stmt, 3, run.recipeName)
@@ -311,7 +310,6 @@ actor LanguageAssetStore {
         """
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let iso = ISO8601DateFormatter()
 
         for result in results {
             var stmt: OpaquePointer?
@@ -397,7 +395,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
-        SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
+        SQL.bind(stmt, 2, iso.string(from: Date()))
         SQL.bind(stmt, 3, id)
 
         if stepSingleWrite(stmt) {
@@ -416,7 +414,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int(stmt, 1, isFavorite ? 1 : 0)
-        SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
+        SQL.bind(stmt, 2, iso.string(from: Date()))
         SQL.bind(stmt, 3, id)
 
         if stepSingleWrite(stmt) {
@@ -457,7 +455,6 @@ actor LanguageAssetStore {
             actionType: actionType,
             detail: detail
         )
-        let iso = ISO8601DateFormatter()
         SQL.bind(stmt, 1, log.id)
         SQL.bind(stmt, 2, iso.string(from: log.createdAt))
         SQL.bindOptional(stmt, 3, log.assetID)
@@ -497,7 +494,6 @@ actor LanguageAssetStore {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let iso = ISO8601DateFormatter()
 
         for asset in assets {
             var stmt: OpaquePointer?
@@ -564,7 +560,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int(stmt, 1, isFavorite ? 1 : 0)
-        SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
+        SQL.bind(stmt, 2, iso.string(from: Date()))
         SQL.bind(stmt, 3, id)
 
         if stepSingleWrite(stmt) {
@@ -583,7 +579,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, LanguageAssetStatus.deleted.rawValue)
-        SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
+        SQL.bind(stmt, 2, iso.string(from: Date()))
         SQL.bind(stmt, 3, id)
 
         if stepSingleWrite(stmt) {
@@ -621,7 +617,6 @@ actor LanguageAssetStore {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let iso = ISO8601DateFormatter()
 
         for candidate in candidates {
             var stmt: OpaquePointer?
@@ -780,7 +775,7 @@ actor LanguageAssetStore {
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
-        SQL.bind(stmt, 2, ISO8601DateFormatter().string(from: Date()))
+        SQL.bind(stmt, 2, iso.string(from: Date()))
         SQL.bind(stmt, 3, id)
 
         try stepDone(stmt, in: db)
@@ -811,7 +806,7 @@ actor LanguageAssetStore {
     /// 总量超 1000 条时裁剪最旧的，待审候选永不动
     func pruneFinishedCandidates(olderThanDays: Int = 90, keepingAtMost: Int = 1000) {
         let cutoff = Calendar.current.date(byAdding: .day, value: -olderThanDays, to: Date()) ?? Date()
-        let cutoffString = ISO8601DateFormatter().string(from: cutoff)
+        let cutoffString = iso.string(from: cutoff)
         // REPAIR_PLAN J3：裁剪失败留痕——静默失败会让候选表无限增长且无迹可查
         if sqlite3_exec(
             db,
@@ -1162,7 +1157,6 @@ actor LanguageAssetStore {
     }
 
     private func decodeJob(from stmt: OpaquePointer?) -> AssetExtractionJob? {
-        let iso = ISO8601DateFormatter()
         guard let rangeType = AssetExtractionRangeType(rawValue: SQL.column(stmt, 4)),
               let status = AssetExtractionJobStatus(rawValue: SQL.column(stmt, 7))
         else { return nil }
@@ -1182,7 +1176,6 @@ actor LanguageAssetStore {
     }
 
     private func decodeRecipe(from stmt: OpaquePointer?) -> ExtractionRecipe? {
-        let iso = ISO8601DateFormatter()
         guard let outputKind = ExtractionOutputKind(rawValue: SQL.column(stmt, 6)),
               let processingStrategy = ExtractionProcessingStrategy(rawValue: SQL.column(stmt, 7)),
               let sourcePolicy = ExtractionSourcePolicy(rawValue: SQL.column(stmt, 8)),
@@ -1211,7 +1204,6 @@ actor LanguageAssetStore {
     }
 
     private func decodeRun(from stmt: OpaquePointer?) -> ExtractionRun? {
-        let iso = ISO8601DateFormatter()
         guard let rangeType = AssetExtractionRangeType(rawValue: SQL.column(stmt, 6)),
               let status = ExtractionRunStatus(rawValue: SQL.column(stmt, 9))
         else { return nil }
@@ -1234,7 +1226,6 @@ actor LanguageAssetStore {
     }
 
     private func decodeResult(from stmt: OpaquePointer?) -> ExtractionResult? {
-        let iso = ISO8601DateFormatter()
         guard let outputKind = ExtractionOutputKind(rawValue: SQL.column(stmt, 5)),
               let sourceRecordIDs = decodeJSONString([String].self, from: SQL.column(stmt, 10)),
               let status = ExtractionResultStatus(rawValue: SQL.column(stmt, 12))
@@ -1261,7 +1252,6 @@ actor LanguageAssetStore {
     }
 
     private func decodeAsset(from stmt: OpaquePointer?) -> LanguageAsset? {
-        let iso = ISO8601DateFormatter()
         guard let assetType = LanguageAssetType(rawValue: SQL.column(stmt, 3)),
               let status = LanguageAssetStatus(rawValue: SQL.column(stmt, 17)),
               let scenes = decodeJSONString([String].self, from: SQL.column(stmt, 9)),
@@ -1293,7 +1283,6 @@ actor LanguageAssetStore {
     }
 
     private func decodeCandidate(from stmt: OpaquePointer?) -> LanguageAssetCandidateRecord? {
-        let iso = ISO8601DateFormatter()
         guard let assetType = LanguageAssetType(rawValue: SQL.column(stmt, 3)),
               let grade = LanguageAssetGrade(rawValue: SQL.column(stmt, 4)),
               let scenes = decodeJSONString([String].self, from: SQL.column(stmt, 9)),
