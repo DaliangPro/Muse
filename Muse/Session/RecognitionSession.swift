@@ -239,7 +239,7 @@ actor RecognitionSession {
             }
         )
 
-        guard await startAudioCapture(client: client) else { return }
+        guard await startAudioCapture(client: client, myGeneration: myGeneration) else { return }
 
         state = .recording
         markReadyIfNeeded()
@@ -331,7 +331,7 @@ actor RecognitionSession {
     }
 
     /// Phase 1 收尾：麦克风权限 + 音频引擎启动。失败时清理客户端并 failStart。
-    private func startAudioCapture(client: any SpeechRecognizer) async -> Bool {
+    private func startAudioCapture(client: any SpeechRecognizer, myGeneration: Int) async -> Bool {
         DebugFileLogger.log("microphone permission check start")
         if !PermissionManager.hasMicrophonePermission {
             let granted = await PermissionManager.requestMicrophonePermission()
@@ -347,14 +347,26 @@ actor RecognitionSession {
         }
         DebugFileLogger.log("microphone permission check done")
 
+        let audioStartT0 = ContinuousClock.now
+        DebugFileLogger.log("audio engine start begin")
         do {
-            try audioEngine.start()
+            try await audioEngine.start()
+            guard sessionGeneration == myGeneration, state == .starting else {
+                DebugFileLogger.log("audio engine start completed after cancel/supersede; stopping capture")
+                audioEngine.stop()
+                audioEngine.clearAudioHandlers()
+                return false
+            }
             AppLogger.log("[Session] Audio engine started OK")
-            DebugFileLogger.log("audio engine started OK")
+            DebugFileLogger.log("audio engine started OK +\(ContinuousClock.now - audioStartT0)")
             return true
         } catch {
+            guard sessionGeneration == myGeneration, state == .starting else {
+                DebugFileLogger.log("audio engine start failed after cancel/supersede, suppressed: \(String(describing: error))")
+                return false
+            }
             AppLogger.log("[Session] Audio engine start FAILED: \(String(describing: error))")
-            DebugFileLogger.log("audio engine start failed: \(String(describing: error))")
+            DebugFileLogger.log("audio engine start failed +\(ContinuousClock.now - audioStartT0): \(String(describing: error))")
             await client.disconnect()
             self.asrClient = nil
             failStart(with: error)

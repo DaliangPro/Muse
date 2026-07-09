@@ -4,6 +4,9 @@ enum AudioCaptureError: Error, LocalizedError {
     case converterCreationFailed
     case microphonePermissionDenied
     case noInputDevice
+    case startTimedOut
+    case startCancelled
+    case systemStartFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -13,7 +16,30 @@ enum AudioCaptureError: Error, LocalizedError {
             return L("未授予麦克风权限", "Microphone permission not granted")
         case .noInputDevice:
             return L("找不到麦克风", "No microphone found")
+        case .startTimedOut:
+            return L("录音启动超时，请再试一次", "Recording startup timed out. Please try again.")
+        case .startCancelled:
+            return L("录音启动已取消", "Recording startup was cancelled.")
+        case .systemStartFailed:
+            return L("录音启动失败", "Failed to start recording")
         }
+    }
+}
+
+struct AudioCaptureStartState: Sendable {
+    private(set) var generation = 0
+
+    mutating func nextToken() -> Int {
+        generation &+= 1
+        return generation
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+    }
+
+    func isCurrent(_ token: Int) -> Bool {
+        token == generation
     }
 }
 
@@ -98,6 +124,15 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     private let outputQueueTag: UInt8 = 1
     private var activeOutput: AVCaptureAudioDataOutput?
     private var levelCounter = 0
+    private var startState = AudioCaptureStartState()
+
+    private enum StartOutcome: Sendable {
+        case success
+        case cancelled
+        case converterCreationFailed
+        case noInputDevice
+        case failed(String)
+    }
 
     // MARK: - Warm-up
 
@@ -142,7 +177,36 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
     // MARK: - Start / Stop
 
-    func start() throws {
+    func start(timeout: Duration = .seconds(2)) async throws {
+        let token = try prepareStart()
+
+        let result: TimedValue<StartOutcome> = await AsyncTimeout.value(timeout) {
+            self.startWithAVCapture(token: token)
+        }
+
+        if result.timedOut {
+            invalidateStart(token)
+            DebugFileLogger.log("audio engine start timeout after \(timeout)")
+            throw AudioCaptureError.startTimedOut
+        }
+
+        switch result.value {
+        case .success:
+            return
+        case .cancelled:
+            throw AudioCaptureError.startCancelled
+        case .converterCreationFailed:
+            throw AudioCaptureError.converterCreationFailed
+        case .noInputDevice:
+            throw AudioCaptureError.noInputDevice
+        case .failed(let message):
+            throw AudioCaptureError.systemStartFailed(message)
+        case .none:
+            throw AudioCaptureError.startTimedOut
+        }
+    }
+
+    private func prepareStart() throws -> Int {
         let authStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         guard authStatus == .authorized else {
             throw AudioCaptureError.microphonePermissionDenied
@@ -156,48 +220,74 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         bufferLock.unlock()
         converter = nil
 
-        try startWithAVCapture()
+        return stateLock.withLock {
+            startState.nextToken()
+        }
     }
 
-    private func startWithAVCapture() throws {
+    private func invalidateStart(_ token: Int) {
+        stateLock.withLock {
+            guard startState.isCurrent(token) else { return }
+            startState.invalidate()
+        }
+    }
+
+    private func startWithAVCapture(token: Int) -> StartOutcome {
         let session = AVCaptureSession()
 
         guard let device = AVCaptureDevice.default(for: .audio) else {
-            throw AudioCaptureError.noInputDevice
+            return .noInputDevice
         }
 
-        let input = try AVCaptureDeviceInput(device: device)
+        let input: AVCaptureDeviceInput
+        do {
+            input = try AVCaptureDeviceInput(device: device)
+        } catch {
+            return .failed(String(describing: error))
+        }
         guard session.canAddInput(input) else {
-            throw AudioCaptureError.converterCreationFailed
+            return .converterCreationFailed
         }
         session.addInput(input)
 
         let output = AVCaptureAudioDataOutput()
         output.setSampleBufferDelegate(self, queue: outputQueue)
         guard session.canAddOutput(output) else {
-            throw AudioCaptureError.converterCreationFailed
+            output.setSampleBufferDelegate(nil, queue: nil)
+            return .converterCreationFailed
         }
         session.addOutput(output)
-        stateLock.withLock {
-            activeOutput = output
-        }
 
         session.startRunning()
-        captureSession = session
-        stateLock.withLock { isWarmedUp = true }
+        let accepted = stateLock.withLock { () -> Bool in
+            guard startState.isCurrent(token) else { return false }
+            captureSession = session
+            activeOutput = output
+            isWarmedUp = true
+            return true
+        }
+        guard accepted else {
+            output.setSampleBufferDelegate(nil, queue: nil)
+            session.stopRunning()
+            DebugFileLogger.log("audio engine late start discarded token=\(token)")
+            return .cancelled
+        }
         AppLogger.log("[Audio] Capture session started (AVCapture), device: \(device.localizedName)")
+        return .success
     }
 
     func stop() {
-        captureSession?.stopRunning()
-        drainOutputQueue()
-        let output = stateLock.withLock { () -> AVCaptureAudioDataOutput? in
-            let current = activeOutput
+        let current = stateLock.withLock { () -> (AVCaptureSession?, AVCaptureAudioDataOutput?) in
+            startState.invalidate()
+            let session = captureSession
+            let output = activeOutput
+            captureSession = nil
             activeOutput = nil
-            return current
+            return (session, output)
         }
-        output?.setSampleBufferDelegate(nil, queue: nil)
-        captureSession = nil
+        current.0?.stopRunning()
+        drainOutputQueue()
+        current.1?.setSampleBufferDelegate(nil, queue: nil)
         flushRemaining()
         bufferLock.lock()
         converter = nil

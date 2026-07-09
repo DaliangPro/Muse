@@ -46,4 +46,20 @@ final class AudioCaptureEngineTests: XCTestCase {
         XCTAssertEqual(received, 3)
         XCTAssertTrue(engine.getRecordedAudio().isEmpty)
     }
+
+    // MARK: - REPAIR_PLAN J21
+
+    func testStartStateInvalidatesLateStarts() {
+        var state = AudioCaptureStartState()
+
+        let first = state.nextToken()
+        XCTAssertTrue(state.isCurrent(first))
+
+        state.invalidate()
+        XCTAssertFalse(state.isCurrent(first))
+
+        let second = state.nextToken()
+        XCTAssertTrue(state.isCurrent(second))
+        XCTAssertFalse(state.isCurrent(first))
+    }
 }
