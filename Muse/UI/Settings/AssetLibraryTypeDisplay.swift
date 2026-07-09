@@ -29,7 +29,7 @@ extension LanguageAssetType {
         case .framework:
             return TF.settingsAccentBlue
         case .caseMaterial:
-            return Color(red: 120 / 255, green: 132 / 255, blue: 154 / 255)
+            return TF.settingsAccentSlate
         case .quote:
             return TF.settingsAccentRed
         case .term:

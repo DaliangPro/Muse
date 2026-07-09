@@ -36,6 +36,12 @@ enum TF {
         dark:  (0.83, 0.57, 0.24)
     )
 
+    /// 琥珀实底上的墨色文字（如向导页「去授权」胶囊）：底色明暗恒定，墨色不随主题翻转
+    static let amberInk = adaptiveColor(
+        light: (0.22, 0.14, 0.02),
+        dark:  (0.22, 0.14, 0.02)
+    )
+
     /// Recording active: warm red-orange, urgent but not alarming
     static let recording = adaptiveColor(
         light: (0.84, 0.34, 0.27),
@@ -282,6 +288,11 @@ enum TF {
         light: (0.290, 0.482, 0.796),
         dark:  (0.470, 0.620, 0.900)
     )
+    /// 蓝灰强调（案例素材等中性分类）：原为写死的单值灰，深色模式下提亮保持对比
+    static let settingsAccentSlate = adaptiveColor(
+        light: (0.471, 0.518, 0.604),
+        dark:  (0.560, 0.610, 0.700)
+    )
     static let settingsSwitchOnFill = adaptiveColor(
         light: (0.245, 0.455, 0.860),
         dark:  (0.220, 0.415, 0.820)
@@ -350,6 +361,9 @@ enum TF {
     static let settingsFontIconSmall = Font.system(size: 9, weight: .medium)
     static let settingsFontIconBody = Font.system(size: 11, weight: .light)
     static let settingsFontIconControl = Font.system(size: 13, weight: .light)
+    // 向导页大图标两档（权限行图标 / 翻页箭头），原为就地写死字号
+    static let settingsFontIconLarge = Font.system(size: 17, weight: .light)
+    static let settingsFontIconHero = Font.system(size: 27, weight: .light)
 
     // MARK: HUD Typography
     // 悬浮条字体（调试预览窗 HUDDebugPreviewWindow 不在此列）

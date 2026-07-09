@@ -218,7 +218,7 @@ struct SetupWizardView: View {
     private func permissionInline(icon: String, title: String, granted: Bool, action: @escaping () -> Void) -> some View {
         HStack(spacing: 10) {
             Image(systemName: icon)
-                .font(.system(size: 17, weight: .light))
+                .font(TF.settingsFontIconLarge)
                 .foregroundStyle(TF.settingsTextSecondary)
 
             Text(title)
@@ -236,7 +236,7 @@ struct SetupWizardView: View {
                 Button(action: action) {
                     Text(L("去授权", "Grant"))
                         .font(TF.settingsFontMetadata)
-                        .foregroundStyle(Color(red: 0.22, green: 0.14, blue: 0.02))
+                        .foregroundStyle(TF.amberInk)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 5)
                         .background(Capsule().fill(TF.amber))
@@ -392,7 +392,7 @@ private struct SetupEdgeArrow: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 27, weight: .light))
+                .font(TF.settingsFontIconHero)
                 .foregroundStyle(isHovered ? TF.settingsText : TF.settingsTextTertiary.opacity(0.75))
                 // 热区比线条大一圈；悬停微放大，给「灵动」的活性
                 .frame(width: 44, height: 88)
