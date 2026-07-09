@@ -324,23 +324,33 @@ struct SettingsIconButton: View {
 
 /// Inline remove affordance inside a chip/tag. It is clickable but should not
 /// render as a standalone button.
+/// J15：加 font/hitSize 参数后同时覆盖常用词规则行的裸叉号删除键（原独立重复实现）。
 struct SettingsInlineRemoveButton: View {
     let accessibilityLabel: String
+    let font: Font
+    let hitSize: CGFloat
     let action: () -> Void
 
     @State private var isHovered = false
 
-    init(accessibilityLabel: String = L("移除", "Remove"), action: @escaping () -> Void) {
+    init(
+        accessibilityLabel: String = L("移除", "Remove"),
+        font: Font = TF.settingsFontIconMicro,
+        hitSize: CGFloat = 10,
+        action: @escaping () -> Void
+    ) {
         self.accessibilityLabel = accessibilityLabel
+        self.font = font
+        self.hitSize = hitSize
         self.action = action
     }
 
     var body: some View {
         Button(action: action) {
             Image(systemName: "xmark")
-                .font(TF.settingsFontIconMicro)
+                .font(font)
                 .foregroundStyle(isHovered ? TF.settingsAccentRed : TF.settingsTextTertiary)
-                .frame(width: 10, height: 10)
+                .frame(width: hitSize, height: hitSize)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

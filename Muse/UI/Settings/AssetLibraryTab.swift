@@ -472,46 +472,46 @@ private extension AssetLibraryTab {
     }
 
     func copyAsset(_ asset: LanguageAsset) {
-        let title = asset.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let payload = !title.isEmpty && title != asset.content
-            ? "\(title)\n\(asset.content)"
-            : asset.content
-
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(payload, forType: .string)
-        copiedAssetID = asset.id
-        logAction(
-            assetID: asset.id,
-            actionType: .copied,
-            detail: L("复制了 1 条 \(asset.assetType.settingsDisplayTitle)", "Copied 1 \(asset.assetType.settingsDisplayTitle)")
+        copyToPasteboard(
+            id: asset.id,
+            title: asset.title,
+            content: asset.content,
+            logAssetID: asset.id,
+            logDetail: L("复制了 1 条 \(asset.assetType.settingsDisplayTitle)", "Copied 1 \(asset.assetType.settingsDisplayTitle)")
         )
-
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1.2))
-            if copiedAssetID == asset.id {
-                copiedAssetID = nil
-            }
-        }
     }
 
     func copyResult(_ result: ExtractionResult) {
-        let title = result.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let payload = !title.isEmpty && title != result.content
-            ? "\(title)\n\(result.content)"
-            : result.content
+        copyToPasteboard(
+            id: result.id,
+            title: result.title,
+            content: result.content,
+            logAssetID: nil,
+            logDetail: L("复制了 1 条「\(recipeDisplayName(result.recipeID))」产物", "Copied 1 \(recipeDisplayName(result.recipeID)) result")
+        )
+    }
+
+    /// 资产与产物复制共用：标题非空且异于正文时带标题行；1.2s 后清「已复制」态
+    private func copyToPasteboard(
+        id: String,
+        title: String?,
+        content: String,
+        logAssetID: String?,
+        logDetail: String
+    ) {
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let payload = !trimmedTitle.isEmpty && trimmedTitle != content
+            ? "\(trimmedTitle)\n\(content)"
+            : content
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(payload, forType: .string)
-        copiedAssetID = result.id
-        logAction(
-            assetID: nil,
-            actionType: .copied,
-            detail: L("复制了 1 条「\(recipeDisplayName(result.recipeID))」产物", "Copied 1 \(recipeDisplayName(result.recipeID)) result")
-        )
+        copiedAssetID = id
+        logAction(assetID: logAssetID, actionType: .copied, detail: logDetail)
 
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.2))
-            if copiedAssetID == result.id {
+            if copiedAssetID == id {
                 copiedAssetID = nil
             }
         }

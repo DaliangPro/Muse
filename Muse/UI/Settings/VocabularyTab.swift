@@ -607,7 +607,12 @@ private struct VocabularyRuleRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                MinimalRuleDeleteButton(action: onDelete)
+                SettingsInlineRemoveButton(
+                    accessibilityLabel: L("删除", "Delete"),
+                    font: TF.settingsFontIconSmall,
+                    hitSize: 20,
+                    action: onDelete
+                )
                 .opacity(isHovered || isSelected ? 1 : 0.70)
                 .frame(width: VocabularySettingsStyle.ruleActionsColumnWidth, alignment: .trailing)
             }
@@ -648,34 +653,6 @@ private struct VocabularyRuleRow: View {
 
     private var hiddenTriggerCount: Int {
         max(displayTriggers.count - VocabularySettingsStyle.visibleTriggerLimit, 0)
-    }
-}
-
-private struct MinimalRuleDeleteButton: View {
-    let action: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: "xmark")
-                .font(TF.settingsFontIconSmall)
-                .foregroundStyle(isHovered ? TF.settingsAccentRed : TF.settingsTextTertiary)
-                .frame(width: 20, height: 20)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(L("删除", "Delete"))
-        .accessibilityLabel(L("删除", "Delete"))
-        .onHover { isHovered = $0 }
-        .onContinuousHover { phase in
-            switch phase {
-            case .active:
-                isHovered = true
-            case .ended:
-                isHovered = false
-            }
-        }
     }
 }
 
