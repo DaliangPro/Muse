@@ -753,13 +753,16 @@ actor AssetExtractionService {
         }
     }
 
+    /// 可进提炼的 history 状态：识别文本本身有效即可，注入结局（仅复制/没找到输入位置）不影响
+    private static let extractableStatuses: Set<String> = ["completed", "copied_only", "no_input_target"]
+
     private func candidateRecords(
         from records: [HistoryRecord],
         configuration: AssetExtractionConfiguration,
         applyLimit: Bool = true
     ) -> (records: [HistoryRecord], truncatedCount: Int) {
         let filtered = records.filter { record in
-            guard record.status == "completed" else { return false }
+            guard Self.extractableStatuses.contains(record.status) else { return false }
             let text = record.finalText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return false }
             guard !configuration.enablesCandidateFiltering || text.count >= configuration.minimumCharacterCount else {
@@ -794,7 +797,7 @@ actor AssetExtractionService {
         applyLimit: Bool = true
     ) -> (records: [HistoryRecord], truncatedCount: Int) {
         let filtered = records.filter { record in
-            guard record.status == "completed" else { return false }
+            guard Self.extractableStatuses.contains(record.status) else { return false }
             return !record.finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
 

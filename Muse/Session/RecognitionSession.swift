@@ -529,7 +529,8 @@ actor RecognitionSession {
             await saveSuccessfulHistory(
                 rawText: rawText,
                 llmResult: llmResult,
-                streamingFailed: streamingFailed
+                streamingFailed: streamingFailed,
+                injection: injectionOutcome
             )
 
         } else {
@@ -750,12 +751,23 @@ actor RecognitionSession {
     private func saveSuccessfulHistory(
         rawText: String,
         llmResult: LLMPostProcessingResult,
-        streamingFailed: Bool
+        streamingFailed: Bool,
+        injection: InjectionOutcome
     ) async {
+        // J15：状态口径反映注入结局——仅复制到剪贴板 / 没找到输入位置时不再记 completed
         let status: String
         if llmResult.llmFailed { status = "llm_error" }
         else if streamingFailed { status = "stream_recovered" }
-        else { status = "completed" }
+        else {
+            switch injection {
+            case .inserted:
+                status = "completed"
+            case .copiedToClipboard, .copiedToClipboardPermissionMissing:
+                status = "copied_only"
+            case .noFocusedInput(let copiedToClipboard):
+                status = copiedToClipboard ? "copied_only" : "no_input_target"
+            }
+        }
 
         let finalText = llmResult.finalText
         await historyStore.insert(HistoryRecord(
