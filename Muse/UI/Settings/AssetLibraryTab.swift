@@ -7,12 +7,9 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
     @State private var ignoredCandidates: [LanguageAssetCandidateRecord] = []
     @State private var candidateStatusFilter: AssetCandidateStatusFilter = .pending
     @State private var sourceRecordMap: [String: HistoryRecord] = [:]
-    @State private var isExtracting = false
-    @State private var extractionProgressPhase: AssetExtractionProgressStage = .preparing
-    @State private var extractionRecipeID: String = ExtractionRecipe.quoteAssetsID
-    @State private var extractionRecipeIDs: Set<String> = [ExtractionRecipe.quoteAssetsID]
-    @State private var extractionRange: AssetExtractionRangeOption = .loadSaved()
-    @State private var extractionTask: Task<Void, Never>?
+    // 2026-07-09 J13 拆分段：提炼编排状态机在 ViewModel，侧栏选中态在值结构
+    @State private var extraction = AssetLibraryExtractionViewModel()
+    @State private var selection = AssetLibrarySelectionState()
     @State private var errorMessage: String?
     @State private var selectedView: PurifierView = .extract
     // 2026-07 重构批三：四区数据
@@ -25,32 +22,18 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
     @State private var totalRecordCount = 0
     @State private var recipes: [ExtractionRecipe] = ExtractionRecipe.builtInRecipes()
     @State private var archivedRecipes: [ExtractionRecipe] = []
-    @State private var selectedRecipeListID: String?
     @State private var recipeQuery = ""
-    @State private var selectedCandidateID: String?
-    @State private var selectedCandidateType: LanguageAssetType?
-    @State private var didInitializeCandidateGroupExpansion = false
     @State private var candidateQuery = ""
-    @State private var selectedLibraryType: LanguageAssetType?
-    @State private var selectedLibraryAssetID: String?
-    @State private var didInitializeLibraryGroupExpansion = false
     @State private var libraryQuery = ""
     @State private var extractionResults: [ExtractionResult] = []
-    @State private var selectedResultKind: ExtractionOutputKind?
-    /// 资产库侧栏的分组选中态（按配方分类；提炼结果页仍按产物类型用 selectedResultKind）
-    @State private var selectedResultRecipeID: String?
-    @State private var selectedResultID: String?
     @State private var resultQuery = ""
     @State private var ruleConfig: AssetExtractionRuleConfig = AssetExtractionRuleConfigStore.load()
     @State private var copiedAssetID: String?
     @State private var activeSheet: AssetLibrarySheet?
-    /// 提炼范围无新内容时在弹窗内就地提示（2026-07-08：弹窗承载全部提炼状态）
-    @State private var extractionEmptyNotice: String?
     @State private var isClearPendingConfirmationPresented = false
 
     private let assetStore = LanguageAssetStore()
     private let historyStore = HistoryStore()
-    private let extractionService = AssetExtractionService()
 
     var body: some View {
         GeometryReader { geometry in
@@ -137,25 +120,17 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
                 // 2026-07-08 大梁老师：开始后弹窗不关、原地显示提炼中；完成后关窗跳待确认
                 AssetExtractionRangeSelectionSheet(
                     recipes: recipes,
-                    selectedRecipeIDs: extractionRecipeIDs,
-                    selectedRange: extractionRange,
-                    isExtracting: isExtracting,
-                    progressPhase: extractionProgressPhase,
-                    emptyNotice: extractionEmptyNotice,
+                    selectedRecipeIDs: extraction.recipeIDs,
+                    selectedRange: extraction.range,
+                    isExtracting: extraction.isExtracting,
+                    progressPhase: extraction.progressPhase,
+                    emptyNotice: extraction.emptyNotice,
                     onConfirm: { recipeIDs, range in
-                        extractionRecipeIDs = recipeIDs
-                        extractionRecipeID = orderedRecipeIDs(from: recipeIDs).first ?? ExtractionRecipe.quoteAssetsID
-                        extractionRange = range
-                        extractionEmptyNotice = nil
-                        range.save()
                         Task { @MainActor in
-                            await startRecipesExtraction(
-                                recipeIDs: orderedRecipeIDs(from: recipeIDs),
-                                range: range
-                            )
+                            await runRecipesExtraction(recipeIDs: recipeIDs, range: range)
                         }
                     },
-                    onCancelExtraction: { extractionTask?.cancel() },
+                    onCancelExtraction: { extraction.cancelExtraction() },
                     onCancel: { activeSheet = nil }
                 )
             }
@@ -175,12 +150,8 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
 }
 
 private extension AssetLibraryTab {
-    var hasLLMConfig: Bool {
-        return KeychainService.loadAssetExtractionLLMConfig() != nil
-    }
-
     var selectedCandidate: LanguageAssetCandidateRecord? {
-        if let selectedCandidateID,
+        if let selectedCandidateID = selection.selectedCandidateID,
            let candidate = searchedCandidates.first(where: { $0.id == selectedCandidateID }) {
             return candidate
         }
@@ -203,10 +174,7 @@ private extension AssetLibraryTab {
     }
 
     var filteredCandidates: [LanguageAssetCandidateRecord] {
-        guard let selectedCandidateType else {
-            return searchedCandidates
-        }
-        return searchedCandidates.filter { $0.assetType == selectedCandidateType }
+        selection.filteredCandidates(from: searchedCandidates)
     }
 
     var creatorAssets: [LanguageAsset] {
@@ -228,12 +196,11 @@ private extension AssetLibraryTab {
     }
 
     var filteredLibraryAssets: [LanguageAsset] {
-        guard let selectedLibraryType else { return searchedLibraryAssets }
-        return searchedLibraryAssets.filter { $0.assetType == selectedLibraryType }
+        selection.filteredLibraryAssets(from: searchedLibraryAssets)
     }
 
     var selectedLibraryAsset: LanguageAsset? {
-        if let selectedLibraryAssetID,
+        if let selectedLibraryAssetID = selection.selectedLibraryAssetID,
            let asset = filteredLibraryAssets.first(where: { $0.id == selectedLibraryAssetID }) {
             return asset
         }
@@ -256,12 +223,11 @@ private extension AssetLibraryTab {
     }
 
     var filteredExtractionResults: [ExtractionResult] {
-        guard let selectedResultKind else { return searchedExtractionResults }
-        return searchedExtractionResults.filter { $0.outputKind == selectedResultKind }
+        selection.filteredExtractionResults(from: searchedExtractionResults)
     }
 
     var selectedExtractionResult: ExtractionResult? {
-        if let selectedResultID,
+        if let selectedResultID = selection.selectedResultID,
            let result = filteredExtractionResults.first(where: { $0.id == selectedResultID }) {
             return result
         }
@@ -284,7 +250,7 @@ private extension AssetLibraryTab {
     }
 
     var selectedRecipeInList: ExtractionRecipe? {
-        if let selectedRecipeListID,
+        if let selectedRecipeListID = selection.selectedRecipeListID,
            let recipe = searchedRecipes.first(where: { $0.id == selectedRecipeListID }) {
             return recipe
         }
@@ -307,17 +273,13 @@ private extension AssetLibraryTab {
         return recipe?.outputKind.settingsAccentColor ?? TF.settingsTextTertiary
     }
 
-    func orderedRecipeIDs(from ids: Set<String>) -> [String] {
-        recipes.map(\.id).filter { ids.contains($0) }
-    }
-
     var purifierToolbar: some View {
         AssetLibraryToolbar(
             selectedView: $selectedView,
-            isExtracting: isExtracting,
-            canExtract: hasLLMConfig,
+            isExtracting: extraction.isExtracting,
+            canExtract: extraction.hasLLMConfig,
             onExtract: { beginExtractionFlow() },
-            onCancelExtraction: { extractionTask?.cancel() }
+            onCancelExtraction: { extraction.cancelExtraction() }
         )
     }
 }
@@ -414,10 +376,10 @@ private extension AssetLibraryTab {
         // 2026-07 重构批三：资产库 = 已入库(saved)产物；老 creatorAssets 体系下线(库内 0 条)
         AssetLibrarySavedAssetsView(
             libraryQuery: $libraryQuery,
-            selectedLibraryType: $selectedLibraryType,
-            selectedLibraryAssetID: $selectedLibraryAssetID,
-            selectedResultRecipeID: $selectedResultRecipeID,
-            selectedResultID: $selectedResultID,
+            selectedLibraryType: $selection.selectedLibraryType,
+            selectedLibraryAssetID: $selection.selectedLibraryAssetID,
+            selectedResultRecipeID: $selection.selectedResultRecipeID,
+            selectedResultID: $selection.selectedResultID,
             creatorAssets: [],
             extractionResults: savedResults,
             recipeName: { recipeDisplayName($0) },
@@ -442,7 +404,7 @@ private extension AssetLibraryTab {
 
     /// 资产库当前选中的已入库产物
     var selectedSavedResult: ExtractionResult? {
-        guard let selectedResultID else { return savedResults.first }
+        guard let selectedResultID = selection.selectedResultID else { return savedResults.first }
         return savedResults.first { $0.id == selectedResultID } ?? savedResults.first
     }
 }
@@ -455,7 +417,7 @@ private extension AssetLibraryTab {
     var recipesView: some View {
         ExtractionRecipesView(
             recipeQuery: $recipeQuery,
-            selectedRecipeID: $selectedRecipeListID,
+            selectedRecipeID: $selection.selectedRecipeListID,
             recipes: searchedRecipes,
             archivedRecipes: archivedRecipes,
             selectedRecipe: selectedRecipeInList,
@@ -581,73 +543,14 @@ private extension AssetLibraryTab {
     }
 
     func normalizeSelections() {
-        if !didInitializeCandidateGroupExpansion {
-            selectedCandidateType = searchedCandidates.first?.assetType
-            didInitializeCandidateGroupExpansion = true
-        } else if let expandedType = selectedCandidateType,
-                  !searchedCandidates.contains(where: { $0.assetType == expandedType }) {
-            selectedCandidateType = nil
-        }
-
-        let visibleCandidates = filteredCandidates
-        if let selectedCandidateID,
-           visibleCandidates.contains(where: { $0.id == selectedCandidateID }) {
-            // Keep current selection.
-        } else {
-            selectedCandidateID = visibleCandidates.first?.id ?? searchedCandidates.first?.id
-        }
-
-        if !didInitializeLibraryGroupExpansion {
-            selectedLibraryType = searchedLibraryAssets.first?.assetType
-            didInitializeLibraryGroupExpansion = true
-        } else if let expandedType = selectedLibraryType,
-                  !searchedLibraryAssets.contains(where: { $0.assetType == expandedType }) {
-            selectedLibraryType = nil
-        }
-
-        let visibleLibraryAssets = filteredLibraryAssets
-        if let selectedLibraryAssetID,
-           visibleLibraryAssets.contains(where: { $0.id == selectedLibraryAssetID }) {
-            // Keep current selection.
-        } else {
-            selectedLibraryAssetID = visibleLibraryAssets.first?.id ?? searchedLibraryAssets.first?.id
-        }
-
-        if let selectedResultKind,
-           !searchedExtractionResults.contains(where: { $0.outputKind == selectedResultKind }) {
-            self.selectedResultKind = nil
-        }
-
-        // 资产库按配方分组的选中态：该分类下已无入库产物时清空
-        if let selectedResultRecipeID,
-           !savedResults.contains(where: { $0.recipeID == selectedResultRecipeID }) {
-            self.selectedResultRecipeID = nil
-        }
-
-        let visibleResults = filteredExtractionResults
-        if let selectedResultID,
-           visibleResults.contains(where: { $0.id == selectedResultID }) {
-            // Keep current selection.
-        } else {
-            selectedResultID = visibleResults.first?.id ?? searchedExtractionResults.first?.id
-        }
-
-        if let selectedRecipeListID,
-           searchedRecipes.contains(where: { $0.id == selectedRecipeListID }) {
-            // Keep current selection.
-        } else {
-            selectedRecipeListID = searchedRecipes.first?.id
-        }
-
-        if !recipes.contains(where: { $0.id == extractionRecipeID }) {
-            extractionRecipeID = ExtractionRecipe.quoteAssetsID
-        }
-        extractionRecipeIDs = extractionRecipeIDs.filter { id in
-            recipes.contains(where: { $0.id == id })
-        }
-        if extractionRecipeIDs.isEmpty {
-            extractionRecipeIDs = [extractionRecipeID]
-        }
+        selection.normalize(
+            searchedCandidates: searchedCandidates,
+            searchedLibraryAssets: searchedLibraryAssets,
+            searchedExtractionResults: searchedExtractionResults,
+            savedResults: savedResults,
+            searchedRecipes: searchedRecipes
+        )
+        extraction.normalizeRecipeSelection(recipes: recipes)
     }
 
     func saveCandidate(_ candidate: LanguageAssetCandidateRecord) {
@@ -686,8 +589,8 @@ private extension AssetLibraryTab {
     func clearPendingCandidates() {
         Task {
             _ = await assetStore.clearCandidates(status: .pending)
-            selectedCandidateID = nil
-            selectedCandidateType = nil
+            selection.selectedCandidateID = nil
+            selection.selectedCandidateType = nil
             await reloadData()
         }
     }
@@ -721,8 +624,8 @@ private extension AssetLibraryTab {
         Task {
             do {
                 try await assetStore.saveRecipesOrThrow([recipe])
-                extractionRecipeID = recipe.id
-                selectedRecipeListID = recipe.id
+                extraction.recipeID = recipe.id
+                selection.selectedRecipeListID = recipe.id
                 await reloadData()
             } catch {
                 errorMessage = error.localizedDescription
@@ -745,17 +648,17 @@ private extension AssetLibraryTab {
                     try await assetStore.saveRecipesOrThrow(newDefinitions)
                 }
                 if let firstSaved = newDefinitions.first {
-                    extractionRecipeID = firstSaved.id
-                    extractionRecipeIDs = [firstSaved.id]
-                    selectedRecipeListID = firstSaved.id
+                    extraction.recipeID = firstSaved.id
+                    extraction.recipeIDs = [firstSaved.id]
+                    selection.selectedRecipeListID = firstSaved.id
                 } else if let firstTemplate = templates.first,
                           let existing = recipes.first(where: {
                               $0.name.trimmingCharacters(in: .whitespacesAndNewlines)
                                   .caseInsensitiveCompare(firstTemplate.name.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
                           }) {
-                    extractionRecipeID = existing.id
-                    extractionRecipeIDs = [existing.id]
-                    selectedRecipeListID = existing.id
+                    extraction.recipeID = existing.id
+                    extraction.recipeIDs = [existing.id]
+                    selection.selectedRecipeListID = existing.id
                 }
                 await reloadData()
             } catch {
@@ -768,112 +671,51 @@ private extension AssetLibraryTab {
         guard !recipe.isBuiltIn else { return }
         Task {
             await assetStore.archiveRecipe(id: recipe.id)
-            if extractionRecipeID == recipe.id {
-                extractionRecipeID = ExtractionRecipe.quoteAssetsID
+            if extraction.recipeID == recipe.id {
+                extraction.recipeID = ExtractionRecipe.quoteAssetsID
             }
-            extractionRecipeIDs.remove(recipe.id)
-            if extractionRecipeIDs.isEmpty {
-                extractionRecipeIDs = [extractionRecipeID]
+            extraction.recipeIDs.remove(recipe.id)
+            if extraction.recipeIDs.isEmpty {
+                extraction.recipeIDs = [extraction.recipeID]
             }
             await reloadData()
         }
     }
 
-
     @MainActor
     func beginExtractionFlow() {
-        guard !isExtracting, hasLLMConfig else { return }
+        guard !extraction.isExtracting, extraction.hasLLMConfig else { return }
         activeSheet = .extractionRangeSelection
     }
 
-    /// 多配方提炼（2026-07 重设计）：逐配方各自预览(防重/空范围)后并入一次执行
-    @MainActor
-    func startRecipesExtraction(recipeIDs: [String], range: AssetExtractionRangeOption) async {
-        guard !isExtracting, hasLLMConfig, !recipeIDs.isEmpty else { return }
-        // 立即进提炼态：弹窗原地切「提炼中」（预览阶段也算准备中，同时防按钮连点重复发起）
-        isExtracting = true
-        extractionProgressPhase = .preparing
-        errorMessage = nil
-
-        var configurations: [AssetExtractionConfiguration] = []
-        for recipeID in recipeIDs {
-            guard let base = makeExtractionConfiguration(
-                recipeID: recipeID,
-                range: range,
-                includesProcessedRecords: false
-            ) else { continue }
-
-            let preview = await extractionService.previewExtraction(
-                configuration: base.applying(ruleConfig: ruleConfig)
-            )
-            guard !preview.records.isEmpty else { continue }
-
-            configurations.append(
-                AssetExtractionConfiguration
-                    .manualSelection(ids: preview.records.map(\.id))
-                    .applying(recipeID: recipeID)
-                    .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-            )
-        }
-
-        guard !configurations.isEmpty else {
-            // 弹窗内就地提示并退回选择态，让用户直接换范围重试
-            isExtracting = false
-            extractionEmptyNotice = L("范围内没有可提炼的新内容，换个范围试试。", "No new records in this range — try another.")
-            return
-        }
-        runExtractions(configurations: configurations)
-    }
-
-    func makeExtractionConfiguration(
-        recipeID: String,
-        range: AssetExtractionRangeOption,
-        includesProcessedRecords: Bool
-    ) -> AssetExtractionConfiguration? {
-        range.makeConfiguration()?
-            .includingProcessedRecords(includesProcessedRecords)
-            .applying(recipeID: recipeID)
-            .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-    }
-
-    /// 执行提炼（调用前须已置 isExtracting = true）：进度在提炼弹窗内呈现，
+    /// 提炼执行（编排在 ViewModel）+ View 收尾：
     /// 结束（成功/取消/失败）一律关弹窗，成功跳待确认（2026-07-08 大梁老师）
     @MainActor
-    private func runExtractions(configurations: [AssetExtractionConfiguration]) {
-        extractionTask = Task { @MainActor in
-            defer {
-                isExtracting = false
-                extractionTask = nil
+    func runRecipesExtraction(recipeIDs: Set<String>, range: AssetExtractionRangeOption) async {
+        errorMessage = nil
+        let outcome = await extraction.runRecipesExtraction(
+            selectedRecipeIDs: recipeIDs,
+            range: range,
+            recipes: recipes,
+            ruleConfig: ruleConfig
+        )
+        switch outcome {
+        case .notStarted, .emptyRange:
+            // emptyRange 的就地提示已由 ViewModel 设置，弹窗保持打开等用户换范围
+            break
+        case .completed:
+            await reloadData()
+            activeSheet = nil
+            withAnimation(.easeInOut(duration: 0.16)) {
+                selectedView = .pending
             }
-            do {
-                // 2026-07 重构批三：所有配方统一走两段式管线（宽提+严审），产物落待确认
-                for configuration in configurations {
-                    try Task.checkCancellation()
-                    let effectiveConfiguration = configuration.applying(ruleConfig: ruleConfig)
-                    _ = try await extractionService.extractRecipeResults(
-                        configuration: effectiveConfiguration
-                    ) { stage in
-                        await MainActor.run {
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                extractionProgressPhase = stage
-                            }
-                        }
-                    }
-                }
-
-                await reloadData()
-                activeSheet = nil
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    selectedView = .pending
-                }
-            } catch is CancellationError {
-                activeSheet = nil
-                await reloadData()
-            } catch {
-                errorMessage = error.localizedDescription
-                activeSheet = nil
-                await reloadData()
-            }
+        case .cancelled:
+            activeSheet = nil
+            await reloadData()
+        case .failed(let message):
+            errorMessage = message
+            activeSheet = nil
+            await reloadData()
         }
     }
 
