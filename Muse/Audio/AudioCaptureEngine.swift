@@ -43,23 +43,6 @@ struct AudioCaptureStartState: Sendable {
     }
 }
 
-struct AudioCaptureIdleState: Sendable {
-    private(set) var generation = 0
-
-    mutating func nextToken() -> Int {
-        generation &+= 1
-        return generation
-    }
-
-    mutating func invalidate() {
-        generation &+= 1
-    }
-
-    func isCurrent(_ token: Int) -> Bool {
-        token == generation
-    }
-}
-
 final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     // MARK: - Static properties
@@ -68,7 +51,6 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     static let channels: AVAudioChannelCount = 1
     static let chunkDurationMs: Int = 200
     static let startTimeout: Duration = .seconds(15)
-    static let idleCaptureRetentionSeconds: TimeInterval = 30
     static let samplesPerChunk: Int = Int(sampleRate * Double(chunkDurationMs) / 1000)
     static let chunkByteSize: Int = samplesPerChunk * MemoryLayout<Int16>.size
     static let targetFormat: AVAudioFormat = AVAudioFormat(
@@ -142,9 +124,6 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     private let outputQueueKey = DispatchSpecificKey<UInt8>()
     private let outputQueueTag: UInt8 = 1
     private var activeOutput: AVCaptureAudioDataOutput?
-    private var idleCaptureSession: AVCaptureSession?
-    private var idleCaptureOutput: AVCaptureAudioDataOutput?
-    private var idleState = AudioCaptureIdleState()
     private var levelCounter = 0
     private var startState = AudioCaptureStartState()
 
@@ -255,10 +234,6 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     }
 
     private func startWithAVCapture(token: Int) -> StartOutcome {
-        if let idleCapture = takeIdleCaptureForReuse(token: token) {
-            return reuseIdleCapture(idleCapture, token: token)
-        }
-
         let session = AVCaptureSession()
 
         guard let device = AVCaptureDevice.default(for: .audio) else {
@@ -311,103 +286,16 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
             activeOutput = nil
             return (session, output)
         }
-        current.1?.setSampleBufferDelegate(nil, queue: nil)
+        current.0?.stopRunning()
         drainOutputQueue()
+        current.1?.setSampleBufferDelegate(nil, queue: nil)
         flushRemaining()
-        if let session = current.0 {
-            parkIdleCapture(session: session, output: current.1)
-        }
         bufferLock.lock()
         converter = nil
         bufferLock.unlock()
         clearAudioHandlers()
         levelCounter = 0
         AppLogger.log("[Audio] Capture session stopped")
-    }
-
-    private func takeIdleCaptureForReuse(token: Int) -> (session: AVCaptureSession, output: AVCaptureAudioDataOutput)? {
-        stateLock.withLock {
-            guard startState.isCurrent(token),
-                  let session = idleCaptureSession,
-                  let output = idleCaptureOutput,
-                  session.isRunning
-            else {
-                return nil
-            }
-            idleCaptureSession = nil
-            idleCaptureOutput = nil
-            idleState.invalidate()
-            return (session, output)
-        }
-    }
-
-    private func reuseIdleCapture(
-        _ idleCapture: (session: AVCaptureSession, output: AVCaptureAudioDataOutput),
-        token: Int
-    ) -> StartOutcome {
-        let accepted = stateLock.withLock { () -> Bool in
-            guard startState.isCurrent(token) else { return false }
-            captureSession = idleCapture.session
-            activeOutput = idleCapture.output
-            isWarmedUp = true
-            return true
-        }
-        guard accepted else {
-            idleCapture.output.setSampleBufferDelegate(nil, queue: nil)
-            idleCapture.session.stopRunning()
-            DebugFileLogger.log("audio engine idle reuse cancelled token=\(token)")
-            return .cancelled
-        }
-
-        idleCapture.output.setSampleBufferDelegate(self, queue: outputQueue)
-        AppLogger.log("[Audio] Reused parked capture session")
-        DebugFileLogger.log("audio engine reused parked session token=\(token)")
-        return .success
-    }
-
-    private func parkIdleCapture(
-        session: AVCaptureSession,
-        output: AVCaptureAudioDataOutput?
-    ) {
-        guard session.isRunning, let output else {
-            output?.setSampleBufferDelegate(nil, queue: nil)
-            session.stopRunning()
-            return
-        }
-
-        let parked = stateLock.withLock { () -> (token: Int, oldSession: AVCaptureSession?, oldOutput: AVCaptureAudioDataOutput?) in
-            let oldSession = idleCaptureSession
-            let oldOutput = idleCaptureOutput
-            idleCaptureSession = session
-            idleCaptureOutput = output
-            return (idleState.nextToken(), oldSession, oldOutput)
-        }
-        parked.oldOutput?.setSampleBufferDelegate(nil, queue: nil)
-        parked.oldSession?.stopRunning()
-
-        let token = parked.token
-        DebugFileLogger.log("audio engine parked session token=\(token)")
-
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.idleCaptureRetentionSeconds) { [weak self] in
-            self?.expireIdleCapture(token: token)
-        }
-    }
-
-    private func expireIdleCapture(token: Int) {
-        let expired = stateLock.withLock { () -> (AVCaptureSession?, AVCaptureAudioDataOutput?) in
-            guard idleState.isCurrent(token) else { return (nil, nil) }
-            let session = idleCaptureSession
-            let output = idleCaptureOutput
-            idleCaptureSession = nil
-            idleCaptureOutput = nil
-            idleState.invalidate()
-            return (session, output)
-        }
-        expired.1?.setSampleBufferDelegate(nil, queue: nil)
-        expired.0?.stopRunning()
-        if expired.0 != nil {
-            DebugFileLogger.log("audio engine idle session expired token=\(token)")
-        }
     }
 
     // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate
