@@ -20,8 +20,7 @@ struct GeneralOverviewSection: View {
 }
 
 private extension GeneralOverviewSection {
-    /// 紧凑横幅（2026-07-08 大梁老师：与语料资产工具栏同高 66）：
-    /// 标志缩小垂直居中，右侧角标+标语纵向叠放，替代原 92 高的「标志顶置+标语沉底」布局
+    /// 标志垂直居中，右侧角标+标语纵向叠放；高度与下方指标卡一致。
     var introBanner: some View {
         ZStack(alignment: .leading) {
             RoundedRectangle(
@@ -52,7 +51,11 @@ private extension GeneralOverviewSection {
             }
             .padding(.horizontal, GeneralSettingsStyle.museBannerHorizontalPadding)
         }
-        .frame(maxWidth: .infinity, minHeight: GeneralSettingsStyle.museBannerHeight, maxHeight: GeneralSettingsStyle.museBannerHeight)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: GeneralSettingsStyle.overviewSummaryCardHeight,
+            maxHeight: GeneralSettingsStyle.overviewSummaryCardHeight
+        )
     }
 
     var introStatusStrip: some View {
@@ -138,7 +141,12 @@ private extension GeneralOverviewSection {
             }
         }
         .padding(GeneralSettingsStyle.surfaceSpacing)
-        .frame(maxWidth: .infinity, minHeight: 76, maxHeight: 76, alignment: .topLeading)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: GeneralSettingsStyle.overviewSummaryCardHeight,
+            maxHeight: GeneralSettingsStyle.overviewSummaryCardHeight,
+            alignment: .topLeading
+        )
         .background(
             RoundedRectangle(cornerRadius: GeneralSettingsStyle.statCardCornerRadius, style: .continuous)
                 .fill(TF.settingsStatCardBase)

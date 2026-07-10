@@ -24,9 +24,9 @@ enum GeneralSettingsStyle {
     )
     static let overviewTopSpacing: CGFloat = componentSpacing
     static let overviewHistoryTopSpacing: CGFloat = componentSpacing
-    /// 66 = 定稿的紧凑横幅高度（2026-07-08 大梁老师；原引用语料资产工具栏高度，
-    /// 该工具栏后续去壳变矮，横幅高度就地固化不再联动）
-    static let museBannerHeight: CGFloat = 66
+    /// Banner 与三张指标卡统一高度；识别记录卡占满剩余空间，
+    /// 因此摘要区增高时页面总高度保持不变。
+    static let overviewSummaryCardHeight: CGFloat = 76
     static let museBannerCornerRadius: CGFloat = surfaceCornerRadius
     static let museBannerHorizontalPadding: CGFloat = surfaceSpacing
     static let museBannerVerticalPadding: CGFloat = surfaceSpacing
