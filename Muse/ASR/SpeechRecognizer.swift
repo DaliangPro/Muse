@@ -4,8 +4,10 @@ import Foundation
 struct ASRRequestOptions: Sendable, Equatable {
     var enablePunc: Bool = true
     var hotwords: [String] = []
-    /// hotwords 中前 N 个是用户手动添加的词,给更高 boosting 权重(其余为内置通用词)
+    /// hotwords 中前 N 个是用户手动添加的词；顺序保持用户词在前、内置词在后。
     var userHotwordCount: Int = 0
+    /// 用户配置的确定性错词纠正，火山端用于实时结果，本地收尾仍会再次兜底。
+    var correctionWords: [String: String] = [:]
     var boostingTableID: String?
     var contextHistoryLength: Int = 0
 

@@ -256,6 +256,19 @@ enum SnippetStorage {
         invalidateCache()
     }
 
+    /// 用户明确配置的错词纠正。下发给支持请求级 correct_words 的 ASR，
+    /// 同时保留 applyEffective 的本地最终兜底，保证云端不支持时行为不变。
+    static func userCorrectionWords() -> [String: String] {
+        var corrections: [String: String] = [:]
+        for snippet in load() where !isDraftTrigger(snippet.trigger) {
+            let trigger = snippet.trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+            let replacement = snippet.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trigger.isEmpty, !replacement.isEmpty else { continue }
+            corrections[trigger] = replacement
+        }
+        return corrections
+    }
+
     // MARK: - Built-in file (Finder editable)
 
     static func loadBuiltin() -> [(trigger: String, value: String)] {

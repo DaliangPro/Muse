@@ -116,7 +116,9 @@ final class VolcProtocolTests: XCTestCase {
             uid: "test-user-123",
             options: ASRRequestOptions(
                 enablePunc: true,
-                hotwords: ["Muse", "DeepSeek"],
+                hotwords: ["OpenClaw", "Claude.md", "GitHub"],
+                userHotwordCount: 2,
+                correctionWords: ["大良": "大梁"],
                 boostingTableID: "boost-123",
                 contextHistoryLength: 6
             )
@@ -131,13 +133,62 @@ final class VolcProtocolTests: XCTestCase {
         let contextData = try XCTUnwrap(contextString?.data(using: .utf8))
         let context = try JSONSerialization.jsonObject(with: contextData) as? [String: Any]
         let hotwords = context?["hotwords"] as? [[String: Any]]
-        XCTAssertEqual(hotwords?.count, 2)
-        XCTAssertEqual(hotwords?.first?["word"] as? String, "Muse")
-        XCTAssertNil(context?["correct_words"])
+        XCTAssertEqual(hotwords?.count, 3)
+        XCTAssertEqual(hotwords?.compactMap { $0["word"] as? String }, ["OpenClaw", "Claude.md", "GitHub"])
+        XCTAssertTrue(hotwords?.allSatisfy { Set($0.keys) == ["word"] } == true)
+
+        let corrections = context?["correct_words"] as? [String: String]
+        XCTAssertEqual(corrections?["Open Claw"], "OpenClaw")
+        XCTAssertEqual(corrections?["open claw"], "OpenClaw")
+        XCTAssertEqual(corrections?["Claude md"], "Claude.md")
+        XCTAssertEqual(corrections?["Claude点md"], "Claude.md")
+        XCTAssertEqual(corrections?["大良"], "大梁")
+        XCTAssertNil(corrections?["Git Hub"], "内置词不应自动生成用户专属格式纠正")
 
         let corpus = request?["corpus"] as? [String: Any]
         XCTAssertEqual(corpus?["boosting_table_id"] as? String, "boost-123")
         XCTAssertNil(corpus?["correct_table_id"])
+    }
+
+    func testClientRequestJSON_userCorrectionOverridesAutomaticVariant() throws {
+        let payload = VolcProtocol.buildClientRequest(
+            uid: "test-user-123",
+            options: ASRRequestOptions(
+                hotwords: ["OpenClaw"],
+                userHotwordCount: 1,
+                correctionWords: ["Open Claw": "自定义结果"]
+            )
+        )
+        let json = try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        let request = json?["request"] as? [String: Any]
+        let contextString = try XCTUnwrap(request?["context"] as? String)
+        let contextData = try XCTUnwrap(contextString.data(using: .utf8))
+        let context = try JSONSerialization.jsonObject(with: contextData) as? [String: Any]
+        let corrections = context?["correct_words"] as? [String: String]
+
+        XCTAssertEqual(corrections?["Open Claw"], "自定义结果")
+    }
+
+    func testClientRequestJSON_cleansHotwordsAndKeepsUserFirst() throws {
+        let payload = VolcProtocol.buildClientRequest(
+            uid: "test-user-123",
+            options: ASRRequestOptions(
+                hotwords: [" OpenClaw ", "", "openclaw", "Muse"],
+                userHotwordCount: 3
+            )
+        )
+        let json = try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        let request = json?["request"] as? [String: Any]
+        let contextString = try XCTUnwrap(request?["context"] as? String)
+        let contextData = try XCTUnwrap(contextString.data(using: .utf8))
+        let context = try JSONSerialization.jsonObject(with: contextData) as? [String: Any]
+        let hotwords = context?["hotwords"] as? [[String: Any]]
+        let corrections = context?["correct_words"] as? [String: String]
+
+        XCTAssertEqual(hotwords?.compactMap { $0["word"] as? String }, ["OpenClaw", "Muse"])
+        XCTAssertTrue(hotwords?.allSatisfy { Set($0.keys) == ["word"] } == true)
+        XCTAssertEqual(corrections?["Open Claw"], "OpenClaw")
+        XCTAssertNil(corrections?["muse"], "内置词不应被空值或重复用户词误算为用户词")
     }
 
     // MARK: - Full Message Encoding

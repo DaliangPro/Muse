@@ -131,7 +131,7 @@ enum HotwordStorage {
 
     // MARK: - Effective (merge both stores)
 
-    /// Returns built-in + user hotwords merged (deduplicated, case-insensitive).
+    /// Returns user + built-in hotwords merged (deduplicated, case-insensitive).
     static func loadEffective() -> [String] {
         let builtin = loadBuiltin()
         let user = load()
@@ -162,7 +162,7 @@ enum HotwordStorage {
     /// 或超出火山引擎内联热词的数量限制。用户词全保留并排前,内置词补到上限内。
     static let asrHotwordLimit = 100
 
-    /// 给 ASR 用的有效热词：用户词优先排前(下游给更高 boosting 权重),内置词补到上限。
+    /// 给 ASR 用的有效热词：用户词优先排前，内置词补到上限。
     /// 返回的 userCount 标出前多少个是用户词。
     static func loadEffectiveForASR(limit: Int = asrHotwordLimit) -> (words: [String], userCount: Int) {
         var seen = Set<String>()

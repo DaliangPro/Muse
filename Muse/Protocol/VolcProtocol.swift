@@ -46,7 +46,11 @@ enum VolcProtocol: Sendable {
             "force_to_speech_time": 1000,
         ]
 
-        if let contextString = buildContextString(hotwords: options.hotwords, userHotwordCount: options.userHotwordCount) {
+        if let contextString = buildContextString(
+            hotwords: options.hotwords,
+            userHotwordCount: options.userHotwordCount,
+            correctionWords: options.correctionWords
+        ) {
             requestDict["context"] = contextString
         }
 
@@ -77,18 +81,44 @@ enum VolcProtocol: Sendable {
         return try! JSONSerialization.data(withJSONObject: payload)
     }
 
-    private static func buildContextString(hotwords: [String], userHotwordCount: Int) -> String? {
+    private static func buildContextString(
+        hotwords: [String],
+        userHotwordCount: Int,
+        correctionWords: [String: String]
+    ) -> String? {
         var contextObject: [String: Any] = [:]
 
-        let cleanedHotwords = hotwords
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        if !cleanedHotwords.isEmpty {
-            // 用户手动加的词(前 userHotwordCount 个)给更高 boosting 权重,明显盖过
-            // 内置通用词,避免你新加的词被一大批内置词稀释(2026-06-13 用户拍板)
-            contextObject["hotwords"] = cleanedHotwords.enumerated().map { index, word in
-                ["word": word, "scale": index < userHotwordCount ? 10.0 : 5.0] as [String: Any]
+        var seenHotwords = Set<String>()
+        var cleanedUserHotwordCount = 0
+        let cleanedHotwords = hotwords.enumerated().compactMap { index, word -> String? in
+            let cleaned = word.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { return nil }
+            let key = cleaned.lowercased()
+            guard seenHotwords.insert(key).inserted else { return nil }
+            if index < max(userHotwordCount, 0) {
+                cleanedUserHotwordCount += 1
             }
+            return cleaned
+        }
+        if !cleanedHotwords.isEmpty {
+            // 火山请求级热词的官方格式只声明 word。此前附带的 scale 无文档背书，
+            // 可能导致服务端忽略所谓权重；用户词优先级由上游顺序保持。
+            contextObject["hotwords"] = cleanedHotwords.map { word in
+                ["word": word] as [String: Any]
+            }
+        }
+
+        let userHotwords = Array(cleanedHotwords.prefix(cleanedUserHotwordCount))
+        var effectiveCorrections = automaticCorrectionWords(for: userHotwords)
+        // 用户手工配置的错词纠正优先于自动格式变体。
+        for (trigger, replacement) in correctionWords {
+            let cleanedTrigger = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanedReplacement = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanedTrigger.isEmpty, !cleanedReplacement.isEmpty else { continue }
+            effectiveCorrections[cleanedTrigger] = cleanedReplacement
+        }
+        if !effectiveCorrections.isEmpty {
+            contextObject["correct_words"] = effectiveCorrections
         }
 
         guard !contextObject.isEmpty,
@@ -98,6 +128,58 @@ enum VolcProtocol: Sendable {
             return nil
         }
         return contextString
+    }
+
+    /// 用户只输入正确词，后台自动补常见的英文大小写、CamelCase 分词与扩展名口语形式。
+    /// 中文同音错词无法可靠猜测，仍由「错词纠正」让用户明确指定，避免误替换。
+    private static func automaticCorrectionWords(for hotwords: [String]) -> [String: String] {
+        var corrections: [String: String] = [:]
+
+        for canonical in hotwords {
+            var variants: [String] = []
+            func appendVariant(_ value: String) {
+                let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleaned.isEmpty, cleaned != canonical, !variants.contains(cleaned) else { return }
+                variants.append(cleaned)
+            }
+
+            appendVariant(canonical.lowercased())
+
+            let camelSpaced = splitCamelCase(canonical)
+            appendVariant(camelSpaced)
+            appendVariant(camelSpaced.lowercased())
+
+            if canonical.contains(".") {
+                let spaceVariant = canonical.replacingOccurrences(of: ".", with: " ")
+                appendVariant(spaceVariant)
+                appendVariant(spaceVariant.lowercased())
+
+                let chineseDotVariant = canonical.replacingOccurrences(of: ".", with: "点")
+                appendVariant(chineseDotVariant)
+                appendVariant(chineseDotVariant.lowercased())
+            }
+
+            for variant in variants where corrections[variant] == nil {
+                corrections[variant] = canonical
+            }
+        }
+
+        return corrections
+    }
+
+    private static func splitCamelCase(_ value: String) -> String {
+        var result = ""
+        var previous: Character?
+        for character in value {
+            if let previous,
+               character.isUppercase,
+               previous.isLowercase || previous.isNumber {
+                result.append(" ")
+            }
+            result.append(character)
+            previous = character
+        }
+        return result
     }
 
     private static func sanitized(_ value: String?) -> String? {

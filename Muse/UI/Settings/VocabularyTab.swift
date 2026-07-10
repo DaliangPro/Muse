@@ -10,7 +10,7 @@ private enum VocabularyPanel: String, CaseIterable {
         case .hotwords:
             return L("识别热词", "Recognition Terms")
         case .snippets:
-            return L("替换规则", "Replacement Rules")
+            return L("错词纠正", "Corrections")
         }
     }
 }
@@ -106,9 +106,9 @@ private extension VocabularyTab {
     var panelExplanation: String {
         switch selectedPanel {
         case .hotwords:
-            return L("教 Muse 认词，提高识别概率", "Teach Muse new words for better accuracy")
+            return L("输入正确词，保存后下次识别生效", "Enter the correct term; it applies next time")
         case .snippets:
-            return L("错词自动改写，命中必改", "Auto-rewrite misheard words, every time")
+            return L("识别错了就改回来，命中必改", "Fix known misheard words, every time")
         }
     }
 
@@ -236,7 +236,7 @@ private extension VocabularyTab {
 
     var snippetPanelHeader: some View {
         HStack(alignment: .center, spacing: 10) {
-            Text(L("替换规则", "Replacement Rules"))
+            Text(L("错词纠正", "Corrections"))
                 .font(TF.settingsFontBodyStrong)
                 .foregroundStyle(TF.settingsText)
 
@@ -261,9 +261,9 @@ private extension VocabularyTab {
 
     var snippetTableHeader: some View {
         HStack(spacing: 0) {
-            Text(L("替换为", "Replacement"))
+            Text(L("正确词", "Correct Word"))
                 .frame(width: VocabularySettingsStyle.ruleReplacementColumnWidth, alignment: .leading)
-            Text(L("触发词", "Triggers"))
+            Text(L("识别错成", "Misheard As"))
                 .frame(maxWidth: .infinity, alignment: .leading)
             Text(L("操作", "Actions"))
                 .frame(width: VocabularySettingsStyle.ruleActionsColumnWidth, alignment: .trailing)
@@ -275,7 +275,7 @@ private extension VocabularyTab {
 
     var ruleEditorPanel: some View {
         VocabularyRuleEditorPanel(
-            title: isCreatingRule ? L("新增规则", "New Rule") : L("编辑规则", "Edit Rule"),
+            title: isCreatingRule ? L("新增错词纠正", "New Correction") : L("编辑错词纠正", "Edit Correction"),
             replacement: $draftReplacement,
             triggers: $draftTriggers,
             triggerInput: $draftTriggerInput,
@@ -338,7 +338,7 @@ private extension VocabularyTab {
             )
             .onSubmit { addHotword() }
 
-            // 按钮观感与替换规则页一致（2026-06-12 用户拍板）：不随输入置灰，
+            // 按钮观感与错词纠正页一致（2026-06-12 用户拍板）：不随输入置灰，
             // 空输入由 addHotword 的 guard 兜底
             SettingsTextButton(L("添加", "Add"), variant: .primary) {
                 addHotword()
@@ -369,7 +369,7 @@ private extension VocabularyTab {
     // MARK: - Derived Data
 
     var emptySnippetMessage: String {
-        L("还没有用户替换规则", "No user replacement rules yet")
+        L("还没有用户错词纠正", "No user corrections yet")
     }
 
     var emptyHotwordMessage: String {
@@ -513,7 +513,7 @@ private extension VocabularyTab {
             newHotword = ""
             return
         }
-        hotwords.insert(word, at: 0)  // 新词置顶:在用户词里排最前,下发 ASR 时权重最高（2026-06-13 用户拍板）
+        hotwords.insert(word, at: 0)  // 新词置顶：在用户词里排最前并优先下发 ASR（2026-06-13 用户拍板）
         guard persistHotwordsOrReload(context: "add hotword") else { return }
         newHotword = ""
     }
@@ -680,19 +680,19 @@ private struct VocabularyRuleEditorPanel: View {
 
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 7) {
-                    VocabularyFieldLabel(L("替换为", "Replacement"))
+                    VocabularyFieldLabel(L("正确词", "Correct Word"))
                         .frame(height: VocabularySettingsStyle.tableHeaderHeight, alignment: .center)
-                    // 回车即保存：替换文本与触发词同为草稿，面板无显式保存按钮
-                    field(prompt: L("输入替换内容", "Replacement"), text: $replacement)
+                    // 回车即保存：正确词与错误结果同为草稿，面板无显式保存按钮
+                    field(prompt: L("输入正确词", "Correct word"), text: $replacement)
                         .onSubmit(onCommit)
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    VocabularyFieldLabel(L("触发词", "Triggers"))
+                    VocabularyFieldLabel(L("识别错成", "Misheard As"))
                         .padding(.top, 16)
 
                     if triggers.isEmpty {
-                        Text(L("还没有触发词", "No triggers yet"))
+                        Text(L("还没有错误词", "No misheard words yet"))
                             .font(TF.settingsFontCaption)
                             .foregroundStyle(TF.settingsTextTertiary)
                             .frame(height: VocabularySettingsStyle.compactTokenHeight)
@@ -719,7 +719,7 @@ private struct VocabularyRuleEditorPanel: View {
                 .padding(.top, VocabularySettingsStyle.footerDividerTopSpacing)
 
             HStack(spacing: 8) {
-                field(prompt: L("输入触发词…", "Add trigger…"), text: $triggerInput)
+                field(prompt: L("输入识别错误结果…", "Add misheard word…"), text: $triggerInput)
                     .onSubmit(onCommit)
 
                 SettingsTextButton(L("添加", "Add"), variant: .primary) {

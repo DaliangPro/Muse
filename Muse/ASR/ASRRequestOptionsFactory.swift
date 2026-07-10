@@ -6,6 +6,7 @@ enum ASRRequestOptionsFactory {
             enablePunc: enablePunc,
             hotwords: userWords,
             userHotwordCount: userWords.count,
+            correctionWords: SnippetStorage.userCorrectionWords(),
             boostingTableID: biasSettings.boostingTableID,
             contextHistoryLength: biasSettings.contextHistoryLength
         )

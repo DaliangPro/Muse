@@ -199,6 +199,7 @@ actor RecognitionSession {
             enablePunc: !needsLLM,
             hotwords: effectiveHotwords.words,
             userHotwordCount: effectiveHotwords.userCount,
+            correctionWords: SnippetStorage.userCorrectionWords(),
             boostingTableID: biasSettings.boostingTableID,
             contextHistoryLength: biasSettings.contextHistoryLength
         )
@@ -386,7 +387,7 @@ actor RecognitionSession {
         do {
             DebugFileLogger.log("ASR connecting provider=\(provider.rawValue)")
             try await client.connect(config: config, options: requestOptions)
-            AppLogger.log("[Session] ASR connected OK (streaming, hotwords=\(hotwordCount), history=\(requestOptions.contextHistoryLength))")
+            AppLogger.log("[Session] ASR connected OK (streaming, hotwords=\(hotwordCount), userHotwords=\(requestOptions.userHotwordCount), corrections=\(requestOptions.correctionWords.count), history=\(requestOptions.contextHistoryLength))")
             DebugFileLogger.log("ASR connected OK provider=\(provider.rawValue)")
         } catch {
             AppLogger.log("[Session] ASR connect FAILED provider=\(provider.rawValue) error=\(String(describing: error))")
