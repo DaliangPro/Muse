@@ -3,6 +3,23 @@ import AppKit
 import XCTest
 
 final class TextInjectionEngineIntegrationTests: XCTestCase {
+    func testCurrentProcessTargetBypassesAccessibility() {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+
+        XCTAssertTrue(
+            TextInjectionEngine.shouldBypassAccessibility(
+                targetProcessIdentifier: currentPID,
+                currentProcessIdentifier: currentPID
+            )
+        )
+        XCTAssertFalse(
+            TextInjectionEngine.shouldBypassAccessibility(
+                targetProcessIdentifier: currentPID + 1,
+                currentProcessIdentifier: currentPID
+            )
+        )
+    }
+
     @MainActor
     func testClipboardInjectionIntoTextEdit() throws {
         guard ProcessInfo.processInfo.environment["MUSE_RUN_UI_INJECTION_TEST"] == "1" else {

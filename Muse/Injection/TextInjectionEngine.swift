@@ -104,8 +104,25 @@ final class TextInjectionEngine: @unchecked Sendable {
         AXIsProcessTrusted()
     }
 
+    /// AppKit 的文本输入对象只能在主线程修改。RecognitionSession 在后台 actor 上注入，
+    /// 若 AX 目标恰好是 Muse 自己，AXSelectedText 会在当前后台队列直接进入 NSTextView，
+    /// 触发 Text Input Source Manager 的队列断言并以 SIGTRAP 退出。
+    /// 自身输入框统一走 Cmd+V 通道；外部进程仍可安全使用 AX 直插。
+    static func shouldBypassAccessibility(
+        targetProcessIdentifier: pid_t,
+        currentProcessIdentifier: pid_t = ProcessInfo.processInfo.processIdentifier
+    ) -> Bool {
+        targetProcessIdentifier == currentProcessIdentifier
+    }
+
     static func frontmostApplicationHasFocusedEditableElement() -> Bool {
         guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else { return false }
+
+        // AppState 会从 detached task 调用本方法。自身进程不做 AX 查询，避免后台队列
+        // 进入 Muse 的 AppKit 文本系统；真正注入时由 inject() 改走 Cmd+V。
+        if shouldBypassAccessibility(targetProcessIdentifier: frontmostApplication.processIdentifier) {
+            return true
+        }
 
         let applicationElement = AXUIElementCreateApplication(frontmostApplication.processIdentifier)
         guard let focusedElement = elementAttribute(applicationElement, kAXFocusedUIElementAttribute as CFString) else {
@@ -142,7 +159,13 @@ final class TextInjectionEngine: @unchecked Sendable {
             copyToClipboard(text)
             return .copiedToClipboardPermissionMissing
         }
-        let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        let frontmostBundleID = frontmostApplication?.bundleIdentifier
+        if let frontmostApplication,
+           Self.shouldBypassAccessibility(targetProcessIdentifier: frontmostApplication.processIdentifier) {
+            DebugFileLogger.log("inject: self target bypass AX, using clipboard")
+            return injectViaClipboard(text)
+        }
         if Self.isAXOpaqueApp(frontmostBundleID) {
             DebugFileLogger.log("inject: axOpaqueApp bypass frontmost=\(frontmostBundleID ?? "unknown")")
             return injectViaClipboard(text)
