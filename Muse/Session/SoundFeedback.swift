@@ -17,12 +17,12 @@ enum SoundFeedback {
     private struct Cache {
         var hasWarmedUp = false
         var players: [String: AVAudioPlayer] = [:]
-        var mutedUntil: Date?
     }
     private static let cache = OSAllocatedUnfairLock(uncheckedState: Cache())
     private static let playbackQueue = DispatchQueue(label: "pro.daliang.muse.sound-feedback")
-    private static let slowPlaybackThreshold: TimeInterval = 0.25
-    private static let muteAfterAudioStackIssue: TimeInterval = 60
+    /// 系统音频栈真阻塞时，旧提示音会堆在串行队列里。解堵后补播已经失去意义，
+    /// 还可能连续占用 CoreAudio；超过此等待时间的请求直接丢弃，只保留新请求。
+    private static let maximumPlaybackQueueDelay: TimeInterval = 0.5
 
     private static let startSpec = ToneSpec(
         tones: [
@@ -93,17 +93,23 @@ enum SoundFeedback {
     private static func play(
         spec: ToneSpec
     ) {
+        let requestedAt = Date()
         playbackQueue.async {
+            let now = Date()
+            guard !shouldDropQueuedPlayback(
+                requestedAt: requestedAt,
+                now: now,
+                maximumDelay: maximumPlaybackQueueDelay
+            ) else {
+                let queueDelay = now.timeIntervalSince(requestedAt)
+                DebugFileLogger.log("sound \(spec.label) skipped: stale queue delay \(String(format: "%.3f", queueDelay))s")
+                return
+            }
             playNow(spec: spec)
         }
     }
 
     private static func playNow(spec: ToneSpec) {
-        if isMuted() {
-            DebugFileLogger.log("sound \(spec.label) skipped: muted after audio stack issue")
-            return
-        }
-
         let startedAt = Date()
         do {
             let didPlay = try playWithCachedPlayer(spec: spec)
@@ -111,36 +117,22 @@ enum SoundFeedback {
 
             AppLogger.log("[SoundFeedback] \(spec.label) play() => \(didPlay ? "true" : "false")")
             DebugFileLogger.log("sound \(spec.label) play() => \(didPlay) +\(String(format: "%.3f", elapsed))s")
-            if elapsed > slowPlaybackThreshold {
-                mutePlayback(label: spec.label, reason: "slow \(String(format: "%.3f", elapsed))s")
-                return
-            }
             guard didPlay else {
-                mutePlayback(label: spec.label, reason: "play returned false")
+                DebugFileLogger.log("sound \(spec.label) play returned false; no retry")
                 return
             }
         } catch {
             AppLogger.log("[SoundFeedback] \(spec.label) init failed: \(String(describing: error))")
             DebugFileLogger.log("sound \(spec.label) init failed: \(String(describing: error))")
-            mutePlayback(label: spec.label, reason: "init failed")
         }
     }
 
-    private static func isMuted(now: Date = Date()) -> Bool {
-        cache.withLock { state in
-            guard let mutedUntil = state.mutedUntil else { return false }
-            if mutedUntil > now { return true }
-            state.mutedUntil = nil
-            return false
-        }
-    }
-
-    private static func mutePlayback(label: String, reason: String) {
-        let until = Date().addingTimeInterval(muteAfterAudioStackIssue)
-        cache.withLock { state in
-            state.mutedUntil = until
-        }
-        DebugFileLogger.log("sound \(label) muted for \(Int(muteAfterAudioStackIssue))s: \(reason)")
+    static func shouldDropQueuedPlayback(
+        requestedAt: Date,
+        now: Date,
+        maximumDelay: TimeInterval
+    ) -> Bool {
+        now.timeIntervalSince(requestedAt) > maximumDelay
     }
 
     private static func preparePlayersIfNeeded() {
