@@ -24,7 +24,7 @@ read_plist() {
 [ "$(read_plist CFBundleName)" = "Muse" ] || fail "CFBundleName should be Muse"
 [ "$(read_plist CFBundleDisplayName)" = "Muse" ] || fail "CFBundleDisplayName should be Muse"
 [ "$(read_plist CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType should be APPL"
-[ "$(read_plist CFBundleShortVersionString)" = "1.7.0" ] || fail "CFBundleShortVersionString should be 1.7.0"
+[ "$(read_plist CFBundleShortVersionString)" = "1.7.1" ] || fail "CFBundleShortVersionString should be 1.7.1"
 [ "$(read_plist CFBundleVersion)" = "1" ] || fail "CFBundleVersion should be 1"
 [ "$(read_plist CFBundleIconFile)" = "AppIcon" ] || fail "CFBundleIconFile should be AppIcon"
 [ "$(read_plist LSMinimumSystemVersion)" = "14.0" ] || fail "LSMinimumSystemVersion should be 14.0"
