@@ -36,6 +36,9 @@ swift build -c release
 
 首次启动会进入引导流程（授权、选择识别引擎）。默认按 **Option** 键开始说话、再按一次结束，文字自动输入到光标位置；可在「设置 → 输入模式」里自定义快捷键与处理模式。
 
-## 许可
+## 版权
 
-见 [LICENSE](LICENSE)。
+Copyright (c) 2026 DaliangPro. All rights reserved.
+
+本项目为专有软件。未经 DaliangPro 事先书面许可，不得使用、复制、修改、分发、
+再许可或销售本项目及其源码。详见 [LICENSE](LICENSE)。

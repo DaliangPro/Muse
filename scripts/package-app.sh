@@ -136,6 +136,7 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 echo "Packaging app bundle at $APP_PATH..."
+trash_path "$APP_PATH/Contents/Resources/THIRD_PARTY_LICENSES.txt"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
 cp "$PROJECT_DIR/Muse/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
@@ -270,9 +271,6 @@ if [ "$LLM_MODEL_SIZE" = "9b" ] && [ -f "$LLM_MODEL_DIR/Qwen3.5-9B-Q4_K_M.gguf" 
     cp "$LLM_MODEL_DIR/Qwen3.5-9B-Q4_K_M.gguf" "$APP_PATH/Contents/Resources/Models/qwen3.5-9b-q4_k_m.gguf"
     echo "Qwen3.5-9B model bundled."
 fi
-
-# Copy third-party licenses
-cp "$PROJECT_DIR/Muse/Resources/THIRD_PARTY_LICENSES.txt" "$APP_PATH/Contents/Resources/" 2>/dev/null || true
 
 echo "Signing with '${SIGNING_IDENTITY}'..."
 # PyInstaller dist dirs contain .dylibs and dist-info dirs that confuse
