@@ -29,9 +29,10 @@ enum GeneralSettingsStyle {
     static let overviewSummaryCardHeight: CGFloat = 76
     static let museBannerCornerRadius: CGFloat = surfaceCornerRadius
     static let museBannerHorizontalPadding: CGFloat = surfaceSpacing
-    static let museBannerVerticalPadding: CGFloat = surfaceSpacing
-    static let museBannerStatusTopPadding: CGFloat = 8
-    static let museBannerStatusTrailingPadding: CGFloat = museBannerHorizontalPadding
+    /// 光学补偿：状态按钮有固定行高，实际字形顶部比视图边界低约 8 点。
+    static let museBannerStatusTopPadding: CGFloat = 6
+    /// 光学补偿：Caption 行框底部比可见字形多约 2 点。
+    static let museBannerSloganBottomPadding: CGFloat = 12
     static let museBannerStatusFont = TF.settingsFontCaption
     static let recordBodyLineSpacing: CGFloat = 2
 }

@@ -39,17 +39,21 @@ private extension GeneralOverviewSection {
                 .offset(y: 1)
 
                 Spacer(minLength: 8)
-
-                VStack(alignment: .trailing, spacing: 3) {
-                    introStatusStrip
-
-                    Text(L("你的灵感缪斯", "Your muse for inspiration"))
-                        .font(TF.settingsFontCaption)
-                        .foregroundStyle(TF.settingsTextSecondary.opacity(colorScheme == .dark ? 0.62 : 0.58))
-                        .lineLimit(1)
-                }
             }
             .padding(.horizontal, GeneralSettingsStyle.museBannerHorizontalPadding)
+
+            introStatusStrip
+                .padding(.top, GeneralSettingsStyle.museBannerStatusTopPadding)
+                .padding(.trailing, GeneralSettingsStyle.museBannerHorizontalPadding)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+
+            Text(L("你的灵感缪斯", "Your muse for inspiration"))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextSecondary.opacity(colorScheme == .dark ? 0.62 : 0.58))
+                .lineLimit(1)
+                .padding(.trailing, GeneralSettingsStyle.museBannerHorizontalPadding)
+                .padding(.bottom, GeneralSettingsStyle.museBannerSloganBottomPadding)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
         }
         .frame(
             maxWidth: .infinity,
