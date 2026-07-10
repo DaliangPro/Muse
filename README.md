@@ -4,12 +4,14 @@
 
 <h3 align="center">macOS 原生语音输入与灵感资产工作台</h3>
 
+## 产品展示
+
 <p align="center">
-  按一次 Option 开始说话，再按一次结束。文字直接落到当前光标，说过的内容继续沉淀为可复用语料。
+  <img src="docs/images/muse-onboarding.png" width="860" alt="Muse 使用引导首页">
 </p>
 
 <p align="center">
-  <img src="docs/images/muse-models.jpg" width="860" alt="Muse 模型配置界面">
+  <img src="docs/images/muse-overview.png" width="860" alt="Muse 概览与记录页面">
 </p>
 
 ## 核心能力
@@ -23,17 +25,29 @@
 
 ## 产品界面
 
+### 语料资产
+
 <p align="center">
-  <img src="docs/images/muse-modes.jpg" width="49%" alt="Muse 输入模式">
-  <img src="docs/images/muse-about.jpg" width="49%" alt="Muse 关于页面">
+  <img src="docs/images/muse-assets.png" width="860" alt="Muse 语料资产页面">
+</p>
+
+### 语音润色
+
+<p align="center">
+  <img src="docs/images/muse-voice-polish.png" width="860" alt="Muse 输入模式语音润色页面">
+</p>
+
+### 模型配置
+
+<p align="center">
+  <img src="docs/images/muse-models.png" width="860" alt="Muse 模型配置页面">
 </p>
 
 ## 使用方式
 
 1. 首次启动时授予麦克风和辅助功能权限。
 2. 在「模型配置」中选择语音识别与文本处理服务。
-3. 按一次 **Option** 开始说话，再按一次结束。
-4. Muse 完成识别和处理后，将文字直接写入当前光标位置。
+3. Muse 完成识别和处理后，将文字直接写入当前光标位置。
 
 快捷键、触发方式和文本处理模式均可在设置中调整。
 
