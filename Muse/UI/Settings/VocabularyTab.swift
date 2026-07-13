@@ -106,7 +106,7 @@ private extension VocabularyTab {
     var panelExplanation: String {
         switch selectedPanel {
         case .hotwords:
-            return L("输入正确词，保存后下次识别生效", "Enter the correct term; it applies next time")
+            return L("提高 Muse 命中概率", "Improve Muse's recognition hit rate")
         case .snippets:
             return L("识别错了就改回来，命中必改", "Fix known misheard words, every time")
         }
