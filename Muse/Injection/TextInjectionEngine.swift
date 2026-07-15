@@ -242,6 +242,22 @@ final class TextInjectionEngine: @unchecked Sendable {
         pasteboard.setString(text, forType: .string)
     }
 
+    /// 注入通道的临时写入：内容同 copyToClipboard，但额外标 org.nspasteboard.TransientType——
+    /// 告知第三方剪贴板管理器（ProNotch 等历史工具）这是「输入中转」临时内容、勿记入历史。
+    /// 背景：注入走「写剪贴板 → Cmd+V → 延迟 0.6s 恢复」，这 0.6s 窗口里按轮询的管理器会抓到
+    /// 识别文本、把每句语音都记进历史（2026-07 大梁老师实测 ProNotch 被污染）。transient 是
+    /// 输入法/密码管理器的行业标准标记；仍写 .string，故 Cmd+V 粘贴与 restore 的 text 守卫均不受影响。
+    /// 注意：不改 copyToClipboard 本身——它还用于「无权限/无输入框」时故意留给用户手动粘贴，
+    /// 那些场景若标 transient，管理器会跳过、用户反而找不到。
+    private func writeInjectionText(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let item = NSPasteboardItem()
+        item.setString(text, forType: .string)
+        item.setData(Data(), forType: .init("org.nspasteboard.TransientType"))
+        pasteboard.writeObjects([item])
+    }
+
     // MARK: - Clipboard injection
 
     /// REPAIR_PLAN J2：剪贴板恢复延迟。Cmd+V 是异步事件，目标 app 何时消费不可控——
@@ -255,7 +271,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         let savedClipboard = preserveClipboard ? ClipboardSnapshot.capture() : nil
         let hasFrontmostApplication = NSWorkspace.shared.frontmostApplication != nil
 
-        copyToClipboard(text)
+        writeInjectionText(text)
         let postWriteChangeCount = NSPasteboard.general.changeCount
 
         usleep(50_000)
