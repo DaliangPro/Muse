@@ -110,6 +110,14 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     static let defaultAccumulatedAudioByteLimit =
         30 * 60 * Int(sampleRate) * MemoryLayout<Int16>.size
 
+    /// REPAIR_PLAN K3：每次 start 后丢弃采集头部字节数。开始提示音在采集开始后
+    /// ~0.1-0.35s 经外放→麦克风回采（无 AEC），会被 ASR 识别成句首幻觉短音节；
+    /// 丢弃前 400ms（6400 samples @16kHz Int16）覆盖提示音窗口。ingest 是流式
+    /// 切块与整段缓存（批量兜底）的唯一入口，两路一并干净。可注入供测试。
+    var leadingSkipBytes = AudioCaptureEngine.defaultLeadingSkipBytes
+    static let defaultLeadingSkipBytes =
+        Int(0.4 * sampleRate) * MemoryLayout<Int16>.size
+
     // MARK: - Private
 
     private var captureSession: AVCaptureSession?
@@ -119,6 +127,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     private var buffer = Data()
     private var accumulatedAudio = Data()
     private var accumulatedAudioOverflowed = false
+    private var leadingSkipBytesPending = 0
     private var converter: AVAudioConverter?
     private let outputQueue = DispatchQueue(label: "pro.daliang.muse.audiocapture")
     private let outputQueueKey = DispatchSpecificKey<UInt8>()
@@ -218,6 +227,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         buffer = Data()
         accumulatedAudio = Data()
         accumulatedAudioOverflowed = false
+        leadingSkipBytesPending = leadingSkipBytes
         bufferLock.unlock()
         converter = nil
 
@@ -372,7 +382,23 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
     /// 转码后的统一入口：累积整段录音（带 B8 上限）+ 切块回调（B2 锁外调用）
     private func ingest(chunk: Data) {
+        var chunk = chunk
+        var leadingSkipJustCompleted = false
         bufferLock.lock()
+        // REPAIR_PLAN K3：丢弃头部提示音窗口（流式与整段缓存一并生效）
+        if leadingSkipBytesPending > 0 {
+            let drop = min(leadingSkipBytesPending, chunk.count)
+            leadingSkipBytesPending -= drop
+            leadingSkipJustCompleted = leadingSkipBytesPending == 0
+            if drop == chunk.count {
+                bufferLock.unlock()
+                if leadingSkipJustCompleted {
+                    DebugFileLogger.log("audio leading skip complete (\(leadingSkipBytes) bytes)")
+                }
+                return
+            }
+            chunk = chunk.subdata(in: drop..<chunk.count)
+        }
         var overflowJustHappened = false
         if !accumulatedAudioOverflowed {
             accumulatedAudio.append(chunk)
@@ -391,6 +417,9 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         }
         bufferLock.unlock()
         let callback = currentAudioChunkHandler()
+        if leadingSkipJustCompleted {
+            DebugFileLogger.log("audio leading skip complete (\(leadingSkipBytes) bytes)")
+        }
         if overflowJustHappened {
             AppLogger.log("[Audio] 录音超过内存上限（\(accumulatedAudioByteLimit) 字节），停止整段缓存，批量兜底对本次会话失效")
         }
@@ -403,6 +432,13 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     /// 测试入口：绕过采集设备直接灌入转码后的数据
     func ingestForTesting(_ chunk: Data) {
         ingest(chunk: chunk)
+    }
+
+    /// 测试入口：模拟 start 后的头部跳过状态（REPAIR_PLAN K3）
+    func armLeadingSkipForTesting() {
+        bufferLock.lock()
+        leadingSkipBytesPending = leadingSkipBytes
+        bufferLock.unlock()
     }
     #endif
 

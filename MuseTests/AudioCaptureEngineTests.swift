@@ -47,6 +47,52 @@ final class AudioCaptureEngineTests: XCTestCase {
         XCTAssertTrue(engine.getRecordedAudio().isEmpty)
     }
 
+    // MARK: - REPAIR_PLAN K3：开始提示音头部跳过
+
+    func testLeadingSkipDefaultCoversToneWindow() {
+        // 400ms @16kHz Int16 = 12800 字节，对齐提示音回采窗口
+        XCTAssertEqual(AudioCaptureEngine.defaultLeadingSkipBytes, 12800)
+        XCTAssertEqual(AudioCaptureEngine().leadingSkipBytes, 12800)
+    }
+
+    func testLeadingSkipDropsHeadAcrossIngests() {
+        let engine = AudioCaptureEngine()
+        engine.leadingSkipBytes = 100
+        engine.armLeadingSkipForTesting()
+
+        engine.ingestForTesting(Data(repeating: 0x01, count: 60))
+        XCTAssertTrue(engine.getRecordedAudio().isEmpty)
+
+        engine.ingestForTesting(Data(repeating: 0x02, count: 60))
+        let recorded = engine.getRecordedAudio()
+        XCTAssertEqual(recorded.count, 20)
+        XCTAssertTrue(recorded.allSatisfy { $0 == 0x02 })
+    }
+
+    func testLeadingSkipAffectsChunkStreamAndAccumulation() {
+        let engine = AudioCaptureEngine()
+        engine.leadingSkipBytes = AudioCaptureEngine.chunkByteSize
+        engine.armLeadingSkipForTesting()
+
+        var chunks: [Data] = []
+        engine.setAudioChunkHandler { chunks.append($0) }
+
+        var payload = Data(repeating: 0x01, count: AudioCaptureEngine.chunkByteSize)
+        payload.append(Data(repeating: 0x02, count: AudioCaptureEngine.chunkByteSize))
+        engine.ingestForTesting(payload)
+
+        // 头部整块被丢弃：流式只回调 1 个 chunk 且全为第二段内容
+        XCTAssertEqual(chunks.count, 1)
+        XCTAssertTrue(chunks[0].allSatisfy { $0 == 0x02 })
+        XCTAssertTrue(engine.getRecordedAudio().allSatisfy { $0 == 0x02 })
+    }
+
+    func testIngestWithoutArmKeepsAllAudio() {
+        let engine = AudioCaptureEngine()
+        engine.ingestForTesting(Data(repeating: 0x01, count: 500))
+        XCTAssertEqual(engine.getRecordedAudio().count, 500)
+    }
+
     // MARK: - REPAIR_PLAN J21
 
     func testStartStateInvalidatesLateStarts() {
