@@ -6,6 +6,14 @@ private struct ASRTeardownResult: Sendable {
     let clean: Bool
 }
 
+/// REPAIR_PLAN K4：ASR 连接的会话级超时（底层 URLSession 默认 60s 过长）
+struct ASRConnectTimeoutError: Error, LocalizedError {
+    var errorDescription: String? {
+        L("识别服务连接超时，请检查网络后重试",
+          "ASR connection timed out. Check your network and try again.")
+    }
+}
+
 private struct LLMPostProcessingResult: Sendable {
     var finalText: String
     var processedText: String?
@@ -55,6 +63,10 @@ actor RecognitionSession {
     /// 「无数据间隔」语义，流式慢速涓流可无限拖延；45s 高于底层正常超时（不抢跑），
     /// 超时按 LLM 失败处理回退原文，HUD 不再卡死在 postProcessing。
     static let llmPostProcessTimeout: Duration = .seconds(45)
+
+    /// REPAIR_PLAN K4：ASR 连接会话级超时。实测正常握手 <1s；网络异常时
+    /// URLSession 默认 60s 会让用户对着无字幕的 HUD 干等，10s 即判失败走报错路径。
+    static let asrConnectTimeout: Duration = .seconds(10)
 
     /// Return the appropriate LLM client for the currently selected provider.
     private func currentLLMClient() -> any LLMClient {
@@ -386,9 +398,24 @@ actor RecognitionSession {
         let provider = activeProvider
         do {
             DebugFileLogger.log("ASR connecting provider=\(provider.rawValue)")
-            try await client.connect(config: config, options: requestOptions)
+            // REPAIR_PLAN K4：URLSession 默认握手超时 60s，网络差时字幕可空转一分钟；
+            // 会话级 10s 硬超时（同 J12 的 Result 包装模式），超时走既有失败路径。
+            let connectT0 = ContinuousClock.now
+            let timed = await AsyncTimeout.asyncValue(Self.asrConnectTimeout) {
+                () -> Result<Void, Error> in
+                do {
+                    try await client.connect(config: config, options: requestOptions)
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            guard let outcome = timed.value else {
+                throw ASRConnectTimeoutError()
+            }
+            try outcome.get()
             AppLogger.log("[Session] ASR connected OK (streaming, hotwords=\(hotwordCount), userHotwords=\(requestOptions.userHotwordCount), corrections=\(requestOptions.correctionWords.count), history=\(requestOptions.contextHistoryLength))")
-            DebugFileLogger.log("ASR connected OK provider=\(provider.rawValue)")
+            DebugFileLogger.log("ASR connected OK provider=\(provider.rawValue) +\(ContinuousClock.now - connectT0)")
         } catch {
             AppLogger.log("[Session] ASR connect FAILED provider=\(provider.rawValue) error=\(String(describing: error))")
             DebugFileLogger.log("ASR connect failed provider=\(provider.rawValue): \(String(describing: error))")

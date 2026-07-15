@@ -186,7 +186,8 @@ final class TextInjectionEngine: @unchecked Sendable {
             DebugFileLogger.log("inject: via AX selectedText len=\(text.count) frontmost=\(frontmostBundleID ?? "unknown")")
             return .inserted
         }
-        DebugFileLogger.log("inject: AX declined, falling back to clipboard")
+        // REPAIR_PLAN K4：记目标 app，便于归因哪些应用 AX 直插不可用
+        DebugFileLogger.log("inject: AX declined, falling back to clipboard frontmost=\(frontmostBundleID ?? "unknown")")
         return injectViaClipboard(text)
     }
 
@@ -221,7 +222,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         }
 
         guard let locationAfter = Self.selectedRangeLocation(focused), locationAfter > locationBefore else {
-            DebugFileLogger.log("inject: AX set ok but caret did not advance, fallback")
+            DebugFileLogger.log("inject: AX set ok but caret did not advance, fallback app=\(app.bundleIdentifier ?? "unknown")")
             return false
         }
         return true

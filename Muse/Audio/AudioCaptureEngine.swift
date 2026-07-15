@@ -244,6 +244,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     }
 
     private func startWithAVCapture(token: Int) -> StartOutcome {
+        let setupT0 = ContinuousClock.now
         let session = AVCaptureSession()
 
         guard let device = AVCaptureDevice.default(for: .audio) else {
@@ -269,7 +270,16 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         }
         session.addOutput(output)
 
+        let runT0 = ContinuousClock.now
         session.startRunning()
+        // REPAIR_PLAN K4：偶发 2-3s 慢启动此前无法区分耗在 input 初始化还是
+        // startRunning（HAL 冷/设备切换），仅慢时留分段耗时便于归因
+        let runElapsed = ContinuousClock.now - runT0
+        if runElapsed > .milliseconds(500) {
+            DebugFileLogger.log(
+                "audio start breakdown: setup +\(runT0 - setupT0), startRunning +\(runElapsed), device=\(device.localizedName)"
+            )
+        }
         let accepted = stateLock.withLock { () -> Bool in
             guard startState.isCurrent(token) else { return false }
             captureSession = session
