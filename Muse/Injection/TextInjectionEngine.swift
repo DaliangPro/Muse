@@ -125,10 +125,45 @@ final class TextInjectionEngine: @unchecked Sendable {
         }
 
         let applicationElement = AXUIElementCreateApplication(frontmostApplication.processIdentifier)
-        guard let focusedElement = elementAttribute(applicationElement, kAXFocusedUIElementAttribute as CFString) else {
+        if let focusedElement = elementAttribute(applicationElement, kAXFocusedUIElementAttribute as CFString) {
+            // 树是活的：查到元素即一锤定音（原生 app 非输入框场景保持零延迟）
+            return isEditableElement(focusedElement, depth: 0)
+        }
+        return hasFocusedEditableElementAfterElectronActivation(
+            applicationElement,
+            bundleID: frontmostApplication.bundleIdentifier
+        )
+    }
+
+    /// REPAIR_PLAN K5：Chromium/Electron 的辅助功能树默认懒激活——冷启动后焦点
+    /// 元素恒不可查（err -25212），且普通 AX 查询不会触发建树，必须由客户端设置
+    /// Electron 官方开关 `AXManualAccessibility`。干净环境（无其他常驻 AX 工具）的
+    /// 用户在 Obsidian/Codex 等 app 里因此永远走 noFocusedInput、注入不发生。
+    /// 原生 app 不支持该属性（set 返回 -25205）立即回原路径、零延迟；set 成功则
+    /// 轮询等待建树（本机实测 Obsidian 约 2.1s，上限 3s），树活即按角色一锤定音。
+    /// 开关对目标进程生命周期持久，同一 app 后续注入零等待。
+    private static func hasFocusedEditableElementAfterElectronActivation(
+        _ applicationElement: AXUIElement,
+        bundleID: String?
+    ) -> Bool {
+        guard AXUIElementSetAttributeValue(
+            applicationElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        ) == .success else {
             return false
         }
-        return isEditableElement(focusedElement, depth: 0)
+        DebugFileLogger.log("inject: AXManualAccessibility set for \(bundleID ?? "unknown"), waiting for AX tree")
+        for _ in 0..<10 {
+            usleep(300_000)
+            if let focusedElement = elementAttribute(applicationElement, kAXFocusedUIElementAttribute as CFString) {
+                let editable = isEditableElement(focusedElement, depth: 0)
+                DebugFileLogger.log("inject: AX tree active after activation, editable=\(editable) app=\(bundleID ?? "unknown")")
+                return editable
+            }
+        }
+        DebugFileLogger.log("inject: AX tree still absent 3s after AXManualAccessibility, app=\(bundleID ?? "unknown")")
+        return false
     }
 
     /// 自绘渲染、AX 树不暴露焦点元素的应用（微信 4.x/QQ/钉钉/企业微信等腾讯系与 IM 类）：

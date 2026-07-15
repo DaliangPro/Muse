@@ -99,6 +99,57 @@ final class TextInjectionEngineIntegrationTests: XCTestCase {
         )
     }
 
+    // REPAIR_PLAN K5：Electron（Chromium）AX 树懒激活——冷启动的 Obsidian 焦点元素
+    // 恒不可查，修复后焦点检测应自动设置 AXManualAccessibility 并等树建成。
+    @MainActor
+    func testElectronColdStartFocusDetectionActivatesAXTree() throws {
+        guard ProcessInfo.processInfo.environment["MUSE_RUN_UI_INJECTION_TEST"] == "1" else {
+            throw XCTSkip("Set MUSE_RUN_UI_INJECTION_TEST=1 to run the Electron AX activation test.")
+        }
+        let obsidianBundleID = "md.obsidian"
+        guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: obsidianBundleID) != nil else {
+            throw XCTSkip("Obsidian not installed; Electron AX activation test needs it.")
+        }
+
+        // 冷启动：先退出确保 AX 树回到未激活状态（K5 的必现前置条件）
+        _ = try? runAppleScript("tell application id \"\(obsidianBundleID)\" to quit")
+        let quitDeadline = Date().addingTimeInterval(8)
+        while Date() < quitDeadline,
+              NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == obsidianBundleID }) {
+            usleep(200_000)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-b", obsidianBundleID]
+        try process.run()
+        process.waitUntilExit()
+        guard let obsidian = waitForRunningApplication(bundleIdentifier: obsidianBundleID, timeout: 10) else {
+            throw XCTSkip("Obsidian did not launch; cannot exercise Electron AX activation.")
+        }
+        defer {
+            _ = try? runAppleScript("tell application id \"\(obsidianBundleID)\" to quit")
+        }
+
+        // 等窗口就绪并置前台（焦点检测要求目标为 frontmost 且窗口有键盘焦点）
+        Thread.sleep(forTimeInterval: 5)
+        let activateDeadline = Date().addingTimeInterval(5)
+        while Date() < activateDeadline,
+              NSWorkspace.shared.frontmostApplication?.bundleIdentifier != obsidianBundleID {
+            _ = obsidian.activate(options: [.activateAllWindows])
+            usleep(200_000)
+        }
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == obsidianBundleID else {
+            throw XCTSkip("Obsidian did not become frontmost; cannot exercise focus detection.")
+        }
+
+        // K5 修复点：冷启动 Electron 上本调用应内部激活 AX 树并最终返回 true
+        XCTAssertTrue(
+            TextInjectionEngine.frontmostApplicationHasFocusedEditableElement(),
+            "Cold-started Electron app should pass focus detection after AXManualAccessibility activation (REPAIR_PLAN K5)."
+        )
+    }
+
     private func waitForRunningApplication(
         bundleIdentifier: String,
         timeout: TimeInterval = 3
