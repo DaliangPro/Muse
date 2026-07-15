@@ -768,7 +768,11 @@ actor RecognitionSession {
             }
         }
 
-        let insertionCleanedText = currentMode.applyingFinalInsertionCleanup(to: finalText)
+        let insertionCleanedText = Self.finalizeInsertionText(
+            finalText,
+            mode: currentMode,
+            isLLMOutput: processedText != nil
+        )
         if insertionCleanedText != finalText {
             DebugFileLogger.log(
                 "stop: final insertion cleanup changed text len \(finalText.count)->\(insertionCleanedText.count)"
@@ -784,6 +788,20 @@ actor RecognitionSession {
             processedText: processedText,
             llmFailed: llmFailed
         )
+    }
+
+    // REPAIR_PLAN K1：防泄漏清洗只作用于真 LLM 输出。直出与 LLM 失败回退的文本是
+    // 用户口述原文，stripLikelyPromptLeakage 的 marker（「现在剪切板」「输入消息」等）
+    // 会命中日常口语并从命中处截断到结尾（2026-07-15 实锤：113 字被截成 5 字）。
+    static func finalizeInsertionText(
+        _ text: String,
+        mode: ProcessingMode,
+        isLLMOutput: Bool
+    ) -> String {
+        guard isLLMOutput else {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return mode.applyingFinalInsertionCleanup(to: text)
     }
 
     private func injectFinalText(

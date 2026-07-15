@@ -50,7 +50,9 @@ final class ProcessingModeCleanupTests: XCTestCase {
         XCTAssertEqual(cleaned, "已经整理好了。")
     }
 
-    func testFinalInsertionCleanupRunsForDirectMode() {
+    // REPAIR_PLAN K1：applyingFinalInsertionCleanup 仅由 LLM 输出路径调用
+    //（RecognitionSession.finalizeInsertionText 分流），以下两条测函数自身清洗能力。
+    func testFinalInsertionCleanupStripsChangeRequestTail() {
         let leaked = "已经写好了。 要求后续变更"
 
         let cleaned = ProcessingMode.direct.applyingFinalInsertionCleanup(to: leaked)
@@ -64,6 +66,56 @@ final class ProcessingModeCleanupTests: XCTestCase {
         let cleaned = ProcessingMode.direct.applyingFinalInsertionCleanup(to: leaked)
 
         XCTAssertEqual(cleaned, "我今晚先把稿子写完。")
+    }
+
+    // REPAIR_PLAN K1：直出（非 LLM 输出）不做防泄漏清洗——marker 会命中日常口语。
+    // 实锤案例：2026-07-15 history 记录，原文 113 字含「现在剪切板」被截成「OK，然后」。
+    func testDirectSpeechContainingMarkerPhraseIsNotTruncated() {
+        let speech = "OK，然后现在剪切板还是有问题，就是我现在有一个语音输入法嘛，然后我语音输入法输入的文字，我明明没有选择让它进入剪切板"
+
+        let finalized = RecognitionSession.finalizeInsertionText(
+            speech,
+            mode: .direct,
+            isLLMOutput: false
+        )
+
+        XCTAssertEqual(finalized, speech)
+    }
+
+    func testDirectSpeechContainingPromptWordIsNotTruncated() {
+        let speech = "提示词：这个部分要展开讲。\n然后输入消息的时候注意换行。"
+
+        let finalized = RecognitionSession.finalizeInsertionText(
+            speech,
+            mode: .direct,
+            isLLMOutput: false
+        )
+
+        XCTAssertEqual(finalized, speech)
+    }
+
+    func testDirectSpeechOnlyTrimsWhitespace() {
+        let speech = "  今天先到这里。\n"
+
+        let finalized = RecognitionSession.finalizeInsertionText(
+            speech,
+            mode: .direct,
+            isLLMOutput: false
+        )
+
+        XCTAssertEqual(finalized, "今天先到这里。")
+    }
+
+    func testLLMOutputStillStripsLeakageViaFinalize() {
+        let leaked = "已经整理好了。现在剪切板里的内容如下"
+
+        let finalized = RecognitionSession.finalizeInsertionText(
+            leaked,
+            mode: .formalWriting,
+            isLLMOutput: true
+        )
+
+        XCTAssertEqual(finalized, "已经整理好了。")
     }
 
     func testPromptOptimizerKeepsGeneratedPromptHeadings() {
