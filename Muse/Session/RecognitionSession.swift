@@ -549,15 +549,29 @@ actor RecognitionSession {
 
         // Batch fallback: if streaming broke mid-session, always retry with
         // the full local recording to get complete text, even if we have partial.
+        // REPAIR_PLAN K2：转写严重滞后时服务端可能只 final 了开头段就正常关流
+        //（实测说 8s 首包 7.4s 才到、注入仅 3 字），clean 关闭不代表文本完整——
+        // 长录音字数低到不合理时同样强制批量复核。
+        let recordedDuration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let implausiblyShort = Self.isTranscriptImplausiblyShort(
+            textCount: Self.effectiveTranscriptText(for: currentTranscript).count,
+            durationSeconds: recordedDuration
+        )
+        if implausiblyShort {
+            DebugFileLogger.log(
+                "stop: transcript implausibly short for \(String(format: "%.1f", recordedDuration))s recording, forcing batch fallback"
+            )
+        }
         let streamingFailed = uploadFailed || !asrTeardown.clean
-            || streamingDegraded
+            || streamingDegraded || implausiblyShort
         await recoverTranscriptAfterStreamingFailureIfNeeded(
             streamingFailed: streamingFailed,
             expectedGeneration: myGeneration
         )
         guard ensureCurrent("batch fallback") else { return }
-        // Combine confirmed segments + any trailing unconfirmed partial.
-        let effectiveText = currentTranscript.displayText
+        // REPAIR_PLAN K2：注入取值经守卫函数——asyncFinal 的权威文本明显短于
+        // 流式累积（HUD 所见）时回退 composed，保证注入与字幕口径一致。
+        let effectiveText = Self.effectiveTranscriptText(for: currentTranscript)
         currentConfig = nil
 
         if !effectiveText.isEmpty {
@@ -952,6 +966,16 @@ actor RecognitionSession {
             return
         }
 
+        // REPAIR_PLAN K2：兜底不劣化——批量结果比流式已有文本更短时保留流式，
+        // 防止「兜底自身被截」反而覆盖掉更完整的字幕文本。
+        let streamingText = Self.effectiveTranscriptText(for: currentTranscript)
+        guard batchText.count >= streamingText.count else {
+            DebugFileLogger.log(
+                "stop: batch fallback shorter than streaming (\(batchText.count) < \(streamingText.count)), keeping streaming text"
+            )
+            return
+        }
+
         currentTranscript = RecognitionTranscript(
             confirmedSegments: [batchText],
             partialText: "",
@@ -959,6 +983,36 @@ actor RecognitionSession {
             isFinal: true
         )
         DebugFileLogger.log("stop: batch fallback succeeded, \(batchText.count) chars")
+    }
+
+    // REPAIR_PLAN K2：注入取值守卫。HUD 字幕与 LLM 路径显示/消费 composedText
+    //（流式累积），而 displayText 优先 authoritativeText（火山 asyncFinal 的
+    // result.text）——后者偶发只承载尾段或被服务端 DDC 重排变短。权威文本明显
+    // 短于流式累积时回退 composed，使注入与用户在 HUD 所见一致。
+    static func effectiveTranscriptText(for transcript: RecognitionTranscript) -> String {
+        let auth = transcript.authoritativeText
+        let composed = transcript.composedText
+        guard !auth.isEmpty else { return composed }
+        guard !composed.isEmpty else { return auth }
+        if Double(auth.count) < Double(composed.count) * 0.6 {
+            DebugFileLogger.log(
+                "stop: authoritative text suspiciously short auth=\(auth.count) composed=\(composed.count), using composed"
+            )
+            return composed
+        }
+        return auth
+    }
+
+    // REPAIR_PLAN K2：长录音字数低到不合理（有字但不足每秒 0.5 字）视为疑似
+    // 流层丢失，强制批量复核。0 字不触发——那是「没说话」，走 empty 路径；
+    // 短录音不触发——短句+快松手是正常形态。
+    static func isTranscriptImplausiblyShort(
+        textCount: Int,
+        durationSeconds: Double
+    ) -> Bool {
+        guard durationSeconds >= 10 else { return false }
+        guard textCount > 0 else { return false }
+        return Double(textCount) < durationSeconds * 0.5
     }
 
     // MARK: - ASR Events
@@ -1166,8 +1220,8 @@ actor RecognitionSession {
                     switch event {
                     case .transcript(let transcript) where transcript.isFinal:
                         await client.disconnect()
-                        let text = transcript.authoritativeText.isEmpty
-                            ? transcript.composedText : transcript.authoritativeText
+                        // REPAIR_PLAN K2：批量 final 同样可能 auth 短于 composed，取长
+                        let text = RecognitionSession.effectiveTranscriptText(for: transcript)
                         return text.isEmpty ? nil : text
                     case .error:
                         await client.disconnect()

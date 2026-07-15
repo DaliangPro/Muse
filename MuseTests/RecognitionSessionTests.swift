@@ -160,6 +160,98 @@ final class RecognitionSessionTests: XCTestCase {
         let state = await session.state
         XCTAssertEqual(state, .recording)
     }
+
+    // MARK: - REPAIR_PLAN K2：注入取值守卫与时长合理性
+
+    func testEffectiveTextPrefersAuthoritativeWhenComparable() {
+        let transcript = RecognitionTranscript(
+            confirmedSegments: ["今天先到这里，", "明天继续。"],
+            partialText: "",
+            authoritativeText: "今天先到这里，明天继续。",
+            isFinal: true
+        )
+
+        XCTAssertEqual(
+            RecognitionSession.effectiveTranscriptText(for: transcript),
+            "今天先到这里，明天继续。"
+        )
+    }
+
+    func testEffectiveTextFallsBackWhenAuthoritativeSuspiciouslyShort() {
+        // 实锤形态：流式累积完整、asyncFinal 的 result.text 只承载开头一小段
+        let composedPieces = ["OK，然后现在还是有问题，", "就是我现在有一个语音输入法嘛，", "然后我输入的文字少了很多"]
+        let transcript = RecognitionTranscript(
+            confirmedSegments: composedPieces,
+            partialText: "",
+            authoritativeText: "OK，然后",
+            isFinal: true
+        )
+
+        XCTAssertEqual(
+            RecognitionSession.effectiveTranscriptText(for: transcript),
+            composedPieces.joined()
+        )
+    }
+
+    func testEffectiveTextUsesComposedWhenAuthoritativeEmpty() {
+        let transcript = RecognitionTranscript(
+            confirmedSegments: ["第一段"],
+            partialText: "第二段",
+            authoritativeText: "",
+            isFinal: false
+        )
+
+        XCTAssertEqual(
+            RecognitionSession.effectiveTranscriptText(for: transcript),
+            "第一段第二段"
+        )
+    }
+
+    func testEffectiveTextUsesAuthoritativeWhenComposedEmpty() {
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [],
+            partialText: "",
+            authoritativeText: "最终文本",
+            isFinal: true
+        )
+
+        XCTAssertEqual(
+            RecognitionSession.effectiveTranscriptText(for: transcript),
+            "最终文本"
+        )
+    }
+
+    func testImplausiblyShortRequiresLongRecording() {
+        XCTAssertFalse(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 3, durationSeconds: 8.0
+        ))
+        XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 4, durationSeconds: 10.0
+        ))
+        XCTAssertFalse(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 5, durationSeconds: 10.0
+        ))
+    }
+
+    func testImplausiblyShortIgnoresEmptyText() {
+        // 0 字=没说话，走 empty 路径，不应触发批量兜底
+        XCTAssertFalse(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 0, durationSeconds: 30.0
+        ))
+    }
+
+    func testImplausiblyShortCatchesHistoricalLossCases() {
+        // history.db 实锤：22.2s/5 字、53.6s/6 字、19.0s/3 字
+        XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 5, durationSeconds: 22.2
+        ))
+        XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 6, durationSeconds: 53.6
+        ))
+        XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 3, durationSeconds: 19.0
+        ))
+    }
 }
 
 private final class RecognitionEventRecorder: @unchecked Sendable {

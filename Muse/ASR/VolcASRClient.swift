@@ -313,7 +313,9 @@ actor VolcASRClient: WebSocketASRClient {
                 lastTranscriptTime = now
 
                 let gapMs = Int(sinceLastUpdate.components.seconds * 1000 + sinceLastUpdate.components.attoseconds / 1_000_000_000_000_000)
-                DebugFileLogger.log("ASR transcript +\(sinceStart) gap=\(gapMs)ms confirmed=\(transcript.confirmedSegments.count) partial=\(transcript.partialText.count) final=\(transcript.isFinal)")
+                // REPAIR_PLAN K2：auth/composed 是注入取值的关键维度（asyncFinal 的
+                // result.text 偶发短于流式累积），必须留痕才能事后归因丢字
+                DebugFileLogger.log("ASR transcript +\(sinceStart) gap=\(gapMs)ms confirmed=\(transcript.confirmedSegments.count) partial=\(transcript.partialText.count) auth=\(transcript.authoritativeText.count) composed=\(transcript.composedText.count) final=\(transcript.isFinal)")
 
                 AppLogger.log("[ASR] Transcript update +\(String(describing: sinceStart)) gap=\(gapMs)ms confirmed=\(transcript.confirmedSegments.count) partial=\(transcript.partialText.count) final=\(transcript.isFinal ? "yes" : "no")")
                 emitEvent(.transcript(transcript))
