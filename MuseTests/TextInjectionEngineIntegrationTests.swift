@@ -99,6 +99,61 @@ final class TextInjectionEngineIntegrationTests: XCTestCase {
         )
     }
 
+    // REPAIR_PLAN K6：nonactivatingPanel 输入框（ProNotch 闪问同配置）——键盘焦点
+    // 在面板、宿主永不是 frontmost。修复后 systemwide 焦点识别 + 剪贴板 Cmd+V
+    // 应把文本注入面板输入框（端到端）。
+    @MainActor
+    func testNonactivatingPanelReceivesInjection() throws {
+        guard ProcessInfo.processInfo.environment["MUSE_RUN_UI_INJECTION_TEST"] == "1" else {
+            throw XCTSkip("Set MUSE_RUN_UI_INJECTION_TEST=1 to run the panel injection test.")
+        }
+
+        final class KeyablePanel: NSPanel {
+            override var canBecomeKey: Bool { true }
+        }
+        let panel = KeyablePanel(
+            contentRect: NSRect(x: 500, y: 500, width: 320, height: 48),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .statusBar
+        let field = NSTextField(frame: NSRect(x: 10, y: 10, width: 300, height: 28))
+        panel.contentView?.addSubview(field)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(field)
+        defer { panel.orderOut(nil) }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+
+        guard let target = TextInjectionEngine.systemwideFocusedTarget(),
+              target.ownerPid == ProcessInfo.processInfo.processIdentifier else {
+            throw XCTSkip("systemwide focus did not land on test panel (environment-dependent); skipping")
+        }
+
+        let marker = "MUSE_PANEL_INJECTION_\(Int(Date().timeIntervalSince1970))"
+        let engine = TextInjectionEngine()
+        engine.preserveClipboard = false
+
+        // inject 禁止主线程调用（B6）；后台执行 + 主线程 spin runloop 处理 Cmd+V
+        let done = expectation(description: "inject finished")
+        nonisolated(unsafe) var outcome: InjectionOutcome?
+        DispatchQueue.global(qos: .userInitiated).async {
+            outcome = engine.inject(marker)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 8)
+
+        XCTAssertEqual(outcome, .inserted, "panel-focused input must be injectable (REPAIR_PLAN K6)")
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, !field.stringValue.contains(marker) {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        XCTAssertTrue(
+            field.stringValue.contains(marker),
+            "Expected panel text field to receive injected text, got: '\(field.stringValue)'"
+        )
+    }
+
     // REPAIR_PLAN K5：Electron（Chromium）AX 树懒激活——冷启动的 Obsidian 焦点元素
     // 恒不可查，修复后焦点检测应自动设置 AXManualAccessibility 并等树建成。
     @MainActor

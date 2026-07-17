@@ -115,7 +115,41 @@ final class TextInjectionEngine: @unchecked Sendable {
         targetProcessIdentifier == currentProcessIdentifier
     }
 
+    /// REPAIR_PLAN K6：系统级键盘焦点目标——`.nonactivatingPanel`（ProNotch 闪问、
+    /// Spotlight 类浮动面板）持有键盘焦点时宿主 app 永不是 frontmost，基于
+    /// frontmost 的判定整体错位。systemwide 元素直接给出「真正会接收输入的元素」
+    /// 及其宿主；Electron 树未激活时该查询同样失败（err -25204/-25212），由调用方
+    /// 回落 frontmost 路径（K5 激活等）。
+    struct SystemwideFocusTarget {
+        let element: AXUIElement
+        let ownerPid: pid_t
+        let ownerBundleID: String?
+    }
+
+    static func systemwideFocusedTarget() -> SystemwideFocusTarget? {
+        let systemWide = AXUIElementCreateSystemWide()
+        guard let focused = elementAttribute(systemWide, kAXFocusedUIElementAttribute as CFString) else {
+            return nil
+        }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(focused, &pid) == .success, pid > 0 else { return nil }
+        return SystemwideFocusTarget(
+            element: focused,
+            ownerPid: pid,
+            ownerBundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        )
+    }
+
     static func frontmostApplicationHasFocusedEditableElement() -> Bool {
+        // REPAIR_PLAN K6：先看系统级键盘焦点——面板类宿主非 frontmost，只有这里能看到
+        if let target = systemwideFocusedTarget() {
+            // 自身进程不做元素级 AX 查询（J22：后台队列进 AppKit 文本系统会崩）
+            if shouldBypassAccessibility(targetProcessIdentifier: target.ownerPid) {
+                return true
+            }
+            return isEditableElement(target.element, depth: 0)
+        }
+
         guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else { return false }
 
         // AppState 会从 detached task 调用本方法。自身进程不做 AX 查询，避免后台队列
@@ -194,6 +228,37 @@ final class TextInjectionEngine: @unchecked Sendable {
             copyToClipboard(text)
             return .copiedToClipboardPermissionMissing
         }
+
+        // REPAIR_PLAN K6：系统级键盘焦点优先。nonactivatingPanel（ProNotch 闪问等）
+        // 的焦点宿主永不是 frontmost app——以焦点宿主做全部判定并直接注入焦点元素；
+        // 剪贴板 Cmd+V 走 CGEvent 发键盘焦点，对面板天然正确。
+        if let target = Self.systemwideFocusedTarget() {
+            let owner = target.ownerBundleID ?? "pid:\(target.ownerPid)"
+            if Self.shouldBypassAccessibility(targetProcessIdentifier: target.ownerPid) {
+                DebugFileLogger.log("inject: self target bypass AX (systemwide), using clipboard")
+                return injectViaClipboard(text)
+            }
+            if Self.isAXOpaqueApp(target.ownerBundleID) {
+                DebugFileLogger.log("inject: axOpaqueApp bypass (systemwide) owner=\(owner)")
+                return injectViaClipboard(text)
+            }
+            guard Self.isEditableElement(target.element, depth: 0) else {
+                DebugFileLogger.log("inject: systemwide focus not editable owner=\(owner)")
+                if !preserveClipboard {
+                    copyToClipboard(text)
+                    return .noFocusedInput(copiedToClipboard: true)
+                }
+                return .noFocusedInput(copiedToClipboard: false)
+            }
+            if injectViaAccessibility(text, into: target.element) {
+                DebugFileLogger.log("inject: via AX selectedText len=\(text.count) owner=\(owner) (systemwide)")
+                return .inserted
+            }
+            DebugFileLogger.log("inject: AX declined (systemwide), falling back to clipboard owner=\(owner)")
+            return injectViaClipboard(text)
+        }
+
+        // systemwide 查不到（Electron 树未激活 / 真无键盘焦点）→ frontmost 路径
         let frontmostApplication = NSWorkspace.shared.frontmostApplication
         let frontmostBundleID = frontmostApplication?.bundleIdentifier
         if let frontmostApplication,
@@ -239,6 +304,15 @@ final class TextInjectionEngine: @unchecked Sendable {
         guard let focused = Self.elementAttribute(appElement, kAXFocusedUIElementAttribute as CFString) else {
             return false
         }
+        return injectViaAccessibility(text, into: focused)
+    }
+
+    /// REPAIR_PLAN K6：直插参数化——systemwide 焦点元素（面板类）与 frontmost
+    /// 焦点元素共用同一套三重防护（可写声明 / set success / 光标前进验证）。
+    private func injectViaAccessibility(_ text: String, into focused: AXUIElement) -> Bool {
+        var ownerPid: pid_t = 0
+        AXUIElementGetPid(focused, &ownerPid)
+        let ownerLabel = NSRunningApplication(processIdentifier: ownerPid)?.bundleIdentifier ?? "pid:\(ownerPid)"
 
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(focused, kAXSelectedTextAttribute as CFString, &settable) == .success,
@@ -257,7 +331,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         }
 
         guard let locationAfter = Self.selectedRangeLocation(focused), locationAfter > locationBefore else {
-            DebugFileLogger.log("inject: AX set ok but caret did not advance, fallback app=\(app.bundleIdentifier ?? "unknown")")
+            DebugFileLogger.log("inject: AX set ok but caret did not advance, fallback app=\(ownerLabel)")
             return false
         }
         return true
