@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && /bin/pwd -P)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)"
 APP_NAME="Muse"
-APP_VERSION="${APP_VERSION:-1.7.3}"
+APP_VERSION="${APP_VERSION:-1.7.4}"
 DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist}"
 DMG_NAME="${DMG_NAME:-${APP_NAME}-v${APP_VERSION}.dmg}"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
