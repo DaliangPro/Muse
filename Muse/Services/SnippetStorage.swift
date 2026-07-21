@@ -1,11 +1,8 @@
 import Foundation
 import os
-#if canImport(AppKit)
-import AppKit
-#endif
 
 /// Snippet replacement with two independent stores:
-/// - **Built-in file** (`builtin-snippets.json`): seeded from defaults, user-editable via Finder for bulk ops
+/// - **Built-in file** (`builtin-snippets.json`): defaults seeded only when the file is missing
 /// - **User file** (`snippets.json`): managed by Settings UI, auto-loaded on save
 /// Both are merged at runtime; user entries override built-in on trigger conflict.
 enum SnippetStorage {
@@ -14,13 +11,15 @@ enum SnippetStorage {
 
     // MARK: - File paths
 
-    private static var appSupportDir: URL { AppPaths.supportDir }
+    static var builtinFileURL: URL { builtinFileURL(in: .production) }
+    static func builtinFileURL(in context: VocabularyStorageContext) -> URL {
+        context.supportDirectory.appendingPathComponent("builtin-snippets.json")
+    }
 
-    /// Built-in snippets file (seeded from defaults, user-editable for bulk ops)
-    static var builtinFileURL: URL { appSupportDir.appendingPathComponent("builtin-snippets.json") }
-
-    /// User snippets file (managed by Settings UI)
-    static var userFileURL: URL { appSupportDir.appendingPathComponent("snippets.json") }
+    static var userFileURL: URL { userFileURL(in: .production) }
+    static func userFileURL(in context: VocabularyStorageContext) -> URL {
+        context.supportDirectory.appendingPathComponent("snippets.json")
+    }
 
     // MARK: - Codable model
 
@@ -198,100 +197,139 @@ enum SnippetStorage {
 
     // MARK: - Initialization
 
-    private static let migratedKey = "tf_snippets_migrated_to_file_v2"
+    private static let schemaVersionKey = "tf_snippets_schema_version"
+    private static let currentSchemaVersion = 1
+    private static let legacyMigratedKey = "tf_snippets_migrated_to_file_v2"
     private static let oldUDKey = "tf_snippets"
 
-    /// Syncs built-in file with code defaults and migrates old UserDefaults data.
-    static func migrateIfNeeded() {
-        // Always sync built-in file with code defaults (picks up new entries on app update)
+    private enum MigrationError: Error {
+        case unsupportedSchemaVersion(Int)
+        case invalidLegacyPayload
+    }
+
+    /// 内置文件只在缺失时 seed；后续默认规则更新必须增加显式 schema migration。
+    static func migrateIfNeeded(context: VocabularyStorageContext = .production) {
         do {
-            try saveBuiltin(defaultSnippets)
+            try seedBuiltinIfMissing(context: context)
+            try runSchemaMigrations(context: context)
         } catch {
-            AppLogger.log("[SnippetStorage] 内置替换规则同步失败: \(error.localizedDescription)")
+            AppLogger.log("[SnippetStorage] 替换规则迁移失败: \(error.localizedDescription)")
         }
+    }
 
-        guard !UserDefaults.standard.bool(forKey: migratedKey) else { return }
+    private static func seedBuiltinIfMissing(context: VocabularyStorageContext) throws {
+        let url = builtinFileURL(in: context)
+        guard !context.fileManager.fileExists(atPath: url.path) else { return }
+        try writeFile(defaultSnippets, to: url)
+        invalidateCache()
+    }
 
+    private static func runSchemaMigrations(context: VocabularyStorageContext) throws {
+        var version = context.userDefaults.integer(forKey: schemaVersionKey)
+        if context.userDefaults.object(forKey: schemaVersionKey) == nil,
+           context.userDefaults.bool(forKey: legacyMigratedKey) {
+            // v2 布尔标记代表旧 UserDefaults 已经处理；桥接后不得重新导入并复活删除项。
+            version = 1
+            context.userDefaults.set(version, forKey: schemaVersionKey)
+        }
+        while version < currentSchemaVersion {
+            let nextVersion = version + 1
+            switch nextVersion {
+            case 1:
+                try migrateLegacyUserDefaults(context: context)
+            default:
+                throw MigrationError.unsupportedSchemaVersion(nextVersion)
+            }
+            context.userDefaults.set(nextVersion, forKey: schemaVersionKey)
+            version = nextVersion
+        }
+    }
+
+    private static func migrateLegacyUserDefaults(context: VocabularyStorageContext) throws {
         // Migrate old UserDefaults to user file (skip if user file already exists)
-        guard !FileManager.default.fileExists(atPath: userFileURL.path) else {
-            UserDefaults.standard.set(true, forKey: migratedKey)
-            return
-        }
-        guard let data = UserDefaults.standard.data(forKey: oldUDKey),
-              let pairs = try? JSONDecoder().decode([[String]].self, from: data)
+        let url = userFileURL(in: context)
+        guard !context.fileManager.fileExists(atPath: url.path) else { return }
+        guard context.userDefaults.object(forKey: oldUDKey) != nil else { return }
+        guard let data = context.userDefaults.data(forKey: oldUDKey),
+              let pairs = try? JSONDecoder().decode([[String]].self, from: data),
+              pairs.allSatisfy({ $0.count == 2 })
         else {
-            UserDefaults.standard.set(true, forKey: migratedKey)
-            return
+            throw MigrationError.invalidLegacyPayload
         }
 
-        let oldSnippets = pairs.compactMap { pair -> (trigger: String, value: String)? in
-            guard pair.count == 2 else { return nil }
-            return (trigger: pair[0], value: pair[1])
+        let oldSnippets = pairs.map { pair in
+            (trigger: pair[0], value: pair[1])
         }
 
         // Filter out entries that duplicate built-in
-        func norm(_ s: String) -> String { s.filter { !$0.isWhitespace }.lowercased() }
-        let builtinKeys = Set(defaultSnippets.map { "\(norm($0.trigger))\t\($0.value)" })
-        let userOnly = oldSnippets.filter { !builtinKeys.contains("\(norm($0.trigger))\t\($0.value)") }
+        let builtinKeys = Set(defaultSnippets.map(pairKey))
+        let userOnly = cleanedUniqueSnippets(oldSnippets)
+            .filter { !builtinKeys.contains(pairKey($0)) }
 
         if !userOnly.isEmpty {
-            do {
-                try save(userOnly)
-            } catch {
-                AppLogger.log("[SnippetStorage] 旧替换规则迁移失败: \(error.localizedDescription)")
-                return
-            }
+            try writeFile(userOnly, to: url)
+            invalidateCache()
         }
-        UserDefaults.standard.set(true, forKey: migratedKey)
     }
 
     // MARK: - User file (Settings UI)
 
-    static func load() -> [(trigger: String, value: String)] {
-        return readFile(userFileURL)
+    static func load(context: VocabularyStorageContext = .production) -> [(trigger: String, value: String)] {
+        readFile(userFileURL(in: context))
     }
 
-    static func save(_ snippets: [(trigger: String, value: String)]) throws {
-        try writeFile(snippets, to: userFileURL)
+    static func save(
+        _ snippets: [(trigger: String, value: String)],
+        context: VocabularyStorageContext = .production
+    ) throws {
+        try writeFile(snippets, to: userFileURL(in: context))
         invalidateCache()
     }
 
     /// 用户明确配置的错词纠正。下发给支持请求级 correct_words 的 ASR，
     /// 同时保留 applyEffective 的本地最终兜底，保证云端不支持时行为不变。
-    static func userCorrectionWords() -> [String: String] {
+    static func userCorrectionWords(
+        context: VocabularyStorageContext = .production
+    ) -> [String: String] {
         var corrections: [String: String] = [:]
-        for snippet in load() where !isDraftTrigger(snippet.trigger) {
-            let trigger = snippet.trigger.trimmingCharacters(in: .whitespacesAndNewlines)
-            let replacement = snippet.value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trigger.isEmpty, !replacement.isEmpty else { continue }
-            corrections[trigger] = replacement
+        for snippet in cleanedUniqueSnippets(load(context: context))
+            where !isDraftTrigger(snippet.trigger) {
+            corrections[snippet.trigger] = snippet.value
         }
         return corrections
     }
 
-    // MARK: - Built-in file (Finder editable)
+    // MARK: - Built-in file (seed once, preserve thereafter)
 
-    static func loadBuiltin() -> [(trigger: String, value: String)] {
-        return readFile(builtinFileURL)
+    static func loadBuiltin(
+        context: VocabularyStorageContext = .production
+    ) -> [(trigger: String, value: String)] {
+        readFile(builtinFileURL(in: context))
     }
 
-    static func saveBuiltin(_ snippets: [(trigger: String, value: String)]) throws {
-        try writeFile(snippets, to: builtinFileURL)
+    static func saveBuiltin(
+        _ snippets: [(trigger: String, value: String)],
+        context: VocabularyStorageContext = .production
+    ) throws {
+        try writeFile(snippets, to: builtinFileURL(in: context))
         invalidateCache()
     }
 
-    static func builtinCount() -> Int {
-        return loadBuiltin().count
+    static func builtinCount(context: VocabularyStorageContext = .production) -> Int {
+        loadBuiltin(context: context).count
     }
 
-    /// Reveal built-in snippets file in Finder.
-    static func revealBuiltinInFinder() {
-        if !FileManager.default.fileExists(atPath: builtinFileURL.path) {
-            try? saveBuiltin(defaultSnippets)
+    /// Finder 批量编辑只打开用户文件，避免把内置 seed 文件误当长期编辑入口。
+    static func revealUserInFinder(context: VocabularyStorageContext = .production) {
+        let url = userFileURL(in: context)
+        if !context.fileManager.fileExists(atPath: url.path) {
+            try? writeFile([], to: url)
         }
-        #if canImport(AppKit)
-        NSWorkspace.shared.activateFileViewerSelecting([builtinFileURL])
-        #endif
+        context.revealFile(url)
+    }
+
+    static func reloadFromDisk(context: VocabularyStorageContext = .production) {
+        invalidateCache()
     }
 
     // MARK: - Compiled cache
@@ -307,11 +345,27 @@ enum SnippetStorage {
     /// 否则 COW 数组被并发重置/遍历会撕裂崩溃。
     /// uncheckedState：CompiledRule 持有 NSRegularExpression（不可变、线程安全，
     /// 但无 Sendable 标注），锁本身保证独占访问。
-    private static let cachedRules = OSAllocatedUnfairLock<[CompiledRule]?>(uncheckedState: nil)
+    private struct CachedRuleSet {
+        let builtinURL: URL
+        let userURL: URL
+        let rules: [CompiledRule]
+    }
+
+    private struct RuleCacheState {
+        var generation = 0
+        var cached: CachedRuleSet?
+    }
+
+    private static let cachedRules = OSAllocatedUnfairLock<RuleCacheState>(
+        uncheckedState: RuleCacheState()
+    )
 
     /// Call after saving either file to force recompilation on next apply.
     static func invalidateCache() {
-        cachedRules.withLock { $0 = nil }
+        cachedRules.withLock {
+            $0.generation &+= 1
+            $0.cached = nil
+        }
     }
 
     static func isDraftTrigger(_ trigger: String) -> Bool {
@@ -322,14 +376,29 @@ enum SnippetStorage {
         isDraftTrigger(trigger) ? draftTriggerDisplayTitle : trigger
     }
 
-    private static func compiledRules() -> [CompiledRule] {
-        if let cached = cachedRules.withLock({ $0 }) { return cached }
+    private static func compiledRules(context: VocabularyStorageContext) -> [CompiledRule] {
+        let builtinURL = builtinFileURL(in: context)
+        let userURL = userFileURL(in: context)
+        let snapshot = cachedRules.withLock { state -> (rules: [CompiledRule]?, generation: Int) in
+            let rules: [CompiledRule]?
+            if let cached = state.cached,
+               cached.builtinURL == builtinURL,
+               cached.userURL == userURL {
+                rules = cached.rules
+            } else {
+                rules = nil
+            }
+            return (rules, state.generation)
+        }
+        if let rules = snapshot.rules { return rules }
         // 编译在锁外进行（含文件 IO，不宜持 unfair lock）；
         // 两个线程同时未命中会各编译一遍，结果幂等，后写覆盖无害。
-        let builtinSnippets = loadBuiltin()
-        let userSnippets = load()
-        let userTriggers = Set(userSnippets.map { $0.trigger.lowercased() })
-        let effectiveBuiltin = builtinSnippets.filter { !userTriggers.contains($0.trigger.lowercased()) }
+        let builtinSnippets = cleanedUniqueSnippets(loadBuiltin(context: context))
+        let userSnippets = cleanedUniqueSnippets(load(context: context))
+        let userTriggers = Set(userSnippets.map { normalizedTriggerKey($0.trigger) })
+        let effectiveBuiltin = builtinSnippets.filter {
+            !userTriggers.contains(normalizedTriggerKey($0.trigger))
+        }
         let allSnippets = effectiveBuiltin + userSnippets
 
         let rules = allSnippets.compactMap { snippet -> CompiledRule? in
@@ -338,16 +407,26 @@ enum SnippetStorage {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
             return CompiledRule(regex: regex, template: NSRegularExpression.escapedTemplate(for: snippet.value))
         }
-        cachedRules.withLock { $0 = rules }
+        cachedRules.withLock { state in
+            guard state.generation == snapshot.generation else { return }
+            state.cached = CachedRuleSet(
+                builtinURL: builtinURL,
+                userURL: userURL,
+                rules: rules
+            )
+        }
         return rules
     }
 
     // MARK: - Apply (merge both stores)
 
     /// Apply built-in + user snippets. User entries override built-in on trigger conflict.
-    static func applyEffective(to text: String) -> String {
+    static func applyEffective(
+        to text: String,
+        context: VocabularyStorageContext = .production
+    ) -> String {
         var result = text
-        for rule in compiledRules() {
+        for rule in compiledRules(context: context) {
             result = rule.regex.stringByReplacingMatches(
                 in: result,
                 range: NSRange(result.startIndex..., in: result),
@@ -380,5 +459,34 @@ enum SnippetStorage {
     private static func writeFile(_ snippets: [(trigger: String, value: String)], to url: URL) throws {
         let entries = snippets.map { Entry(trigger: $0.trigger, replacement: $0.value) }
         try JSONFileStore.writeOrThrow(entries, to: url)
+    }
+
+    private static func cleanedUniqueSnippets(
+        _ snippets: [(trigger: String, value: String)]
+    ) -> [(trigger: String, value: String)] {
+        var seen = Set<String>()
+        var result: [(trigger: String, value: String)] = []
+        for snippet in snippets {
+            let trigger = snippet.trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = snippet.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trigger.isEmpty, !value.isEmpty else { continue }
+            let key = normalizedTriggerKey(trigger)
+            guard seen.insert(key).inserted else { continue }
+            result.append((trigger: trigger, value: value))
+        }
+        return result
+    }
+
+    private static func normalizedTriggerKey(_ trigger: String) -> String {
+        trigger.filter { !$0.isWhitespace }.lowercased()
+    }
+
+    private static func pairKey(_ snippet: (trigger: String, value: String)) -> String {
+        let trigger = snippet.trigger
+            .filter { !$0.isWhitespace }
+            .lowercased()
+        let value = snippet.value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(trigger)\t\(value)"
     }
 }

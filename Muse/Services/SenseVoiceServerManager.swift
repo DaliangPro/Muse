@@ -72,7 +72,7 @@ actor SenseVoiceServerManager {
     /// Write effective hotwords (builtin + user) to hotwords.txt for Python servers.
     /// Called from non-actor context (HotwordStorage.save, etc).
     nonisolated static func syncHotwordsFile() {
-        let words = HotwordStorage.loadEffective()
+        let words = HotwordStorage.loadEffectiveForASR().words
         let dir = AppPaths.ensureSupportDir()
         let path = dir.appendingPathComponent("hotwords.txt")
         let content = words.joined(separator: "\n")

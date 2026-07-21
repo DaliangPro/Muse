@@ -19,6 +19,7 @@ struct VocabularyTab: View, SettingsCardHelpers {
     @State private var hotwords: [String] = HotwordStorage.load()
     @State private var newHotword = ""
     @State private var builtinHotwordCount = HotwordStorage.builtinCount()
+    @State private var truncatedUserHotwordCount = 0
 
     @State private var snippets: [(trigger: String, value: String)] = SnippetStorage.load()
     @State private var builtinSnippetCount = SnippetStorage.builtinCount()
@@ -56,8 +57,7 @@ struct VocabularyTab: View, SettingsCardHelpers {
             selectInitialRuleIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            // 从 Finder 改完内置文件切回 app 时,只重读内置计数(不动用户列表,避免覆盖编辑中的内容),
-            // 让「内置 N 条」实时反映改动（2026-06-13 用户拍板）
+            // Finder 返回时刷新只读计数；用户文件由明确的「重新加载」动作同步到服务。
             builtinHotwordCount = HotwordStorage.builtinCount()
             builtinSnippetCount = SnippetStorage.builtinCount()
         }
@@ -287,12 +287,15 @@ private extension VocabularyTab {
 
     var snippetFooter: some View {
         VocabularyBuiltInFooter(
-            summary: L("内置 \(builtinSnippetCount) 条纠正规则", "\(builtinSnippetCount) built-in correction rules"),
-            onOpenBuiltInFile: {
-                SnippetStorage.revealBuiltinInFinder()
+            summary: L(
+                "内置默认文件：\(builtinSnippetCount) 条纠正规则",
+                "Built-in defaults: \(builtinSnippetCount) correction rules"
+            ),
+            onOpenUserFile: {
+                SnippetStorage.revealUserInFinder()
             },
             onReload: {
-                builtinSnippetCount = SnippetStorage.builtinCount()
+                reloadSnippetsFromDisk()
             }
         )
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -302,12 +305,16 @@ private extension VocabularyTab {
 
     var hotwordFooter: some View {
         VocabularyBuiltInFooter(
-            summary: L("内置 \(builtinHotwordCount) 条热词", "\(builtinHotwordCount) built-in terms"),
-            onOpenBuiltInFile: {
-                HotwordStorage.revealBuiltinInFinder()
+            summary: L(
+                "内置默认文件：\(builtinHotwordCount) 条热词",
+                "Built-in defaults: \(builtinHotwordCount) terms"
+            ),
+            warning: hotwordTruncationWarning,
+            onOpenUserFile: {
+                HotwordStorage.revealUserInFinder()
             },
             onReload: {
-                builtinHotwordCount = HotwordStorage.builtinCount()
+                reloadHotwordsFromDisk()
             }
         )
     }
@@ -388,6 +395,14 @@ private extension VocabularyTab {
         hotwords
     }
 
+    var hotwordTruncationWarning: String? {
+        guard truncatedUserHotwordCount > 0 else { return nil }
+        return L(
+            "用户热词超过下发上限，暂不下发 \(truncatedUserHotwordCount) 条",
+            "\(truncatedUserHotwordCount) user terms are not sent because the limit was reached"
+        )
+    }
+
     var trimmedDraftReplacement: String {
         draftReplacement.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -411,6 +426,30 @@ private extension VocabularyTab {
         snippets = SnippetStorage.load()
         builtinHotwordCount = HotwordStorage.builtinCount()
         builtinSnippetCount = SnippetStorage.builtinCount()
+        truncatedUserHotwordCount = HotwordStorage.loadEffectiveForASR().truncatedUserCount
+    }
+
+    func reloadSnippetsFromDisk() {
+        SnippetStorage.reloadFromDisk()
+        snippets = SnippetStorage.load()
+        builtinSnippetCount = SnippetStorage.builtinCount()
+
+        if let selectedRuleReplacement,
+           let refreshed = VocabularySnippetGrouping.groups(for: snippets)
+            .first(where: { $0.replacement == selectedRuleReplacement }) {
+            beginEditing(refreshed)
+        } else {
+            self.selectedRuleReplacement = nil
+            editingRuleReplacement = nil
+            selectInitialRuleIfNeeded()
+        }
+    }
+
+    func reloadHotwordsFromDisk() {
+        HotwordStorage.reloadFromDisk()
+        hotwords = HotwordStorage.load()
+        builtinHotwordCount = HotwordStorage.builtinCount()
+        truncatedUserHotwordCount = HotwordStorage.loadEffectiveForASR().truncatedUserCount
     }
 
     func selectInitialRuleIfNeeded() {
@@ -538,10 +577,12 @@ private extension VocabularyTab {
     func persistHotwordsOrReload(context: String) -> Bool {
         do {
             try HotwordStorage.save(hotwords)
+            truncatedUserHotwordCount = HotwordStorage.loadEffectiveForASR().truncatedUserCount
             return true
         } catch {
             AppLogger.log("[VocabularyTab] \(context) failed: \(error.localizedDescription)")
             hotwords = HotwordStorage.load()
+            truncatedUserHotwordCount = HotwordStorage.loadEffectiveForASR().truncatedUserCount
             return false
         }
     }
