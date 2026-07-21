@@ -28,7 +28,7 @@
 | MUSE-020 | ✅ 完成 | `b2d5cd0` | 会话资源所有权与 7 条竞态回归测试完成。 |
 | MUSE-030 | ✅ 完成 | `f396df3` | 火山连接生命周期与会话事件流已分离。 |
 | MUSE-040 | ✅ 完成 | `05227b5` | Apple Speech 会话令牌与可靠截止时间已完成。 |
-| MUSE-050 | 🟡 AirPods 已验收，其余设备待办 | `43c58b1` | AudioBufferList 安全复制与 ASan 通过；AirPods 真机通过，内置麦克风、USB 双声道声卡、聚合设备待办。 |
+| MUSE-050 | 🟡 AirPods 与内置麦克风已验收 | `43c58b1` | AudioBufferList 安全复制与 ASan 通过；USB 双声道声卡、聚合设备待办。 |
 | MUSE-060 | ✅ 完成 | `0239544` | 本地双引擎会话流、终态和迟到终校隔离完成。 |
 
 ### MUSE-010：建立真正的硬超时工具
@@ -104,7 +104,7 @@
 
 ### MUSE-050：修复 CMSampleBuffer 多声道内存越界风险
 
-- 状态：🟡 实现与自动验收完成；AirPods 人工录音通过，其余三类设备待办。
+- 状态：🟡 实现与自动验收完成；AirPods 与内置麦克风人工录音通过，其余两类设备待办。
 - 提交：`43c58b1`（`修复: 按 AudioBufferList 安全转换采集音频`）。
 - 测试优先：先新增 `AudioCaptureBufferConversionTests` 的 9 条用例；修复前执行 `swift test --filter AudioCaptureBufferConversionTests` 明确编译失败，原因是生产端只有 `Data` 重载，且没有安全的 CMSampleBuffer 转换与可测重采样入口。
 - 修改：
@@ -125,8 +125,14 @@
   - 成功产生 22 个音频块、136,298 字节；最大绝对采样值 13,544，最大归一化电平 0.6825921；0 个 `CMSampleBuffer` 转换失败或被丢弃。
   - 转换结果保持 16 kHz、mono、Int16、interleaved，验收程序返回 `ACCEPTANCE_RESULT=PASS`。
   - 验收后 `swift test --filter 'AudioCaptureBufferConversionTests|AudioCaptureEngineTests'`：19 项，0 失败；`swift test`：299 项，5 项按环境条件跳过，0 失败。
+- 内置麦克风人工验收（2026-07-20 PDT）：
+  - 经用户明确授权，将默认输入从 AirPods“听”（CoreAudio ID 267）临时切换至“MacBook Pro麦克风”（ID 104）；测试结束后立即恢复 ID 267，并再次读取确认恢复成功。
+  - 使用同一临时程序执行 5 秒内存采集；输入为 44.1 kHz、1 声道，音频未保存、未上传，也未访问用户数据目录。
+  - 成功产生 25 个音频块、155,486 字节；最大绝对采样值 1,903，最大归一化电平 0.31228927；0 个 `CMSampleBuffer` 转换失败或被丢弃。
+  - 转换结果保持 16 kHz、mono、Int16、interleaved，验收程序返回 `ACCEPTANCE_RESULT=PASS`。
+  - 验收后 `swift test --filter 'AudioCaptureBufferConversionTests|AudioCaptureEngineTests'`：19 项，0 失败；`swift test`：299 项，5 项按环境条件跳过，0 失败。
 - 硬件盘点：当前可见 AirPods“听”（1 声道/24 kHz）、MacBook Pro 内置麦克风（1 声道/44.1 kHz）、Maono USB 双声道输入（48 kHz）、Maono AI USB 双声道输入（48 kHz）及多个虚拟多声道设备；未确认聚合音频设备。
-- 遗留风险：AirPods 已通过；内置麦克风、USB 双声道声卡和聚合音频设备仍未逐项执行人工录音验收。自动更新开关仍为 `false`。
+- 遗留风险：AirPods 与内置麦克风已通过；USB 双声道声卡和聚合音频设备仍未逐项执行人工录音验收。自动更新开关仍为 `false`。
 
 ### MUSE-060：修复 SenseVoiceWSClient 中断后终校事件丢失
 
@@ -157,4 +163,4 @@
 - 真实用户数据：未访问、未修改 `~/Library/Application Support/Muse/`。
 - 收口自动验收：`bash scripts/health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建通过，全量 `swift test` 执行 299 项、5 项按环境条件跳过、0 失败，Shell 语法与两个 Python 服务语法检查通过。
 - 收口环境限制：`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按设计标记为 `SKIP`；未安装工具，也未降低构建或测试门槛。
-- 待人工项：MUSE-050 的内置麦克风、USB 双声道声卡和聚合设备录音（AirPods 已通过）；MUSE-030 真实火山断网/重连；MUSE-040 真实 Apple Speech 超时；MUSE-060 真实 SenseVoice 中断后 Qwen 终校。
+- 待人工项：MUSE-050 的 USB 双声道声卡和聚合设备录音（AirPods、内置麦克风已通过）；MUSE-030 真实火山断网/重连；MUSE-040 真实 Apple Speech 超时；MUSE-060 真实 SenseVoice 中断后 Qwen 终校。
