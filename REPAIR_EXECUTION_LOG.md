@@ -581,7 +581,7 @@
 | 任务 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | MUSE-190 | ✅ 完成 | `a441ce6` | Apple 识别强制端侧，拒绝 locale 回退并提供可操作错误；隐私文案与实现一致。 |
-| MUSE-200 | ⬜ 未开始 | — | 等待 MUSE-190 完成。 |
+| MUSE-200 | ✅ 完成 | `f9a8ce9` | macOS CI、双制品签名公证、不可变跨作业复验与发布门槛已落库；真实发布环境和真机 gate 未完成，自动更新仍关闭。 |
 
 ### MUSE-190：对齐 Apple 识别的端侧行为和隐私说明
 
@@ -612,3 +612,49 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、530 项 Swift 测试、模型与签名策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；三轮独立只读复审完成，最终确认无剩余 P0/P1、无云端 fallback，并独立复跑 16 项定向测试通过。
 - 遗留风险：遵照用户指示未执行麦克风、AirPods、真实 Apple Speech 或其他音频真机测试；端侧 locale 的实际可用性仍取决于目标 macOS、硬件与已安装语言资产，自动测试只覆盖框架边界与可控工厂。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按规则跳过。测试使用 fake 与临时资源，未访问真实 Muse 用户数据目录。Cloud、Local 双制品签名、SHA256、真实更新与回滚验收尚未全部完成，因此 `UpdateChecker.updateChannelEnabled` 继续保持 `false`。
+
+### MUSE-200：建立持续集成与双制品发布验签门槛
+
+- 状态：✅ 仓库实现完成；正式发布仍被外部环境与真机验收 gate 阻断。
+- 提交：`f9a8ce9a97fc93e0adbad9efe6378d37383b7d3c`（`配置: 建立 Muse 持续集成和发布验签门槛`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `ce65e1579593978cb08636b06219d77ea754f021`；开始前除执行日志的任务认领外，仅有用户既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖、未修改、未纳入提交。基线 `swift build` 通过；`swift test` 执行 530 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 首轮补 CI、发布工作流和双制品验证合同后，定向测试先出现 14 项测试、20 个断言失败；扩展 Swift 工具链固定、依赖冻结、签名与环境保护合同时先出现 19 项测试、23 个失败。
+  - 再以失败测试锁定严格版本递增、稳定 Release 判定、跨作业 artifact ID/digest、签名窗口预构建 SHA、Bundle 权限归一化和安全清理；签名窗口阶段 4 项测试先出现 5 个失败。
+  - 公证与 Hardened Runtime 合同首轮 6 项测试出现 19 个失败；实现 `notarytool submit --wait`、staple、Gatekeeper 复验及“公证后才计算 SHA256”后转绿。
+  - 独立复审指出默认并发只保留一个 pending 发布；先让 `testReleaseWorkflowBuildsAndRevalidatesBothProductsBeforePublishing` 明确 1 项失败，再按 GitHub 官方语法加入 `queue: max`，目标测试转绿。
+- 修改：
+  - 新增 push/PR macOS CI，固定 Xcode 26.2 / Swift 6.2 和官方 Action commit SHA；每次执行 Debug/Release 构建、完整 Swift 测试、健康检查、全部 Bash 语法、6 个 Python 入口语法及 12 项 Python 安全测试。`shellcheck`、SwiftLint 仅在工具存在时执行，已安装工具失败不会被吞掉。
+  - 新增严格 SwiftLint 配置和可移植相对路径 baseline，覆盖 `Muse` 与 `MuseTests`；在仓库根目录及另一绝对路径复制中均以 SwiftLint 0.65.0 `--strict --no-cache` 通过。
+  - 两套冻结服务构建固定 Python 3.12.10 / 3.14.6、uv 0.11.30 与完整 lock 依赖；旧 build/dist 只移入废纸篓，不再永久删除或覆盖 spec。
+  - 发布工作流用 `release-signing`、`release` 两个受保护环境串联质量、签名和公开阶段；所有发布请求在 `muse-release` 并发组串行排队，公开前后各复核线上最高稳定版本，拒绝已有 tag、草稿或预发布同版本。
+  - 签名密钥仅在消费 SHA256 锁定的预构建 Swift 二进制时导入临时 keychain；Cloud/Local 均由内到外使用 Developer ID、时间戳和 Hardened Runtime 签名，提交 Apple 公证、staple 后执行 DMG/App 严格验签、Gatekeeper、Team ID 和镜像验证。
+  - 仅在两套公证制品全部通过后计算真实 SHA256、生成并校验 manifest fragment；跨作业传递锚定本次运行的 artifact ID 与 digest，公开前下载候选和远端草稿资产再次复验，失败时只清理当前运行创建且带标记的草稿。
+  - 发布工作流保留 TextEdit、微信、Electron、nonactivatingPanel、Apple Speech、火山重连、本地双引擎、Cloud/Local 更新和失败回滚共 10 项人工真机 gate；未确认时禁止公开 Release。
+- 修改文件：
+  - 工作流与静态检查：`.github/workflows/ci.yml`、`.github/workflows/release-verify.yml`、`.swiftlint.yml`、`.swiftlint-baseline.json`。
+  - 发布与构建脚本：`scripts/health-check.sh`、`release-verify.sh`、`run-signed-release-build.sh`、`prepare-release-binary.sh`、`notarize-release-artifacts.sh`、`verify-release-environments.sh`、`verify-release-artifact.sh`、`verify-release-version.sh`、`build-sensevoice-server.sh`、`build-qwen3-asr-server.sh`、`build-dmg.sh`、`package-app.sh`、`sign-app-bundle.sh`、`test_app_bundle.sh`。
+  - 冻结依赖：`sensevoice-server/requirements.lock.txt`、`qwen3-asr-server/requirements.lock.txt`。
+  - 测试：`MuseTests/CIWorkflowTests.swift`、`ReleaseVerifyScriptTests.swift`、`PackageScriptTests.swift`、`DMGScriptTests.swift`。
+- 验证：
+  - `swift test --filter 'CIWorkflowTests|ReleaseVerifyScriptTests|PackageScriptTests|DMGScriptTests|UpdateManifestTests|AppUpdaterChecksumTests|AppUpdaterScriptTests|AppUpdaterStatusTests'`：86 项，0 失败。
+  - 最终 `swift test --filter CIWorkflowTests`：11 项，0 失败；最终 `swift test`：554 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、554 项 Swift 测试、模型/签名/CI 发布策略、全部 Shell/Python 语法和 12 项 Python 服务测试通过。
+  - `bash -n scripts/*.sh`、6 个 Python 文件 `py_compile`、两份 workflow Ruby YAML 解析、`git diff --check`：通过；`shellcheck`、`periphery` 本机不可用，按既定可选规则跳过。
+  - SwiftLint 0.65.0：仓库根目录 strict 通过；复制到另一绝对路径后 strict 通过。actionlint 1.7.12 对除 2026 年新增 `concurrency.queue` 外的 workflow 规则通过；该版本尚未收录 `queue` schema，检查时仅忽略这一条已由 GitHub 官方文档确认的兼容性误报，两份 YAML 均通过解析。
+  - 只读线上版本策略实测：`RELEASE_VERSION_POLICY_RESULT: PASS (1.7.4 -> 2.0.0)`。线上环境策略按预期 fail-closed：仓库当前环境数量为 0，Actions secrets/variables 为空，不能进入真实签名发布链。
+  - 两轮独立只读审计未发现剩余代码级 P0/P1；公证顺序、artifact ID/digest 语义、远端复验与 fail-closed 边界均复核通过。
+- 遗留风险：
+  - GitHub 仓库尚未配置 `release-signing`、`release` 受保护环境、Developer ID/Apple Notary secrets 与 `APPLE_TEAM_ID`；未使用正式凭据构建、公证或验签真实 Cloud/Local DMG，也未执行真实冻结服务构建。因此本任务只完成仓库内门槛，不能宣称发布链已真实跑通。
+  - 10 项真机发布 gate 均未在本任务执行；遵照用户指示跳过全部音频测试。真实旧版 Cloud/Local 更新、失败回滚、Gatekeeper、Intel/Apple Silicon、本地 MLX Hardened Runtime 兼容性仍是正式发布前阻断项。
+  - 未访问或修改 `~/Library/Application Support/Muse/`，未安装任何插件、技能或系统级工具。Cloud、Local 双制品签名、公证、SHA256、更新和回滚真机验收未全部完成，`UpdateChecker.updateChannelEnabled` 继续保持 `false`。
+
+## 批次 E 收口
+
+- 代码任务：MUSE-190、MUSE-200 已按依赖顺序完成仓库实现，均先建立失败测试、再修复、通过定向和完整测试并独立提交。
+- 当前代码 HEAD：`f9a8ce9a97fc93e0adbad9efe6378d37383b7d3c`。
+- 收口自动验收：`swift build`、`swift build -c release` 通过；最终完整 `swift test` 执行 554 项、5 项按条件跳过、0 失败；`bash scripts/health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`；严格 SwiftLint 在根目录与另一绝对路径均通过。
+- 自动更新：仓库内双制品签名、公证、SHA256 和发布 fail-closed 链已建立，但真实 Developer ID/Notary 制品、GitHub 受保护环境、10 项真机更新与回滚验收尚未完成，开关继续保持 `false`。
+- 外部阻断：需要仓库管理员配置 `release-signing`、`release` 受保护环境及签名/公证 secrets/variables，再用正式候选执行 Cloud/Local 公证、Gatekeeper、更新和回滚验收；在此之前不得公开发布或开启自动更新。
+- 用户数据与音频：本批次未访问真实 Muse 用户数据目录；遵照用户明确指示，未执行麦克风、AirPods、Apple Speech 或其他音频真机测试。
