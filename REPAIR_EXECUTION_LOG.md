@@ -283,7 +283,7 @@
 |---|---|---|---|
 | MUSE-110 | ✅ 完成 | `ef60ef4` | 候选转资产幂等事务、提炼最终状态原子提交及失败状态独立兜底完成。 |
 | MUSE-120 | ✅ 完成 | `2c9a716` | 固定版本清单、逐文件 SHA256、ephemeral 下载、staging 原子安装与失败回滚完成。 |
-| MUSE-130 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-130 | ✅ 完成 | `2d9d915` | Provider 级 Endpoint 策略、共享 ephemeral 会话、重定向阻断及有界 SSE 完整性校验完成。 |
 | MUSE-140 | ⬜ 未开始 | — | 等待前置任务。 |
 | MUSE-150 | ⬜ 未开始 | — | 等待前置任务。 |
 | MUSE-160 | ⬜ 未开始 | — | 等待前置任务。 |
@@ -346,3 +346,37 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、385 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；独立只读复审未发现 MUSE-120 的 P0/P1 阻断问题，17 个文件的版本、大小与 SHA256 元数据和官方来源一致。
 - 遗留风险：本任务未下载或加载最大约 5.6 GB 的真实模型，因此真实 CDN 重定向后的文件名/Content-Length/续传兼容性、真实 Python 模型加载仍属于发布前人工 gate；进程若恰好在“旧目录 → backup”和“候选目录 → 正式目录”之间崩溃，可能留下隐藏 backup，当前覆盖所有可捕获运行时失败，但尚无安装 journal 或启动恢复；backup 删除若因权限问题在删除前失败，会保留已验证的新正式目录和隐藏 backup 供后续清理；bsdtar 列举、校验和解压是独立进程，虽在解压前后重验归档并审计结果，同用户恶意进程理论上仍可制造本地竞态。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过，未安装工具或降低门槛。未触碰真实用户数据目录，按用户指示未执行任何音频测试。自动更新开关仍为 `false`。
+
+### MUSE-130：加固 LLM Endpoint、SSE 和网络会话
+
+- 状态：✅ 完成。
+- 提交：`2d9d915`（`修复: 强制安全 LLM 地址并校验流式响应完整性`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `b81be17c0a0d12616a88bf22e36275aee2f1ddf7`；仅保留既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入提交。基线 `swift build`、`swift build -c release` 通过，`swift test` 执行 385 项、5 项按既有环境条件跳过、0 失败，健康检查通过。
+- 测试优先：
+  - 先新增云端/本地 URL 策略、凭证规范化、ephemeral 会话、local token、SSE 格式/完整性、响应上限及错误脱敏测试；修复前定向测试明确编译失败，缺少 Endpoint policy 与流式 parser API。
+  - 随后依次以失败测试锁定 JSON/Authorization/query 脱敏、IPv6 与 CRLF、无 delta 的 `finish_reason`、空端口、有限读取、重定向、部分传输、取消传播与 parser 错误分类，均先观察红灯再实施修复。
+  - 最后一轮先新增超长数字端口、原始 SSE 单行/总量、独立多行 event 包络和默认 session 复用测试；修复前分别因缺少 `SSEByteStreamDecoder`、`maxEventBytes` 与共享 session API 编译失败，实施后转绿。
+- 修改：
+  - 新增 provider-aware Endpoint policy：云端只允许 HTTPS，Ollama 的 HTTP 仅允许精确回环主机，localQwen 仅允许当前进程端口的 `127.0.0.1/v1`；拒绝 userinfo、fragment、query、空 host、空/越界/超长端口，并使用 URL API 拼接路径。
+  - 保存 LLM 凭证前统一 trim、验证和规范化 base URL；localQwen 仅在 Endpoint 精确校验后加入进程级鉴权 Header。
+  - 默认 client 与模型列表复用专用共享 ephemeral URLSession，禁用 Cookie、URLCache 和 credential storage，设置 request/resource timeout，并拒绝全部 HTTP 重定向，避免认证 Header 或请求体跨地址转发。
+  - SSE 改为逐字节读取：原始总量 16 MiB、单行 4 MiB、单 event 4 MiB、累计文本 2 MiB；支持 `data:`、可选空格、CRLF、空行、多行 event、`[DONE]` 与非空 `finish_reason`，提前断流返回可重试 truncated，取消和既有 parser 错误保持原类型。
+  - 非流式响应和预热改为有界读取；错误体有限保留并脱敏 API key、token、Authorization 与 URL query，用户可见错误不再携带原始服务响应。
+- 修改文件：
+  - `Muse/LLM/ClaudeChatClient.swift`
+  - `Muse/LLM/DoubaoChatClient.swift`
+  - `Muse/LLM/LLMEndpointPolicy.swift`
+  - `Muse/LLM/LLMModelListFetcher.swift`
+  - `Muse/LLM/Providers/ClaudeLLMConfig.swift`
+  - `Muse/LLM/Providers/LLMBaseURLValidator.swift`
+  - `Muse/LLM/Providers/OpenAICompatibleLLMConfig.swift`
+  - `Muse/Services/KeychainService.swift`
+  - `MuseTests/LLMEndpointPolicyTests.swift`
+  - `MuseTests/LLMStreamingParserTests.swift`
+- 验证：
+  - `swift test --filter 'LLMEndpointPolicyTests|LLMStreamingParserTests|LLMProviderConfigTests|LLMModelListFetcherTests|LocalServiceAuthTests|DoubaoChatClientTests'`：45 项，0 失败。
+  - `swift test`：414 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、414 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；两轮独立只读复审均未发现剩余 P0/P1。
+- 遗留风险：未连接真实云端 LLM 或本地 Qwen 服务进行网络联调，服务商若依赖重定向须把配置改为最终 HTTPS Endpoint；未使用真实 API key，也未读写真实用户数据目录。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
