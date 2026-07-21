@@ -13,20 +13,58 @@ struct ServerMemoryUsage: Sendable {
 actor SenseVoiceServerManager {
     static let shared = SenseVoiceServerManager()
 
+    private static let senseVoiceKind = "sensevoice-server"
+    private static let qwen3Kind = "qwen3-asr-server"
+    private static let knownKinds = Set([senseVoiceKind, qwen3Kind])
+
     /// Synchronous kill of all server processes. Safe to call from applicationWillTerminate.
-    /// Reads PIDs from disk file, only kills processes we spawned.
+    /// 只向身份仍匹配的记录发信号；总等待时间有界，未确认退出的记录继续保留。
     nonisolated static func killAllServerProcesses() {
-        if let content = try? String(contentsOf: pidFileURL, encoding: .utf8) {
-            for line in content.split(separator: "\n") {
-                // REPAIR_PLAN J9：kill 前 kill(pid,0) 探活（对齐 killOrphanedServers），
-                // 避免 PID 文件残留的号码被系统复用给无关进程后误杀
-                if let pid = Int32(line.trimmingCharacters(in: .whitespaces)), pid > 0,
-                   kill(pid, 0) == 0 {
-                    kill(pid, SIGTERM)
+        var pending: [ServerProcessIdentity] = []
+        var preserved: [ServerProcessIdentity] = []
+        for identity in loadRecordedIdentities() {
+            guard knownKinds.contains(identity.kind) else {
+                securityLog("拒绝清理未知 kind 的 PID 身份：\(identity.kind)")
+                preserved.append(identity)
+                continue
+            }
+            switch ServerProcessController.validate(identity, expectedKind: identity.kind) {
+            case .matching:
+                pending.append(identity)
+                if !ServerProcessController.sendSignal(
+                    SIGTERM,
+                    identity: identity,
+                    expectedKind: identity.kind,
+                    log: { message in securityLog(message) }
+                ) {
+                    securityLog("SIGTERM 发送失败，保留 PID 身份：\(identity.pid)")
                 }
+            case .notRunning, .mismatchedPath, .mismatchedStartTime, .mismatchedKind:
+                // 原记录对应的进程已经退出或 PID 已复用，不向当前进程发信号。
+                continue
+            case .unreadable:
+                securityLog("无法确认 PID 身份，保留记录且不发信号：\(identity.pid)")
+                preserved.append(identity)
             }
         }
-        clearPidFile()
+
+        waitSynchronouslyForExit(&pending, timeout: 3)
+        for identity in pending {
+            guard ServerProcessController.validate(
+                identity,
+                expectedKind: identity.kind
+            ) == .matching else { continue }
+            if !ServerProcessController.sendSignal(
+                SIGKILL,
+                identity: identity,
+                expectedKind: identity.kind,
+                log: { message in securityLog(message) }
+            ) {
+                securityLog("SIGKILL 发送失败，保留 PID 身份：\(identity.pid)")
+            }
+        }
+        waitSynchronouslyForExit(&pending, timeout: 1)
+        writeRecordedIdentities(preserved + pending)
         currentPort = nil
         currentQwen3Port = nil
     }
@@ -87,12 +125,17 @@ actor SenseVoiceServerManager {
     private let logger = Logger(subsystem: "pro.daliang.muse.sensevoice", category: "ServerManager")
 
     private var process: Process?
+    private var processIdentity: ServerProcessIdentity?
+    private var processExitLatch: ServerProcessExitLatch?
     private(set) var port: Int?
     private var stdoutPipe: Pipe?
 
     private var qwen3Process: Process?
+    private var qwen3Identity: ServerProcessIdentity?
+    private var qwen3ExitLatch: ServerProcessExitLatch?
     private(set) var qwen3Port: Int?
     private var qwen3StdoutPipe: Pipe?
+    private var stoppingProcessIDs: Set<Int32> = []
 
     var isRunning: Bool { process?.isRunning ?? false }
 
@@ -135,7 +178,7 @@ actor SenseVoiceServerManager {
 
     /// Called once at app launch. Kills orphans, then starts enabled servers.
     func start() async throws {
-        killOrphanedServers()
+        await killOrphanedServers()
         Self.syncHotwordsFile()
 
         let svEnabled = UserDefaults.standard.object(forKey: DefaultsKeys.sensevoiceEnabled) as? Bool ?? true
@@ -148,12 +191,12 @@ actor SenseVoiceServerManager {
         // 本地 LLM(Qwen3.5-9B) 也能在 app 内独立运行（server 进入 LLM-only 模式）。
         let needQwen3Server = qwen3Enabled || LocalQwenLLMConfig.isModelAvailable
         var qwen3Task: Task<Void, Error>?
-        if Self.isAppleSilicon && needQwen3Server && !(qwen3Process?.isRunning ?? false) {
+        if Self.isAppleSilicon && needQwen3Server && qwen3Process == nil {
             qwen3Task = Task { try await self.launchQwen3Server() }
         }
 
         // SenseVoice 启动失败不应拖垮整个 start()（更不应连累上面的 LLM/Qwen3 server）
-        if svEnabled && !(process?.isRunning ?? false) {
+        if svEnabled && process == nil {
             do {
                 try await launchSenseVoiceServer()
             } catch {
@@ -202,7 +245,9 @@ actor SenseVoiceServerManager {
             }
         }
         self.stdoutPipe = pipe
-        proc.terminationHandler = { [weak self] p in
+        let exitLatch = ServerProcessExitLatch()
+        proc.terminationHandler = { [weak self, exitLatch] p in
+            exitLatch.signal()
             Task { await self?.handleUnexpectedExit(of: p, label: "sensevoice-server") }
         }
 
@@ -211,22 +256,48 @@ actor SenseVoiceServerManager {
         do {
             try proc.run()
         } catch {
+            detachPipeHandlers(of: proc)
+            stdoutPipe = nil
             logger.error("Failed to start SenseVoice server: \(error)")
             throw ServerError.launchFailed(error)
         }
+        guard let identity = await Self.captureLaunchedIdentity(
+            kind: Self.senseVoiceKind,
+            pid: proc.processIdentifier
+        ) else {
+            detachPipeHandlers(of: proc)
+            _ = await Self.terminateUnidentifiedLaunchedProcess(
+                proc,
+                exitLatch: exitLatch,
+                label: "sensevoice-server"
+            )
+            stdoutPipe = nil
+            throw ServerError.processIdentityUnavailable
+        }
         self.process = proc
+        self.processIdentity = identity
+        self.processExitLatch = exitLatch
+        savePidsToFile()
 
         // SenseVoice model loading via PyTorch/FunASR is slow (~2 min), needs generous timeout
-        let portResult = await readPortFromStdout(pipe: pipe, timeout: 180)
+        let portResult = await ServerPortReader.discoverPort(from: pipe, timeout: .seconds(180))
         guard let discoveredPort = portResult else {
-            detachPipeHandlers(of: proc)
-            proc.terminate()
-            self.process = nil
+            let stopped = await reliablyTerminate(
+                proc,
+                identity: identity,
+                kind: Self.senseVoiceKind,
+                exitLatch: exitLatch,
+                label: "sensevoice-server"
+            )
+            if stopped, process === proc {
+                clearSenseVoiceState()
+                savePidsToFile()
+            }
             throw ServerError.portDiscoveryFailed
         }
         self.port = discoveredPort
         Self.currentPort = discoveredPort
-        // 拿到 PORT 后 readPortFromStdout 的读循环已退出（resume 前即 return），
+        // 拿到 PORT 后 ServerPortReader 已摘除发现阶段 handler，
         // 此处给 stdout 装持续排空 handler，避免运行期日志写满管道缓冲让 Python 卡死。
         drainStdout(pipe: pipe, label: "sensevoice-server")
         logger.info("SenseVoice server started on port \(discoveredPort)")
@@ -266,7 +337,9 @@ actor SenseVoiceServerManager {
             }
         }
         self.qwen3StdoutPipe = pipe
-        proc.terminationHandler = { [weak self] p in
+        let exitLatch = ServerProcessExitLatch()
+        proc.terminationHandler = { [weak self, exitLatch] p in
+            exitLatch.signal()
             Task { await self?.handleUnexpectedExit(of: p, label: "qwen3-asr-server") }
         }
 
@@ -275,21 +348,47 @@ actor SenseVoiceServerManager {
         do {
             try proc.run()
         } catch {
+            detachPipeHandlers(of: proc)
+            qwen3StdoutPipe = nil
             logger.error("Failed to start Qwen3-ASR server: \(error)")
             throw ServerError.launchFailed(error)
         }
-        self.qwen3Process = proc
-
-        let portResult = await readPortFromStdout(pipe: pipe, timeout: 120)
-        guard let discoveredPort = portResult else {
+        guard let identity = await Self.captureLaunchedIdentity(
+            kind: Self.qwen3Kind,
+            pid: proc.processIdentifier
+        ) else {
             detachPipeHandlers(of: proc)
-            proc.terminate()
-            self.qwen3Process = nil
+            _ = await Self.terminateUnidentifiedLaunchedProcess(
+                proc,
+                exitLatch: exitLatch,
+                label: "qwen3-asr-server"
+            )
+            qwen3StdoutPipe = nil
+            throw ServerError.processIdentityUnavailable
+        }
+        self.qwen3Process = proc
+        self.qwen3Identity = identity
+        self.qwen3ExitLatch = exitLatch
+        savePidsToFile()
+
+        let portResult = await ServerPortReader.discoverPort(from: pipe, timeout: .seconds(120))
+        guard let discoveredPort = portResult else {
+            let stopped = await reliablyTerminate(
+                proc,
+                identity: identity,
+                kind: Self.qwen3Kind,
+                exitLatch: exitLatch,
+                label: "qwen3-asr-server"
+            )
+            if stopped, qwen3Process === proc {
+                clearQwen3State()
+                savePidsToFile()
+            }
             throw ServerError.portDiscoveryFailed
         }
         self.qwen3Port = discoveredPort
         Self.currentQwen3Port = discoveredPort
-        // 拿到 PORT 后 readPortFromStdout 的读循环已退出（resume 前即 return），
+        // 拿到 PORT 后 ServerPortReader 已摘除发现阶段 handler，
         // 此处给 stdout 装持续排空 handler，避免运行期日志写满管道缓冲让 Python 卡死。
         drainStdout(pipe: pipe, label: "qwen3-asr-server")
         logger.info("Qwen3-ASR server started on port \(discoveredPort)")
@@ -320,17 +419,32 @@ actor SenseVoiceServerManager {
     }
 
     /// Stop the SenseVoice server independently.
-    func stopSenseVoice() {
-        detachPipeHandlers(of: process)
-        if let proc = process, proc.isRunning {
-            proc.terminate()
+    func stopSenseVoice() async {
+        guard let proc = process else {
+            clearSenseVoiceState()
+            savePidsToFile()
+            return
         }
-        process = nil
-        port = nil
-        Self.currentPort = nil
-        stdoutPipe = nil
-        logger.info("SenseVoice server stopped")
-        DebugFileLogger.log("SenseVoice server stopped (user toggle)")
+        guard let identity = processIdentity, let exitLatch = processExitLatch else {
+            Self.securityLog("拒绝停止 SenseVoice：缺少已验证的进程身份或退出观察器")
+            return
+        }
+
+        let stopped = await reliablyTerminate(
+            proc,
+            identity: identity,
+            kind: Self.senseVoiceKind,
+            exitLatch: exitLatch,
+            label: "sensevoice-server"
+        )
+        guard process === proc else { return }
+        if stopped {
+            clearSenseVoiceState()
+            logger.info("SenseVoice server stopped")
+            DebugFileLogger.log("SenseVoice server stopped (user toggle)")
+        } else {
+            Self.securityLog("SenseVoice 停止未确认，保留进程引用与 PID 身份")
+        }
         savePidsToFile()
     }
 
@@ -341,42 +455,44 @@ actor SenseVoiceServerManager {
     }
 
     /// Stop the Qwen3-ASR server independently (e.g. when user disables verification).
-    func stopQwen3() {
-        detachPipeHandlers(of: qwen3Process)
-        if let proc = qwen3Process, proc.isRunning {
-            proc.terminate()
+    func stopQwen3() async {
+        guard let proc = qwen3Process else {
+            clearQwen3State()
+            savePidsToFile()
+            return
         }
-        qwen3Process = nil
-        qwen3Port = nil
-        Self.currentQwen3Port = nil
-        qwen3StdoutPipe = nil
-        logger.info("Qwen3-ASR server stopped")
-        DebugFileLogger.log("Qwen3-ASR server stopped (user toggle)")
+        guard let identity = qwen3Identity, let exitLatch = qwen3ExitLatch else {
+            Self.securityLog("拒绝停止 Qwen3：缺少已验证的进程身份或退出观察器")
+            return
+        }
+
+        let stopped = await reliablyTerminate(
+            proc,
+            identity: identity,
+            kind: Self.qwen3Kind,
+            exitLatch: exitLatch,
+            label: "qwen3-asr-server"
+        )
+        guard qwen3Process === proc else { return }
+        if stopped {
+            clearQwen3State()
+            logger.info("Qwen3-ASR server stopped")
+            DebugFileLogger.log("Qwen3-ASR server stopped (user toggle)")
+        } else {
+            Self.securityLog("Qwen3 停止未确认，保留进程引用与 PID 身份")
+        }
         savePidsToFile()
     }
 
     /// Stop all server processes.
-    func stop() {
-        detachPipeHandlers(of: process)
-        if let proc = process, proc.isRunning {
-            proc.terminate()
+    func stop() async {
+        await stopSenseVoice()
+        await stopQwen3()
+        if process == nil, qwen3Process == nil {
+            logger.info("All ASR servers stopped")
+        } else {
+            Self.securityLog("本地服务停止未完全确认，仍保留活动进程引用")
         }
-        process = nil
-        port = nil
-        Self.currentPort = nil
-        stdoutPipe = nil
-
-        detachPipeHandlers(of: qwen3Process)
-        if let proc = qwen3Process, proc.isRunning {
-            proc.terminate()
-        }
-        qwen3Process = nil
-        qwen3Port = nil
-        Self.currentQwen3Port = nil
-        qwen3StdoutPipe = nil
-
-        logger.info("All ASR servers stopped")
-        savePidsToFile()  // Update (clear) PID file
     }
 
     // MARK: - PID File Management
@@ -385,37 +501,98 @@ actor SenseVoiceServerManager {
         AppPaths.support("server-pids.txt")
     }
 
-    /// Save current managed PIDs to disk so we can clean up after a crash.
+    /// 保存完整进程身份；停止未确认时 identity 会继续留在账本中。
     private func savePidsToFile() {
-        var pids: [String] = []
-        if let p = process, p.isRunning { pids.append(String(p.processIdentifier)) }
-        if let p = qwen3Process, p.isRunning { pids.append(String(p.processIdentifier)) }
-        try? pids.joined(separator: "\n").write(to: Self.pidFileURL, atomically: true, encoding: .utf8)
+        Self.writeRecordedIdentities(currentIdentities())
     }
 
-    private static func clearPidFile() {
-        try? FileManager.default.removeItem(at: pidFileURL)
+    private func currentIdentities() -> [ServerProcessIdentity] {
+        [processIdentity, qwen3Identity].compactMap { $0 }
+    }
+
+    nonisolated private static func loadRecordedIdentities() -> [ServerProcessIdentity] {
+        guard let data = try? Data(contentsOf: pidFileURL) else { return [] }
+        return ServerProcessIdentityLedger.decode(
+            data,
+            log: { message in securityLog(message) }
+        )
+    }
+
+    nonisolated private static func writeRecordedIdentities(
+        _ identities: [ServerProcessIdentity]
+    ) {
+        do {
+            let data = try ServerProcessIdentityLedger.encode(identities)
+            try data.write(to: pidFileURL, options: .atomic)
+        } catch {
+            securityLog("写入 PID 身份文件失败：\(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func securityLog(_ message: String) {
+        Logger(
+            subsystem: "pro.daliang.muse.sensevoice",
+            category: "ProcessSecurity"
+        ).error("\(message, privacy: .public)")
+        DebugFileLogger.log("[ProcessSecurity] \(message)")
+    }
+
+    nonisolated private static func waitSynchronouslyForExit(
+        _ identities: inout [ServerProcessIdentity],
+        timeout: TimeInterval
+    ) {
+        let timeoutNanoseconds = UInt64(max(timeout, 0) * 1_000_000_000)
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
+        repeat {
+            identities.removeAll { identity in
+                switch ServerProcessController.validate(identity, expectedKind: identity.kind) {
+                case .notRunning, .mismatchedKind, .mismatchedPath, .mismatchedStartTime:
+                    return true
+                case .matching, .unreadable:
+                    return false
+                }
+            }
+            if identities.isEmpty || DispatchTime.now().uptimeNanoseconds >= deadline { return }
+            usleep(25_000)
+        } while true
     }
 
     /// Kill orphaned server processes from previous app runs using saved PID file.
-    /// Only kills PIDs we previously spawned, never touches other users' processes.
-    private func killOrphanedServers() {
+    /// 只有 JSON 中 kind、path、start time 全部仍匹配时才会发信号。
+    private func killOrphanedServers() async {
         // 当前进程正在管理的 server 不是「孤儿」。start() 可能被多次调用（启动、保存配置、
         // 切换 provider 都触发）——若把自己刚拉起的 server 当孤儿杀掉、又因 isRunning 判定
         // 已在而不重启，就会出现「LLM/ASR 全部连不上」（2026-06-22 修复）。
         let managed = Set([process?.processIdentifier, qwen3Process?.processIdentifier].compactMap { $0 })
-        if let content = try? String(contentsOf: Self.pidFileURL, encoding: .utf8) {
-            for line in content.split(separator: "\n") {
-                guard let pid = Int32(line.trimmingCharacters(in: .whitespaces)), pid > 0 else { continue }
-                if managed.contains(pid) { continue }  // 当前管理的 server，不当孤儿杀
-                // Verify process is still alive before killing
-                if kill(pid, 0) == 0 {
-                    kill(pid, SIGTERM)
-                    DebugFileLogger.log("Killed orphaned server PID \(pid)")
-                }
+        var unresolved: [ServerProcessIdentity] = []
+        for identity in Self.loadRecordedIdentities() where !managed.contains(identity.pid) {
+            guard Self.knownKinds.contains(identity.kind) else {
+                Self.securityLog("拒绝清理未知 kind 的孤儿 PID 身份：\(identity.kind)")
+                unresolved.append(identity)
+                continue
+            }
+            let result = await ServerProcessController.terminate(
+                identity: identity,
+                expectedKind: identity.kind,
+                log: { message in Self.securityLog(message) }
+            )
+            switch result {
+            case .terminatedGracefully, .killed:
+                DebugFileLogger.log("Reaped verified orphan server PID \(identity.pid)")
+            case .alreadyExited:
+                break
+            case .refused, .failed:
+                Self.securityLog(
+                    "孤儿进程清理未确认，未向不匹配身份升级信号：PID \(identity.pid)"
+                )
+                unresolved.append(identity)
             }
         }
-        savePidsToFile()  // 重写为当前实际管理的 PID（保留自己、清掉已杀孤儿）
+        var seen: Set<String> = []
+        let merged = (currentIdentities() + unresolved).filter { identity in
+            seen.insert("\(identity.kind):\(identity.pid):\(identity.startTimeSeconds)").inserted
+        }
+        Self.writeRecordedIdentities(merged)
     }
 
     /// Check if the server is healthy.
@@ -603,52 +780,100 @@ actor SenseVoiceServerManager {
         return nil
     }
 
-    private func readPortFromStdout(pipe: Pipe, timeout: Int) async -> Int? {
-        return await withCheckedContinuation { continuation in
-            let handle = pipe.fileHandleForReading
-            let lock = NSLock()
-            var resolved = false
-
-            // Read in background
-            DispatchQueue.global().async {
-                while true {
-                    let data = handle.availableData
-                    guard !data.isEmpty else { break }
-                    if let output = String(data: data, encoding: .utf8) {
-                        for line in output.split(separator: "\n") {
-                            if line.hasPrefix("PORT:"),
-                               let portNum = Int(line.dropFirst(5)) {
-                                lock.lock()
-                                guard !resolved else { lock.unlock(); return }
-                                resolved = true
-                                lock.unlock()
-                                continuation.resume(returning: portNum)
-                                return
-                            }
-                        }
-                    }
-                }
-                lock.lock()
-                guard !resolved else { lock.unlock(); return }
-                resolved = true
-                lock.unlock()
-                continuation.resume(returning: nil)
+    nonisolated private static func captureLaunchedIdentity(
+        kind: String,
+        pid: Int32
+    ) async -> ServerProcessIdentity? {
+        for _ in 0..<5 {
+            if let identity = ServerProcessController.captureIdentity(kind: kind, pid: pid) {
+                return identity
             }
-
-            // Timeout
-            DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(timeout)) {
-                lock.lock()
-                guard !resolved else { lock.unlock(); return }
-                resolved = true
-                lock.unlock()
-                continuation.resume(returning: nil)
-            }
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        securityLog("启动后无法捕获真实进程身份：kind=\(kind) pid=\(pid)")
+        return nil
+    }
+
+    /// 身份捕获失败发生在 run 后的启动窗口；此时仍持有刚创建的精确 Process 对象。
+    /// 先 TERM，再在对象仍报告运行时 KILL，确保不会留下无账本子进程。
+    nonisolated private static func terminateUnidentifiedLaunchedProcess(
+        _ proc: Process,
+        exitLatch: ServerProcessExitLatch,
+        label: String
+    ) async -> Bool {
+        if !proc.isRunning { return true }
+        proc.terminate()
+        if await exitLatch.wait(timeout: .seconds(1)) || !proc.isRunning {
+            return true
+        }
+
+        guard proc.isRunning else { return true }
+        if kill(proc.processIdentifier, SIGKILL) != 0 {
+            securityLog("\(label) 身份捕获失败后 SIGKILL 发送失败：errno=\(errno)")
+            return false
+        }
+        let stopped = await exitLatch.wait(timeout: .seconds(1)) || !proc.isRunning
+        if !stopped {
+            securityLog("\(label) 身份捕获失败后的强制回收未确认")
+        }
+        return stopped
+    }
+
+    private func reliablyTerminate(
+        _ proc: Process,
+        identity: ServerProcessIdentity,
+        kind: String,
+        exitLatch: ServerProcessExitLatch,
+        label: String
+    ) async -> Bool {
+        if stoppingProcessIDs.contains(proc.processIdentifier) {
+            let exited = await exitLatch.wait(timeout: .seconds(4))
+            return exited || !proc.isRunning
+        }
+        stoppingProcessIDs.insert(proc.processIdentifier)
+        detachPipeHandlers(of: proc)
+        let result = await ServerProcessController.terminate(
+            process: proc,
+            identity: identity,
+            expectedKind: kind,
+            exitLatch: exitLatch,
+            log: { message in Self.securityLog(message) }
+        )
+        stoppingProcessIDs.remove(proc.processIdentifier)
+
+        if !proc.isRunning { return true }
+
+        switch result {
+        case .alreadyExited, .terminatedGracefully, .killed:
+            return !proc.isRunning
+        case .refused, .failed:
+            Self.securityLog("\(label) 停止失败：\(String(describing: result))")
+            restorePipeHandlers(of: proc, label: label)
+            return false
+        }
+    }
+
+    private func clearSenseVoiceState() {
+        process = nil
+        processIdentity = nil
+        processExitLatch = nil
+        port = nil
+        Self.currentPort = nil
+        stdoutPipe = nil
+    }
+
+    private func clearQwen3State() {
+        qwen3Process = nil
+        qwen3Identity = nil
+        qwen3ExitLatch = nil
+        qwen3Port = nil
+        Self.currentQwen3Port = nil
+        qwen3StdoutPipe = nil
     }
 
     /// 端口发现完成后给 stdout 装持续排空 handler（与 stderr 一致），把运行期日志喂给
     /// DebugFileLogger。否则 Python server 运行期的 print 会写满管道缓冲（约 64KB），阻塞在
-    /// print() 上而拖死 ASR/LLM 引擎。须在 readPortFromStdout 读循环退出后调用，避免两者争抢句柄。
+    /// print() 上而拖死 ASR/LLM 引擎。须在 ServerPortReader 摘除发现 handler 后调用，避免争抢句柄。
     /// REPAIR_PLAN J9：进程收尾时摘除管道读 handler——handler 挂着的 dispatch source
     /// 会钉住已关闭的 FD，热词变更等频繁重启会累积泄漏句柄与 source。
     private func detachPipeHandlers(of proc: Process?) {
@@ -656,28 +881,41 @@ actor SenseVoiceServerManager {
         (proc?.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
     }
 
+    private func restorePipeHandlers(of proc: Process, label: String) {
+        if let stdout = proc.standardOutput as? Pipe {
+            drainStdout(pipe: stdout, label: label)
+        }
+        if let stderr = proc.standardError as? Pipe {
+            stderr.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty,
+                      let message = String(data: data, encoding: .utf8) else { return }
+                for line in message.split(separator: "\n") where !line.isEmpty {
+                    DebugFileLogger.log("\(label): \(line)")
+                }
+            }
+        }
+    }
+
     /// REPAIR_PLAN J9：感知服务进程意外退出——此前无 terminationHandler，Python 崩溃后
     /// App 仍以为服务在运行，ASR/LLM 静默不可用。主动 stop/重启会先把属性换掉，
     /// 回调进 actor 时进程已不在册即忽略；仍在册说明是意外退出，清理在册状态留痕。
     /// 不做自动重启（避免崩溃风暴），下次识别/健康探测会走正常启动路径。
     private func handleUnexpectedExit(of proc: Process, label: String) {
+        if stoppingProcessIDs.contains(proc.processIdentifier) {
+            return
+        }
         if proc === process {
             logger.error("\(label) exited unexpectedly (status \(proc.terminationStatus))")
             DebugFileLogger.log("\(label) exited unexpectedly status=\(proc.terminationStatus)")
             detachPipeHandlers(of: proc)
-            process = nil
-            port = nil
-            Self.currentPort = nil
-            stdoutPipe = nil
+            clearSenseVoiceState()
             savePidsToFile()
         } else if proc === qwen3Process {
             logger.error("\(label) exited unexpectedly (status \(proc.terminationStatus))")
             DebugFileLogger.log("\(label) exited unexpectedly status=\(proc.terminationStatus)")
             detachPipeHandlers(of: proc)
-            qwen3Process = nil
-            qwen3Port = nil
-            Self.currentQwen3Port = nil
-            qwen3StdoutPipe = nil
+            clearQwen3State()
             savePidsToFile()
         }
     }
@@ -707,6 +945,7 @@ actor SenseVoiceServerManager {
         case venvNotFound
         case modelNotFound
         case launchFailed(Error)
+        case processIdentityUnavailable
         case portDiscoveryFailed
 
         var errorDescription: String? {
@@ -719,6 +958,8 @@ actor SenseVoiceServerManager {
                 return L("本地 ASR 模型未找到，请先下载", "Local ASR model not found, please download first")
             case .launchFailed(let e):
                 return L("服务启动失败: \(e.localizedDescription)", "Server launch failed: \(e.localizedDescription)")
+            case .processIdentityUnavailable:
+                return L("无法验证本地服务进程身份", "Unable to verify local server process identity")
             case .portDiscoveryFailed:
                 return L("服务端口发现失败", "Server port discovery failed")
             }
