@@ -229,9 +229,7 @@ final class AppState {
             return
         }
 
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        ClipboardLeaseCoordinator.shared.writeTextPermanently(text)
         copyFallbackWasCopied = true
         feedbackMessage = L("已复制", "Copied")
         scheduleAutoHide(for: .copyFallback, delay: .seconds(0.9))

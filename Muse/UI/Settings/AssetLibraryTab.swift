@@ -504,8 +504,7 @@ private extension AssetLibraryTab {
             ? "\(trimmedTitle)\n\(content)"
             : content
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(payload, forType: .string)
+        ClipboardLeaseCoordinator.shared.writeTextPermanently(payload)
         copiedAssetID = id
         logAction(assetID: logAssetID, actionType: .copied, detail: logDetail)
 

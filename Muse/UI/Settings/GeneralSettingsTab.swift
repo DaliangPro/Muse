@@ -97,8 +97,7 @@ struct GeneralSettingsTab: View {
     }
 
     private func copyRecentRecord(_ record: HistoryRecord) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(record.finalText, forType: .string)
+        ClipboardLeaseCoordinator.shared.writeTextPermanently(record.finalText)
         copiedRecentRecordId = record.id
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             if copiedRecentRecordId == record.id {
