@@ -282,7 +282,7 @@
 | 任务 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | MUSE-110 | ✅ 完成 | `ef60ef4` | 候选转资产幂等事务、提炼最终状态原子提交及失败状态独立兜底完成。 |
-| MUSE-120 | ⬜ 未开始 | — | 等待 MUSE-110 完成后执行。 |
+| MUSE-120 | ✅ 完成 | `2c9a716` | 固定版本清单、逐文件 SHA256、ephemeral 下载、staging 原子安装与失败回滚完成。 |
 | MUSE-130 | ⬜ 未开始 | — | 等待前置任务。 |
 | MUSE-140 | ⬜ 未开始 | — | 等待前置任务。 |
 | MUSE-150 | ⬜ 未开始 | — | 等待前置任务。 |
@@ -317,3 +317,32 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、356 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；独立只读复审未发现 MUSE-110 阻断问题。
 - 遗留风险：旧版本曾为同一 Candidate 生成随机 Asset UUID，现有历史库没有可靠映射字段，本次不扫描或迁移真实用户数据，因此历史内容级重复无法自动合并；`commitExtraction` 的最终提交显式重放时仍会以 `OR REPLACE` 覆盖后来人工修改的 Candidate/Result 状态并新增一条 action log，正常服务流程不会重放同一 final commit，后续若引入自动重试需增加 run 级提交幂等键；action-log 表损坏时优先保证 failed job/run 落库，因此该次失败可能只有应用日志而没有数据库 action log。测试全部使用临时数据库和 SQLite trigger 注入，未在真实用户库验证迁移或多进程锁竞争。按用户指示未执行任何音频测试。自动更新开关仍为 `false`。
+
+### MUSE-120：给模型下载增加固定版本、哈希和原子安装
+
+- 状态：✅ 完成。
+- 提交：`2c9a716`（`修复: 固定模型版本并以哈希和原子目录安装`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `21ec6adff2cfee4aa52084a6ce5eada69c56076c`；保留既有 `REPAIR_EXECUTION_LOG.md` 修改及未跟踪的 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入代码提交。基线 `swift build` 通过；`swift test` 执行 356 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 先新增模型清单校验和安装事务测试；修复前运行定向测试明确编译失败，报告缺少固定制品清单、逐文件校验、可注入下载边界、归档安全检查和事务安装 API。
+  - 再先新增调用方取消、取消后迟到进度、固定 revision 绑定续传、归档链接根目录边界、回滚删除失败及 backup 清理失败用例；各用例修复前分别出现下载未取消且仍安装、迟到进度多回调一次、错误复用 12 字节旧续传、缺少根目录校验 API、正式目录保留 7 字节损坏内容及验证后的新模型因清理错误被错误回滚等红灯，随后逐项修复转绿。
+- 修改：
+  - 为 5 个模型维护固定 revision 的制品清单，覆盖 17 个文件的固定 URL、精确字节数与 SHA256；拒绝 `resolve/main`、缺少哈希或不完整清单，并使用流式 CommonCrypto SHA256 校验。
+  - 下载统一使用不持久化 cookie/缓存的 ephemeral URLSession；续传状态绑定 revision、URL、SHA256 与目标路径，校验响应文件名、Content-Length 或实际字节数，并让调用方取消向下载任务、会话和 UI 进度闸门传播。
+  - 多文件、单文件和压缩包均先写入 `Downloads/<model-id>/<uuid>/` staging；全部校验后执行“旧目录 → backup、候选目录 → 正式目录、安装后再校验”，任一运行时失败恢复旧模型，验证成功后才清理 backup。
+  - tar 在解压前真实列举条目并拒绝绝对路径、`..` 越界、特殊文件及越界软/硬链接；只解压到 staging，解压前后重验归档 SHA256，并审计解压树中的真实目录、普通文件和符号链接边界。
+  - 模型删除先取消进行中的操作；哈希和 tar 工作移出 actor 临界区，operation ID 防止旧任务清理新状态。健康检查新增模型制品策略门，阻止浮动 revision、默认 URLSession 或缺失清单完整性测试回归。
+- 修改文件：
+  - `Muse/Services/ModelArtifactManifest.swift`
+  - `Muse/Services/ModelManager.swift`
+  - `MuseTests/ModelArtifactVerificationTests.swift`
+  - `MuseTests/ModelInstallationTransactionTests.swift`
+  - `scripts/health-check.sh`
+- 验证：
+  - `swift test --filter 'ModelArtifactVerificationTests|ModelInstallationTransactionTests'`：29 项，0 失败。
+  - `swift test --sanitize=thread --filter 'ModelArtifactVerificationTests|ModelInstallationTransactionTests'`：29 项，0 失败，未报告数据竞争。
+  - `swift test`：385 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、385 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；独立只读复审未发现 MUSE-120 的 P0/P1 阻断问题，17 个文件的版本、大小与 SHA256 元数据和官方来源一致。
+- 遗留风险：本任务未下载或加载最大约 5.6 GB 的真实模型，因此真实 CDN 重定向后的文件名/Content-Length/续传兼容性、真实 Python 模型加载仍属于发布前人工 gate；进程若恰好在“旧目录 → backup”和“候选目录 → 正式目录”之间崩溃，可能留下隐藏 backup，当前覆盖所有可捕获运行时失败，但尚无安装 journal 或启动恢复；backup 删除若因权限问题在删除前失败，会保留已验证的新正式目录和隐藏 backup 供后续清理；bsdtar 列举、校验和解压是独立进程，虽在解压前后重验归档并审计结果，同用户恶意进程理论上仍可制造本地竞态。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过，未安装工具或降低门槛。未触碰真实用户数据目录，按用户指示未执行任何音频测试。自动更新开关仍为 `false`。
