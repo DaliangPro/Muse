@@ -174,6 +174,7 @@
 |---|---|---|---|
 | MUSE-070 | ✅ 完成 | `b387d76` | 本地服务进程级 token 鉴权与 HTTP、LLM、WebSocket 输入边界完成。 |
 | MUSE-080 | ✅ 完成 | `aad11af` | 本地服务进程身份校验、可靠停止和增量端口解析完成。 |
+| MUSE-090 | ✅ 完成 | `aa2d925` | 火山协议 Header、未对齐长度读取及压缩/JSON 资源边界完成。 |
 
 ### MUSE-070：给本地 ASR 和 LLM 服务增加鉴权与输入上限
 
@@ -217,3 +218,24 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、322 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过。
 - 遗留风险：进程测试只终止测试自身创建的 `/bin/sleep` 与忽略 TERM 的 Python fixture，未启动真实 ASR/LLM 模型，也未读取或迁移真实用户数据目录中的既有 PID 台账；Python 服务类型属于 manager 持有的逻辑身份，操作系统层仅能再次证明解释器路径。`proc_pidinfo` 复核与 `kill` 之间仍存在极小的系统调用竞态窗口，当前实现已按任务要求在每次信号前重复校验。按用户指示未执行任何麦克风、音频设备或真机音频测试。自动更新开关仍为 `false`。
+
+### MUSE-090：加固火山二进制协议解析
+
+- 状态：✅ 完成。
+- 提交：`aa2d925`（`修复: 为火山协议解析增加对齐安全和大小上限`）。
+- 测试优先：先扩充 `VolcProtocolTests`；修复前运行 `swift test --filter VolcProtocolTests` 明确编译失败，报告缺少 `unsupportedVersion`、`invalidHeaderSize`、`truncatedSequence`、`payloadTooLarge`、utterance/文本上限错误、协议大小常量及带 `maximumOutputBytes` 的解压 API。
+- 修改：
+  - Header 解码只接受 v1，要求 `headerSize >= 1` 且声明的 Header 字节数不超过输入；序列号分支统一使用 `flags.hasSequence`，不足 4 字节时给出明确错误。
+  - payload 长度改为逐字节大端组合，不再对可能未对齐的 Data slice 使用 `load(as:)`；边界判断使用减法，避免偏移与长度相加溢出。
+  - gzip 线缆 payload 上限为 4 MiB，解压后及未压缩 JSON payload 上限为 16 MiB；流式解压在每次 append 前检查 `maximumOutputBytes`，无进展或损坏流立即失败。
+  - JSON 解析前再次核对大小；utterance 最多 10,000 条，主文本和每条 utterance 文本最多 1 MiB。
+  - server error 的 JSON 与 gzip 兼容保持不变，进入日志/UI 的错误消息按 UTF-8 安全截断至 4 KiB；非 JSON 错误正文同样有限。
+- 验证：
+  - `swift test --filter VolcProtocolTests`：32 项，0 失败。
+  - `swift test --filter 'VolcProtocolTests|VolcASRReconnectTests|VolcReconnectMergeTests'`：42 项，0 失败。
+  - `swift test --sanitize address --filter VolcProtocolTests`：32 项，0 失败，未报告未对齐或内存访问问题。
+  - `swift test`：335 项，5 项按环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、335 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过。
+- 遗留风险：回归测试使用合成二进制、固定 zlib fixture 与本地 Compression API，未连接真实火山服务验证线上异常帧；4 MiB、16 MiB、10,000 条、1 MiB 和 4 KiB 均为任务卡要求或其“有限长度”要求的明确本地策略，若服务端协议未来提高合法上限需同步调整并补兼容测试。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行任何麦克风、音频设备或真机音频测试。自动更新开关仍为 `false`。
