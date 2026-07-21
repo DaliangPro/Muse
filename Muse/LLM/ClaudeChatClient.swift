@@ -4,15 +4,25 @@ import os
 actor ClaudeChatClient: LLMClient {
 
     private let logger = Logger(subsystem: "pro.daliang.muse.llm", category: "ClaudeChatClient")
+    private let session: URLSession
+
+    init(session: URLSession = LLMNetworkSession.shared) {
+        self.session = session
+    }
 
     /// Pre-establish TCP+TLS connection so the first real request skips handshake.
     func warmUp(baseURL: String) async {
-        guard let url = URL(string: baseURL) else { return }
+        guard let url = try? LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: baseURL,
+            provider: .claude
+        ) else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 5
-        _ = try? await URLSession.shared.data(for: request)
-        logger.info("Claude connection pre-warmed to \(baseURL)")
+        if let response = try? await session.bytes(for: request) {
+            _ = try? await LLMNetworkSession.readPrefix(response.0, limit: 1)
+        }
+        logger.info("Claude connection pre-warmed")
     }
 
     /// Process text through Anthropic Messages API (streaming).
@@ -21,9 +31,14 @@ actor ClaudeChatClient: LLMClient {
         guard !trimmedText.isEmpty else { return text }
         let promptParts = prompt.separatedLLMMessages(with: trimmedText)
 
-        guard let url = URL(string: "\(config.baseURL)/messages") else {
-            throw LLMError.invalidURL
-        }
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: config.baseURL,
+            provider: .claude
+        )
+        let url = try LLMEndpointPolicy.endpoint(
+            baseURL: baseURL,
+            pathComponents: ["messages"]
+        )
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -43,7 +58,7 @@ actor ClaudeChatClient: LLMClient {
 
         logger.info("Claude request: \(text.count) chars, model=\(config.model)")
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw LLMError.requestFailed(0)
         }
@@ -52,30 +67,41 @@ actor ClaudeChatClient: LLMClient {
             throw LLMError.requestFailed(http.statusCode)
         }
 
-        // Parse SSE stream (Anthropic format)
-        var result = ""
-        for try await line in bytes.lines {
-            guard line.hasPrefix("data: ") else { continue }
-            let payload = String(line.dropFirst(6))
-            guard let data = payload.data(using: .utf8),
-                  let event = try? JSONDecoder().decode(ClaudeStreamEvent.self, from: data)
-            else { continue }
-
-            switch event.type {
-            case "content_block_delta":
-                if let delta = event.delta, let text = delta.text {
-                    result += text
+        var parser = ClaudeStreamingParser()
+        var decoder = SSEByteStreamDecoder()
+        do {
+            for try await byte in bytes {
+                if let line = try decoder.consume(byte: byte) {
+                    try parser.consume(line: line)
+                    if parser.isComplete { break }
                 }
-            case "message_stop":
-                break
-            default:
-                continue
             }
+            if !parser.isComplete, let line = try decoder.finish() {
+                try parser.consume(line: line)
+            }
+        } catch {
+            if Self.shouldFlushPendingLine(after: error) {
+                do {
+                    if let line = try decoder.finish() {
+                        try parser.consume(line: line)
+                    }
+                } catch {
+                    throw parser.errorForStreamFailure(error)
+                }
+            }
+            throw parser.errorForStreamFailure(error)
         }
+        let result = try parser.finish()
 
         logger.info("Claude result: \(result.count) chars")
 
         return result.strippingThinkTags()
+    }
+
+    private static func shouldFlushPendingLine(after error: Error) -> Bool {
+        !(error is LLMError)
+            && !(error is CancellationError)
+            && (error as? URLError)?.code != .cancelled
     }
 }
 
@@ -103,4 +129,78 @@ private struct ClaudeStreamEvent: Decodable, Sendable {
 
 private struct ClaudeDelta: Decodable, Sendable {
     let text: String?
+}
+
+private struct ClaudeStreamingParser: Sendable {
+    private var events = SSEEventAccumulator()
+    private var result = ""
+    private var resultBytes = 0
+    private(set) var isComplete = false
+
+    mutating func consume(line: String) throws {
+        guard !isComplete else { return }
+        for payload in try events.consume(line: line) {
+            try consume(payload: payload)
+        }
+    }
+
+    mutating func finish() throws -> String {
+        if !isComplete {
+            for payload in events.finish() {
+                try consume(payload: payload)
+            }
+        }
+        guard isComplete else {
+            throw LLMError.truncatedResponse(result.count)
+        }
+        guard !result.isEmpty else {
+            throw LLMError.emptyResponse(nil)
+        }
+        return result
+    }
+
+    mutating func errorForStreamFailure(_ streamError: Error) -> Error {
+        if Task.isCancelled {
+            return CancellationError()
+        }
+        if streamError is CancellationError
+            || (streamError as? URLError)?.code == .cancelled
+            || streamError is LLMError {
+            return streamError
+        }
+        do {
+            for payload in events.finish() {
+                try consume(payload: payload)
+            }
+        } catch {
+            return error
+        }
+        return result.isEmpty ? streamError : LLMError.truncatedResponse(result.count)
+    }
+
+    private mutating func consume(payload: String) throws {
+        if payload == "[DONE]" {
+            isComplete = true
+            return
+        }
+        guard let data = payload.data(using: .utf8),
+              let event = try? JSONDecoder().decode(ClaudeStreamEvent.self, from: data)
+        else { return }
+
+        switch event.type {
+        case "content_block_delta":
+            guard let text = event.delta?.text, !text.isEmpty else { return }
+            let additionalBytes = text.utf8.count
+            let maximum = LLMStreamingParser.defaultMaximumResponseBytes
+            guard additionalBytes <= maximum - resultBytes else {
+                throw LLMError.responseTooLarge(maximum)
+            }
+            result += text
+            resultBytes += additionalBytes
+        case "message_stop":
+            isComplete = true
+        default:
+            break
+        }
+    }
 }

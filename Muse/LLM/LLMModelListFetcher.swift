@@ -4,6 +4,8 @@ import Foundation
 /// OpenAI 兼容口走 GET {base}/models；Claude 走 Anthropic 原生接口。
 enum LLMModelListFetcher {
 
+    private static let session = LLMNetworkSession.shared
+
     enum FetchError: Error, LocalizedError {
         case unsupportedProvider
         case invalidURL
@@ -32,32 +34,48 @@ enum LLMModelListFetcher {
                 .map(\.name)
         }
 
-        let base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedBase = base.isEmpty ? provider.defaultBaseURL : base
+        let resolvedBase: URL
+        do {
+            resolvedBase = try LLMEndpointPolicy.normalizedBaseURL(
+                rawValue: baseURL,
+                provider: provider
+            )
+        } catch {
+            throw FetchError.invalidURL
+        }
 
         var request: URLRequest
-        if provider == .claude {
-            guard let url = URL(string: normalized(resolvedBase) + "/models") else {
+        let url: URL
+        do {
+            guard let modelListBase = URL(string: normalized(resolvedBase.absoluteString)) else {
                 throw FetchError.invalidURL
             }
+            url = try LLMEndpointPolicy.endpoint(baseURL: modelListBase, pathComponents: ["models"])
+        } catch {
+            throw FetchError.invalidURL
+        }
+        if provider == .claude {
             request = URLRequest(url: url, timeoutInterval: 12)
             request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         } else {
-            guard let url = URL(string: normalized(resolvedBase) + "/models") else {
-                throw FetchError.invalidURL
-            }
             request = URLRequest(url: url, timeoutInterval: 12)
             if !apiKey.isEmpty {
                 request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             }
         }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            let body = String(data: data.prefix(160), encoding: .utf8) ?? ""
+            let errorData = try await LLMNetworkSession.readPrefix(bytes, limit: 160)
+            let body = LLMNetworkSession.sanitizedErrorBody(errorData, limit: 160)
             throw FetchError.server(http.statusCode, body)
         }
+
+        let data = try await LLMNetworkSession.readCapped(
+            bytes,
+            limit: LLMStreamingParser.defaultMaximumResponseBytes
+        )
 
         let ids = parseModelIDs(from: data)
         guard !ids.isEmpty else { throw FetchError.emptyList }

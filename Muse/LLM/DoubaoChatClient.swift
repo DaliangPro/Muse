@@ -5,22 +5,31 @@ actor DoubaoChatClient: LLMClient {
 
     private let logger = Logger(subsystem: "pro.daliang.muse.llm", category: "DoubaoChatClient")
     private let provider: LLMProvider
+    private let session: URLSession
 
-    init(provider: LLMProvider = .doubao) {
+    init(
+        provider: LLMProvider = .doubao,
+        session: URLSession = LLMNetworkSession.shared
+    ) {
         self.provider = provider
+        self.session = session
     }
-
-    private let session = URLSession.shared
 
     /// Pre-establish TCP+TLS connection so the first real request skips handshake.
     func warmUp(baseURL: String) async {
-        guard let url = URL(string: baseURL) else { return }
+        guard let url = try? LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: baseURL,
+            provider: provider,
+            localQwenPort: provider == .localQwen ? LLMEndpointPolicy.currentLocalQwenPort : nil
+        ) else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 5
         Self.authorizeLocalServiceRequest(&request, provider: provider)
-        _ = try? await session.data(for: request)
-        logger.info("LLM connection pre-warmed to \(baseURL)")
+        if let response = try? await session.bytes(for: request) {
+            _ = try? await LLMNetworkSession.readPrefix(response.0, limit: 1)
+        }
+        logger.info("LLM connection pre-warmed")
     }
 
     /// Process text through Doubao ARK API (OpenAI-compatible streaming).
@@ -30,9 +39,15 @@ actor DoubaoChatClient: LLMClient {
         guard !trimmedText.isEmpty else { return text }
         let promptParts = prompt.separatedLLMMessages(with: trimmedText)
 
-        guard let url = URL(string: "\(config.baseURL)/chat/completions") else {
-            throw LLMError.invalidURL
-        }
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: config.baseURL,
+            provider: provider,
+            localQwenPort: provider == .localQwen ? LLMEndpointPolicy.currentLocalQwenPort : nil
+        )
+        let url = try LLMEndpointPolicy.endpoint(
+            baseURL: baseURL,
+            pathComponents: ["chat", "completions"]
+        )
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -94,54 +109,75 @@ actor DoubaoChatClient: LLMClient {
             throw LLMError.requestFailed(http.statusCode)
         }
 
-        var result = ""
         var lineCount = 0
-        var firstDataLine: String?
-        for try await line in bytes.lines {
-            lineCount += 1
-            guard line.hasPrefix("data: ") else { continue }
-            let payload = String(line.dropFirst(6))
-            if firstDataLine == nil { firstDataLine = String(payload.prefix(300)) }
-            if payload == "[DONE]" { break }
-            guard let data = payload.data(using: .utf8),
-                  let chunk = try? JSONDecoder().decode(ChatStreamChunk.self, from: data),
-                  let content = chunk.choices.first?.delta.content
-            else { continue }
-            result += content
+        var parser = LLMStreamingParser()
+        var decoder = SSEByteStreamDecoder()
+        do {
+            for try await byte in bytes {
+                if let line = try decoder.consume(byte: byte) {
+                    lineCount += 1
+                    try parser.consume(line: line)
+                    if parser.isComplete { break }
+                }
+            }
+            if !parser.isComplete, let line = try decoder.finish() {
+                lineCount += 1
+                try parser.consume(line: line)
+            }
+        } catch {
+            if Self.shouldFlushPendingLine(after: error) {
+                do {
+                    if let line = try decoder.finish() {
+                        try parser.consume(line: line)
+                    }
+                } catch {
+                    throw parser.errorForStreamFailure(error)
+                }
+            }
+            throw parser.errorForStreamFailure(error)
         }
 
-        if result.isEmpty && lineCount > 0 {
-            DebugFileLogger.log(
-                "LLM[\(model)]: \(lineCount) lines but 0 content chars; first data bytes=\(firstDataLine?.utf8.count ?? 0)"
-            )
-            throw LLMError.emptyResponse(firstDataLine)
+        do {
+            return try parser.finish()
+        } catch {
+            DebugFileLogger.log("LLM[\(model)]: stream incomplete lines=\(lineCount)")
+            throw error
         }
-        if result.isEmpty {
-            DebugFileLogger.log("LLM[\(model)]: 0 lines received (connection closed immediately)")
-            throw LLMError.emptyResponse(nil)
-        }
-        return result
+    }
+
+    private static func shouldFlushPendingLine(after error: Error) -> Bool {
+        !(error is LLMError)
+            && !(error is CancellationError)
+            && (error as? URLError)?.code != .cancelled
     }
 
     // MARK: - Non-streaming (single JSON response)
 
     private func processNonStreaming(request: URLRequest, model: String) async throws -> String {
-        let (data, response) = try await session.data(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw LLMError.requestFailed(0)
         }
         guard http.statusCode == 200 else {
+            let errorData = try await LLMNetworkSession.readPrefix(bytes, limit: 512)
+            let errorBody = LLMNetworkSession.sanitizedErrorBody(errorData, limit: 512)
             logger.error("LLM HTTP \(http.statusCode)")
-            DebugFileLogger.log("LLM[\(model)]: HTTP \(http.statusCode)")
+            DebugFileLogger.log(
+                "LLM[\(model)]: HTTP \(http.statusCode), retained error bytes=\(errorBody.utf8.count)"
+            )
             throw LLMError.requestFailed(http.statusCode)
         }
+
+        let data = try await LLMNetworkSession.readCapped(
+            bytes,
+            limit: LLMStreamingParser.defaultMaximumResponseBytes
+        )
 
         guard let json = try? JSONDecoder().decode(ChatCompletionResponse.self, from: data),
               let content = json.choices.first?.message.content, !content.isEmpty
         else {
-            let raw = String(data: data.prefix(300), encoding: .utf8)
-            DebugFileLogger.log("LLM[\(model)]: non-streaming empty; raw bytes=\(raw?.utf8.count ?? 0)")
-            throw LLMError.emptyResponse(raw)
+            DebugFileLogger.log("LLM[\(model)]: non-streaming empty; raw bytes=\(min(data.count, 300))")
+            throw LLMError.emptyResponse(nil)
         }
         return content
     }
@@ -188,7 +224,8 @@ struct ChatStreamChunk: Decodable, Sendable {
 }
 
 struct ChunkChoice: Decodable, Sendable {
-    let delta: ChunkDelta
+    let delta: ChunkDelta?
+    let finish_reason: String?
 }
 
 struct ChunkDelta: Decodable, Sendable {
@@ -199,6 +236,8 @@ enum LLMError: Error, LocalizedError {
     case invalidURL
     case requestFailed(Int)
     case emptyResponse(String?)
+    case truncatedResponse(Int)
+    case responseTooLarge(Int)
     /// REPAIR_PLAN J12：会话级硬超时（底层 30s 是无数据间隔语义，慢速涓流可绕过）
     case timedOut
 
@@ -216,10 +255,12 @@ enum LLMError: Error, LocalizedError {
             default:  return L("LLM 请求失败 (\(code))", "LLM request failed (\(code))")
             }
         case .emptyResponse(let raw):
-            if let raw {
-                return L("LLM 未返回内容: \(raw)", "LLM returned no content: \(raw)")
-            }
+            _ = raw
             return L("LLM 未返回内容", "LLM returned no content")
+        case .truncatedResponse:
+            return L("LLM 流式响应提前中断，请重试", "LLM streaming response was truncated; retry")
+        case .responseTooLarge:
+            return L("LLM 响应超过安全上限", "LLM response exceeded the safety limit")
         }
     }
 }

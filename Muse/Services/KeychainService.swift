@@ -268,14 +268,32 @@ enum KeychainService {
         return sanitized
     }
 
+    static func normalizedLLMCredentialsForStorage(
+        provider: LLMProvider,
+        values: [String: String]
+    ) throws -> [String: String] {
+        var normalized = sanitizeLLMCredentials(values)
+        guard provider != .localQwen else {
+            normalized.removeValue(forKey: "baseURL")
+            return normalized
+        }
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: normalized["baseURL"] ?? "",
+            provider: provider
+        )
+        normalized["baseURL"] = baseURL.absoluteString
+        return normalized
+    }
+
     private static func assetExtractionModelOverrideKey(for provider: LLMProvider) -> String {
         "tf_assetExtractionModelOverride_\(provider.rawValue)"
     }
 
     static func saveLLMCredentials(for provider: LLMProvider, values: [String: String]) throws {
+        let normalized = try normalizedLLMCredentialsForStorage(provider: provider, values: values)
         lock.lock()
         defer { lock.unlock() }
-        try saveSecureDictionary(sanitizeLLMCredentials(values), key: llmStorageKey(for: provider))
+        try saveSecureDictionary(normalized, key: llmStorageKey(for: provider))
         var dict = loadAll()
         dict.removeValue(forKey: llmStorageKey(for: provider))
         try saveAll(dict)
