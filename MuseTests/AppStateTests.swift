@@ -6,14 +6,14 @@ import XCTest
 final class AppStateTests: XCTestCase {
 
     func testStartRecordingTransitionsToPreparing() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.startRecording()
 
         XCTAssertEqual(appState.barPhase, .preparing)
     }
 
     func testStopRecordingIgnoredWhenNotRecording() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.currentMode = .smartDirect
         appState.cancel()
 
@@ -23,7 +23,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testStopRecordingCancelsWhenPreparing() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.startRecording()
 
         appState.stopRecording()
@@ -32,7 +32,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testStopRecordingTransitionsToProcessingWhenRecording() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.currentMode = .smartDirect
         appState.startRecording()
         appState.markRecordingReady()
@@ -43,7 +43,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testStopRecordingTransitionsDirectModeToProcessing() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.currentMode = .direct
         appState.startRecording()
         appState.markRecordingReady()
@@ -54,7 +54,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testSetLiveTranscriptReplacesExistingConfirmedSegments() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.setLiveTranscript(
             RecognitionTranscript(
                 confirmedSegments: ["我想", "买咖"],
@@ -77,7 +77,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testSetLiveTranscriptUsesAuthoritativeFinalTextWhenDifferent() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.setLiveTranscript(
             RecognitionTranscript(
                 confirmedSegments: ["deep seek"],
@@ -93,7 +93,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testFinalizeShowsClipboardFallbackMessage() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
 
         appState.finalize(text: "测试文本", outcome: .copiedToClipboard)
 
@@ -103,7 +103,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testFinalizeWithoutFocusedInputShowsCopyFallbackCard() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
 
         appState.finalize(text: "测试文本", outcome: .noFocusedInput(copiedToClipboard: false))
 
@@ -116,7 +116,7 @@ final class AppStateTests: XCTestCase {
     func testCopyFallbackCopiesTextAndMarksCopied() {
         let snapshot = capturePasteboardItems()
         defer { restorePasteboardItems(snapshot) }
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.finalize(text: "测试文本", outcome: .noFocusedInput(copiedToClipboard: false))
 
         appState.copyFallbackToClipboard()
@@ -127,7 +127,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testShowErrorDisplaysErrorPhaseAndMessage() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
 
         appState.showError("找不到麦克风")
 
@@ -136,7 +136,7 @@ final class AppStateTests: XCTestCase {
     }
 
     func testReconcileCurrentModeKeepsSupportedCustomModeForQuickOnlyProvider() {
-        let appState = AppState()
+        let appState = AppState(initialModes: ProcessingMode.defaults)
         let customMode = ProcessingMode(
             id: UUID(),
             name: "结构化",

@@ -468,7 +468,10 @@ final class AssetExtractionLowValueFilterTests: XCTestCase {
 
     /// 改造方案 #10：重复语气词不再漏网，真实内容不误伤
     func testLowValueDetection() async {
-        let service = AssetExtractionService()
+        let service = AssetExtractionService(
+            historyStore: HistoryStore(path: ":memory:"),
+            assetStore: LanguageAssetStore(path: ":memory:")
+        )
 
         let lowValue = ["好的", "好的好的", "嗯嗯", "嗯嗯嗯", "OK", "okok", "哈哈哈哈", "。。。", "  "]
         for text in lowValue {

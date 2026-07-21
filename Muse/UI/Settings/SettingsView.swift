@@ -1,3 +1,4 @@
+import AppKit
 import ServiceManagement
 import SwiftUI
 
@@ -10,6 +11,7 @@ struct SettingsView: View {
     @Environment(AppState.self) private var appState
     @State private var selectedTab: SettingsTab = .general
     @State private var isSidebarSettingsPanelOpen = false
+    @State private var storageRecoveryNotice: StorageRecoveryNotice?
     @AppStorage(DefaultsKeys.language) private var language = AppLanguage.systemSelection
     @AppStorage("tf_settingsAppearance") private var settingsAppearance = SettingsAppearanceMode.system.rawValue
     @AppStorage("tf_launchAtLogin") private var launchAtLogin = true
@@ -94,6 +96,17 @@ struct SettingsView: View {
         .ignoresSafeArea(.container, edges: .top)
         .task {
             syncLoginItemState()
+            storageRecoveryNotice = StorageRecoveryScanner.firstPendingNotice()
+        }
+        .alert(item: $storageRecoveryNotice) { notice in
+            Alert(
+                title: Text(L("需要恢复配置文件", "Configuration recovery required")),
+                message: Text(notice.message),
+                primaryButton: .default(Text(L("在 Finder 中显示备份", "Show Backup in Finder"))) {
+                    NSWorkspace.shared.activateFileViewerSelecting([notice.backupURL])
+                },
+                secondaryButton: .cancel(Text(L("稍后处理", "Review Later")))
+            )
         }
         .onChange(of: settingsAppearance) { _, _ in
             AppearanceController.apply()

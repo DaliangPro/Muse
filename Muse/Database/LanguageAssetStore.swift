@@ -76,6 +76,16 @@ actor LanguageAssetStore {
     }
 
     func latestJob() -> AssetExtractionJob? {
+        do {
+            return try latestJobOrThrow()
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 最近任务查询失败: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func latestJobOrThrow() throws -> AssetExtractionJob? {
+        let db = try requireDB()
         let sql = """
         SELECT id, created_at, started_at, finished_at, range_type, range_payload, source_record_count, status, summary, error_message
         FROM asset_extraction_job
@@ -83,11 +93,20 @@ actor LanguageAssetStore {
         LIMIT 1;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return codec.decodeJob(from: stmt)
+        switch sqlite3_step(stmt) {
+        case SQLITE_ROW:
+            guard let job = codec.decodeJob(from: stmt) else {
+                throw LanguageAssetStoreError.sqlite(L("任务数据损坏", "Job data is corrupt"))
+            }
+            return job
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
+        }
     }
 
     // MARK: - Recipe Architecture
@@ -103,6 +122,16 @@ actor LanguageAssetStore {
     }
 
     func fetchRecipes(status: ExtractionRecipeStatus = .active) -> [ExtractionRecipe] {
+        do {
+            return try fetchRecipesOrThrow(status: status)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 配方查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchRecipesOrThrow(status: ExtractionRecipeStatus = .active) throws -> [ExtractionRecipe] {
+        let db = try requireDB()
         let sql = """
         SELECT id, created_at, updated_at, name, description, goal_prompt, output_kind, processing_strategy, source_policy, output_schema, quality_rules, destination, is_built_in, status, save_rule, ignore_rule
         FROM extraction_recipe
@@ -110,21 +139,38 @@ actor LanguageAssetStore {
         ORDER BY is_built_in DESC, updated_at DESC, created_at ASC;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
 
         var recipes: [ExtractionRecipe] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let recipe = codec.decodeRecipe(from: stmt) {
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let recipe = codec.decodeRecipe(from: stmt) else {
+                    throw LanguageAssetStoreError.sqlite(L("配方数据损坏", "Recipe data is corrupt"))
+                }
                 recipes.append(recipe)
+            case SQLITE_DONE:
+                return recipes
+            default:
+                throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
             }
         }
-        return recipes
     }
 
     func fetchRecipe(id: String) -> ExtractionRecipe? {
+        do {
+            return try fetchRecipeOrThrow(id: id)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 配方查询失败: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func fetchRecipeOrThrow(id: String) throws -> ExtractionRecipe? {
+        let db = try requireDB()
         let sql = """
         SELECT id, created_at, updated_at, name, description, goal_prompt, output_kind, processing_strategy, source_policy, output_schema, quality_rules, destination, is_built_in, status, save_rule, ignore_rule
         FROM extraction_recipe
@@ -132,12 +178,21 @@ actor LanguageAssetStore {
         LIMIT 1;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, id)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return codec.decodeRecipe(from: stmt)
+        switch sqlite3_step(stmt) {
+        case SQLITE_ROW:
+            guard let recipe = codec.decodeRecipe(from: stmt) else {
+                throw LanguageAssetStoreError.sqlite(L("配方数据损坏", "Recipe data is corrupt"))
+            }
+            return recipe
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
+        }
     }
 
     func archiveRecipe(id: String) {
@@ -190,6 +245,16 @@ actor LanguageAssetStore {
 
     /// 最近提炼批次列表（提炼页历史 + 待确认页分组头用，2026-07 重构批三）
     func fetchRuns(limit: Int = 20) -> [ExtractionRun] {
+        do {
+            return try fetchRunsOrThrow(limit: limit)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 提炼批次查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchRunsOrThrow(limit: Int = 20) throws -> [ExtractionRun] {
+        let db = try requireDB()
         let sql = """
         SELECT id, recipe_id, recipe_name, created_at, started_at, finished_at, range_type, range_payload, source_record_count, status, result_count, summary, error_message
         FROM extraction_run
@@ -197,21 +262,38 @@ actor LanguageAssetStore {
         LIMIT ?;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int(stmt, 1, Int32(limit))
 
         var runs: [ExtractionRun] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let run = codec.decodeRun(from: stmt) {
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let run = codec.decodeRun(from: stmt) else {
+                    throw LanguageAssetStoreError.sqlite(L("提炼批次数据损坏", "Extraction run data is corrupt"))
+                }
                 runs.append(run)
+            case SQLITE_DONE:
+                return runs
+            default:
+                throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
             }
         }
-        return runs
     }
 
     func latestRun() -> ExtractionRun? {
+        do {
+            return try latestRunOrThrow()
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 最近提炼批次查询失败: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func latestRunOrThrow() throws -> ExtractionRun? {
+        let db = try requireDB()
         let sql = """
         SELECT id, recipe_id, recipe_name, created_at, started_at, finished_at, range_type, range_payload, source_record_count, status, result_count, summary, error_message
         FROM extraction_run
@@ -219,11 +301,20 @@ actor LanguageAssetStore {
         LIMIT 1;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return codec.decodeRun(from: stmt)
+        switch sqlite3_step(stmt) {
+        case SQLITE_ROW:
+            guard let run = codec.decodeRun(from: stmt) else {
+                throw LanguageAssetStoreError.sqlite(L("提炼批次数据损坏", "Extraction run data is corrupt"))
+            }
+            return run
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
+        }
     }
 
     func saveResultsOrThrow(_ results: [ExtractionResult]) throws {
@@ -273,6 +364,19 @@ actor LanguageAssetStore {
         runID: String? = nil,
         status: ExtractionResultStatus = .active
     ) -> [ExtractionResult] {
+        do {
+            return try fetchResultsOrThrow(runID: runID, status: status)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 提炼结果查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchResultsOrThrow(
+        runID: String? = nil,
+        status: ExtractionResultStatus = .active
+    ) throws -> [ExtractionResult] {
+        let db = try requireDB()
         let sql: String
         if runID == nil {
             sql = """
@@ -291,7 +395,7 @@ actor LanguageAssetStore {
         }
 
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
@@ -300,12 +404,19 @@ actor LanguageAssetStore {
         }
 
         var results: [ExtractionResult] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let result = codec.decodeResult(from: stmt) {
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let result = codec.decodeResult(from: stmt) else {
+                    throw LanguageAssetStoreError.sqlite(L("提炼结果数据损坏", "Extraction result data is corrupt"))
+                }
                 results.append(result)
+            case SQLITE_DONE:
+                return results
+            default:
+                throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
             }
         }
-        return results
     }
 
     /// 待确认产物的拍板：入库(saved)或抛弃(discarded)。2026-07 重构统一处置入口
@@ -349,13 +460,25 @@ actor LanguageAssetStore {
 
     /// 各状态产物计数（待确认角标等）
     func countResults(status: ExtractionResultStatus) -> Int {
+        do {
+            return try countResultsOrThrow(status: status)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 提炼结果计数失败: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
+    func countResultsOrThrow(status: ExtractionResultStatus) throws -> Int {
+        let db = try requireDB()
         let sql = "SELECT COUNT(*) FROM extraction_result WHERE status = ?;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
+        }
         return Int(sqlite3_column_int(stmt, 0))
     }
 
@@ -410,6 +533,16 @@ actor LanguageAssetStore {
     }
 
     func fetchAll(status: LanguageAssetStatus = .active) -> [LanguageAsset] {
+        do {
+            return try fetchAllOrThrow(status: status)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 资产查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchAllOrThrow(status: LanguageAssetStatus = .active) throws -> [LanguageAsset] {
+        let db = try requireDB()
         let sql = """
         SELECT id, created_at, updated_at, asset_type, grade, title, content, summary, reason, scenes_json, audiences_json, rule_hit, keywords_json, source_record_ids_json, source_record_count, extraction_job_id, is_favorite, status
         FROM language_asset
@@ -417,18 +550,25 @@ actor LanguageAssetStore {
         ORDER BY created_at DESC;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
 
         var assets: [LanguageAsset] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let asset = codec.decodeAsset(from: stmt) {
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let asset = codec.decodeAsset(from: stmt) else {
+                    throw LanguageAssetStoreError.sqlite(L("资产数据损坏", "Asset data is corrupt"))
+                }
                 assets.append(asset)
+            case SQLITE_DONE:
+                return assets
+            default:
+                throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
             }
         }
-        return assets
     }
 
     func setFavorite(id: String, isFavorite: Bool) {
@@ -490,6 +630,18 @@ actor LanguageAssetStore {
     }
 
     func fetchCandidates(status: LanguageAssetCandidateStatus = .pending) -> [LanguageAssetCandidateRecord] {
+        do {
+            return try fetchCandidatesOrThrow(status: status)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 候选资产查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchCandidatesOrThrow(
+        status: LanguageAssetCandidateStatus = .pending
+    ) throws -> [LanguageAssetCandidateRecord] {
+        let db = try requireDB()
         let sql = """
         SELECT id, created_at, updated_at, asset_type, grade, title, content, summary, reason, scenes_json, audiences_json, rule_hit, source_record_ids_json, source_record_count, extraction_job_id, status
         FROM language_asset_candidate
@@ -497,18 +649,25 @@ actor LanguageAssetStore {
         ORDER BY created_at DESC;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         SQL.bind(stmt, 1, status.rawValue)
 
         var candidates: [LanguageAssetCandidateRecord] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let candidate = codec.decodeCandidate(from: stmt) {
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let candidate = codec.decodeCandidate(from: stmt) else {
+                    throw LanguageAssetStoreError.sqlite(L("候选资产数据损坏", "Candidate asset data is corrupt"))
+                }
                 candidates.append(candidate)
+            case SQLITE_DONE:
+                return candidates
+            default:
+                throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
             }
         }
-        return candidates
     }
 
     @discardableResult
@@ -633,12 +792,24 @@ actor LanguageAssetStore {
 
     /// 资产条数（改造方案 #11：概览页计数不再全表加载）
     func count(status: LanguageAssetStatus = .active) -> Int {
+        do {
+            return try countOrThrow(status: status)
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 资产计数失败: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
+    func countOrThrow(status: LanguageAssetStatus = .active) throws -> Int {
+        let db = try requireDB()
         let sql = "SELECT COUNT(*) FROM language_asset WHERE status = ?;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
         SQL.bind(stmt, 1, status.rawValue)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
+        }
         return Int(sqlite3_column_int(stmt, 0))
     }
 
@@ -681,15 +852,36 @@ actor LanguageAssetStore {
     /// 已被任何候选（含已忽略/已入库）或正式资产引用过的识别记录 id 集合。
     /// 提炼取数阶段据此排除，避免同一条输入反复被提炼成新候选。
     func referencedSourceRecordIDs() -> Set<String> {
+        do {
+            return try referencedSourceRecordIDsOrThrow()
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 已引用语料查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func referencedSourceRecordIDsOrThrow() throws -> Set<String> {
+        let db = try requireDB()
         var ids = Set<String>()
         for table in ["language_asset_candidate", "language_asset"] {
             let sql = "SELECT source_record_ids_json FROM \(table);"
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { continue }
+            try prepare(sql, in: db, statement: &stmt)
             defer { sqlite3_finalize(stmt) }
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let parsed = codec.decodeJSONString([String].self, from: SQL.column(stmt, 0)) {
+            var isDone = false
+            while !isDone {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    guard let parsed = codec.decodeJSONString([String].self, from: SQL.column(stmt, 0)) else {
+                        throw LanguageAssetStoreError.sqlite(
+                            L("资产来源记录数据损坏", "Asset source record data is corrupt")
+                        )
+                    }
                     ids.formUnion(parsed)
+                case SQLITE_DONE:
+                    isDone = true
+                default:
+                    throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
                 }
             }
         }
@@ -699,17 +891,35 @@ actor LanguageAssetStore {
     /// 库内已有候选与资产的内容去重键（type|title|content 小写），
     /// 规范化阶段据此剔除与既有内容重复的新候选。
     func existingDedupeKeys() -> Set<String> {
+        do {
+            return try existingDedupeKeysOrThrow()
+        } catch {
+            AppLogger.log("[LanguageAssetStore] 资产去重键查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func existingDedupeKeysOrThrow() throws -> Set<String> {
+        let db = try requireDB()
         var keys = Set<String>()
         for table in ["language_asset_candidate", "language_asset"] {
             let sql = "SELECT asset_type, COALESCE(title, ''), content FROM \(table);"
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { continue }
+            try prepare(sql, in: db, statement: &stmt)
             defer { sqlite3_finalize(stmt) }
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let type = SQL.column(stmt, 0)
-                let title = SQL.column(stmt, 1)
-                let content = SQL.column(stmt, 2)
-                keys.insert("\(type)|\(title.lowercased())|\(content.lowercased())")
+            var isDone = false
+            while !isDone {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    let type = SQL.column(stmt, 0)
+                    let title = SQL.column(stmt, 1)
+                    let content = SQL.column(stmt, 2)
+                    keys.insert("\(type)|\(title.lowercased())|\(content.lowercased())")
+                case SQLITE_DONE:
+                    isDone = true
+                default:
+                    throw LanguageAssetStoreError.sqlite(sqliteMessage(in: db))
+                }
             }
         }
         return keys

@@ -13,17 +13,26 @@ struct ModeStorage {
     }
 
     func save(_ modes: [ProcessingMode]) throws {
-        let data = try JSONEncoder().encode(modes)
-        try data.write(to: fileURL, options: .atomic)
+        try JSONFileStore.writeOrThrow(modes, to: fileURL)
     }
 
+    /// 核心读取：保留 missing / value / corrupt 三态，供设置页决定是否进入恢复流程。
+    func loadResult() -> JSONFileReadResult<[ProcessingMode]> {
+        JSONFileStore.read([ProcessingMode].self, from: fileURL).map(migrate)
+    }
+
+    /// 运行时兼容边界：缺失使用默认模式；损坏只在内存降级，绝不自动写盘。
     func load() -> [ProcessingMode] {
-        guard let data = try? Data(contentsOf: fileURL),
-              let saved = try? JSONDecoder().decode([ProcessingMode].self, from: data),
-              !saved.isEmpty
-        else {
+        switch loadResult() {
+        case .value(let modes):
+            return modes
+        case .missing, .corrupt:
             return ProcessingMode.defaults
         }
+    }
+
+    private func migrate(_ saved: [ProcessingMode]) -> [ProcessingMode] {
+        guard !saved.isEmpty else { return ProcessingMode.defaults }
 
         // Migrate legacy built-in flags for default modes, and drop unknown built-ins.
         var result = saved.compactMap { mode -> ProcessingMode? in

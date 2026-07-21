@@ -61,6 +61,7 @@ enum HotwordStorage {
     private enum MigrationError: Error {
         case unsupportedSchemaVersion(Int)
         case invalidLegacyPayload
+        case corruptFile(URL, Error)
     }
 
     /// 内置文件只在缺失时 seed；后续默认词更新必须增加显式 schema migration。
@@ -75,8 +76,18 @@ enum HotwordStorage {
 
     private static func seedBuiltinIfMissing(context: VocabularyStorageContext) throws {
         let url = builtinFileURL(in: context)
-        guard !context.fileManager.fileExists(atPath: url.path) else { return }
-        try writeFile(defaultHotwords, to: url)
+        switch JSONFileStore.read(
+            [String].self,
+            from: url,
+            fileManager: context.fileManager
+        ) {
+        case .missing:
+            try writeFile(defaultHotwords, to: url)
+        case .value:
+            return
+        case .corrupt(let backupURL, let error):
+            throw MigrationError.corruptFile(backupURL, error)
+        }
     }
 
     private static func runSchemaMigrations(context: VocabularyStorageContext) throws {
@@ -101,9 +112,16 @@ enum HotwordStorage {
     }
 
     private static func migrateLegacyUserDefaults(context: VocabularyStorageContext) throws {
-        // Migrate old UserDefaults to user file (skip if user file already exists)
         let url = userFileURL(in: context)
-        guard !context.fileManager.fileExists(atPath: url.path) else { return }
+        // 只有明确 missing 才允许导入；损坏文件必须先恢复，不能推进 schema 后丢失恢复源。
+        switch loadResult(context: context) {
+        case .missing:
+            break
+        case .value:
+            return
+        case .corrupt(let backupURL, let error):
+            throw MigrationError.corruptFile(backupURL, error)
+        }
         guard context.userDefaults.object(forKey: oldUDKey) != nil else { return }
         guard let raw = context.userDefaults.string(forKey: oldUDKey) else {
             throw MigrationError.invalidLegacyPayload
@@ -121,8 +139,24 @@ enum HotwordStorage {
 
     // MARK: - User file (Settings UI)
 
+    static func loadResult(
+        context: VocabularyStorageContext = .production
+    ) -> JSONFileReadResult<[String]> {
+        JSONFileStore.read(
+            [String].self,
+            from: userFileURL(in: context),
+            fileManager: context.fileManager
+        )
+    }
+
+    /// 运行时兼容边界：missing/corrupt 均只在内存降级为空，写入仍受恢复保护。
     static func load(context: VocabularyStorageContext = .production) -> [String] {
-        readFile(userFileURL(in: context))
+        switch loadResult(context: context) {
+        case .value(let words):
+            return words
+        case .missing, .corrupt:
+            return []
+        }
     }
 
     static func save(
@@ -136,7 +170,22 @@ enum HotwordStorage {
     // MARK: - Built-in file (seed once, preserve thereafter)
 
     static func loadBuiltin(context: VocabularyStorageContext = .production) -> [String] {
-        readFile(builtinFileURL(in: context))
+        switch loadBuiltinResult(context: context) {
+        case .value(let words):
+            return words
+        case .missing, .corrupt:
+            return []
+        }
+    }
+
+    static func loadBuiltinResult(
+        context: VocabularyStorageContext = .production
+    ) -> JSONFileReadResult<[String]> {
+        JSONFileStore.read(
+            [String].self,
+            from: builtinFileURL(in: context),
+            fileManager: context.fileManager
+        )
     }
 
     static func saveBuiltin(
@@ -155,6 +204,10 @@ enum HotwordStorage {
     static func revealUserInFinder(context: VocabularyStorageContext = .production) {
         let url = userFileURL(in: context)
         if !context.fileManager.fileExists(atPath: url.path) {
+            if let backupURL = JSONFileStore.recoveryURL(for: url, fileManager: context.fileManager) {
+                context.revealFile(backupURL)
+                return
+            }
             try? writeFile([], to: url)
         }
         context.revealFile(url)
@@ -211,10 +264,6 @@ enum HotwordStorage {
     }
 
     // MARK: - File I/O helpers
-
-    private static func readFile(_ url: URL) -> [String] {
-        JSONFileStore.read([String].self, from: url) ?? []
-    }
 
     private static func writeFile(_ words: [String], to url: URL) throws {
         try JSONFileStore.writeOrThrow(words, to: url)

@@ -83,7 +83,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         DebugFileLogger.startSession()
         DebugFileLogger.log("applicationDidFinishLaunching")
-        DebugFileLogger.log("launch args=\(ProcessInfo.processInfo.arguments.joined(separator: " "))")
+        let filteredArguments = LogRedactor.redactedArguments(ProcessInfo.processInfo.arguments)
+        DebugFileLogger.log("launch args=\(filteredArguments.joined(separator: " "))")
         floatingBarController = FloatingBarController(state: appState)
         appState.onCopyFallbackVisibilityChange = { [weak self] isVisible in
             self?.hotkeyManager.isCopyFallbackVisible = isVisible

@@ -1397,13 +1397,13 @@ actor RecognitionSession {
 
         case .transcript(let transcript):
             currentTranscript = transcript
-            logger.info("Transcript updated: \(transcript.displayText)")
+            logger.info("Transcript updated chars=\(transcript.displayText.count, privacy: .public) segments=\(transcript.confirmedSegments.count, privacy: .public) final=\(transcript.isFinal, privacy: .public)")
             if state == .recording && !currentMode.prompt.isEmpty {
                 scheduleSpeculativeLLM(sessionID: sessionID)
             }
 
         case .error(let error):
-            logger.error("ASR error: \(error)")
+            logger.error("ASR error: \(error, privacy: .private)")
             if state == .recording || state == .starting {
                 Task { await self.failActiveSessionAfterASRError(sessionID: sessionID) }
             }

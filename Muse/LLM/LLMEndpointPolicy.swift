@@ -199,30 +199,9 @@ enum LLMNetworkSession {
 
     static func sanitizedErrorBody(_ data: Data, limit: Int = 512) -> String {
         let inspectionLimit = max(0, limit) + 4_096
-        var text = String(decoding: data.prefix(inspectionLimit), as: UTF8.self)
-        let secretName = #"(?:authorization|api[ _-]?key|access[ _-]?key|access_token|client_secret|password|token)"#
-        let replacements: [(String, String)] = [
-            (
-                #"(?i)(\""# + secretName + #"\"\s*:\s*\")[^\"]*(?:\"|$)"#,
-                "$1<redacted>\""
-            ),
-            (
-                #"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)([^\s\"',;}]+)"#,
-                "$1<redacted>"
-            ),
-            (
-                #"(?i)("# + secretName + #"\s*[:=]\s*)([^\s,\"';}]+)"#,
-                "$1<redacted>"
-            ),
-            (#"([?&][^=&\s]+)=([^&\s\"']+)"#, "$1=<redacted>"),
-        ]
-        for (pattern, replacement) in replacements {
-            text = text.replacingOccurrences(
-                of: pattern,
-                with: replacement,
-                options: .regularExpression
-            )
-        }
+        let text = LogRedactor.redact(
+            String(decoding: data.prefix(inspectionLimit), as: UTF8.self)
+        )
         let maximum = max(0, limit)
         let utf8 = Data(text.utf8)
         guard utf8.count > maximum else { return text }

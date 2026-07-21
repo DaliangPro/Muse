@@ -5,6 +5,20 @@ extension Notification.Name {
     static let historyStoreDidChange = Notification.Name("Muse.historyStoreDidChange")
 }
 
+enum HistoryStoreError: Error, LocalizedError {
+    case databaseUnavailable
+    case sqlite(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .databaseUnavailable:
+            return L("历史数据库不可用", "History database unavailable")
+        case .sqlite(let message):
+            return L("历史数据库查询失败：\(message)", "History database query failed: \(message)")
+        }
+    }
+}
+
 actor HistoryStore {
 
     static let baselineTypingCharactersPerMinute: Double = 50
@@ -73,12 +87,25 @@ actor HistoryStore {
 
     /// 测试与诊断用：指定名称的索引是否存在
     func hasIndex(named name: String) -> Bool {
+        do {
+            return try hasIndexOrThrow(named: name)
+        } catch {
+            AppLogger.log("[HistoryStore] 索引查询失败: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    func hasIndexOrThrow(named name: String) throws -> Bool {
+        let db = try requireDB()
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
         SQL.bind(stmt, 1, name)
-        return sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) > 0
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
+        return sqlite3_column_int(stmt, 0) > 0
     }
 
     // MARK: - CRUD
@@ -118,35 +145,67 @@ actor HistoryStore {
     }
 
     func fetchAll(limit: Int? = nil, offset: Int = 0) -> [HistoryRecord] {
-        let sql: String
-        if let limit {
-            sql = "SELECT * FROM recognition_history ORDER BY created_at DESC LIMIT \(limit) OFFSET \(offset);"
-        } else {
-            sql = "SELECT * FROM recognition_history ORDER BY created_at DESC;"
+        do {
+            return try fetchAllOrThrow(limit: limit, offset: offset)
+        } catch {
+            AppLogger.log("[HistoryStore] 历史查询失败: \(error.localizedDescription)")
+            return []
         }
+    }
+
+    /// 核心查询：数据库不可用、prepare 或 step 失败均向上传播。
+    func fetchAllOrThrow(limit: Int? = nil, offset: Int = 0) throws -> [HistoryRecord] {
+        let db = try requireDB()
+        let sql = limit == nil
+            ? "SELECT * FROM recognition_history ORDER BY created_at DESC;"
+            : "SELECT * FROM recognition_history ORDER BY created_at DESC LIMIT ? OFFSET ?;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
+        if let limit {
+            sqlite3_bind_int64(stmt, 1, sqlite3_int64(max(0, limit)))
+            sqlite3_bind_int64(stmt, 2, sqlite3_int64(max(0, offset)))
+        }
 
         var records: [HistoryRecord] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            records.append(decodeRecord(from: stmt))
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                records.append(decodeRecord(from: stmt))
+            case SQLITE_DONE:
+                return records
+            default:
+                throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+            }
         }
-        return records
     }
 
     func fetchRecent(limit: Int) -> [HistoryRecord] {
         fetchAll(limit: limit)
     }
 
+    func fetchRecentOrThrow(limit: Int) throws -> [HistoryRecord] {
+        try fetchAllOrThrow(limit: limit)
+    }
+
     func fetchBetween(start: Date, end: Date) -> [HistoryRecord] {
+        do {
+            return try fetchBetweenOrThrow(start: start, end: end)
+        } catch {
+            AppLogger.log("[HistoryStore] 日期范围查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchBetweenOrThrow(start: Date, end: Date) throws -> [HistoryRecord] {
+        let db = try requireDB()
         let sql = """
         SELECT * FROM recognition_history
         WHERE created_at >= ? AND created_at < ?
         ORDER BY created_at DESC;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         let iso = ISO8601DateFormatter()
@@ -154,14 +213,30 @@ actor HistoryStore {
         SQL.bind(stmt, 2, iso.string(from: end))
 
         var records: [HistoryRecord] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            records.append(decodeRecord(from: stmt))
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                records.append(decodeRecord(from: stmt))
+            case SQLITE_DONE:
+                return records
+            default:
+                throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+            }
         }
-        return records
     }
 
     func fetch(ids: [String]) -> [HistoryRecord] {
+        do {
+            return try fetchOrThrow(ids: ids)
+        } catch {
+            AppLogger.log("[HistoryStore] 指定记录查询失败: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func fetchOrThrow(ids: [String]) throws -> [HistoryRecord] {
         guard !ids.isEmpty else { return [] }
+        let db = try requireDB()
 
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
         let sql = """
@@ -170,7 +245,7 @@ actor HistoryStore {
         ORDER BY created_at DESC;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         for (index, id) in ids.enumerated() {
@@ -178,23 +253,45 @@ actor HistoryStore {
         }
 
         var records: [HistoryRecord] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            records.append(decodeRecord(from: stmt))
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                records.append(decodeRecord(from: stmt))
+            case SQLITE_DONE:
+                return records
+            default:
+                throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+            }
         }
-        return records
     }
 
     func count(from start: Date? = nil, to end: Date? = nil) -> Int {
-        var sql = "SELECT COUNT(*) FROM recognition_history"
-        let iso = ISO8601DateFormatter()
-        if let start, let end {
-            sql += " WHERE created_at >= '\(iso.string(from: start))' AND created_at < '\(iso.string(from: end))'"
+        do {
+            return try countOrThrow(from: start, to: end)
+        } catch {
+            AppLogger.log("[HistoryStore] 历史计数失败: \(error.localizedDescription)")
+            return 0
         }
-        sql += ";"
+    }
+
+    func countOrThrow(from start: Date? = nil, to end: Date? = nil) throws -> Int {
+        let db = try requireDB()
+        let hasRange = start != nil && end != nil
+        let sql = hasRange
+            ? "SELECT COUNT(*) FROM recognition_history WHERE created_at >= ? AND created_at < ?;"
+            : "SELECT COUNT(*) FROM recognition_history;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
-        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
+        if let start, let end {
+            let iso = ISO8601DateFormatter()
+            SQL.bind(stmt, 1, iso.string(from: start))
+            SQL.bind(stmt, 2, iso.string(from: end))
+        }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
+        return Int(sqlite3_column_int(stmt, 0))
     }
 
     func delete(id: String) {
@@ -337,6 +434,16 @@ actor HistoryStore {
     /// 可提炼语料计数：与提炼管线输入口径一致(status=completed 且有正文)——
     /// 语料池卡片显示这个数才「准确」，全表 COUNT 会把失败/中断记录也算进去（2026-07）
     func extractableRecordCount(since: Date? = nil) -> Int {
+        do {
+            return try extractableRecordCountOrThrow(since: since)
+        } catch {
+            AppLogger.log("[HistoryStore] 可提炼语料计数失败: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
+    func extractableRecordCountOrThrow(since: Date? = nil) throws -> Int {
+        let db = try requireDB()
         var sql = "SELECT COUNT(*) FROM recognition_history WHERE status = 'completed' AND TRIM(final_text) != ''"
         if since != nil {
             sql += " AND created_at >= ?"
@@ -344,17 +451,29 @@ actor HistoryStore {
         sql += ";"
 
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         if let since {
             SQL.bind(stmt, 1, ISO8601DateFormatter().string(from: since))
         }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
         return Int(sqlite3_column_int(stmt, 0))
     }
 
     func getStatistics() async -> Statistics {
+        do {
+            return try getStatisticsOrThrow()
+        } catch {
+            AppLogger.log("[HistoryStore] 统计查询失败: \(error.localizedDescription)")
+            return Statistics(totalDuration: 0, totalCharacters: 0, recordCount: 0, timeSavedSeconds: 0)
+        }
+    }
+
+    func getStatisticsOrThrow() throws -> Statistics {
+        let db = try requireDB()
         // Only sum duration for rows that have token_count, so averageSpeed
         // is accurate even if some legacy rows haven't been migrated yet.
         let sql = """
@@ -377,9 +496,7 @@ actor HistoryStore {
         FROM recognition_history;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return Statistics(totalDuration: 0, totalCharacters: 0, recordCount: 0, timeSavedSeconds: 0)
-        }
+        try prepare(sql, in: db, statement: &stmt)
         defer { sqlite3_finalize(stmt) }
 
         if sqlite3_step(stmt) == SQLITE_ROW {
@@ -396,10 +513,30 @@ actor HistoryStore {
                 timeSavedSeconds: timeSaved
             )
         }
-        return Statistics(totalDuration: 0, totalCharacters: 0, recordCount: 0, timeSavedSeconds: 0)
+        throw HistoryStoreError.sqlite(sqliteMessage(in: db))
     }
 
     // MARK: - SQLite Helpers
+
+    private func requireDB() throws -> OpaquePointer {
+        guard let db else { throw HistoryStoreError.databaseUnavailable }
+        return db
+    }
+
+    private func prepare(
+        _ sql: String,
+        in db: OpaquePointer,
+        statement: inout OpaquePointer?
+    ) throws {
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
+    }
+
+    private func sqliteMessage(in db: OpaquePointer) -> String {
+        sqlite3_errmsg(db).map { String(cString: $0) }
+            ?? L("SQLite 操作失败", "SQLite operation failed")
+    }
 
     private func decodeRecord(from stmt: OpaquePointer?) -> HistoryRecord {
         let iso = ISO8601DateFormatter()

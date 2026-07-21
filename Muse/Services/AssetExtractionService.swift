@@ -285,7 +285,7 @@ actor AssetExtractionService {
         progress: (AssetExtractionProgressStage) async -> Void = { _ in }
     ) async throws -> AssetExtractionRunResult {
         await progress(.preparing)
-        let recipe = await assetStore.fetchRecipe(id: configuration.recipeID)
+        let recipe = try await assetStore.fetchRecipeOrThrow(id: configuration.recipeID)
             ?? ExtractionRecipe.contentCreatorAssets()
         guard recipe.outputKind == .assetCandidates else {
             throw AssetExtractionError.unsupportedRecipe(recipe.name)
@@ -329,7 +329,7 @@ actor AssetExtractionService {
                 actionDetail: nil
             )
             await progress(.loadingRecords)
-            let sourceRecords = await loadFreshSourceRecords(configuration: configuration).records
+            let sourceRecords = try await loadFreshSourceRecords(configuration: configuration).records
             loadedSourceRecordCount = sourceRecords.count
             let runningJob = AssetExtractionJob(
                 id: createdJob.id,
@@ -417,7 +417,7 @@ actor AssetExtractionService {
             let result = try await provider.extractAssets(from: candidateRecords, configuration: configuration)
             await progress(.normalizingResults)
             // 跨任务防重②：对照库内既有候选与资产的内容键，剔除重复产出
-            let existingKeys = await assetStore.existingDedupeKeys()
+            let existingKeys = try await assetStore.existingDedupeKeysOrThrow()
             let candidates = normalizer.normalizeCandidates(
                 result: result,
                 sourceRecords: candidateRecords,
@@ -521,7 +521,7 @@ actor AssetExtractionService {
         progress: (AssetExtractionProgressStage) async -> Void = { _ in }
     ) async throws -> RecipeExtractionRunResult {
         await progress(.preparing)
-        let recipe = await assetStore.fetchRecipe(id: configuration.recipeID)
+        let recipe = try await assetStore.fetchRecipeOrThrow(id: configuration.recipeID)
             ?? configuration.recipe
         // 2026-07 重构批二：金句/创作素材类配方也走统一两段式管线，不再拦截
         // （老 extractAssets 路径保留供旧界面过渡，批四清退）
@@ -552,7 +552,7 @@ actor AssetExtractionService {
                 actionDetail: nil
             )
             await progress(.loadingRecords)
-            let loadedRecords = await loadSourceRecords(configuration: configuration)
+            let loadedRecords = try await loadSourceRecords(configuration: configuration)
             // mapReduce(金句/素材类逐条淘金)全量不截断,片级再拆;whole(日报/待办整体阅读)维持单次上限
             let fullCoverage = recipe.processingStrategy == .mapReduce
             let inputOutcome = recipeInputRecords(
@@ -702,13 +702,13 @@ actor AssetExtractionService {
     }
 
     /// 提炼前预览：本地跑完取数+防重+过滤，零模型成本（改造方案 #7/#9）
-    func previewExtraction(configuration: AssetExtractionConfiguration) async -> AssetExtractionPreview {
-        let recipe = await assetStore.fetchRecipe(id: configuration.recipeID)
+    func previewExtraction(configuration: AssetExtractionConfiguration) async throws -> AssetExtractionPreview {
+        let recipe = try await assetStore.fetchRecipeOrThrow(id: configuration.recipeID)
             ?? configuration.recipe
         // mapReduce 配方预览给全量(截断只在执行时的片级发生)——预览如实报告覆盖范围
         let fullCoverage = recipe.processingStrategy == .mapReduce
         guard recipe.outputKind == .assetCandidates else {
-            let loadedRecords = await loadSourceRecords(configuration: configuration)
+            let loadedRecords = try await loadSourceRecords(configuration: configuration)
             let filtered = recipeInputRecords(
                 from: loadedRecords,
                 configuration: configuration,
@@ -727,7 +727,7 @@ actor AssetExtractionService {
             )
         }
 
-        let loaded = await loadFreshSourceRecords(configuration: configuration)
+        let loaded = try await loadFreshSourceRecords(configuration: configuration)
         let filtered = candidateRecords(
             from: loaded.records,
             configuration: configuration,
@@ -750,29 +750,29 @@ actor AssetExtractionService {
     /// 手动点名或显式要求重新提炼时豁免——用户明确要重跑的记录不拦
     private func loadFreshSourceRecords(
         configuration: AssetExtractionConfiguration
-    ) async -> (records: [HistoryRecord], excludedAsProcessedCount: Int) {
-        let records = await loadSourceRecords(configuration: configuration)
+    ) async throws -> (records: [HistoryRecord], excludedAsProcessedCount: Int) {
+        let records = try await loadSourceRecords(configuration: configuration)
         guard configuration.rangeType != .manualSelection,
               !configuration.includesProcessedRecords
         else {
             return (records, 0)
         }
-        let referenced = await assetStore.referencedSourceRecordIDs()
+        let referenced = try await assetStore.referencedSourceRecordIDsOrThrow()
         let fresh = records.filter { !referenced.contains($0.id) }
         return (fresh, records.count - fresh.count)
     }
 
-    private func loadSourceRecords(configuration: AssetExtractionConfiguration) async -> [HistoryRecord] {
+    private func loadSourceRecords(configuration: AssetExtractionConfiguration) async throws -> [HistoryRecord] {
         switch configuration.rangeType {
         case .last1Day, .last7Days, .last30Days:
             guard let startDate = configuration.startDate,
                   let endDate = configuration.endDate
             else { return [] }
-            return await historyStore.fetchBetween(start: startDate, end: endDate)
+            return try await historyStore.fetchBetweenOrThrow(start: startDate, end: endDate)
         case .lastNRecords:
-            return await historyStore.fetchRecent(limit: configuration.maxRecordCount)
+            return try await historyStore.fetchRecentOrThrow(limit: configuration.maxRecordCount)
         case .manualSelection:
-            return await historyStore.fetch(ids: configuration.selectedRecordIDs)
+            return try await historyStore.fetchOrThrow(ids: configuration.selectedRecordIDs)
         }
     }
 

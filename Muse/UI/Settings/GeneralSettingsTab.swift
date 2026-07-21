@@ -18,12 +18,19 @@ struct GeneralSettingsTab: View {
     @State private var statistics: HistoryStore.Statistics? = GeneralSettingsTab.cachedStatistics
     @State private var recentRecords: [HistoryRecord] = GeneralSettingsTab.cachedRecords
     @State private var languageAssetCount = GeneralSettingsTab.cachedAssetCount
+    @State private var historyDatabaseErrorMessage: String?
+    @State private var assetDatabaseErrorMessage: String?
     @State private var copiedRecentRecordId: String?
     @State private var selectedDayKey = GeneralRecentHistorySection.dayKey(for: Date())
 
     private static var cachedStatistics: HistoryStore.Statistics?
     private static var cachedRecords: [HistoryRecord] = []
     private static var cachedAssetCount = 0
+
+    private var databaseErrorMessage: String? {
+        let messages = [historyDatabaseErrorMessage, assetDatabaseErrorMessage].compactMap { $0 }
+        return messages.isEmpty ? nil : messages.joined(separator: "\n")
+    }
 
     private let historyStore = HistoryStore()
     private let assetStore = LanguageAssetStore()
@@ -35,6 +42,11 @@ struct GeneralSettingsTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if let databaseErrorMessage {
+                databaseFailureBanner(databaseErrorMessage)
+                    .padding(.bottom, 10)
+            }
+
             GeneralOverviewSection(
                 stats: currentStatistics,
                 hasMicrophonePermission: hasMic,
@@ -55,7 +67,6 @@ struct GeneralSettingsTab: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task {
             checkPermissions()
-            await reloadAssetCount()
             await reloadHistoryData()
         }
         .onReceive(NotificationCenter.default.publisher(for: .historyStoreDidChange)) { _ in
@@ -70,30 +81,61 @@ struct GeneralSettingsTab: View {
     }
 
     private func reloadHistoryData() async {
-        let stats = await historyStore.getStatistics()
-        // 按所选日期取全天记录（2026-06-12 用户拍板：日期选择器替代固定最近 N 条）
-        let day = GeneralRecentHistorySection.day(fromKey: selectedDayKey)
-            ?? Calendar.current.startOfDay(for: Date())
-        let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day
-        let records = await historyStore.fetchBetween(start: day, end: nextDay)
-        let assetCount = await assetStore.count()
-        let sortedRecords = records.sorted { $0.createdAt > $1.createdAt }
-        await MainActor.run {
-            statistics = stats
-            recentRecords = sortedRecords
-            languageAssetCount = assetCount
-            Self.cachedStatistics = stats
-            Self.cachedRecords = sortedRecords
-            Self.cachedAssetCount = assetCount
+        do {
+            let stats = try await historyStore.getStatisticsOrThrow()
+            // 按所选日期取全天记录（2026-06-12 用户拍板：日期选择器替代固定最近 N 条）
+            let day = GeneralRecentHistorySection.day(fromKey: selectedDayKey)
+                ?? Calendar.current.startOfDay(for: Date())
+            let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day
+            let records = try await historyStore.fetchBetweenOrThrow(start: day, end: nextDay)
+            let sortedRecords = records.sorted { $0.createdAt > $1.createdAt }
+            await MainActor.run {
+                statistics = stats
+                recentRecords = sortedRecords
+                historyDatabaseErrorMessage = nil
+                Self.cachedStatistics = stats
+                Self.cachedRecords = sortedRecords
+            }
+        } catch {
+            await MainActor.run {
+                // 保留上次成功数据；错误不能伪装成 0 条。
+                historyDatabaseErrorMessage = error.localizedDescription
+            }
         }
+        await reloadAssetCount()
     }
 
     private func reloadAssetCount() async {
-        let assetCount = await assetStore.count()
-        await MainActor.run {
-            languageAssetCount = assetCount
-            Self.cachedAssetCount = assetCount
+        do {
+            let assetCount = try await assetStore.countOrThrow()
+            await MainActor.run {
+                languageAssetCount = assetCount
+                assetDatabaseErrorMessage = nil
+                Self.cachedAssetCount = assetCount
+            }
+        } catch {
+            await MainActor.run {
+                assetDatabaseErrorMessage = error.localizedDescription
+            }
         }
+    }
+
+    private func databaseFailureBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+            Text(message)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button(L("重试", "Retry")) {
+                Task { await reloadHistoryData() }
+            }
+            .buttonStyle(.borderless)
+        }
+        .font(TF.settingsFontCaption)
+        .foregroundStyle(.red)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func copyRecentRecord(_ record: HistoryRecord) {

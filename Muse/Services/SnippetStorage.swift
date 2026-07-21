@@ -205,6 +205,7 @@ enum SnippetStorage {
     private enum MigrationError: Error {
         case unsupportedSchemaVersion(Int)
         case invalidLegacyPayload
+        case corruptFile(URL, Error)
     }
 
     /// 内置文件只在缺失时 seed；后续默认规则更新必须增加显式 schema migration。
@@ -219,9 +220,19 @@ enum SnippetStorage {
 
     private static func seedBuiltinIfMissing(context: VocabularyStorageContext) throws {
         let url = builtinFileURL(in: context)
-        guard !context.fileManager.fileExists(atPath: url.path) else { return }
-        try writeFile(defaultSnippets, to: url)
-        invalidateCache()
+        switch JSONFileStore.read(
+            [Entry].self,
+            from: url,
+            fileManager: context.fileManager
+        ) {
+        case .missing:
+            try writeFile(defaultSnippets, to: url)
+            invalidateCache()
+        case .value:
+            return
+        case .corrupt(let backupURL, let error):
+            throw MigrationError.corruptFile(backupURL, error)
+        }
     }
 
     private static func runSchemaMigrations(context: VocabularyStorageContext) throws {
@@ -246,9 +257,16 @@ enum SnippetStorage {
     }
 
     private static func migrateLegacyUserDefaults(context: VocabularyStorageContext) throws {
-        // Migrate old UserDefaults to user file (skip if user file already exists)
         let url = userFileURL(in: context)
-        guard !context.fileManager.fileExists(atPath: url.path) else { return }
+        // 只有明确 missing 才允许导入；损坏文件必须先恢复，不能推进 schema 后丢失恢复源。
+        switch loadResult(context: context) {
+        case .missing:
+            break
+        case .value:
+            return
+        case .corrupt(let backupURL, let error):
+            throw MigrationError.corruptFile(backupURL, error)
+        }
         guard context.userDefaults.object(forKey: oldUDKey) != nil else { return }
         guard let data = context.userDefaults.data(forKey: oldUDKey),
               let pairs = try? JSONDecoder().decode([[String]].self, from: data),
@@ -274,8 +292,26 @@ enum SnippetStorage {
 
     // MARK: - User file (Settings UI)
 
+    static func loadResult(
+        context: VocabularyStorageContext = .production
+    ) -> JSONFileReadResult<[(trigger: String, value: String)]> {
+        JSONFileStore.read(
+            [Entry].self,
+            from: userFileURL(in: context),
+            fileManager: context.fileManager
+        ).map { entries in
+            entries.map { (trigger: $0.trigger, value: $0.replacement) }
+        }
+    }
+
+    /// 运行时兼容边界：missing/corrupt 均只在内存降级为空，写入仍受恢复保护。
     static func load(context: VocabularyStorageContext = .production) -> [(trigger: String, value: String)] {
-        readFile(userFileURL(in: context))
+        switch loadResult(context: context) {
+        case .value(let snippets):
+            return snippets
+        case .missing, .corrupt:
+            return []
+        }
     }
 
     static func save(
@@ -304,7 +340,24 @@ enum SnippetStorage {
     static func loadBuiltin(
         context: VocabularyStorageContext = .production
     ) -> [(trigger: String, value: String)] {
-        readFile(builtinFileURL(in: context))
+        switch loadBuiltinResult(context: context) {
+        case .value(let snippets):
+            return snippets
+        case .missing, .corrupt:
+            return []
+        }
+    }
+
+    static func loadBuiltinResult(
+        context: VocabularyStorageContext = .production
+    ) -> JSONFileReadResult<[(trigger: String, value: String)]> {
+        JSONFileStore.read(
+            [Entry].self,
+            from: builtinFileURL(in: context),
+            fileManager: context.fileManager
+        ).map { entries in
+            entries.map { (trigger: $0.trigger, value: $0.replacement) }
+        }
     }
 
     static func saveBuiltin(
@@ -323,6 +376,10 @@ enum SnippetStorage {
     static func revealUserInFinder(context: VocabularyStorageContext = .production) {
         let url = userFileURL(in: context)
         if !context.fileManager.fileExists(atPath: url.path) {
+            if let backupURL = JSONFileStore.recoveryURL(for: url, fileManager: context.fileManager) {
+                context.revealFile(backupURL)
+                return
+            }
             try? writeFile([], to: url)
         }
         context.revealFile(url)
@@ -450,11 +507,6 @@ enum SnippetStorage {
     }
 
     // MARK: - File I/O helpers
-
-    private static func readFile(_ url: URL) -> [(trigger: String, value: String)] {
-        let entries = JSONFileStore.read([Entry].self, from: url) ?? []
-        return entries.map { (trigger: $0.trigger, value: $0.replacement) }
-    }
 
     private static func writeFile(_ snippets: [(trigger: String, value: String)], to url: URL) throws {
         let entries = snippets.map { Entry(trigger: $0.trigger, replacement: $0.value) }

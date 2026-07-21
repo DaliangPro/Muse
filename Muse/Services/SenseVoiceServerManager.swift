@@ -530,11 +530,12 @@ actor SenseVoiceServerManager {
     }
 
     nonisolated private static func securityLog(_ message: String) {
+        let redacted = LogRedactor.redact(message)
         Logger(
             subsystem: "pro.daliang.muse.sensevoice",
             category: "ProcessSecurity"
-        ).error("\(message, privacy: .public)")
-        DebugFileLogger.log("[ProcessSecurity] \(message)")
+        ).error("\(redacted, privacy: .private)")
+        DebugFileLogger.log("[ProcessSecurity] \(redacted)")
     }
 
     nonisolated private static func waitSynchronouslyForExit(

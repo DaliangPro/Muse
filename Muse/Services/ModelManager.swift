@@ -518,7 +518,7 @@ actor ModelManager {
             if attempt > 0 {
                 let delay = min(3 + (2 * Double(attempt - 1)), 10)
                 logger.info(
-                    "重试模型制品 \(key, privacy: .public)/\(artifact.relativePath, privacy: .public)，等待 \(delay)s"
+                    "重试模型制品 \(key, privacy: .public)/\(artifact.relativePath, privacy: .private)，等待 \(delay)s"
                 )
                 try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 try Task.checkCancellation()
@@ -732,7 +732,7 @@ actor ModelManager {
                 // 新制品已通过安装后校验，此时不能再破坏正式路径；遗留 backup
                 // 比尝试回滚到一个可能已被部分删除的 backup 更安全。
                 logger.error(
-                    "模型 backup 清理失败，将保留已验证的新制品：\(error.localizedDescription, privacy: .public)"
+                    "模型 backup 清理失败，将保留已验证的新制品：\(error.localizedDescription, privacy: .private)"
                 )
             }
         }
@@ -933,7 +933,7 @@ actor ModelManager {
             try fileOperations.removeItem(at: url)
         } catch {
             logger.error(
-                "清理模型 staging 失败：\(url.path, privacy: .private(mask: .hash))，\(error.localizedDescription, privacy: .public)"
+                "清理模型 staging 失败：\(url.path, privacy: .private(mask: .hash))，\(error.localizedDescription, privacy: .private)"
             )
         }
     }

@@ -274,7 +274,7 @@ actor AppleASRClient: SpeechRecognizer {
         }
 
         if let error = callback.error {
-            logger.error("Apple ASR callback error: \(String(describing: error), privacy: .public)")
+            logger.error("Apple ASR callback error: \(String(describing: error), privacy: .private)")
             finishStream(
                 sessionID: callbackSessionID,
                 emitFallbackFinal: true,

@@ -85,6 +85,20 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
         .onReceive(NotificationCenter.default.publisher(for: .languageAssetStoreDidChange)) { _ in
             Task { await reloadData() }
         }
+        .alert(
+            L("数据加载失败", "Data Load Failed"),
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
+            Button(L("重试", "Retry")) {
+                Task { await reloadData() }
+            }
+            Button(L("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(errorMessage ?? "")
+        }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .candidateSources(let candidate):
@@ -520,11 +534,19 @@ private extension AssetLibraryTab {
 private extension AssetLibraryTab {
     @MainActor
     func reloadData() async {
-        let snapshot = await AssetLibraryDataSnapshot.load(
-            assetStore: assetStore,
-            historyStore: historyStore
-        )
+        let snapshot: AssetLibraryDataSnapshot
+        do {
+            snapshot = try await AssetLibraryDataSnapshot.load(
+                assetStore: assetStore,
+                historyStore: historyStore
+            )
+        } catch {
+            // 保留上次成功快照；数据库故障不能显示成空资产库。
+            errorMessage = error.localizedDescription
+            return
+        }
 
+        errorMessage = nil
         self.recipes = snapshot.recipes
         self.archivedRecipes = snapshot.archivedRecipes
         self.assets = snapshot.assets
