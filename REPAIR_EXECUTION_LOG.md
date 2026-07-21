@@ -284,7 +284,7 @@
 | MUSE-110 | ✅ 完成 | `ef60ef4` | 候选转资产幂等事务、提炼最终状态原子提交及失败状态独立兜底完成。 |
 | MUSE-120 | ✅ 完成 | `2c9a716` | 固定版本清单、逐文件 SHA256、ephemeral 下载、staging 原子安装与失败回滚完成。 |
 | MUSE-130 | ✅ 完成 | `2d9d915` | Provider 级 Endpoint 策略、共享 ephemeral 会话、重定向阻断及有界 SSE 完整性校验完成。 |
-| MUSE-140 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-140 | ✅ 完成 | `df15455` | 显式 schema 迁移、内置文件保护、用户词优先与 100 条严格下发上限完成。 |
 | MUSE-150 | ⬜ 未开始 | — | 等待前置任务。 |
 | MUSE-160 | ⬜ 未开始 | — | 等待前置任务。 |
 
@@ -380,3 +380,38 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、414 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；两轮独立只读复审均未发现剩余 P0/P1。
 - 遗留风险：未连接真实云端 LLM 或本地 Qwen 服务进行网络联调，服务商若依赖重定向须把配置改为最终 HTTPS Endpoint；未使用真实 API key，也未读写真实用户数据目录。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
+
+### MUSE-140：保护词库迁移并严格限制热词下发
+
+- 状态：✅ 完成。
+- 提交：`df15455`（`修复: 保留词库文件改动并严格限制下发热词`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `2e991df0432e3ea19922c4f4122087a4d27145bb`；仅保留既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入提交。基线 `swift build` 通过；`swift test` 执行 414 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 先新增词库迁移、内置文件保护、用户文件保留、热词去空/去重/截断、Finder 入口、缓存隔离与重载测试；修复前定向测试明确编译失败，报告缺少可注入 `VocabularyStorageContext`、schema 迁移 API、重载 API、Finder 回调和截断结果字段。
+  - 再以失败测试锁定旧 v2 完成标记不得复活已删除 legacy 数据、legacy snippet 替换文本须保留大小写、损坏 legacy payload 不得推进 schema，以及用户 `cloudcode` 必须覆盖内置 `Cloud Code`；各项均先观察红灯再修复转绿。
+  - 重载测试直接写入临时 user 文件绕过 `save`，证明 snippet 缓存在显式 reload 前保持旧值；所有存储测试均使用临时目录和独立 UserDefaults suite。
+- 修改：
+  - 新增可注入的 `VocabularyStorageContext`，生产环境保留既有支持目录，测试环境使用临时目录、独立 defaults 和无副作用回调；内置热词与 snippet 仅在文件缺失时 seed，已有空文件、损坏文件或人工修改文件均不覆盖。
+  - 新增 `tf_hotwords_schema_version`、`tf_snippets_schema_version` 与逐版本迁移框架；兼容旧 v2 完成标记但不重新导入，legacy key 缺失视为成功空迁移，类型错误、损坏 JSON、非法 snippet 行或未来版本均报错且不推进 schema。
+  - 热词选择统一 trim、丢弃空项、大小写不敏感去重、用户优先并严格限制最终 100 条，返回实际用户入选数及截断数；RecognitionSession、请求选项和本地服务派生文件统一复用同一入口，设置页显示未下发数量。
+  - snippet 覆盖键与实际匹配语义统一移除全部空白并忽略大小写，保留用户 replacement 原始大小写；缓存按 builtin/user URL 分区并以 generation 防止失效期间写回旧规则。
+  - 批量编辑入口仅创建并打开用户自定义文件；snippet 重载只失效缓存并刷新编辑草稿，hotword 重载才同步并重启本地服务，URL command 同步执行对应重载。
+- 修改文件：
+  - `Muse/ASR/ASRRequestOptionsFactory.swift`
+  - `Muse/AppURLCommandHandler.swift`
+  - `Muse/Services/HotwordStorage.swift`
+  - `Muse/Services/SenseVoiceServerManager.swift`
+  - `Muse/Services/SnippetStorage.swift`
+  - `Muse/Services/VocabularyStorageContext.swift`
+  - `Muse/UI/Settings/VocabularyBuiltInFooter.swift`
+  - `Muse/UI/Settings/VocabularyTab.swift`
+  - `MuseTests/SnippetStorageConcurrencyTests.swift`
+  - `MuseTests/VocabularyMigrationTests.swift`
+- 验证：
+  - `swift test --filter 'VocabularyMigrationTests|SnippetStorageConcurrencyTests|VocabularySnippetGroupingTests|VolcProtocolTests|RecognitionSessionTests|RecognitionSessionRaceTests'`：76 项，0 失败。
+  - `swift test --sanitize thread --filter 'VocabularyMigrationTests|SnippetStorageConcurrencyTests'`：16 项，0 失败，未报告数据竞争。
+  - `swift test`：428 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、428 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；独立只读终审未发现剩余 P0/P1。
+- 遗留风险：未在真实用户词库上执行迁移，未实际点击 Finder/UI 入口，也未联调真实本地 ASR 服务；损坏的现有新版 JSON 文件如何向用户恢复属于 MUSE-160 范围。本任务没有访问或修改 `~/Library/Application Support/Muse/`。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
