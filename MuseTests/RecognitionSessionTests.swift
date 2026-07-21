@@ -7,13 +7,13 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testInitialStateIsIdle() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let state = await session.state
         XCTAssertEqual(state, .idle)
     }
 
     func testSetState() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         await session.setState(.recording)
         let state = await session.state
         XCTAssertEqual(state, .recording)
@@ -21,7 +21,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testCanStartRecordingOnlyWhenIdle() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         var canStart = await session.canStartRecording
         XCTAssertTrue(canStart)
 
@@ -33,7 +33,7 @@ final class RecognitionSessionTests: XCTestCase {
 
     func testSwitchModeAppliesToDirect() async {
         KeychainService.selectedASRProvider = .volcano
-        let session = RecognitionSession()
+        let session = makeSession()
 
         await session.switchMode(to: .direct)
 
@@ -43,7 +43,7 @@ final class RecognitionSessionTests: XCTestCase {
 
     func testSwitchModeDirectWorksForVolcano() async {
         KeychainService.selectedASRProvider = .volcano
-        let session = RecognitionSession()
+        let session = makeSession()
 
         await session.switchMode(to: .direct)
 
@@ -52,7 +52,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testReadyEventsAreDeduplicated() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
 
@@ -65,7 +65,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testTranscriptEventUpdatesStoredTranscriptAndForwardsToUI() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
         let transcript = RecognitionTranscript(
@@ -82,11 +82,13 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(storedTranscript, transcript)
     }
 
-    func testStaleASREventsAreIgnoredAfterGenerationChanges() async {
-        let session = RecognitionSession()
+    func testStaleASREventsAreIgnoredAfterSessionChanges() async throws {
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
-        let staleGeneration = await session.sessionGenerationForTesting
+        await session.handleASREventForTesting(.ready)
+        let staleSessionIDCandidate = await session.currentSessionIDForTesting
+        let staleSessionID = try XCTUnwrap(staleSessionIDCandidate)
         await session.setState(.recording)
         await session.forceResetForTesting()
 
@@ -97,16 +99,16 @@ final class RecognitionSessionTests: XCTestCase {
                 authoritativeText: "",
                 isFinal: true
             )),
-            expectedGeneration: staleGeneration
+            expectedSessionID: staleSessionID
         )
 
-        XCTAssertEqual(recorder.values, [])
+        XCTAssertEqual(recorder.values, ["ready"])
         let storedTranscript = await session.transcriptForTesting
         XCTAssertEqual(storedTranscript, .empty)
     }
 
     func testAbortCurrentSessionWhileIdleEmitsCompletedForUICleanup() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
 
@@ -118,7 +120,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testAbortCurrentSessionFromStartingResetsToIdleAndEmitsCompleted() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
         await session.setState(.starting)
@@ -131,7 +133,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testASRErrorWhileRecordingResetsSessionAndCompletesUI() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
         await session.setState(.recording)
@@ -149,7 +151,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testStreamingInterruptedKeepsRecordingActive() async {
-        let session = RecognitionSession()
+        let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
         await session.setState(.recording)
@@ -251,6 +253,10 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
             textCount: 3, durationSeconds: 19.0
         ))
+    }
+
+    private func makeSession() -> RecognitionSession {
+        RecognitionSession(historyStore: HistoryStore(path: ":memory:"))
     }
 }
 

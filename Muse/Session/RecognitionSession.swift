@@ -8,6 +8,10 @@ private struct ASRTeardownResult: Sendable {
 
 private struct BatchFallbackTimeoutError: Error {}
 
+struct RecognitionSessionID: Hashable, Sendable {
+    let rawValue: UInt64
+}
+
 /// REPAIR_PLAN K4：ASR 连接的会话级超时（底层 URLSession 默认 60s 过长）
 struct ASRConnectTimeoutError: Error, LocalizedError {
     var errorDescription: String? {
@@ -51,10 +55,51 @@ actor RecognitionSession {
 
     // MARK: - Dependencies
 
-    private let audioEngine = AudioCaptureEngine()
-    private let injectionEngine = TextInjectionEngine()
-    let historyStore = HistoryStore()
+    private let audioEngine: any AudioCaptureControlling
+    private let injectionEngine: any TextInjecting
+    let historyStore: HistoryStore
+    private let asrClientFactory: @Sendable (ASRProvider) -> (any SpeechRecognizer)?
+    private let selectedASRProvider: @Sendable () -> ASRProvider
+    private let asrConfigLoader: (@Sendable (ASRProvider) async -> (any ASRProviderConfig)?)?
+    private let microphonePermission: (@Sendable () async -> Bool)?
+    private let promptContextCapture: @Sendable () async -> PromptContext
+    private let requestOptionsProvider: (@Sendable (ProcessingMode) -> (
+        options: ASRRequestOptions,
+        hotwordCount: Int
+    ))?
     private var asrClient: (any SpeechRecognizer)?
+    private var asrClientSessionID: RecognitionSessionID?
+
+    init(
+        audioEngine: any AudioCaptureControlling = AudioCaptureEngine(),
+        injectionEngine: any TextInjecting = TextInjectionEngine(),
+        historyStore: HistoryStore = HistoryStore(),
+        asrClientFactory: @escaping @Sendable (ASRProvider) -> (any SpeechRecognizer)? = {
+            ASRProviderRegistry.createClient(for: $0)
+        },
+        selectedASRProvider: @escaping @Sendable () -> ASRProvider = {
+            KeychainService.selectedASRProvider
+        },
+        asrConfigLoader: (@Sendable (ASRProvider) async -> (any ASRProviderConfig)?)? = nil,
+        microphonePermission: (@Sendable () async -> Bool)? = nil,
+        promptContextCapture: @escaping @Sendable () async -> PromptContext = {
+            PromptContext.capture()
+        },
+        requestOptionsProvider: (@Sendable (ProcessingMode) -> (
+            options: ASRRequestOptions,
+            hotwordCount: Int
+        ))? = nil
+    ) {
+        self.audioEngine = audioEngine
+        self.injectionEngine = injectionEngine
+        self.historyStore = historyStore
+        self.asrClientFactory = asrClientFactory
+        self.selectedASRProvider = selectedASRProvider
+        self.asrConfigLoader = asrConfigLoader
+        self.microphonePermission = microphonePermission
+        self.promptContextCapture = promptContextCapture
+        self.requestOptionsProvider = requestOptionsProvider
+    }
 
     private let logger = Logger(
         subsystem: "pro.daliang.muse.session",
@@ -109,7 +154,9 @@ actor RecognitionSession {
 
     private var currentMode: ProcessingMode = .direct
     private var recordingStartTime: Date?
+    private var recordingStartSessionID: RecognitionSessionID?
     private var currentConfig: (any ASRProviderConfig)?
+    private var currentConfigSessionID: RecognitionSessionID?
     /// The ASR provider for the current session, captured at start time.
     /// stopRecording reads this, not the global setting.
     private var activeProvider: ASRProvider = .volcano
@@ -131,16 +178,51 @@ actor RecognitionSession {
         onAudioLevel = handler
     }
 
-    // MARK: - Session generation (prevents zombie tasks after forceReset)
+    // MARK: - Session identity (prevents zombie tasks after reset/restart)
 
-    private var sessionGeneration: Int = 0
+    private var nextSessionIDRawValue: UInt64 = 0
+    private var currentSessionID: RecognitionSessionID?
+
+    private func makeSessionID() -> RecognitionSessionID {
+        nextSessionIDRawValue &+= 1
+        return RecognitionSessionID(rawValue: nextSessionIDRawValue)
+    }
+
+    private func isCurrent(_ sessionID: RecognitionSessionID) -> Bool {
+        currentSessionID == sessionID
+    }
+
+    private func ownsASRClient(
+        _ client: any SpeechRecognizer,
+        sessionID: RecognitionSessionID
+    ) -> Bool {
+        guard currentSessionID == sessionID,
+              asrClientSessionID == sessionID,
+              let activeClient = asrClient else {
+            return false
+        }
+        return ObjectIdentifier(activeClient) == ObjectIdentifier(client)
+    }
+
+    private func clearASRClientIfOwned(
+        _ client: any SpeechRecognizer,
+        sessionID: RecognitionSessionID
+    ) {
+        guard ownsASRClient(client, sessionID: sessionID) else { return }
+        asrClient = nil
+        asrClientSessionID = nil
+    }
 
     // MARK: - Accumulated text
 
     private var currentTranscript: RecognitionTranscript = .empty
     private var eventConsumptionTask: Task<Void, Never>?
+    private var eventConsumptionTaskSessionID: RecognitionSessionID?
+    private var eventConsumptionTaskToken: UUID?
     private var hasEmittedReadyForCurrentSession = false
     private var audioChunkPipeline: AudioChunkUploadPipeline?
+    private var audioChunkPipelineSessionID: RecognitionSessionID?
+    private var audioCaptureSessionID: RecognitionSessionID?
     /// REPAIR_PLAN B7b：本次会话流式是否降级（断流/重连过），停止时强制批量复核
     private var streamingDegraded = false
 
@@ -151,8 +233,11 @@ actor RecognitionSession {
     // MARK: - Speculative LLM (fire during recording pauses)
 
     private var speculativeLLMTask: Task<String?, Never>?
+    private var speculativeLLMSessionID: RecognitionSessionID?
     private var speculativeLLMText: String = ""
     private var speculativeDebounceTask: Task<Void, Never>?
+    private var speculativeDebounceSessionID: RecognitionSessionID?
+    private var speculativeDebounceTaskToken: UUID?
     /// Stores the last LLM error from the early/fresh LLM task, consumed once by stopRecording().
     private var pendingLLMError: Error?
 
@@ -175,64 +260,80 @@ actor RecognitionSession {
         if state != .idle {
             AppLogger.log("[Session] startRecording: forcing reset from state=\(String(describing: state))")
             DebugFileLogger.log("session forcing reset from state=\(state)")
-            await forceReset()
+            forceReset()
         }
 
-        let provider = KeychainService.selectedASRProvider
+        let provider = selectedASRProvider()
+        let sessionID = makeSessionID()
+        currentSessionID = sessionID
         activeProvider = provider
         let effectiveMode = ASRProviderRegistry.resolvedMode(for: mode, provider: provider)
-        sessionGeneration &+= 1
-        let myGeneration = sessionGeneration
-        DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) generation=\(myGeneration)")
+        DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
 
         self.currentMode = effectiveMode
         self.recordingStartTime = nil
+        recordingStartSessionID = nil
         hasEmittedReadyForCurrentSession = false
         pendingLLMError = nil
         streamingDegraded = false
         state = .starting
 
         // Load credentials for selected provider
-        guard let config = await resolveASRConfig(provider: provider, myGeneration: myGeneration) else {
+        guard let config = await resolveASRConfig(provider: provider, sessionID: sessionID) else {
             return
         }
+        guard isCurrent(sessionID), state == .starting else { return }
         self.currentConfig = config
+        currentConfigSessionID = sessionID
 
-        guard let client = ASRProviderRegistry.createClient(for: provider) else {
+        guard let client = asrClientFactory(provider) else {
             AppLogger.log("[Session] No client implementation for provider=\(provider.rawValue)")
-            failStart(with: NSError(domain: "Muse", code: -2, userInfo: [NSLocalizedDescriptionKey: L("\(provider.displayName) 暂不支持", "\(provider.displayName) not yet supported")]))
+            failStart(
+                with: NSError(domain: "Muse", code: -2, userInfo: [NSLocalizedDescriptionKey: L("\(provider.displayName) 暂不支持", "\(provider.displayName) not yet supported")]),
+                sessionID: sessionID
+            )
             return
         }
         self.asrClient = client
+        asrClientSessionID = sessionID
 
         // Load hotwords（用户词优先置前 + 内置词补到上限,见 loadEffectiveForASR）
-        let effectiveHotwords = HotwordStorage.loadEffectiveForASR()
-        let biasSettings = ASRBiasSettingsStorage.load()
-        let needsLLM = !effectiveMode.prompt.isEmpty
-        let requestOptions = ASRRequestOptions(
-            enablePunc: !needsLLM,
-            hotwords: effectiveHotwords.words,
-            userHotwordCount: effectiveHotwords.userCount,
-            correctionWords: SnippetStorage.userCorrectionWords(),
-            boostingTableID: biasSettings.boostingTableID,
-            contextHistoryLength: biasSettings.contextHistoryLength
-        )
+        let requestSetup: (options: ASRRequestOptions, hotwordCount: Int)
+        if let requestOptionsProvider {
+            requestSetup = requestOptionsProvider(effectiveMode)
+        } else {
+            let effectiveHotwords = HotwordStorage.loadEffectiveForASR()
+            let biasSettings = ASRBiasSettingsStorage.load()
+            let needsLLM = !effectiveMode.prompt.isEmpty
+            requestSetup = (
+                ASRRequestOptions(
+                    enablePunc: !needsLLM,
+                    hotwords: effectiveHotwords.words,
+                    userHotwordCount: effectiveHotwords.userCount,
+                    correctionWords: SnippetStorage.userCorrectionWords(),
+                    boostingTableID: biasSettings.boostingTableID,
+                    contextHistoryLength: biasSettings.contextHistoryLength
+                ),
+                effectiveHotwords.words.count
+            )
+        }
 
         // Capture prompt context while the user's selection is still active.
         DebugFileLogger.log("prompt context capture start")
-        promptContext = await PromptContext.capture()
+        let capturedPromptContext = await promptContextCapture()
         DebugFileLogger.log("prompt context capture done")
-        guard sessionGeneration == myGeneration else {
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
             DebugFileLogger.log("startRecording: zombie detected after capture, bailing")
             return
         }
+        promptContext = capturedPromptContext
 
         // Reset text state and clean up previous pipeline
         currentTranscript = .empty
         DebugFileLogger.log("audio pipeline cleanup start")
-        await finishAudioChunkPipeline(timeout: .milliseconds(100))
+        await finishAudioChunkPipeline(sessionID: sessionID, timeout: .milliseconds(100))
         DebugFileLogger.log("audio pipeline cleanup done")
-        guard sessionGeneration == myGeneration else {
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
             DebugFileLogger.log("startRecording: zombie detected after pipeline cleanup, bailing")
             return
         }
@@ -254,10 +355,11 @@ actor RecognitionSession {
             }
         )
 
-        guard await startAudioCapture(client: client, myGeneration: myGeneration) else { return }
+        guard await startAudioCapture(client: client, sessionID: sessionID) else { return }
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else { return }
 
         state = .recording
-        markReadyIfNeeded()
+        markReadyIfNeeded(sessionID: sessionID)
         DebugFileLogger.log("session entered recording state (buffering, ASR connecting)")
 
         // ── Phase 2: Connect ASR (audio is already recording) ──
@@ -265,38 +367,121 @@ actor RecognitionSession {
         guard await connectASR(
             client: client,
             config: config,
-            options: requestOptions,
-            hotwordCount: effectiveHotwords.words.count,
-            myGeneration: myGeneration
+            options: requestSetup.options,
+            hotwordCount: requestSetup.hotwordCount,
+            sessionID: sessionID,
+            provider: provider
         ) else { return }
 
         // ── Phase 3: Flush buffer → switch to live pipeline ──
 
-        await activateLivePipeline(client: client, audioBuffer: audioBuffer)
+        guard await activateLivePipeline(
+            client: client,
+            audioBuffer: audioBuffer,
+            sessionID: sessionID,
+            provider: provider
+        ) else { return }
 
-        await prewarmLLMIfNeeded(myGeneration: myGeneration)
+        await prewarmLLMIfNeeded(sessionID: sessionID)
     }
 
     // MARK: - Start Helpers（J15：startRecording ~260 行按既有三阶段拆分，纯代码搬移）
 
     /// 启动失败共用收尾：错误音 + 回 idle + 通知 UI（error 后补 completed 收 HUD）
-    private func failStart(with error: Error) {
+    private func failStart(
+        with error: Error,
+        sessionID: RecognitionSessionID,
+        client expectedClient: (any SpeechRecognizer)? = nil
+    ) {
+        guard isCurrent(sessionID) else { return }
+
+        let clientToDisconnect: (any SpeechRecognizer)?
+        if let expectedClient {
+            guard ownsASRClient(expectedClient, sessionID: sessionID) else {
+                DebugFileLogger.log("start failure ignored for non-owned client session=\(sessionID.rawValue)")
+                Task.detached { await expectedClient.disconnect() }
+                return
+            }
+            clientToDisconnect = expectedClient
+        } else {
+            guard asrClient == nil, asrClientSessionID == nil else {
+                DebugFileLogger.log("start failure without client identity refused to clear active client")
+                return
+            }
+            clientToDisconnect = nil
+        }
+
+        // 先让 session 失效并摘除全部共享引用；后续断开只持有局部旧 client。
+        currentSessionID = nil
+        asrClient = nil
+        asrClientSessionID = nil
+
+        if eventConsumptionTaskSessionID == sessionID {
+            eventConsumptionTask?.cancel()
+            eventConsumptionTask = nil
+            eventConsumptionTaskSessionID = nil
+            eventConsumptionTaskToken = nil
+        }
+        if audioChunkPipelineSessionID == sessionID {
+            audioChunkPipeline?.cancel()
+            audioChunkPipeline = nil
+            audioChunkPipelineSessionID = nil
+        }
+        if audioCaptureSessionID == sessionID {
+            audioCaptureSessionID = nil
+            audioEngine.stop()
+            audioEngine.clearAudioHandlers()
+        }
+        if currentConfigSessionID == sessionID {
+            currentConfig = nil
+            currentConfigSessionID = nil
+        }
+        if speculativeLLMSessionID == sessionID || speculativeDebounceSessionID == sessionID {
+            resetSpeculativeLLM(sessionID: sessionID)
+        }
+
         SoundFeedback.playError()
         state = .idle
+        currentTranscript = .empty
+        hasEmittedReadyForCurrentSession = false
+        if recordingStartSessionID == sessionID {
+            recordingStartTime = nil
+            recordingStartSessionID = nil
+        }
         onASREvent?(.error(error))
         onASREvent?(.completed)
+
+        if let clientToDisconnect {
+            Task.detached { await clientToDisconnect.disconnect() }
+        }
     }
 
     /// 凭证/配置解析：本地引擎兜底默认模型目录并校验模型就绪；云端支持 env var 开发回退。
     /// 返回 nil 表示已走 failStart 收尾（或代际失效静默退出）。
     private func resolveASRConfig(
         provider: ASRProvider,
-        myGeneration: Int
+        sessionID: RecognitionSessionID
     ) async -> (any ASRProviderConfig)? {
-        let savedConfig = await loadASRConfigOffActor(for: provider)
-        guard sessionGeneration == myGeneration, state == .starting else {
+        let savedConfig: (any ASRProviderConfig)?
+        if let asrConfigLoader {
+            savedConfig = await asrConfigLoader(provider)
+        } else {
+            savedConfig = await loadASRConfigOffActor(for: provider)
+        }
+        guard isCurrent(sessionID), state == .starting else {
             DebugFileLogger.log("startRecording: cancelled during ASR config load, bailing")
             return nil
+        }
+
+        if asrConfigLoader != nil {
+            guard let savedConfig else {
+                failStart(
+                    with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")]),
+                    sessionID: sessionID
+                )
+                return nil
+            }
+            return savedConfig
         }
 
         if provider.isLocal {
@@ -310,13 +495,19 @@ actor RecognitionSession {
                 AppLogger.log("[Session] Using default model directory for \(provider.rawValue)")
             } else {
                 AppLogger.log("[Session] Failed to create default config for \(provider.rawValue)!")
-                failStart(with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("本地模型未配置", "Local model not configured")]))
+                failStart(
+                    with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("本地模型未配置", "Local model not configured")]),
+                    sessionID: sessionID
+                )
                 return nil
             }
             // Verify required models are downloaded
             if !ModelManager.shared.areRequiredModelsAvailable() {
                 AppLogger.log("[Session] Required local models not downloaded for \(provider.rawValue)")
-                failStart(with: NSError(domain: "Muse", code: -3, userInfo: [NSLocalizedDescriptionKey: L("请先下载识别模型", "Please download ASR models first")]))
+                failStart(
+                    with: NSError(domain: "Muse", code: -3, userInfo: [NSLocalizedDescriptionKey: L("请先下载识别模型", "Please download ASR models first")]),
+                    sessionID: sessionID
+                )
                 return nil
             }
             return config
@@ -341,50 +532,71 @@ actor RecognitionSession {
         }
 
         AppLogger.log("[Session] No ASR credentials found for provider=\(provider.rawValue)!")
-        failStart(with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")]))
+        failStart(
+            with: NSError(domain: "Muse", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")]),
+            sessionID: sessionID
+        )
         return nil
     }
 
     /// Phase 1 收尾：麦克风权限 + 音频引擎启动。失败时清理客户端并 failStart。
-    private func startAudioCapture(client: any SpeechRecognizer, myGeneration: Int) async -> Bool {
+    private func startAudioCapture(
+        client: any SpeechRecognizer,
+        sessionID: RecognitionSessionID
+    ) async -> Bool {
         DebugFileLogger.log("microphone permission check start")
-        if !PermissionManager.hasMicrophonePermission {
-            let granted = await PermissionManager.requestMicrophonePermission()
-            guard granted else {
-                AppLogger.log("[Session] Microphone permission denied")
-                DebugFileLogger.log("microphone permission denied before audio start")
-                await client.disconnect()
-                self.asrClient = nil
-                audioEngine.clearAudioHandlers()
-                failStart(with: AudioCaptureError.microphonePermissionDenied)
-                return false
-            }
+        let granted: Bool
+        if let microphonePermission {
+            granted = await microphonePermission()
+        } else if PermissionManager.hasMicrophonePermission {
+            granted = true
+        } else {
+            granted = await PermissionManager.requestMicrophonePermission()
+        }
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+            DebugFileLogger.log("microphone permission returned for stale session=\(sessionID.rawValue)")
+            Task.detached { await client.disconnect() }
+            return false
+        }
+        guard granted else {
+            AppLogger.log("[Session] Microphone permission denied")
+            DebugFileLogger.log("microphone permission denied before audio start")
+            failStart(
+                with: AudioCaptureError.microphonePermissionDenied,
+                sessionID: sessionID,
+                client: client
+            )
+            return false
         }
         DebugFileLogger.log("microphone permission check done")
 
+        audioCaptureSessionID = sessionID
         let audioStartT0 = ContinuousClock.now
         DebugFileLogger.log("audio engine start begin")
         do {
             try await audioEngine.start()
-            guard sessionGeneration == myGeneration, state == .starting else {
-                DebugFileLogger.log("audio engine start completed after cancel/supersede; stopping capture")
-                audioEngine.stop()
-                audioEngine.clearAudioHandlers()
+            guard isCurrent(sessionID),
+                  ownsASRClient(client, sessionID: sessionID),
+                  audioCaptureSessionID == sessionID,
+                  state == .starting else {
+                // reset/new start 已负责停旧 token；这里绝不能 stop 共享引擎，否则会拆掉新会话。
+                DebugFileLogger.log("audio engine start completed after cancel/supersede; ignored")
                 return false
             }
             AppLogger.log("[Session] Audio engine started OK")
             DebugFileLogger.log("audio engine started OK +\(ContinuousClock.now - audioStartT0)")
             return true
         } catch {
-            guard sessionGeneration == myGeneration, state == .starting else {
+            guard isCurrent(sessionID),
+                  ownsASRClient(client, sessionID: sessionID),
+                  audioCaptureSessionID == sessionID,
+                  state == .starting else {
                 DebugFileLogger.log("audio engine start failed after cancel/supersede, suppressed: \(String(describing: error))")
                 return false
             }
             AppLogger.log("[Session] Audio engine start FAILED: \(String(describing: error))")
             DebugFileLogger.log("audio engine start failed +\(ContinuousClock.now - audioStartT0): \(String(describing: error))")
-            await client.disconnect()
-            self.asrClient = nil
-            failStart(with: error)
+            failStart(with: error, sessionID: sessionID, client: client)
             return false
         }
     }
@@ -395,9 +607,9 @@ actor RecognitionSession {
         config: any ASRProviderConfig,
         options requestOptions: ASRRequestOptions,
         hotwordCount: Int,
-        myGeneration: Int
+        sessionID: RecognitionSessionID,
+        provider: ASRProvider
     ) async -> Bool {
-        let provider = activeProvider
         do {
             DebugFileLogger.log("ASR connecting provider=\(provider.rawValue)")
             // REPAIR_PLAN K4：URLSession 默认握手超时 60s，网络差时字幕可空转一分钟；
@@ -421,29 +633,25 @@ actor RecognitionSession {
         } catch {
             AppLogger.log("[Session] ASR connect FAILED provider=\(provider.rawValue) error=\(String(describing: error))")
             DebugFileLogger.log("ASR connect failed provider=\(provider.rawValue): \(String(describing: error))")
-            audioEngine.stop()
-            audioEngine.clearAudioHandlers()
-            await client.disconnect()
-            self.asrClient = nil
-            hasEmittedReadyForCurrentSession = false
-
-            // 快速启停竞态（2026-07 修）：用户已取消/会话已被顶替时，连接失败只是被掐断的余波——
-            // 静默清理即可，不响错误音、不往 HUD 糊报错
-            guard sessionGeneration == myGeneration, state == .recording else {
-                DebugFileLogger.log("ASR connect failed after cancel/supersede, suppressed (gen=\(myGeneration) current=\(sessionGeneration) state=\(state))")
-                if state == .recording { state = .idle }
+            // 先判会话身份。旧连接只允许断开自己，禁止停止共享音频或清空新 client。
+            guard isCurrent(sessionID),
+                  ownsASRClient(client, sessionID: sessionID),
+                  state == .recording else {
+                DebugFileLogger.log("ASR connect failed after cancel/supersede, suppressed (session=\(sessionID.rawValue) active=\(String(describing: currentSessionID?.rawValue)) state=\(state))")
+                Task.detached { await client.disconnect() }
                 return false
             }
 
-            failStart(with: error)
+            failStart(with: error, sessionID: sessionID, client: client)
             return false
         }
 
         // Bail out if session was superseded or user stopped while we were connecting
-        guard sessionGeneration == myGeneration, state == .recording else {
-            DebugFileLogger.log("startRecording: zombie or state change after connect (gen=\(myGeneration) current=\(sessionGeneration) state=\(state)), bailing")
-            await client.disconnect()
-            self.asrClient = nil
+        guard isCurrent(sessionID),
+              ownsASRClient(client, sessionID: sessionID),
+              state == .recording else {
+            DebugFileLogger.log("startRecording: zombie or state change after connect (session=\(sessionID.rawValue) active=\(String(describing: currentSessionID?.rawValue)) state=\(state)), bailing")
+            Task.detached { await client.disconnect() }
             return false
         }
         return true
@@ -452,19 +660,38 @@ actor RecognitionSession {
     /// Phase 3：事件消费任务 + 缓冲冲刷 → 切换到实时上传管线
     private func activateLivePipeline(
         client: any SpeechRecognizer,
-        audioBuffer: AudioChunkBuffer
-    ) async {
+        audioBuffer: AudioChunkBuffer,
+        sessionID: RecognitionSessionID,
+        provider: ASRProvider
+    ) async -> Bool {
         let events = await client.events
-        let expectedGeneration = sessionGeneration
-        eventConsumptionTask = Task { [weak self] in
-            for await event in events {
-                guard let self else { break }
-                await self.handleASREvent(event, expectedGeneration: expectedGeneration)
-                if case .completed = event { break }
-            }
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+            DebugFileLogger.log("event stream obtained for stale session=\(sessionID.rawValue)")
+            Task.detached { await client.disconnect() }
+            return false
         }
 
-        let audioUploadPipeline = setupAudioChunkPipeline()
+        let taskToken = UUID()
+        let eventTask = Task { [weak self] in
+            for await event in events {
+                guard let self else { break }
+                await self.handleASREvent(event, sessionID: sessionID)
+                if case .completed = event { break }
+            }
+            await self?.eventConsumptionDidFinish(sessionID: sessionID, token: taskToken)
+        }
+        eventConsumptionTask = eventTask
+        eventConsumptionTaskSessionID = sessionID
+        eventConsumptionTaskToken = taskToken
+
+        guard let audioUploadPipeline = setupAudioChunkPipeline(
+            client: client,
+            provider: provider,
+            sessionID: sessionID
+        ) else {
+            eventTask.cancel()
+            return false
+        }
 
         // Flush all chunks buffered during connect
         let bufferedChunks = audioBuffer.drain()
@@ -484,13 +711,14 @@ actor RecognitionSession {
         }
 
         DebugFileLogger.log("ASR pipeline live, flushed \(bufferedChunks.count) buffered chunks")
+        return true
     }
 
     /// Pre-warm LLM connection for modes with post-processing
-    private func prewarmLLMIfNeeded(myGeneration: Int) async {
+    private func prewarmLLMIfNeeded(sessionID: RecognitionSessionID) async {
         guard !currentMode.prompt.isEmpty else { return }
         let llmConfig = await loadLLMConfigOffActor()
-        guard sessionGeneration == myGeneration, state == .recording else {
+        guard isCurrent(sessionID), state == .recording else {
             DebugFileLogger.log("startRecording: cancelled during LLM prewarm config load, bailing")
             return
         }
@@ -508,7 +736,7 @@ actor RecognitionSession {
     // MARK: - Stop
 
     /// ESC means interrupt immediately: no post-processing, no clipboard write, no injection.
-    /// 中断安全由代际守卫兜底：forceReset 换代后，在途 stop 管线在下一个 ensureCurrent 处退出。
+    /// 中断安全由会话身份守卫兜底：forceReset 使旧 ID 失效后，在途 stop 管线会退出。
     func abortCurrentSession() async {
         guard state != .idle else {
             DebugFileLogger.log("abortCurrentSession idle: emit completed for UI cleanup")
@@ -516,24 +744,30 @@ actor RecognitionSession {
             return
         }
         DebugFileLogger.log("abortCurrentSession: force reset from state=\(state)")
-        await forceReset()
+        forceReset()
         onASREvent?(.completed)
     }
 
-    func stopRecording() async {
-        let myGeneration = sessionGeneration
-        if state == .starting {
-            DebugFileLogger.log("stopRecording during starting: cancelling pending session")
-            await forceReset()
+    func stopRecording(expectedSessionID: RecognitionSessionID? = nil) async {
+        if let expectedSessionID, !isCurrent(expectedSessionID) {
+            DebugFileLogger.log(
+                "stopRecording ignored for stale session=\(expectedSessionID.rawValue)"
+            )
             return
         }
-        guard state == .recording else {
+        if state == .starting {
+            DebugFileLogger.log("stopRecording during starting: cancelling pending session")
+            forceReset()
+            return
+        }
+        guard state == .recording, let sessionID = currentSessionID else {
             logger.warning("stopRecording called but state is \(String(describing: self.state))")
             return
         }
+        let stoppingClient = asrClientSessionID == sessionID ? asrClient : nil
 
         func ensureCurrent(_ stage: String) -> Bool {
-            guard sessionGeneration == myGeneration else {
+            guard currentSessionID == sessionID else {
                 DebugFileLogger.log("stopRecording: superseded during \(stage), bailing")
                 return false
             }
@@ -548,30 +782,39 @@ actor RecognitionSession {
         SoundFeedback.playStop()
 
         // Stop capture first so flushRemaining() can emit the tail audio chunk.
-        audioEngine.stop()
-        audioEngine.clearAudioHandlers()
-        let uploadFailed = await finishAudioChunkPipeline()
+        if audioCaptureSessionID == sessionID {
+            audioCaptureSessionID = nil
+            audioEngine.stop()
+            audioEngine.clearAudioHandlers()
+        }
+        let uploadFailed = await finishAudioChunkPipeline(sessionID: sessionID)
         DebugFileLogger.log("stop: audio stopped +\(ContinuousClock.now - stopT0)")
-        guard sessionGeneration == myGeneration else {
+        guard ensureCurrent("audio pipeline") else {
             DebugFileLogger.log("stopRecording: zombie after audio pipeline, bailing")
             return
         }
 
         // Keep speculative LLM task alive — we'll compare its input text
         // against the final ASR transcript after full teardown.
-        cancelSpeculativeLLM()
+        cancelSpeculativeLLM(sessionID: sessionID)
         let needsLLM = !currentMode.prompt.isEmpty
         let provider = activeProvider
 
-        let asrTeardown = await teardownASRClient(provider: provider, stopStartedAt: stopT0)
+        let asrTeardown = await teardownASRClient(
+            provider: provider,
+            client: stoppingClient,
+            sessionID: sessionID,
+            stopStartedAt: stopT0
+        )
+        guard ensureCurrent("ASR teardown") else { return }
 
         let earlyLLMTask = await prepareEarlyLLMTask(
             needsLLM: needsLLM,
             canEarlyLLM: asrTeardown.providerIsStreaming,
-            expectedGeneration: myGeneration,
+            sessionID: sessionID,
             stopStartedAt: stopT0
         )
-        guard sessionGeneration == myGeneration else {
+        guard ensureCurrent("early LLM preparation") else {
             DebugFileLogger.log("stopRecording: zombie after ASR teardown, bailing")
             return
         }
@@ -581,7 +824,9 @@ actor RecognitionSession {
         // REPAIR_PLAN K2：转写严重滞后时服务端可能只 final 了开头段就正常关流
         //（实测说 8s 首包 7.4s 才到、注入仅 3 字），clean 关闭不代表文本完整——
         // 长录音字数低到不合理时同样强制批量复核。
-        let recordedDuration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let recordedDuration = recordingStartSessionID == sessionID
+            ? recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            : 0
         let implausiblyShort = Self.isTranscriptImplausiblyShort(
             textCount: Self.effectiveTranscriptText(for: currentTranscript).count,
             durationSeconds: recordedDuration
@@ -595,13 +840,16 @@ actor RecognitionSession {
             || streamingDegraded || implausiblyShort
         await recoverTranscriptAfterStreamingFailureIfNeeded(
             streamingFailed: streamingFailed,
-            expectedGeneration: myGeneration
+            sessionID: sessionID
         )
         guard ensureCurrent("batch fallback") else { return }
         // REPAIR_PLAN K2：注入取值经守卫函数——asyncFinal 的权威文本明显短于
         // 流式累积（HUD 所见）时回退 composed，保证注入与字幕口径一致。
         let effectiveText = Self.effectiveTranscriptText(for: currentTranscript)
-        currentConfig = nil
+        if currentConfigSessionID == sessionID {
+            currentConfig = nil
+            currentConfigSessionID = nil
+        }
 
         if !effectiveText.isEmpty {
             let rawText = effectiveText
@@ -609,7 +857,7 @@ actor RecognitionSession {
                 rawText: rawText,
                 needsLLM: needsLLM,
                 earlyLLMTask: earlyLLMTask,
-                expectedGeneration: myGeneration,
+                sessionID: sessionID,
                 stopStartedAt: stopT0
             ) else { return }
             guard ensureCurrent("pre-injection") else { return }
@@ -625,23 +873,33 @@ actor RecognitionSession {
                 rawText: rawText,
                 llmResult: llmResult,
                 streamingFailed: streamingFailed,
-                injection: injectionOutcome
+                injection: injectionOutcome,
+                durationSeconds: recordedDuration,
+                sessionID: sessionID
             )
+            guard ensureCurrent("history save") else { return }
 
         } else {
-            await saveEmptyHistoryIfNeeded(streamingFailed: streamingFailed)
+            await saveEmptyHistoryIfNeeded(
+                streamingFailed: streamingFailed,
+                durationSeconds: recordedDuration,
+                sessionID: sessionID
+            )
             guard ensureCurrent("empty completion") else { return }
             onASREvent?(.processingResult(text: ""))
             onASREvent?(.completed)
         }
 
         // Only reset to idle if this is still the active session.
-        if sessionGeneration == myGeneration, state != .idle {
+        if currentSessionID == sessionID, state != .idle {
+            currentSessionID = nil
             state = .idle
             hasEmittedReadyForCurrentSession = false
             currentTranscript = .empty
+            recordingStartTime = nil
+            recordingStartSessionID = nil
         }
-        resetSpeculativeLLM()
+        resetSpeculativeLLM(sessionID: sessionID)
         logger.info("Session complete, injected \(effectiveText.count) chars")
     }
 
@@ -650,7 +908,7 @@ actor RecognitionSession {
     private func prepareEarlyLLMTask(
         needsLLM: Bool,
         canEarlyLLM: Bool,
-        expectedGeneration: Int,
+        sessionID: RecognitionSessionID,
         stopStartedAt stopT0: ContinuousClock.Instant
     ) async -> Task<String?, Never>? {
         guard needsLLM && canEarlyLLM else { return nil }
@@ -661,7 +919,9 @@ actor RecognitionSession {
         DebugFileLogger.log("stop: needsLLM=true mode=\(currentMode.name) text=\(finalASRText.count)chars specMatch=\(finalASRText == speculativeLLMText)")
         guard !finalASRText.isEmpty else { return nil }
 
-        if finalASRText == speculativeLLMText, let specTask = speculativeLLMTask {
+        if finalASRText == speculativeLLMText,
+           speculativeLLMSessionID == sessionID,
+           let specTask = speculativeLLMTask {
             // Final transcript matches speculative input — reuse (may already be done!)
             state = .postProcessing
             DebugFileLogger.log("stop: reusing speculative LLM +\(ContinuousClock.now - stopT0)")
@@ -669,14 +929,16 @@ actor RecognitionSession {
         }
 
         guard let llmConfig = await loadLLMConfigOffActor() else { return nil }
-        guard sessionGeneration == expectedGeneration else {
+        guard isCurrent(sessionID) else {
             DebugFileLogger.log("stopRecording: superseded during fresh llm config, bailing")
             return nil
         }
 
         // Final transcript differs from speculative input (tail words arrived),
         // discard stale result and fire fresh LLM with complete text.
-        speculativeLLMTask?.cancel()
+        if speculativeLLMSessionID == sessionID {
+            speculativeLLMTask?.cancel()
+        }
         let mode = currentMode
         let prompt = mode.applyingLLMFormatGuard(
             to: promptContext.expandContextVariables(mode.prompt)
@@ -688,7 +950,7 @@ actor RecognitionSession {
         }
         DebugFileLogger.log("stop: fresh LLM firing mode=\(mode.name) model=\(llmConfig.model) with \(finalASRText.count) chars +\(ContinuousClock.now - stopT0)")
 
-        return Task {
+        let task: Task<String?, Never> = Task {
             do {
                 let result = try await client.process(
                     text: finalASRText, prompt: prompt, config: llmConfig
@@ -698,17 +960,21 @@ actor RecognitionSession {
                 return cleanedResult
             } catch {
                 DebugFileLogger.log("stop: fresh LLM FAILED +\(ContinuousClock.now - stopT0) error=\(error)")
-                self.setPendingLLMError(error)
+                self.setPendingLLMError(error, sessionID: sessionID)
                 return nil
             }
         }
+        speculativeLLMTask = task
+        speculativeLLMSessionID = sessionID
+        speculativeLLMText = finalASRText
+        return task
     }
 
     private func postProcessRecognizedText(
         rawText: String,
         needsLLM: Bool,
         earlyLLMTask: Task<String?, Never>?,
-        expectedGeneration: Int,
+        sessionID: RecognitionSessionID,
         stopStartedAt stopT0: ContinuousClock.Instant
     ) async -> LLMPostProcessingResult? {
         var finalText = SnippetStorage.applyEffective(to: rawText)
@@ -731,7 +997,7 @@ actor RecognitionSession {
                 DebugFileLogger.log("stop: early LLM timed out at session level")
             }
             let earlyResult = timedEarly.value.flatMap { $0 }
-            guard sessionGeneration == expectedGeneration else {
+            guard isCurrent(sessionID) else {
                 DebugFileLogger.log("stopRecording: superseded during early llm, bailing")
                 return nil
             }
@@ -750,7 +1016,7 @@ actor RecognitionSession {
         } else if needsLLM {
             state = .postProcessing
             if let llmConfig = await loadLLMConfigOffActor() {
-                guard sessionGeneration == expectedGeneration else {
+                guard isCurrent(sessionID) else {
                     DebugFileLogger.log("stopRecording: superseded during sync llm config, bailing")
                     return nil
                 }
@@ -781,7 +1047,7 @@ actor RecognitionSession {
                     }
                     let result = try outcome.get()
                     let cleanedResult = mode.applyingLLMResultCleanup(to: result)
-                    guard sessionGeneration == expectedGeneration else {
+                    guard isCurrent(sessionID) else {
                         DebugFileLogger.log("stopRecording: superseded during sync llm, bailing")
                         return nil
                     }
@@ -795,7 +1061,7 @@ actor RecognitionSession {
                         onASREvent?(.processingResult(text: cleanedResult))
                     }
                 } catch {
-                    guard sessionGeneration == expectedGeneration else {
+                    guard isCurrent(sessionID) else {
                         DebugFileLogger.log("stopRecording: superseded during sync llm error, bailing")
                         return nil
                     }
@@ -865,7 +1131,9 @@ actor RecognitionSession {
         rawText: String,
         llmResult: LLMPostProcessingResult,
         streamingFailed: Bool,
-        injection: InjectionOutcome
+        injection: InjectionOutcome,
+        durationSeconds: TimeInterval,
+        sessionID: RecognitionSessionID
     ) async {
         // J15：状态口径反映注入结局——仅复制到剪贴板 / 没找到输入位置时不再记 completed
         let status: String
@@ -886,7 +1154,7 @@ actor RecognitionSession {
         await historyStore.insert(HistoryRecord(
             id: UUID().uuidString,
             createdAt: Date(),
-            durationSeconds: recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0,
+            durationSeconds: durationSeconds,
             rawText: rawText,
             processingMode: currentMode.id == ProcessingMode.directId ? nil : currentMode.name,
             processedText: llmResult.processedText,
@@ -895,6 +1163,7 @@ actor RecognitionSession {
             characterCount: finalText.count,
             tokenCount: EstimatedTokenCounter.count(in: finalText)
         ))
+        guard isCurrent(sessionID) else { return }
 
         // REPAIR_PLAN C1：按保留上限裁剪（默认 1 万条，defaults 可调）
         let defaults = UserDefaults.standard
@@ -904,17 +1173,20 @@ actor RecognitionSession {
         await historyStore.prune(keepingMostRecent: retentionLimit)
     }
 
-    private func saveEmptyHistoryIfNeeded(streamingFailed: Bool) async {
+    private func saveEmptyHistoryIfNeeded(
+        streamingFailed: Bool,
+        durationSeconds: TimeInterval,
+        sessionID: RecognitionSessionID
+    ) async {
         // No text recognized: save to history as failed, then exit.
-        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
-        guard duration > 1.0 else { return }
+        guard durationSeconds > 1.0 else { return }
 
         // Only save if recording lasted more than 1 second (skip accidental taps)
         let status = streamingFailed ? "stream_failed" : "empty"
         await historyStore.insert(HistoryRecord(
             id: UUID().uuidString,
             createdAt: Date(),
-            durationSeconds: duration,
+            durationSeconds: durationSeconds,
             rawText: "",
             processingMode: currentMode.id == ProcessingMode.directId ? nil : currentMode.name,
             processedText: nil,
@@ -923,11 +1195,14 @@ actor RecognitionSession {
             characterCount: 0,
             tokenCount: 0
         ))
+        guard isCurrent(sessionID) else { return }
         DebugFileLogger.log("stop: no text recognized, saved to history as \(status)")
     }
 
     private func teardownASRClient(
         provider: ASRProvider,
+        client: (any SpeechRecognizer)?,
+        sessionID: RecognitionSessionID,
         stopStartedAt stopT0: ContinuousClock.Instant
     ) async -> ASRTeardownResult {
         // ASR teardown: send endAudio and drain event stream with hard deadlines.
@@ -935,19 +1210,28 @@ actor RecognitionSession {
         let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider).isStreaming
         var clean = true
 
-        defer {
-            eventConsumptionTask = nil
-            asrClient = nil
-            hasEmittedReadyForCurrentSession = false
-        }
-
-        guard let client = asrClient else {
+        guard let client,
+              isCurrent(sessionID),
+              ownsASRClient(client, sessionID: sessionID) else {
             return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: clean)
+        }
+        let ownedEventTask: Task<Void, Never>?
+        let ownedEventToken: UUID?
+        if eventConsumptionTaskSessionID == sessionID {
+            ownedEventTask = eventConsumptionTask
+            ownedEventToken = eventConsumptionTaskToken
+        } else {
+            ownedEventTask = nil
+            ownedEventToken = nil
         }
 
         let endAudioTimeout: Duration = providerIsStreaming ? .seconds(3) : .seconds(60)
         let endAudioOK = await AsyncTimeout.run(endAudioTimeout) {
             try await client.endAudio()
+        }
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+            DebugFileLogger.log("stop: ASR endAudio returned for stale session=\(sessionID.rawValue)")
+            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
         }
         if !endAudioOK {
             DebugFileLogger.log("endAudio timeout or failed")
@@ -956,10 +1240,14 @@ actor RecognitionSession {
 
         // Always try to drain events — even if endAudio failed, the server
         // may have already queued transcript events before the connection broke.
-        if let evtTask = eventConsumptionTask {
+        if let evtTask = ownedEventTask {
             let drainTimeout: Duration = providerIsStreaming ? .seconds(2) : .seconds(5)
             let drained = await AsyncTimeout.run(drainTimeout) {
                 await evtTask.value
+            }
+            guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+                DebugFileLogger.log("stop: event drain returned for stale session=\(sessionID.rawValue)")
+                return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
             }
             if !drained {
                 DebugFileLogger.log("event stream drain timeout")
@@ -968,30 +1256,50 @@ actor RecognitionSession {
         }
 
         await client.disconnect()
-        eventConsumptionTask?.cancel()
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+            DebugFileLogger.log("stop: disconnect returned for stale session=\(sessionID.rawValue)")
+            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+        }
+
+        ownedEventTask?.cancel()
+        if eventConsumptionTaskSessionID == sessionID,
+           eventConsumptionTaskToken == ownedEventToken {
+            eventConsumptionTask = nil
+            eventConsumptionTaskSessionID = nil
+            eventConsumptionTaskToken = nil
+        }
+        clearASRClientIfOwned(client, sessionID: sessionID)
+        hasEmittedReadyForCurrentSession = false
         DebugFileLogger.log("stop: ASR teardown complete (clean=\(clean)) +\(ContinuousClock.now - stopT0)")
         return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: clean)
     }
 
     private func recoverTranscriptAfterStreamingFailureIfNeeded(
         streamingFailed: Bool,
-        expectedGeneration: Int
+        sessionID: RecognitionSessionID
     ) async {
-        guard streamingFailed else { return }
+        guard streamingFailed, isCurrent(sessionID) else { return }
 
         let partialText = currentTranscript.composedText
         DebugFileLogger.log("stop: streaming failed (partial=\(partialText.count) chars), attempting batch fallback")
 
         let fullAudio = audioEngine.getRecordedAudio()
-        guard !fullAudio.isEmpty, let config = currentConfig else { return }
+        guard !fullAudio.isEmpty,
+              currentConfigSessionID == sessionID,
+              let config = currentConfig else { return }
+        let provider = activeProvider
 
         onASREvent?(.processingResult(text: partialText.isEmpty ? "重新识别中..." : partialText))
-        guard let batchText = await attemptBatchFallback(audio: fullAudio, config: config) else {
+        guard let batchText = await attemptBatchFallback(
+            audio: fullAudio,
+            config: config,
+            provider: provider
+        ) else {
             DebugFileLogger.log("stop: batch fallback failed, using partial text")
             return
         }
-        guard sessionGeneration == expectedGeneration else {
-            DebugFileLogger.log("stop: batch fallback result ignored for stale generation")
+        guard isCurrent(sessionID) else {
+            DebugFileLogger.log("stop: batch fallback result ignored for stale session")
             return
         }
 
@@ -1046,9 +1354,11 @@ actor RecognitionSession {
 
     // MARK: - ASR Events
 
-    private func handleASREvent(_ event: RecognitionEvent, expectedGeneration: Int) {
-        guard expectedGeneration == sessionGeneration else {
-            DebugFileLogger.log("ignoring stale ASR event for gen=\(expectedGeneration), active=\(sessionGeneration)")
+    private func handleASREvent(_ event: RecognitionEvent, sessionID: RecognitionSessionID) {
+        guard isCurrent(sessionID) else {
+            DebugFileLogger.log(
+                "ignoring stale ASR event for session=\(sessionID.rawValue), active=\(String(describing: currentSessionID?.rawValue))"
+            )
             return
         }
         switch event {
@@ -1056,7 +1366,7 @@ actor RecognitionSession {
             // Deduplicate: ASR clients may emit .ready, but we also emit it
             // on first audio chunk via markReadyIfNeeded(). Route both through
             // the same guard to avoid double-firing the start sound.
-            markReadyIfNeeded()
+            markReadyIfNeeded(sessionID: sessionID)
             return  // markReadyIfNeeded calls onASREvent(.ready) internally
 
         case .completed:
@@ -1068,7 +1378,7 @@ actor RecognitionSession {
                 AppLogger.log("[Session] Server closed ASR while recording, initiating stop")
                 DebugFileLogger.log("server-initiated stop from recording state")
                 onASREvent?(.completed)
-                Task { await self.stopRecording() }
+                Task { await self.stopRecording(expectedSessionID: sessionID) }
             } else {
                 DebugFileLogger.log("ASR stream closed in state=\(state); completed not forwarded")
             }
@@ -1089,14 +1399,13 @@ actor RecognitionSession {
             currentTranscript = transcript
             logger.info("Transcript updated: \(transcript.displayText)")
             if state == .recording && !currentMode.prompt.isEmpty {
-                scheduleSpeculativeLLM()
+                scheduleSpeculativeLLM(sessionID: sessionID)
             }
 
         case .error(let error):
             logger.error("ASR error: \(error)")
             if state == .recording || state == .starting {
-                let generation = sessionGeneration
-                Task { await self.failActiveSessionAfterASRError(expectedGeneration: generation) }
+                Task { await self.failActiveSessionAfterASRError(sessionID: sessionID) }
             }
 
         case .streamingInterrupted:
@@ -1110,26 +1419,52 @@ actor RecognitionSession {
         }
     }
 
-    private func failActiveSessionAfterASRError(expectedGeneration: Int) async {
-        guard expectedGeneration == sessionGeneration else { return }
+    private func failActiveSessionAfterASRError(sessionID: RecognitionSessionID) async {
+        guard isCurrent(sessionID) else { return }
         guard state == .recording || state == .starting else { return }
         DebugFileLogger.log("ASR error forced session teardown state=\(state)")
-        await forceReset()
+        forceReset()
         onASREvent?(.completed)
     }
 
     // MARK: - Internal helpers
 
-    private func setupAudioChunkPipeline() -> AudioChunkUploadPipeline {
-        audioChunkPipeline?.cancel()
+    private func eventConsumptionDidFinish(
+        sessionID: RecognitionSessionID,
+        token: UUID
+    ) {
+        guard isCurrent(sessionID),
+              eventConsumptionTaskSessionID == sessionID,
+              eventConsumptionTaskToken == token else {
+            return
+        }
+        eventConsumptionTask = nil
+        eventConsumptionTaskSessionID = nil
+        eventConsumptionTaskToken = nil
+    }
+
+    private func setupAudioChunkPipeline(
+        client: any SpeechRecognizer,
+        provider: ASRProvider,
+        sessionID: RecognitionSessionID
+    ) -> AudioChunkUploadPipeline? {
+        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+            return nil
+        }
+        if let existingPipeline = audioChunkPipeline {
+            guard audioChunkPipelineSessionID == sessionID else {
+                DebugFileLogger.log("refusing to replace audio pipeline owned by another session")
+                return nil
+            }
+            existingPipeline.cancel()
+        }
         // Capture everything needed for sending so the Task body
         // does NOT hop back to the actor.  This prevents a blocking
         // WebSocket send from starving stopRecording().
-        let client = asrClient
-        let audioInput = ASRProviderRegistry.capabilities(for: activeProvider).audioInput
-        // REPAIR_PLAN B7a：中断瞬间直通 UI（AppState 侧有 recording 相位守卫，
-        // 过期事件天然无害），不经 handleASREvent 以免 detached 任务回跳 actor
-        let emitInterrupted = self.onASREvent
+        let audioInput = ASRProviderRegistry.capabilities(for: provider).audioInput
+        let emitInterrupted: @Sendable (RecognitionEvent) -> Void = { [weak self] event in
+            Task { await self?.handleASREvent(event, sessionID: sessionID) }
+        }
 
         let pipeline = AudioChunkUploadPipeline(
             client: client,
@@ -1137,24 +1472,33 @@ actor RecognitionSession {
             emitInterrupted: emitInterrupted
         )
         audioChunkPipeline = pipeline
+        audioChunkPipelineSessionID = sessionID
         return pipeline
     }
 
     @discardableResult
-    private func finishAudioChunkPipeline(timeout: Duration = .seconds(1)) async -> Bool {
+    private func finishAudioChunkPipeline(
+        sessionID: RecognitionSessionID,
+        timeout: Duration = .seconds(1)
+    ) async -> Bool {
         // Give the detached sender a brief window to drain remaining chunks
         // (especially the tail audio from flushRemaining). Since it's detached,
         // this wait does NOT block the actor.
-        guard let pipeline = audioChunkPipeline else { return false }
-        let failed = await pipeline.finish(timeout: timeout)
+        guard audioChunkPipelineSessionID == sessionID,
+              let pipeline = audioChunkPipeline else { return false }
+        // 先摘除共享引用；旧 finish 晚到时无法清理新会话管线。
         audioChunkPipeline = nil
+        audioChunkPipelineSessionID = nil
+        let failed = await pipeline.finish(timeout: timeout)
         return failed
     }
 
-    private func markReadyIfNeeded() {
+    private func markReadyIfNeeded(sessionID: RecognitionSessionID) {
+        guard isCurrent(sessionID) else { return }
         guard !hasEmittedReadyForCurrentSession else { return }
         hasEmittedReadyForCurrentSession = true
         recordingStartTime = Date()
+        recordingStartSessionID = sessionID
         DebugFileLogger.log("session emitting ready")
         onASREvent?(.ready)
         logger.info("Recording started")
@@ -1165,75 +1509,107 @@ actor RecognitionSession {
     /// Debounce: after each transcript update, wait 800ms of silence before
     /// speculatively sending current text to LLM. If the user is still
     /// speaking, the timer resets.
-    private func scheduleSpeculativeLLM() {
+    private func scheduleSpeculativeLLM(sessionID: RecognitionSessionID) {
+        guard isCurrent(sessionID) else { return }
         // Skip speculative LLM for local models — they're fast enough (~0.5s)
         // and would compete for Metal GPU with local ASR.
         guard KeychainService.selectedLLMProvider != .localQwen else { return }
 
         speculativeDebounceTask?.cancel()
+        let debounceToken = UUID()
+        speculativeDebounceSessionID = sessionID
+        speculativeDebounceTaskToken = debounceToken
         speculativeDebounceTask = Task {
             try? await Task.sleep(for: .milliseconds(800))
-            guard !Task.isCancelled, state == .recording else { return }
-            await fireSpeculativeLLM()
+            guard !Task.isCancelled,
+                  isCurrent(sessionID),
+                  state == .recording,
+                  speculativeDebounceSessionID == sessionID,
+                  speculativeDebounceTaskToken == debounceToken else { return }
+            speculativeDebounceTask = nil
+            speculativeDebounceSessionID = nil
+            speculativeDebounceTaskToken = nil
+            await fireSpeculativeLLM(sessionID: sessionID)
         }
     }
 
-    private func fireSpeculativeLLM() async {
+    private func fireSpeculativeLLM(sessionID: RecognitionSessionID) async {
+        guard isCurrent(sessionID), state == .recording else { return }
         var text = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         text = SnippetStorage.applyEffective(to: text)
         guard !text.isEmpty, text != speculativeLLMText else { return }
         guard let llmConfig = await loadLLMConfigOffActor() else { return }
-        guard state == .recording else { return }
+        guard isCurrent(sessionID), state == .recording else { return }
 
         // Cancel previous speculative call if text changed
-        speculativeLLMTask?.cancel()
+        if speculativeLLMSessionID == sessionID {
+            speculativeLLMTask?.cancel()
+        }
         speculativeLLMText = text
-        let prompt = currentMode.applyingLLMFormatGuard(
-            to: promptContext.expandContextVariables(currentMode.prompt)
+        let mode = currentMode
+        let prompt = mode.applyingLLMFormatGuard(
+            to: promptContext.expandContextVariables(mode.prompt)
         )
 
         let client = currentLLMClient()
-        DebugFileLogger.log("speculative LLM: firing mode=\(currentMode.name) model=\(llmConfig.model) with \(text.count) chars")
-        speculativeLLMTask = Task {
+        DebugFileLogger.log("speculative LLM: firing mode=\(mode.name) model=\(llmConfig.model) with \(text.count) chars")
+        let task: Task<String?, Never> = Task {
             do {
                 let result = try await client.process(
                     text: text, prompt: prompt, config: llmConfig
                 )
-                let cleanedResult = currentMode.applyingLLMResultCleanup(to: result)
+                let cleanedResult = mode.applyingLLMResultCleanup(to: result)
                 DebugFileLogger.log("speculative LLM: done \(cleanedResult.count) chars")
                 return cleanedResult
             } catch {
                 DebugFileLogger.log("speculative LLM: failed \(error)")
-                self.setPendingLLMError(error)
+                self.setPendingLLMError(error, sessionID: sessionID)
                 return nil
             }
         }
+        speculativeLLMTask = task
+        speculativeLLMSessionID = sessionID
     }
 
-    private func cancelSpeculativeLLM() {
-        speculativeDebounceTask?.cancel()
-        speculativeDebounceTask = nil
+    private func cancelSpeculativeLLM(sessionID: RecognitionSessionID) {
+        if speculativeDebounceSessionID == sessionID {
+            speculativeDebounceTask?.cancel()
+            speculativeDebounceTask = nil
+            speculativeDebounceSessionID = nil
+            speculativeDebounceTaskToken = nil
+        }
         // Don't cancel speculativeLLMTask here — stopRecording may reuse it
     }
 
-    private func setPendingLLMError(_ error: Error) {
+    private func setPendingLLMError(_ error: Error, sessionID: RecognitionSessionID) {
+        guard isCurrent(sessionID), speculativeLLMSessionID == sessionID else { return }
         pendingLLMError = error
     }
 
-    private func resetSpeculativeLLM() {
-        speculativeDebounceTask?.cancel()
-        speculativeDebounceTask = nil
-        speculativeLLMTask?.cancel()
-        speculativeLLMTask = nil
-        speculativeLLMText = ""
+    private func resetSpeculativeLLM(sessionID: RecognitionSessionID? = nil) {
+        if sessionID == nil || speculativeDebounceSessionID == sessionID {
+            speculativeDebounceTask?.cancel()
+            speculativeDebounceTask = nil
+            speculativeDebounceSessionID = nil
+            speculativeDebounceTaskToken = nil
+        }
+        if sessionID == nil || speculativeLLMSessionID == sessionID {
+            speculativeLLMTask?.cancel()
+            speculativeLLMTask = nil
+            speculativeLLMSessionID = nil
+            speculativeLLMText = ""
+        }
     }
 
     // MARK: - Batch Fallback
 
     /// Try to transcribe full audio via the same provider in a fresh connection.
-    private func attemptBatchFallback(audio: Data, config: any ASRProviderConfig) async -> String? {
-        let provider = activeProvider
+    private func attemptBatchFallback(
+        audio: Data,
+        config: any ASRProviderConfig,
+        provider: ASRProvider
+    ) async -> String? {
         do {
             return try await AsyncTimeout.throwingValue(
                 .seconds(30),
@@ -1288,45 +1664,99 @@ actor RecognitionSession {
     /// Aggressively tear down all resources and return to idle.
     /// Used when a new recording is requested but the session is stuck
     /// (e.g. stopRecording hung on a WebSocket timeout).
-    private func forceReset() async {
+    private func forceReset() {
         AppLogger.log("[Session] forceReset from state=\(String(describing: state))")
         DebugFileLogger.log("forceReset from state=\(state)")
 
-        eventConsumptionTask?.cancel()
-        eventConsumptionTask = nil
-        resetSpeculativeLLM()
+        // 会话 ID 是本函数的第一项状态修改。此后所有旧回调都会被身份守卫拒绝；
+        // 剩余清理均同步摘除共享引用，唯一可能挂起的 disconnect 完全使用局部对象。
+        let resetSessionID = currentSessionID
+        currentSessionID = nil
 
-        audioEngine.stop()
-        audioEngine.clearAudioHandlers()
-        await finishAudioChunkPipeline(timeout: .milliseconds(100))
+        let client = asrClient
+        let eventTask = eventConsumptionTask
+        let pipeline = audioChunkPipeline
+        let debounceTask = speculativeDebounceTask
+        let llmTask = speculativeLLMTask
+        let shouldStopAudio = resetSessionID != nil && audioCaptureSessionID == resetSessionID
 
-        if let client = asrClient {
-            Task.detached { await client.disconnect() }  // fire-and-forget: detached to avoid blocking actor
-        }
         asrClient = nil
-
-        sessionGeneration &+= 1
+        asrClientSessionID = nil
+        eventConsumptionTask = nil
+        eventConsumptionTaskSessionID = nil
+        eventConsumptionTaskToken = nil
+        audioChunkPipeline = nil
+        audioChunkPipelineSessionID = nil
+        audioCaptureSessionID = nil
+        speculativeDebounceTask = nil
+        speculativeDebounceSessionID = nil
+        speculativeDebounceTaskToken = nil
+        speculativeLLMTask = nil
+        speculativeLLMSessionID = nil
+        speculativeLLMText = ""
+        currentConfig = nil
+        currentConfigSessionID = nil
+        recordingStartTime = nil
+        recordingStartSessionID = nil
+        pendingLLMError = nil
         state = .idle
         currentTranscript = .empty
         hasEmittedReadyForCurrentSession = false
-        currentConfig = nil
+        streamingDegraded = false
+
+        eventTask?.cancel()
+        pipeline?.cancel()
+        debounceTask?.cancel()
+        llmTask?.cancel()
+        if shouldStopAudio {
+            audioEngine.clearAudioHandlers()
+            audioEngine.stop()
+        }
+
+        if let client {
+            Task.detached { await client.disconnect() }
+        }
     }
 
 }
 
 #if DEBUG
 extension RecognitionSession {
-    func handleASREventForTesting(_ event: RecognitionEvent, expectedGeneration: Int? = nil) {
-        handleASREvent(event, expectedGeneration: expectedGeneration ?? sessionGeneration)
+    func handleASREventForTesting(
+        _ event: RecognitionEvent,
+        expectedSessionID: RecognitionSessionID? = nil
+    ) {
+        let sessionID: RecognitionSessionID
+        if let expectedSessionID {
+            sessionID = expectedSessionID
+        } else if let currentSessionID {
+            sessionID = currentSessionID
+        } else {
+            sessionID = makeSessionID()
+            currentSessionID = sessionID
+        }
+        handleASREvent(event, sessionID: sessionID)
     }
 
-    /// 测试用：换代重置（原经由已删除的死代码 cancelRecording 触达）
-    func forceResetForTesting() async {
-        await forceReset()
+    /// 测试用：同步使当前会话失效，异步断连仅持有旧客户端局部引用。
+    func forceResetForTesting() {
+        forceReset()
     }
 
-    var sessionGenerationForTesting: Int {
-        sessionGeneration
+    var currentSessionIDForTesting: RecognitionSessionID? {
+        currentSessionID
+    }
+
+    func isActiveClientForTesting(_ client: any SpeechRecognizer) -> Bool {
+        guard let currentSessionID else { return false }
+        return ownsASRClient(client, sessionID: currentSessionID)
+    }
+
+    var activeClientCountForTesting: Int {
+        guard let currentSessionID,
+              let client = asrClient,
+              ownsASRClient(client, sessionID: currentSessionID) else { return 0 }
+        return 1
     }
 
     var transcriptForTesting: RecognitionTranscript {
