@@ -575,3 +575,40 @@
 - 自动更新：Cloud/Local 双制品协议、签名与回滚代码链已建立，但真实 Developer ID 双制品、SHA256 manifest、更新和回滚真机验收仍未完成，开关继续为 `false`。
 - 收口自动验收：Debug/Release 构建通过；全量 `swift test` 520 项、5 项跳过、0 失败；`health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`。
 - 环境与人工门槛：缺少 Developer ID、真实 Local 双服务 dist、公证发布 DMG 和断电恢复 journal；`shellcheck`、`swiftlint`、`periphery` 未安装。按用户指示未做任何麦克风、AirPods 或人工音频测试。
+
+## 批次 E
+
+| 任务 | 状态 | 提交 | 备注 |
+|---|---|---|---|
+| MUSE-190 | ✅ 完成 | `a441ce6` | Apple 识别强制端侧，拒绝 locale 回退并提供可操作错误；隐私文案与实现一致。 |
+| MUSE-200 | ⬜ 未开始 | — | 等待 MUSE-190 完成。 |
+
+### MUSE-190：对齐 Apple 识别的端侧行为和隐私说明
+
+- 状态：✅ 完成。
+- 提交：`a441ce627c9e276ce7665e7d0f3b66173e48e274`（`修复: 对齐 Apple 识别的端侧行为和隐私说明`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `a4eeb486df4529afb59cefe3a2d9badca7425955`；保留执行日志中的进行中标记及既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入代码提交。基线 `swift build` 通过；`swift test` 执行 520 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 先新增 Apple 请求强制端侧、端侧不支持错误、配置 locale 传递及中英文隐私文案测试；修复前定向测试明确编译失败，缺少端侧配置入口与错误类型。
+  - 将识别会话工厂改为 throwing 后，先补旧工厂迟到失败不得清理新会话的竞态回归测试。
+  - 独立复审发现 Speech 框架可能把不支持的 locale 回退到键盘听写语言；先补识别器为空、实际 locale 不匹配、等价 locale 写法及临时 unavailable 测试，首轮因缺少校验入口编译失败，实施后又以红灯锁定连字符/下划线归一化。
+  - 二次复审发现 `isAvailable == false` 可能掩盖 `supportsOnDeviceRecognition == false`；先补 both-false 优先报告端侧不支持的失败测试，再固定校验顺序。
+- 修改：
+  - 创建 Apple recognition task 前校验请求 locale 与框架实际 locale 一致，并依次判定端侧能力和临时可用性；识别器为空或框架回退语言均返回包含 locale、切换语言及火山引擎建议的明确错误。
+  - 请求始终设置 `requiresOnDeviceRecognition = true` 与 partial result；端侧不支持时不创建 task，不允许静默云端 fallback。
+  - throwing 工厂异常在清理前核对 `sessionID`；旧连接的迟到失败转换为取消，不能使新会话失效。
+  - README、设置页和首次引导的中英文说明统一为 Apple 仅端侧、识别音频不上传，不支持时切换语言或火山引擎。
+- 修改文件：
+  - `Muse/ASR/AppleASRClient.swift`
+  - `Muse/UI/Settings/ASRSettingsFooter.swift`
+  - `Muse/UI/Setup/SetupWizardView.swift`
+  - `README.md`
+  - `MuseTests/AppleASRClientLifecycleTests.swift`
+  - `MuseTests/AppleASRConfigurationTests.swift`
+- 验证：
+  - `swift test --filter 'AppleASRConfigurationTests|AppleASRClientLifecycleTests'`：16 项，0 失败。
+  - `swift test`：530 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、530 项 Swift 测试、模型与签名策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；三轮独立只读复审完成，最终确认无剩余 P0/P1、无云端 fallback，并独立复跑 16 项定向测试通过。
+- 遗留风险：遵照用户指示未执行麦克风、AirPods、真实 Apple Speech 或其他音频真机测试；端侧 locale 的实际可用性仍取决于目标 macOS、硬件与已安装语言资产，自动测试只覆盖框架边界与可控工厂。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按规则跳过。测试使用 fake 与临时资源，未访问真实 Muse 用户数据目录。Cloud、Local 双制品签名、SHA256、真实更新与回滚验收尚未全部完成，因此 `UpdateChecker.updateChannelEnabled` 继续保持 `false`。
