@@ -47,6 +47,7 @@ import sys
 
 paths = [
     pathlib.Path("sensevoice-server/server.py"),
+    pathlib.Path("sensevoice-server/sensevoice_model.py"),
     pathlib.Path("qwen3-asr-server/server.py"),
     pathlib.Path("local-service-shared/local_service_security.py"),
     pathlib.Path("local-service-shared/test_local_service_security.py"),
@@ -133,6 +134,39 @@ package_signing_policy() {
   fi
 }
 
+ci_release_policy() {
+  local required_files=(
+    ".github/workflows/ci.yml"
+    ".github/workflows/release-verify.yml"
+    "scripts/notarize-release-artifacts.sh"
+    "scripts/release-verify.sh"
+    "scripts/prepare-release-binary.sh"
+    "scripts/run-signed-release-build.sh"
+    "scripts/verify-release-artifact.sh"
+    "scripts/verify-release-environments.sh"
+    "scripts/verify-release-version.sh"
+    ".swiftlint.yml"
+    ".swiftlint-baseline.json"
+    "MuseTests/CIWorkflowTests.swift"
+    "MuseTests/ReleaseVerifyScriptTests.swift"
+  )
+  local file
+  for file in "${required_files[@]}"; do
+    if [ ! -f "$file" ]; then
+      echo "ERROR: required CI/release gate is missing: $file"
+      return 1
+    fi
+  done
+  if ! grep -Fq 'static let updateChannelEnabled = false' Muse/Services/UpdateChecker.swift; then
+    echo "ERROR: automatic updates must remain disabled until real dual-artifact acceptance"
+    return 1
+  fi
+  if grep -Fq 'static let updateChannelEnabled = true' Muse/Services/UpdateChecker.swift; then
+    echo "ERROR: automatic update channel was enabled before real acceptance"
+    return 1
+  fi
+}
+
 run_optional_tool() {
   local name="$1"
   local command_name="$2"
@@ -154,12 +188,13 @@ run_step "swift-build-release" swift build -c release
 run_step "swift-test" swift test
 run_step "model-artifact-policy" model_artifact_policy
 run_step "package-signing-policy" package_signing_policy
+run_step "ci-release-policy" ci_release_policy
 run_step "bash-syntax" bash_syntax
 run_step "python-service-syntax" python_service_syntax
 run_step "python-service-tests" python_service_tests
 
 run_optional_tool "shellcheck" shellcheck shellcheck scripts/*.sh
-run_optional_tool "swiftlint" swiftlint swiftlint
+run_optional_tool "swiftlint" swiftlint swiftlint lint --strict --config .swiftlint.yml
 run_optional_tool "periphery" periphery periphery scan
 
 echo

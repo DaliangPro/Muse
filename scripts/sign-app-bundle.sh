@@ -15,6 +15,11 @@ fail() {
 [ -d "$APP_PATH" ] || fail "app bundle not found at $APP_PATH"
 [ -f "$INFO_PLIST" ] || fail "Info.plist missing at $INFO_PLIST"
 [ -n "$SIGNING_IDENTITY" ] || fail "SIGNING_IDENTITY is required"
+MUSE_DEFER_GATEKEEPER_ASSESSMENT="${MUSE_DEFER_GATEKEEPER_ASSESSMENT:-0}"
+case "$MUSE_DEFER_GATEKEEPER_ASSESSMENT" in
+    0|1) ;;
+    *) fail "MUSE_DEFER_GATEKEEPER_ASSESSMENT must be 0 or 1" ;;
+esac
 
 MAIN_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO_PLIST" 2>/dev/null)" \
     || fail "unable to read CFBundleExecutable"
@@ -42,14 +47,27 @@ while IFS= read -r -d '' candidate; do
     is_macho_file "$candidate" || continue
 
     echo "Signing nested Mach-O: ${candidate#"$APP_PATH"/}"
-    if ! "$NESTED_CODESIGN_BIN" --force --sign "$SIGNING_IDENTITY" "$candidate"; then
+    if [[ "$SIGNING_IDENTITY" == "Developer ID Application:"* ]]; then
+        sign_status=0
+        "$NESTED_CODESIGN_BIN" --force --timestamp --options runtime \
+            --sign "$SIGNING_IDENTITY" "$candidate" || sign_status="$?"
+    else
+        sign_status=0
+        "$NESTED_CODESIGN_BIN" --force --sign "$SIGNING_IDENTITY" "$candidate" \
+            || sign_status="$?"
+    fi
+    if [ "$sign_status" -ne 0 ]; then
         echo "Nested code signing failed: $candidate" >&2
         exit 1
     fi
 done < <(/usr/bin/find "$APP_PATH/Contents" -type f -print0)
 
 echo "Signing outer app bundle last..."
-/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH"
+if [[ "$SIGNING_IDENTITY" == "Developer ID Application:"* ]]; then
+    /usr/bin/codesign --force --timestamp --options runtime --sign "$SIGNING_IDENTITY" "$APP_PATH"
+else
+    /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH"
+fi
 
 # 从此处开始只允许读 Bundle：严格验签、读取元数据和 Gatekeeper 评估。
 /usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH"
@@ -68,7 +86,9 @@ fi
 
 case "$SIGNED_AUTHORITY" in
     "Developer ID Application:"*)
-        /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH"
+        if [ "$MUSE_DEFER_GATEKEEPER_ASSESSMENT" != "1" ]; then
+            /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH"
+        fi
         ;;
 esac
 

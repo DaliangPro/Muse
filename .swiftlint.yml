@@ -1,0 +1,6 @@
+included:
+  - Muse
+  - MuseTests
+
+baseline: .swiftlint-baseline.json
+check_for_updates: false

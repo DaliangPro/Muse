@@ -27,6 +27,7 @@ final class DMGScriptTests: XCTestCase {
         XCTAssertTrue(source.contains(#"TeamIdentifier"#))
         XCTAssertTrue(source.contains(#"PARTIAL_DMG"#))
         XCTAssertTrue(source.contains(#"UPDATE_READY"#))
+        XCTAssertTrue(source.contains(#"/bin/chmod 755 "$STAGING_DIR""#))
         XCTAssertTrue(source.contains(#"APP_VERSION must be numeric dot-separated"#))
         XCTAssertTrue(source.contains(#"DMG_NAME must be a .dmg basename"#))
         XCTAssertTrue(source.contains(#""$PARTIAL_DMG""#), "hdiutil 必须先写入临时 DMG")
@@ -271,6 +272,7 @@ final class DMGScriptTests: XCTestCase {
             *" -dvvv "*)
                 printf 'codesign:app-display %s\n' "$subject" >> "$MUSE_TEST_TOOL_LOG"
                 printf 'Authority=Developer ID Application: Fixture\n' >&2
+                printf 'flags=0x10000(runtime)\n' >&2
                 printf 'TeamIdentifier=TEAM123456\n' >&2
                 ;;
             *)

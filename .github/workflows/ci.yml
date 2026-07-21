@@ -1,0 +1,88 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: 记录工具链
+        run: |
+          swift --version
+          swift --version | grep -F 'Apple Swift version 6.2'
+
+      - name: 配置最小 Python 测试环境
+        run: |
+          python3 -m venv "$RUNNER_TEMP/muse-python"
+          "$RUNNER_TEMP/muse-python/bin/python" -m pip install --disable-pip-version-check \
+            fastapi==0.136.3 \
+            httpx==0.28.1 \
+            numpy==2.4.6 \
+            uvicorn==0.49.0
+          echo "$RUNNER_TEMP/muse-python/bin" >> "$GITHUB_PATH"
+
+      - name: Debug 构建
+        run: swift build
+
+      - name: Release 构建
+        run: swift build -c release
+
+      - name: Swift 全量测试
+        run: swift test
+
+      - name: 仓库健康检查
+        run: bash scripts/health-check.sh
+
+      - name: 全部 Shell 语法检查
+        run: bash -n scripts/*.sh
+
+      - name: SenseVoice 入口语法检查
+        run: python3 -m py_compile sensevoice-server/server.py
+
+      - name: Qwen 入口语法检查
+        run: python3 -m py_compile qwen3-asr-server/server.py
+
+      - name: 其余 Python 服务语法检查
+        run: >-
+          python3 -m py_compile
+          sensevoice-server/sensevoice_model.py
+          local-service-shared/local_service_security.py
+          local-service-shared/test_local_service_security.py
+          local-service-shared/test_server_security_wiring.py
+
+      - name: ShellCheck（安装时强制）
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/*.sh
+          else
+            echo "SKIP: shellcheck not installed"
+          fi
+
+      - name: SwiftLint（安装时强制）
+        run: |
+          if command -v swiftlint >/dev/null 2>&1; then
+            swiftlint lint --strict --config .swiftlint.yml
+          else
+            echo "SKIP: swiftlint not installed"
+          fi

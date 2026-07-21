@@ -133,7 +133,29 @@ run_swift_build() {
     fi
 }
 
-if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+MUSE_PACKAGE_REQUIRE_PREBUILT="${MUSE_PACKAGE_REQUIRE_PREBUILT:-0}"
+case "$MUSE_PACKAGE_REQUIRE_PREBUILT" in
+    0|1) ;;
+    *) echo "MUSE_PACKAGE_REQUIRE_PREBUILT must be 0 or 1" >&2; exit 1 ;;
+esac
+
+if [ "$MUSE_PACKAGE_REQUIRE_PREBUILT" = "1" ]; then
+    BINARY="${MUSE_PACKAGE_PREBUILT_BINARY:-}"
+    EXPECTED_BINARY_SHA256="${MUSE_PACKAGE_PREBUILT_SHA256:-}"
+    [ -n "$BINARY" ] && [ -f "$BINARY" ] && [ ! -L "$BINARY" ] && [ -x "$BINARY" ] || {
+        echo "Signing-window packaging requires an executable regular prebuilt binary" >&2
+        exit 1
+    }
+    [[ "$EXPECTED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "MUSE_PACKAGE_PREBUILT_SHA256 must be 64 lowercase hexadecimal characters" >&2
+        exit 1
+    }
+    ACTUAL_BINARY_SHA256="$(/usr/bin/shasum -a 256 "$BINARY" | /usr/bin/awk '{print $1}')"
+    [ "$ACTUAL_BINARY_SHA256" = "$EXPECTED_BINARY_SHA256" ] || {
+        echo "Prebuilt release binary SHA256 mismatch" >&2
+        exit 1
+    }
+elif [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
     BINARY="${MUSE_PACKAGE_BINARY:-}"
     [ -f "$BINARY" ] || {
         echo "MUSE_PACKAGE_BINARY must point to a fixture executable" >&2
@@ -167,6 +189,7 @@ echo "Packaging app bundle at $APP_PATH..."
 trash_path "$APP_PATH/Contents"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
+/bin/chmod 755 "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
 cp "$PROJECT_DIR/Muse/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
 cp "$PROJECT_DIR/Muse/Resources/BrandLogo.png" "$APP_PATH/Contents/Resources/BrandLogo.png" 2>/dev/null || true
 
@@ -288,6 +311,18 @@ if [ "$LLM_MODEL_SIZE" = "9b" ] && [ -f "$LLM_MODEL_DIR/Qwen3.5-9B-Q4_K_M.gguf" 
     cp "$LLM_MODEL_DIR/Qwen3.5-9B-Q4_K_M.gguf" "$APP_PATH/Contents/Resources/Models/qwen3.5-9b-q4_k_m.gguf"
     echo "Qwen3.5-9B model bundled."
 fi
+
+# Normalize distributable Bundle permissions before the final signature. The release
+# wrapper intentionally protects credentials with umask 077, but those private modes
+# must never leak into an App copied for other macOS accounts.
+/usr/bin/find "$APP_PATH" -type d -exec /bin/chmod 755 {} +
+while IFS= read -r -d '' bundle_file; do
+    if [ -x "$bundle_file" ]; then
+        /bin/chmod 755 "$bundle_file"
+    else
+        /bin/chmod 644 "$bundle_file"
+    fi
+done < <(/usr/bin/find "$APP_PATH" -type f -print0)
 
 # Remove quarantine flag that macOS adds to downloaded apps.
 # This must happen before the final outer signature; after that the Bundle is read-only.

@@ -8,6 +8,7 @@ final class PackageScriptTests: XCTestCase {
     func testPackagingScriptsPassBashSyntaxCheck() throws {
         for relativePath in [
             "scripts/package-app.sh",
+            "scripts/prepare-release-binary.sh",
             "scripts/sign-app-bundle.sh",
             "scripts/test_app_bundle.sh",
             "scripts/health-check.sh",
@@ -25,8 +26,14 @@ final class PackageScriptTests: XCTestCase {
         XCTAssertFalse(packageSource.range(of: #"codesign[^\n]*--sign[^\n]*\|\|\s*true"#, options: .regularExpression) != nil)
         XCTAssertTrue(packageSource.contains("sign-app-bundle.sh"))
         XCTAssertTrue(packageSource.contains("test_app_bundle.sh"))
+        XCTAssertTrue(packageSource.contains(#"/usr/bin/find "$APP_PATH" -type d"#))
+        XCTAssertTrue(packageSource.contains(#"/bin/chmod 644"#))
+        XCTAssertTrue(packageSource.contains(#"/bin/chmod 755"#))
         XCTAssertTrue(signingSource.contains(#"/usr/bin/file"#))
         XCTAssertTrue(signingSource.contains(#"MetalLib\ executable"#))
+        XCTAssertTrue(signingSource.contains("--options runtime"), signingSource)
+        XCTAssertTrue(signingSource.contains("--timestamp"), signingSource)
+        XCTAssertTrue(signingSource.contains("MUSE_DEFER_GATEKEEPER_ASSESSMENT"), signingSource)
 
         let outerSign = #"/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH""#
         let strictVerify = #"/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH""#
@@ -108,6 +115,61 @@ final class PackageScriptTests: XCTestCase {
 
         let validation = try runBundleValidation(for: fixture.app, expectsLocalServices: false)
         XCTAssertEqual(validation.status, 0, validation.output)
+    }
+
+    func testSigningWindowRequiresHashLockedPrebuiltBinary() throws {
+        let fixture = try makePackagingFixture()
+        defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
+
+        let missing = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: ["MUSE_PACKAGE_REQUIRE_PREBUILT": "1"]
+        )
+        XCTAssertNotEqual(missing.status, 0, missing.output)
+
+        let wrongHash = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: [
+                "MUSE_PACKAGE_PREBUILT_BINARY": fixture.binary.path,
+                "MUSE_PACKAGE_PREBUILT_SHA256": String(repeating: "0", count: 64),
+                "MUSE_PACKAGE_REQUIRE_PREBUILT": "1"
+            ]
+        )
+        XCTAssertNotEqual(wrongHash.status, 0, wrongHash.output)
+
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: fixture.binary.path
+        )
+        try fileManager.createDirectory(at: fixture.app, withIntermediateDirectories: true)
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: fixture.app.path
+        )
+        let hash = try run(
+            "/usr/bin/shasum",
+            arguments: ["-a", "256", fixture.binary.path]
+        ).output.split(separator: " ").first.map(String.init)
+        let valid = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: [
+                "MUSE_PACKAGE_PREBUILT_BINARY": fixture.binary.path,
+                "MUSE_PACKAGE_PREBUILT_SHA256": try XCTUnwrap(hash),
+                "MUSE_PACKAGE_REQUIRE_PREBUILT": "1"
+            ]
+        )
+        XCTAssertEqual(valid.status, 0, valid.output)
+        let executable = fixture.app.appendingPathComponent("Contents/MacOS/Muse")
+        let attributes = try fileManager.attributesOfItem(atPath: executable.path)
+        XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o755)
+        let appAttributes = try fileManager.attributesOfItem(atPath: fixture.app.path)
+        XCTAssertEqual(appAttributes[.posixPermissions] as? Int, 0o755)
+        let plist = fixture.app.appendingPathComponent("Contents/Info.plist")
+        let plistAttributes = try fileManager.attributesOfItem(atPath: plist.path)
+        XCTAssertEqual(plistAttributes[.posixPermissions] as? Int, 0o644)
     }
 
     func testLocalBundleMissingDistributionFailsBeforeReplacingExistingContents() throws {
@@ -327,20 +389,23 @@ final class PackageScriptTests: XCTestCase {
 
     private func runPackage(
         _ fixture: PackagingFixture,
-        includesLocalServices: Bool
+        includesLocalServices: Bool,
+        extraEnvironment: [String: String] = [:]
     ) throws -> (status: Int32, output: String) {
-        try run(
+        var environment = [
+            "APP_PATH": fixture.app.path,
+            "BUNDLE_LOCAL_ASR": includesLocalServices ? "1" : "0",
+            "CODESIGN_IDENTITY": "-",
+            "HOME": fixture.home.path,
+            "MUSE_PACKAGE_BINARY": fixture.binary.path,
+            "MUSE_PACKAGE_PROJECT_DIR": fixture.project.path,
+            "MUSE_PACKAGE_TEST_MODE": "1"
+        ]
+        environment.merge(extraEnvironment) { _, new in new }
+        return try run(
             "/bin/bash",
             arguments: [repositoryRoot.appendingPathComponent("scripts/package-app.sh").path],
-            environment: [
-                "APP_PATH": fixture.app.path,
-                "BUNDLE_LOCAL_ASR": includesLocalServices ? "1" : "0",
-                "CODESIGN_IDENTITY": "-",
-                "HOME": fixture.home.path,
-                "MUSE_PACKAGE_BINARY": fixture.binary.path,
-                "MUSE_PACKAGE_PROJECT_DIR": fixture.project.path,
-                "MUSE_PACKAGE_TEST_MODE": "1",
-            ]
+            environment: environment
         )
     }
 

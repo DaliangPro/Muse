@@ -8,6 +8,7 @@ EXPECTED_VERSION="${APP_VERSION:-1.7.4}"
 EXPECTED_BUILD="${APP_BUILD:-1}"
 EXPECTED_MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 EXPECT_LOCAL_BUNDLE="${EXPECT_LOCAL_BUNDLE:-auto}"
+MUSE_DEFER_GATEKEEPER_ASSESSMENT="${MUSE_DEFER_GATEKEEPER_ASSESSMENT:-0}"
 
 fail() {
     echo "FAIL: $1" >&2
@@ -23,6 +24,10 @@ read_plist() {
 [ -f "$INFO_PLIST" ] || fail "Info.plist missing at $INFO_PLIST"
 [ -f "$APP_PATH/Contents/MacOS/Muse" ] || fail "app executable missing"
 [ -f "$APP_PATH/Contents/Resources/AppIcon.icns" ] || fail "app icon missing"
+case "$MUSE_DEFER_GATEKEEPER_ASSESSMENT" in
+    0|1) ;;
+    *) fail "MUSE_DEFER_GATEKEEPER_ASSESSMENT must be 0 or 1" ;;
+esac
 
 [ "$(read_plist CFBundleExecutable)" = "Muse" ] || fail "CFBundleExecutable should be Muse"
 [ "$(read_plist CFBundleIdentifier)" = "$EXPECTED_BUNDLE_ID" ] || fail "CFBundleIdentifier should be $EXPECTED_BUNDLE_ID"
@@ -67,8 +72,10 @@ SIGNED_DETAILS="$(/usr/bin/codesign -dvvv "$APP_PATH" 2>&1)"
 SIGNED_AUTHORITY="$(printf '%s\n' "$SIGNED_DETAILS" | /usr/bin/awk -F= '/^Authority=/{print $2; exit}')"
 case "$SIGNED_AUTHORITY" in
     "Developer ID Application:"*)
-        /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH" \
-            || fail "Gatekeeper assessment failed"
+        if [ "$MUSE_DEFER_GATEKEEPER_ASSESSMENT" != "1" ]; then
+            /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH" \
+                || fail "Gatekeeper assessment failed"
+        fi
         ;;
 esac
 

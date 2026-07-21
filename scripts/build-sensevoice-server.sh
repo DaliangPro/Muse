@@ -5,6 +5,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SERVER_DIR="$PROJECT_DIR/sensevoice-server"
 
+trash_path() {
+    local path="$1"
+    [ -e "$path" ] || [ -L "$path" ] || return 0
+    local trash_dir base target
+    trash_dir="$HOME/.Trash"
+    /bin/mkdir -p "$trash_dir"
+    base="$(basename "$path")"
+    target="$trash_dir/${base}-$(/bin/date '+%Y%m%d-%H%M%S')-$$"
+    while [ -e "$target" ] || [ -L "$target" ]; do
+        target="$target-$RANDOM"
+    done
+    /bin/mv "$path" "$target"
+}
+
 echo "=== Building sensevoice-server standalone binary ==="
 
 cd "$SERVER_DIR"
@@ -13,7 +27,7 @@ cd "$SERVER_DIR"
 if [ ! -d .venv ]; then
     echo "Creating venv..."
     # 用 uv 建 venv（自带 python 管理，不依赖系统 brew python3.12 是否存在）
-    uv venv --python 3.12 .venv
+    uv venv --python 3.12.10 .venv
 fi
 
 source .venv/bin/activate
@@ -21,18 +35,24 @@ source .venv/bin/activate
 # Install dependencies + pyinstaller（.venv 由 uv 创建，不含 pip，改用 uv pip）
 echo "Installing dependencies..."
 REQUIREMENTS_FILE="requirements.lock.txt"
-[ -f "$REQUIREMENTS_FILE" ] || REQUIREMENTS_FILE="requirements.txt"
+[ -f "$REQUIREMENTS_FILE" ] || {
+    echo "Missing pinned dependency file: $REQUIREMENTS_FILE" >&2
+    exit 1
+}
 uv pip install -q -r "$REQUIREMENTS_FILE"
-uv pip install -q pyinstaller
+uv pip check
 
-# Clean previous build
-rm -rf build dist *.spec
+# 旧构建可恢复地移入废纸篓；不覆盖仓库中的 spec 文件。
+trash_path "$SERVER_DIR/build"
+trash_path "$SERVER_DIR/dist"
+/bin/mkdir -p "$SERVER_DIR/build/spec"
 
 # Build standalone binary
 echo "Running PyInstaller..."
 pyinstaller \
     --onedir \
     --name sensevoice-server \
+    --specpath "$SERVER_DIR/build/spec" \
     --paths "$PROJECT_DIR/local-service-shared" \
     --hidden-import=funasr \
     --hidden-import=funasr.models \

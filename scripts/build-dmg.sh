@@ -73,6 +73,7 @@ TX_ID="$(/usr/bin/uuidgen)"
 PARTIAL_DMG="$DIST_DIR/.${DMG_NAME%.dmg}.partial-$TX_ID.dmg"
 PREVIOUS_DMG="$DIST_DIR/.${DMG_NAME}.previous-$TX_ID"
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/muse-dmg.XXXXXX")"
+/bin/chmod 755 "$STAGING_DIR"
 PUBLISHED=0
 
 trash_path() {
@@ -131,6 +132,10 @@ if [ "$UPDATE_READY" = "yes" ]; then
     }
     echo "$APP_SIGNATURE_DETAILS" | /usr/bin/grep -q '^Authority=Developer ID Application:' || {
         echo "Release App must use a Developer ID Application identity" >&2
+        exit 1
+    }
+    echo "$APP_SIGNATURE_DETAILS" | /usr/bin/grep -q 'flags=.*runtime' || {
+        echo "Release App must enable Hardened Runtime" >&2
         exit 1
     }
 fi
