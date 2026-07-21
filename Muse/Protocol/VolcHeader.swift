@@ -35,6 +35,8 @@ enum VolcCompression: UInt8, Sendable {
 // MARK: - Header
 
 struct VolcHeader: Sendable, Equatable {
+    static let supportedVersion: UInt8 = 0b0001
+
     var version: UInt8 = 0b0001
     var headerSize: UInt8 = 0b0001  // 1 unit = 4 bytes
     var messageType: VolcMessageType
@@ -70,6 +72,14 @@ struct VolcHeader: Sendable, Equatable {
         let serRaw = (byte2 >> 4) & 0x0F
         let compRaw = byte2 & 0x0F
 
+        guard version == supportedVersion else {
+            throw VolcProtocolError.unsupportedVersion(version)
+        }
+        let headerBytes = Int(headerSize) * 4
+        guard headerSize >= 1, headerBytes <= data.count else {
+            throw VolcProtocolError.invalidHeaderSize(headerSize)
+        }
+
         guard let messageType = VolcMessageType(rawValue: msgTypeRaw) else {
             throw VolcProtocolError.unknownMessageType(msgTypeRaw)
         }
@@ -99,11 +109,17 @@ struct VolcHeader: Sendable, Equatable {
 
 enum VolcProtocolError: Error, Sendable {
     case headerTooShort
+    case unsupportedVersion(UInt8)
+    case invalidHeaderSize(UInt8)
     case unknownMessageType(UInt8)
     case unknownFlags(UInt8)
     case unknownSerialization(UInt8)
     case unknownCompression(UInt8)
+    case truncatedSequence
     case invalidPayload
+    case payloadTooLarge(limit: Int, actual: Int)
+    case tooManyUtterances(limit: Int, actual: Int)
+    case textTooLarge(limit: Int)
     case decompressionFailed
     case compressionFailed
     case serverError(code: Int?, message: String?)
