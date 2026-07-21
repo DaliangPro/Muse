@@ -498,7 +498,7 @@
 | 任务 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | MUSE-170 | ✅ 完成 | `828c726` | 外层签名保持最后；Mach-O/MetalLib 嵌套代码、Cloud/Local 内容和严格验签均有自动回归门槛。 |
-| MUSE-180 | ⬜ 未开始 | — | 等待 MUSE-170 完成。 |
+| MUSE-180 | ✅ 完成 | `f89d7db` | Cloud/Local 清单、SHA256、不可变验签、ready 握手、可回滚同卷替换与 DMG 发布链均有自动回归门槛；自动更新仍关闭。 |
 
 ### MUSE-170：修复 App Bundle 最终签名顺序
 
@@ -531,3 +531,47 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、477 项 Swift 测试、模型与签名策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；独立只读终审确认无剩余 P0/P1。
 - 遗留风险：仓库当前没有两套完整冻结服务 dist，因此真实 Local 成品未能在本机打包；Local 自动验收使用执行真实打包脚本的隔离 fixture，真实 Qwen MetalLib 另行完成签名验证。没有 Developer ID identity，故只验证 ad-hoc 严格签名，`spctl` 的发布证书路径仍是发布前 gate；未生成/公证 DMG，也未做 Cloud/Local 真机安装。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。测试均使用临时目录和隔离 HOME，未访问真实 Muse 用户数据目录或系统钥匙串；但 MUSE-160 已披露的更早测试隔离事故仍无法确认持久影响。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未全部完成，自动更新开关仍为 `false`。
+
+### MUSE-180：重构自动更新与回滚为不可变双制品链
+
+- 状态：✅ 完成。
+- 提交：`f89d7db`（`修复: 建立双制品不可变签名更新链`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `acb62675de5a803399c38803db7ebf1dc83c2b86`；保留既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入提交。基线 Debug 构建与全量测试通过，自动更新开关为 `false`。
+- 测试优先：
+  - 先新增双制品 manifest、必填 SHA256、严格 URL/版本与禁止 legacy fallback 测试；初始实现因缺少新类型及严格解析而编译失败，非法版本测试也明确红灯。
+  - 更新脚本首轮不可变制品策略测试出现 8 项失败；随后用隔离 fixture 逐项锁定带空格挂载路径、精确 `Muse.app`、当前/挂载/复制/正式路径验签、Bundle/Team/version、Cloud/Local 内容、首次及挂载前二次 SHA、四个 rename/清理故障相位和 Trash 实际内容。
+  - 独立审计发现父 App 固定延时退出会令早期失败无日志且无法重启；先补缺失接口编译红灯、ready 生命周期与早期 stderr 测试，再实现父进程安全日志描述符和 ready 后退出握手。
+  - DMG 动态顺序测试先因脚本绕过测试 shim、直接调用系统 `codesign` 而失败；实现显式测试模式后，证明创建、签名、严格验签、镜像验证、SHA256、发布的实际顺序及中途失败不发布。
+  - 终审以真实 `TERM` 故障注入复现破坏性 rename 后不回滚；加入 `HUP/INT/TERM` 统一进入 EXIT 回滚后转绿。随后以编译红灯和 spoof 测试将 ready 改为随机 UUID 目录，并删除 Shell 对日志路径的二次打开；悬空日志符号链接测试也先红后以 `O_EXCL | O_NOFOLLOW` 收口。
+- 修改：
+  - 更新清单改为严格的 Cloud/Local 双制品结构；按安装形态只选择对应 URL 与 SHA256，缺失、HTTP、非法版本或 hash 一律拒绝且不跨制品 fallback。
+  - 下载文件名绑定制品类型，下载后和安装前均校验 SHA256；旧下载、成功 staging、旧 App 和已安装 DMG 均使用可恢复的废纸篓清理。
+  - 更新脚本不再本机重签或回写旧 Local 组件；对当前、挂载、同卷临时及正式 App 严格验签，并校验 Bundle ID、TeamIdentifier、版本与 Cloud/Local 内容。
+  - 使用同卷临时 App、备份和 rename 事务安装；四个移动故障及 `HUP/INT/TERM` 均尝试隔离失败候选、恢复并复验旧 App，明确输出 `ROLLBACK_OK` 或 `ROLLBACK_FAILED`。
+  - 父进程以 `0600`、`O_EXCL | O_NOFOLLOW` 创建并继承更新日志，使用随机 ready 目录握手；预检失败时保留父 App，ready 后才退出。失败或不完整日志保留并显示有界诊断，只有精确终态 `SUCCESS` 才清理 staging。
+  - `build-dmg.sh` 强制显式 Cloud/Local、数值版本和安全文件名；发布制品要求 Developer ID App/DMG 签名、严格验签、镜像验证和 SHA256，验证全部成功后才替换正式 DMG。ad-hoc 仅生成不可发布开发制品。
+- 修改文件：
+  - `Muse/Services/AppUpdater.swift`
+  - `Muse/Services/UpdateChecker.swift`
+  - `MuseTests/AppUpdaterChecksumTests.swift`
+  - `MuseTests/AppUpdaterScriptTests.swift`
+  - `MuseTests/AppUpdaterStatusTests.swift`
+  - `MuseTests/DMGScriptTests.swift`
+  - `MuseTests/UpdateManifestTests.swift`
+  - `scripts/build-dmg.sh`
+- 验证：
+  - `swift test --filter 'UpdateManifestTests|AppUpdaterScriptTests|AppUpdaterChecksumTests|AppUpdaterStatusTests|DMGScriptTests'`：52 项，0 失败。
+  - `swift test`：520 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash -n scripts/build-dmg.sh`、`git diff --check`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、520 项 Swift 测试、模型与签名策略、全部 Shell/Python 语法和 12 项 Python 服务测试通过。
+  - 独立最终复审确认无剩余 P0/P1，并独立复跑 `AppUpdaterScriptTests|AppUpdaterStatusTests` 29 项、0 失败。
+- 遗留风险：本机没有 Developer ID 身份和两套完整冻结服务 dist，未生成/公证真实 Cloud/Local 发布 DMG，也未执行真实旧版到新版更新、失败回滚、Gatekeeper 或断电恢复验收；`updates.json` 尚无可发布的真实双制品信息。`SIGKILL`、突然断电或系统崩溃无法由进程内 trap 收口，两个 rename 之间仍需持久事务日志与启动恢复才能达到正式开放门槛。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按规则跳过。所有自动安装测试均使用临时目录和隔离 HOME，未访问真实 Muse 用户数据目录。按用户指示未执行麦克风、AirPods 或其他音频真机测试；完整 `swift test` 中的纯单元音频缓冲测试仍按硬门槛执行。Cloud、Local 双制品签名、SHA256、真实更新与回滚验收尚未全部完成，因此 `UpdateChecker.updateChannelEnabled` 继续保持 `false`。
+
+## 批次 D 收口
+
+- 代码任务：MUSE-170、MUSE-180 已按依赖顺序完成，各自先红灯、后修复、通过定向与全量测试并独立提交。
+- 当前代码 HEAD：`f89d7db19725eb3c57907230b9dc41df705fd357`。
+- 自动更新：Cloud/Local 双制品协议、签名与回滚代码链已建立，但真实 Developer ID 双制品、SHA256 manifest、更新和回滚真机验收仍未完成，开关继续为 `false`。
+- 收口自动验收：Debug/Release 构建通过；全量 `swift test` 520 项、5 项跳过、0 失败；`health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`。
+- 环境与人工门槛：缺少 Developer ID、真实 Local 双服务 dist、公证发布 DMG 和断电恢复 journal；`shellcheck`、`swiftlint`、`periphery` 未安装。按用户指示未做任何麦克风、AirPods 或人工音频测试。
