@@ -21,7 +21,7 @@ struct SenseVoiceConnectionPlan: Sendable {
 }
 
 typealias SenseVoiceConnectionPlanProvider = @Sendable () async throws -> SenseVoiceConnectionPlan
-typealias SenseVoiceDialFactory = @Sendable (URL) -> SenseVoiceDialResources
+typealias SenseVoiceDialFactory = @Sendable (URLRequest) -> SenseVoiceDialResources
 typealias SenseVoiceQwenTranscriber = @Sendable (
     Data,
     Int,
@@ -75,9 +75,9 @@ actor SenseVoiceWSClient: SpeechRecognizer {
         connectionPlanProvider: @escaping SenseVoiceConnectionPlanProvider = {
             try await SenseVoiceWSClient.resolveProductionConnectionPlan()
         },
-        dialFactory: @escaping SenseVoiceDialFactory = { url in
+        dialFactory: @escaping SenseVoiceDialFactory = { request in
             let session = URLSession(configuration: .default)
-            let task = session.webSocketTask(with: url)
+            let task = session.webSocketTask(with: request)
             return SenseVoiceDialResources(
                 task: task,
                 invalidateSession: { session.invalidateAndCancel() }
@@ -146,7 +146,9 @@ actor SenseVoiceWSClient: SpeechRecognizer {
         qwenPort = plan.qwenPort
 
         if let url = plan.webSocketURL {
-            let resources = dialFactory(url)
+            var request = URLRequest(url: url)
+            LocalServiceAuth.authorize(&request)
+            let resources = dialFactory(request)
             let task = resources.task
             let newConnectionID = UUID()
 
@@ -379,6 +381,7 @@ actor SenseVoiceWSClient: SpeechRecognizer {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.httpBody = audio
         request.timeoutInterval = timeout
+        LocalServiceAuth.authorize(&request)
         guard let (data, _) = try? await URLSession.shared.data(for: request),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let text = json["text"] as? String,

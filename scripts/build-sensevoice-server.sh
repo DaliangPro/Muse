@@ -33,6 +33,7 @@ echo "Running PyInstaller..."
 pyinstaller \
     --onedir \
     --name sensevoice-server \
+    --paths "$PROJECT_DIR/local-service-shared" \
     --hidden-import=funasr \
     --hidden-import=funasr.models \
     --hidden-import=asr_decoder \

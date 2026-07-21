@@ -18,6 +18,7 @@ actor DoubaoChatClient: LLMClient {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 5
+        Self.authorizeLocalServiceRequest(&request, provider: provider)
         _ = try? await session.data(for: request)
         logger.info("LLM connection pre-warmed to \(baseURL)")
     }
@@ -57,6 +58,7 @@ actor DoubaoChatClient: LLMClient {
             reasoning_split: provider.needsReasoningSplit ? true : nil
         )
         request.httpBody = try JSONEncoder().encode(body)
+        Self.authorizeLocalServiceRequest(&request, provider: provider)
 
         logger.info("LLM request: \(text.count) chars, endpoint=\(config.model), stream=\(useStreaming)")
 
@@ -69,6 +71,14 @@ actor DoubaoChatClient: LLMClient {
 
         logger.info("LLM result: \(result.count) chars")
         return result.strippingThinkTags()
+    }
+
+    static func authorizeLocalServiceRequest(
+        _ request: inout URLRequest,
+        provider: LLMProvider
+    ) {
+        guard provider == .localQwen else { return }
+        LocalServiceAuth.authorize(&request)
     }
 
     // MARK: - Streaming (SSE)

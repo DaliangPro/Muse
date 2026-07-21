@@ -48,6 +48,9 @@ import sys
 paths = [
     pathlib.Path("sensevoice-server/server.py"),
     pathlib.Path("qwen3-asr-server/server.py"),
+    pathlib.Path("local-service-shared/local_service_security.py"),
+    pathlib.Path("local-service-shared/test_local_service_security.py"),
+    pathlib.Path("local-service-shared/test_server_security_wiring.py"),
 ]
 
 failed = False
@@ -61,6 +64,10 @@ for path in paths:
 
 sys.exit(1 if failed else 0)
 PY
+}
+
+python_service_tests() {
+  python3 -m unittest discover -s local-service-shared -p 'test_*.py'
 }
 
 run_optional_tool() {
@@ -84,6 +91,7 @@ run_step "swift-build-release" swift build -c release
 run_step "swift-test" swift test
 run_step "bash-syntax" bash_syntax
 run_step "python-service-syntax" python_service_syntax
+run_step "python-service-tests" python_service_tests
 
 run_optional_tool "shellcheck" shellcheck shellcheck scripts/*.sh
 run_optional_tool "swiftlint" swiftlint swiftlint

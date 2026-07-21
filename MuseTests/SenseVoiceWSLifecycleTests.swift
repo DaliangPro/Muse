@@ -198,8 +198,8 @@ final class SenseVoiceWSLifecycleTests: XCTestCase {
                     qwenPort: 2
                 )
             },
-            dialFactory: { url in
-                factory.make(url: url)
+            dialFactory: { request in
+                factory.make(request: request)
             },
             qwenFinalEnabledProvider: { qwenEnabled },
             qwenTranscriber: qwenTranscriber
@@ -259,8 +259,8 @@ private final class SenseVoiceDialFactorySpy: @unchecked Sendable {
         self.tasks = tasks
     }
 
-    func make(url: URL) -> SenseVoiceDialResources {
-        _ = url
+    func make(request: URLRequest) -> SenseVoiceDialResources {
+        _ = request
         return lock.withLock {
             SenseVoiceDialResources(
                 task: tasks.removeFirst(),

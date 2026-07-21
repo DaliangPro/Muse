@@ -33,6 +33,7 @@ echo "Running PyInstaller..."
 pyinstaller \
     --onedir \
     --name qwen3-asr-server \
+    --paths "$PROJECT_DIR/local-service-shared" \
     --hidden-import=mlx \
     --hidden-import=mlx.core \
     --hidden-import=mlx.nn \

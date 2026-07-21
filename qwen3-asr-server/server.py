@@ -25,6 +25,27 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+_SHARED_SECURITY_DIR = Path(__file__).resolve().parent.parent / "local-service-shared"
+if str(_SHARED_SECURITY_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SECURITY_DIR))
+
+from local_service_security import (
+    AUTH_ENV_NAME,
+    MAX_HTTP_AUDIO_BYTES,
+    MAX_JSON_BYTES,
+    MAX_WS_FRAME_BYTES,
+    MissingAuthToken,
+    RequestValidationError,
+    WebSocketValidationError,
+    decode_and_validate_llm_body,
+    load_required_token,
+    read_body_limited,
+    validate_http_headers,
+    validate_pcm_body,
+    validate_websocket_audio_frame,
+    validate_websocket_headers,
+)
+
 import re
 import threading
 
@@ -48,17 +69,24 @@ class CancelToken:
 
 app = FastAPI()
 
+_auth_token = os.environ.get(AUTH_ENV_NAME, "")
+
+
+def configure_auth_token(environment=None):
+    """读取本进程会话 token；校验失败时保留原有有效值。"""
+    token = load_required_token(os.environ if environment is None else environment)
+    global _auth_token
+    _auth_token = token
+    return token
+
 
 @app.middleware("http")
 async def _reject_non_local(request: Request, call_next):
-    # REPAIR_PLAN J6：本服务仅供本机 Muse 进程调用（URLSession 不带 Origin 头）。
-    # 浏览器跨站请求必带 Origin、DNS-rebinding 的 Host 非回环域——两类一律 403，
-    # 防恶意网页/本机第三方经 localhost 白嫖 GPU/LLM 推理。
-    if request.headers.get("origin") is not None:
-        return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
-    host = (request.headers.get("host") or "").split(":")[0]
-    if host not in ("127.0.0.1", "localhost"):
-        return JSONResponse({"error": "invalid host"}, status_code=403)
+    # Host/Origin 与会话 token 统一校验，错误信息不得包含 token。
+    try:
+        validate_http_headers(request.headers, _auth_token)
+    except RequestValidationError as error:
+        return JSONResponse({"error": str(error)}, status_code=error.status_code)
     return await call_next(request)
 
 
@@ -89,18 +117,22 @@ _session_busy = False
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    # REPAIR_PLAN J6：浏览器发起的 WebSocket 必带 Origin——accept 前拒绝（403 握手失败），
-    # 仅服务本机进程（HTTP middleware 不覆盖 WS，需单独设防）
-    if ws.headers.get("origin") is not None:
-        await ws.close(code=4003, reason="cross-origin rejected")
+    # HTTP middleware 不覆盖 WS，鉴权及 Host/Origin 必须在 accept 前完成。
+    try:
+        validate_websocket_headers(ws.headers, _auth_token)
+    except WebSocketValidationError as error:
+        await ws.close(code=error.close_code, reason=str(error))
         return
-    # REPAIR_PLAN B3: 全局单 Session 不支持并发会话，同一时刻只服务一个连接
     global _session_busy
-    await ws.accept()
     if _session_busy:
         await ws.close(code=4001, reason="another session is active")
         return
     _session_busy = True
+    try:
+        await ws.accept()
+    except Exception:
+        _session_busy = False
+        raise
 
     try:
         sess = get_session()
@@ -140,16 +172,26 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "completed"})
                 break
 
+            try:
+                validate_websocket_audio_frame(
+                    len(data), cumulative_bytes=len(all_samples) * 2
+                )
+            except WebSocketValidationError as error:
+                await ws.close(code=error.close_code, reason=str(error))
+                return
+
             # Accumulate PCM16 samples
             sample_count = len(data) // 2
             samples = list(struct.unpack(f"<{sample_count}h", data))
-            # REPAIR_PLAN J10：超上限停止累积（保留前 30 分钟供 final），留痕一次
-            if len(all_samples) < max_total_samples:
-                all_samples.extend(samples)
-            elif not total_overflow_logged:
+            # 只追加上限以内的样本，单个大帧也不能突破 30 分钟边界。
+            remaining = max_total_samples - len(all_samples)
+            if remaining > 0:
+                all_samples.extend(samples[:remaining])
+            if len(samples) > remaining:
+                if not total_overflow_logged:
+                    print("[qwen3-asr] audio buffer over limit; keeping first "
+                          f"{MAX_TOTAL_AUDIO_SEC // 60} min for final", flush=True)
                 total_overflow_logged = True
-                print("[qwen3-asr] audio buffer over limit; keeping first "
-                      f"{MAX_TOTAL_AUDIO_SEC // 60} min for final", flush=True)
 
             # Periodic partial: transcribe without punctuation
             new_audio = len(all_samples) - last_partial_at
@@ -232,9 +274,16 @@ def _transcribe_sync(sess, samples_i16: list[int], strip_punct: bool = False,
 @app.post("/transcribe")
 async def transcribe_http(request: Request):
     """HTTP endpoint for speculative transcription. Accepts raw PCM16-LE audio."""
-    body = await request.body()
-    if len(body) < 100:
-        return {"text": ""}
+    try:
+        body = await read_body_limited(request, maximum_bytes=MAX_HTTP_AUDIO_BYTES)
+        validation = validate_pcm_body(
+            request.headers.get("content-type"), body
+        )
+    except RequestValidationError as error:
+        return JSONResponse({"error": str(error)}, status_code=error.status_code)
+
+    if validation == "too_short":
+        return {"text": "", "reason": "audio_too_short"}
 
     sample_count = len(body) // 2
     samples = list(struct.unpack(f"<{sample_count}h", body))
@@ -299,15 +348,21 @@ def _load_llm(model_path: str):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: dict):
+async def chat_completions(request: Request):
+    try:
+        body = await read_body_limited(request, maximum_bytes=MAX_JSON_BYTES)
+        payload = decode_and_validate_llm_body(body)
+    except RequestValidationError as error:
+        return JSONResponse({"error": str(error)}, status_code=error.status_code)
+
     if _llm_disabled:
         return {"error": "LLM disabled", "choices": [{"message": {"content": ""}}]}
     if _llm is None and not _llm_model_path:
         return JSONResponse({"error": "LLM not configured"}, status_code=503)
 
-    messages = request.get("messages", [])
-    temperature = request.get("temperature", 0.7)
-    max_tokens = request.get("max_tokens", 1024)
+    messages = payload["messages"]
+    temperature = payload.get("temperature", 0.7)
+    max_tokens = payload.get("max_tokens", 1024)
 
     async with _llm_lock:
         llm = await asyncio.get_event_loop().run_in_executor(
@@ -351,6 +406,11 @@ def find_free_port():
 
 def main():
     global _model_path, _llm_model_path, _hotword_context
+
+    try:
+        configure_auth_token()
+    except MissingAuthToken as error:
+        raise SystemExit(str(error)) from None
 
     # Prevent HF hub from trying to download/update models
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -398,7 +458,13 @@ def main():
     port = args.port if args.port != 0 else find_free_port()
     print(f"PORT:{port}", flush=True)
 
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        ws_max_size=MAX_WS_FRAME_BYTES,
+    )
 
 
 if __name__ == "__main__":

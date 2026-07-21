@@ -177,6 +177,7 @@ actor SenseVoiceServerManager {
     /// Launch the SenseVoice server as the primary streaming server.
     private func launchSenseVoiceServer() async throws {
         let proc = Process()
+        proc.environment = LocalServiceAuth.serverEnvironment()
         var args: [String] = []
 
         try configureSenseVoiceServer(proc: proc, args: &args)
@@ -240,6 +241,7 @@ actor SenseVoiceServerManager {
     /// Launch the Qwen3-ASR server as secondary (speculative final + LLM).
     private func launchQwen3Server() async throws {
         let proc = Process()
+        proc.environment = LocalServiceAuth.serverEnvironment()
         var args: [String] = []
 
         try configureQwen3Server(proc: proc, args: &args)
@@ -297,7 +299,9 @@ actor SenseVoiceServerManager {
         var healthy = false
         for _ in 0..<30 {
             do {
-                let (_, response) = try await URLSession.shared.data(from: qwen3HealthURL)
+                var request = URLRequest(url: qwen3HealthURL)
+                LocalServiceAuth.authorize(&request)
+                let (_, response) = try await URLSession.shared.data(for: request)
                 if (response as? HTTPURLResponse)?.statusCode == 200 { healthy = true; break }
             } catch {}
             try? await Task.sleep(for: .seconds(1))
@@ -418,7 +422,9 @@ actor SenseVoiceServerManager {
     nonisolated func isHealthy() async -> Bool {
         guard let url = await healthURL else { return false }
         do {
-            let (_, response) = try await URLSession.shared.data(from: url)
+            var request = URLRequest(url: url)
+            LocalServiceAuth.authorize(&request)
+            let (_, response) = try await URLSession.shared.data(for: request)
             return (response as? HTTPURLResponse)?.statusCode == 200
         } catch {
             return false
