@@ -175,6 +175,7 @@
 | MUSE-070 | ✅ 完成 | `b387d76` | 本地服务进程级 token 鉴权与 HTTP、LLM、WebSocket 输入边界完成。 |
 | MUSE-080 | ✅ 完成 | `aad11af` | 本地服务进程身份校验、可靠停止和增量端口解析完成。 |
 | MUSE-090 | ✅ 完成 | `aa2d925` | 火山协议 Header、未对齐长度读取及压缩/JSON 资源边界完成。 |
+| MUSE-100 | ✅ 完成 | `4e18a03` | 进程级剪贴板租约、代际恢复闸门与并发注入事务完成。 |
 
 ### MUSE-070：给本地 ASR 和 LLM 服务增加鉴权与输入上限
 
@@ -239,3 +240,39 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、335 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过。
 - 遗留风险：回归测试使用合成二进制、固定 zlib fixture 与本地 Compression API，未连接真实火山服务验证线上异常帧；4 MiB、16 MiB、10,000 条、1 MiB 和 4 KiB 均为任务卡要求或其“有限长度”要求的明确本地策略，若服务端协议未来提高合法上限需同步调整并补兼容测试。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行任何麦克风、音频设备或真机音频测试。自动更新开关仍为 `false`。
+
+### MUSE-100：修复连续剪贴板注入丢失原剪贴板
+
+- 状态：✅ 完成。
+- 提交：`4e18a03`（`修复: 用剪贴板租约协调连续文本注入`）。
+- 测试优先：
+  - 先新增连续注入、第三方复制、迟到旧恢复、空原内容、图文多类型和粘贴事件失败用例，并把既有恢复测试迁移到唯一命名 pasteboard；修复前运行 `swift test --filter 'TextInjectionClipboardRestoreTests|TextInjectionOverlapTests'` 明确编译失败，报告缺少 `ClipboardLeaseCoordinator`、可取消恢复调度边界、可注入 pasteboard/粘贴模拟器和可测剪贴板注入入口。
+  - 再新增两个 engine 真并发用例；未加进程级注入事务门时，该测试明确失败：第二个 engine 在第一轮 Cmd+V 完成前进入并把剪贴板改成第二段文本，且只注册到一个恢复任务。
+  - 再新增“永久复制与活跃租约文本相同”用例；原实现因缺少原子 `writeTextPermanently` 接口而编译失败，随后补齐永久写入与租约失效的一体化边界。
+- 修改：
+  - 新增进程级 `ClipboardLeaseCoordinator.shared`；第一次注入只捕获一份原始 snapshot，后续重叠注入复用它、递增 generation、取消旧任务，并更新最新文本与 changeCount。
+  - 只有 pasteboard 名称和 generation 同时匹配的最后恢复任务可以执行；恢复成功、第三方内容导致放弃、不可恢复快照或粘贴失败后均清理租约。
+  - 用独立状态锁保护 snapshot/generation/任务，用进程级递归事务锁串行化“临时写入 → Cmd+V → 注册恢复”；调度器和任务取消均在状态锁外调用，避免同步回调重入死锁。
+  - `simulatePaste()` 改为返回 Bool；CGEvent 创建失败时不再误报 inserted，而是保留带 transient type 的识别文本、返回 `.copiedToClipboard`，且不安排恢复。
+  - 剪贴板 snapshot 支持注入命名 pasteboard 与 logger；新增测试全部使用 `NSPasteboard.withUniqueName()`，不接触系统通用剪贴板。
+  - 引擎显式复制、无目标/不保留路径以及 AppState、资产库、最近记录三个 UI 永久复制入口统一经协调器原子失效租约，防止迟到恢复覆盖主动复制。
+- 验证：
+  - `swift test --filter 'TextInjectionClipboardRestoreTests|TextInjectionOverlapTests'`：14 项，0 失败。
+  - `swift test --filter 'AppStateTests|TextInjectionEngineIntegrationTests'`：17 项，4 项既有 UI 真机门控测试按环境条件跳过，0 失败。
+  - `swift test --sanitize thread --filter TextInjectionOverlapTests`：9 项，0 失败，未报告数据竞争。
+  - `swift test`：344 项，5 项按环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、344 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过。
+- 遗留风险：第三方恰好复制与当前注入完全相同的字符串时，无法与既有“目标应用改写剪贴板但文本相同”的 J2 兼容场景可靠区分；UI 永久复制若与注入事务正面相撞，主线程最多等待现有约 150 ms 注入窗口；TextEdit、Electron 与 nonactivatingPanel 的真实 UI 注入仍由发布前真机 gate 覆盖，本任务未启用其环境变量。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行任何麦克风、音频设备或真机音频测试。自动更新开关仍为 `false`。
+
+## 批次 B 收口
+
+- 代码任务：MUSE-070 至 MUSE-100 已按依赖顺序实施，每项均先红灯、再修复、跑定向与全量测试、最后独立提交。
+- 当前代码 HEAD：`4e18a03e84b056f26f0e2a13e373641162f1d12c`。
+- 自动更新：`UpdateChecker.updateChannelEnabled = false`，未改动；Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，因此继续保持关闭。
+- 真实用户数据：未访问、未修改 `~/Library/Application Support/Muse/`；MUSE-100 新增剪贴板测试全部使用唯一命名 pasteboard。
+- 收口自动验收：`bash scripts/health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建通过，全量 `swift test` 执行 344 项、5 项按环境条件跳过、0 失败，Shell/Python 语法和 12 项 Python 服务测试通过。
+- 收口环境限制：`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按设计标记为 `SKIP`；未安装工具，也未降低构建或测试门槛。
+- 音频测试：遵照用户指示，本批次未执行任何麦克风、音频设备或真机音频测试。
+- 待人工项：MUSE-070 冻结后的真实本地 ASR/LLM 制品鉴权与模型加载；MUSE-080 真实服务进程停止与既有 PID 台账迁移；MUSE-090 真实火山异常帧；MUSE-100 TextEdit、微信剪贴板 fallback、Electron 与 nonactivatingPanel 连续注入。以上不影响本批次自动验收结论，仍须在发布前真机 gate 中完成。
