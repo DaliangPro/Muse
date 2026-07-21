@@ -27,4 +27,15 @@ final class AppUpdaterChecksumTests: XCTestCase {
     func testCaseInsensitiveMatchIsAccepted() {
         XCTAssertTrue(AppUpdater.isChecksumAcceptable(expected: "ABC123", actual: "abc123"))
     }
+
+    func testStagedDMGIsNeverPermanentlyDeleted() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Muse/Services/AppUpdater.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertFalse(source.contains("removeItem(at: destination)"))
+        XCTAssertTrue(source.contains("trashItem(at: destination"))
+    }
 }

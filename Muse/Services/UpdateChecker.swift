@@ -2,39 +2,104 @@ import Foundation
 
 // MARK: - Models
 
-struct UpdateInfo: Codable, Identifiable {
+enum UpdateArtifactKind: String, Codable, Equatable, Sendable {
+    case cloud
+    case local
+}
+
+struct UpdateArtifact: Codable, Equatable, Sendable {
+    let url: String?
+    let sha256: String?
+}
+
+struct UpdateArtifacts: Codable, Equatable, Sendable {
+    let cloud: UpdateArtifact?
+    let local: UpdateArtifact?
+
+    subscript(kind: UpdateArtifactKind) -> UpdateArtifact? {
+        switch kind {
+        case .cloud: cloud
+        case .local: local
+        }
+    }
+}
+
+struct ResolvedUpdateArtifact: Equatable, Sendable {
+    let kind: UpdateArtifactKind
+    let url: URL
+    let sha256: String
+}
+
+enum UpdateArtifactResolutionError: LocalizedError, Equatable {
+    case invalidVersion
+    case missingArtifact(UpdateArtifactKind)
+    case invalidURL(UpdateArtifactKind)
+    case missingSHA256(UpdateArtifactKind)
+    case invalidSHA256(UpdateArtifactKind)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidVersion:
+            "更新清单中的版本号格式无效。"
+        case .missingArtifact(let kind):
+            "更新清单缺少 \(kind.rawValue) 制品。"
+        case .invalidURL(let kind):
+            "更新清单中的 \(kind.rawValue) 制品 URL 无效或不安全。"
+        case .missingSHA256(let kind):
+            "更新清单中的 \(kind.rawValue) 制品缺少 SHA256。"
+        case .invalidSHA256(let kind):
+            "更新清单中的 \(kind.rawValue) 制品 SHA256 格式无效。"
+        }
+    }
+}
+
+struct UpdateInfo: Codable, Identifiable, Equatable, Sendable {
     let version: String
     let date: String
     let notes: String
-    let cloudDmgURL: String?
-    let cloudDmgSHA256: String?
+    let artifacts: UpdateArtifacts
 
     var id: String { version }
 
-    enum CodingKeys: String, CodingKey {
-        case version, date, notes
-        case cloudDmgURL = "cloud_dmg_url"
-        case cloudDmgSHA256 = "cloud_dmg_sha256"
-    }
+    func resolvedArtifact(isLocalInstallation: Bool) throws -> ResolvedUpdateArtifact {
+        let versionParts = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard !versionParts.isEmpty,
+              versionParts.allSatisfy({ part in
+                  !part.isEmpty
+                      && part.utf8.allSatisfy { (48...57).contains($0) }
+                      && Int(part) != nil
+              }) else {
+            throw UpdateArtifactResolutionError.invalidVersion
+        }
 
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        version = try c.decode(String.self, forKey: .version)
-        date = try c.decode(String.self, forKey: .date)
-        notes = try c.decode(String.self, forKey: .notes)
-        cloudDmgURL = try c.decodeIfPresent(String.self, forKey: .cloudDmgURL)
-        cloudDmgSHA256 = try c.decodeIfPresent(String.self, forKey: .cloudDmgSHA256)
-    }
+        let kind: UpdateArtifactKind = isLocalInstallation ? .local : .cloud
+        guard let artifact = artifacts[kind] else {
+            throw UpdateArtifactResolutionError.missingArtifact(kind)
+        }
 
-    /// Resolved DMG download URL (explicit or fallback from version)
-    var resolvedDmgURL: URL {
-        if let urlStr = cloudDmgURL, let url = URL(string: urlStr) { return url }
-        return URL(string: "https://github.com/DaliangPro/Muse/releases/download/v\(version)/Muse-v\(version)-cloud.dmg")!
-    }
+        let rawURL = artifact.url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let url = URL(string: rawURL),
+              url.scheme?.lowercased() == "https",
+              url.host?.isEmpty == false,
+              url.user == nil,
+              url.password == nil,
+              url.path.lowercased().hasSuffix(".dmg") else {
+            throw UpdateArtifactResolutionError.invalidURL(kind)
+        }
 
+        let sha256 = artifact.sha256?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !sha256.isEmpty else {
+            throw UpdateArtifactResolutionError.missingSHA256(kind)
+        }
+        guard sha256.count == 64, sha256.allSatisfy({ $0.hexDigitValue != nil }) else {
+            throw UpdateArtifactResolutionError.invalidSHA256(kind)
+        }
+
+        return ResolvedUpdateArtifact(kind: kind, url: url, sha256: sha256.lowercased())
+    }
 }
 
-struct UpdateManifest: Codable {
+struct UpdateManifest: Codable, Equatable, Sendable {
     let latest: String
     let releases: [UpdateInfo]
 }
