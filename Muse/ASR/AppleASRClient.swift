@@ -7,6 +7,7 @@ enum AppleASRError: Error, LocalizedError {
     case invalidConfig
     case permissionDenied
     case recognizerUnavailable
+    case onDeviceRecognitionUnsupported(localeIdentifier: String)
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +17,11 @@ enum AppleASRError: Error, LocalizedError {
             return L("未授予语音识别权限", "Speech recognition permission not granted")
         case .recognizerUnavailable:
             return L("Apple 语音识别当前不可用", "Apple speech recognition is currently unavailable")
+        case .onDeviceRecognitionUnsupported(let localeIdentifier):
+            return L(
+                "Apple 端侧语音识别不支持当前语言（\(localeIdentifier)）。请切换识别语言，或改用火山引擎。",
+                "Apple on-device speech recognition does not support \(localeIdentifier). Switch the recognition language or use Volcano Speech."
+            )
         }
     }
 }
@@ -37,7 +43,7 @@ protocol AppleRecognitionSessionControlling: AnyObject, Sendable {
 typealias AppleRecognitionSessionFactory = @Sendable (
     Locale,
     @escaping @Sendable (AppleRecognitionCallback) -> Void
-) async -> (any AppleRecognitionSessionControlling)?
+) async throws -> (any AppleRecognitionSessionControlling)?
 
 private final class LiveAppleRecognitionSession: AppleRecognitionSessionControlling, @unchecked Sendable {
     private let recognizer: SFSpeechRecognizer
@@ -57,15 +63,28 @@ private final class LiveAppleRecognitionSession: AppleRecognitionSessionControll
     static func make(
         locale: Locale,
         callback: @escaping @Sendable (AppleRecognitionCallback) -> Void
-    ) async -> LiveAppleRecognitionSession? {
-        await MainActor.run {
-            guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
-                return nil
+    ) async throws -> LiveAppleRecognitionSession? {
+        try await MainActor.run {
+            let recognizer = SFSpeechRecognizer(locale: locale)
+            try AppleASRClient.validateOnDeviceRecognizer(
+                requestedLocaleIdentifier: locale.identifier,
+                resolvedLocaleIdentifier: recognizer?.locale.identifier,
+                isAvailable: recognizer?.isAvailable ?? false,
+                supportsOnDeviceRecognition: recognizer?.supportsOnDeviceRecognition ?? false
+            )
+            guard let recognizer else {
+                // validateOnDeviceRecognizer 已将 nil 转换为可操作的语言不支持错误。
+                throw AppleASRError.onDeviceRecognitionUnsupported(
+                    localeIdentifier: locale.identifier
+                )
             }
 
             let request = SFSpeechAudioBufferRecognitionRequest()
-            request.shouldReportPartialResults = true
-            request.requiresOnDeviceRecognition = false
+            try AppleASRClient.configureOnDeviceRequest(
+                request,
+                supportsOnDeviceRecognition: recognizer.supportsOnDeviceRecognition,
+                localeIdentifier: locale.identifier
+            )
             let task = recognizer.recognitionTask(with: request) { result, error in
                 let text = result?.bestTranscription.formattedString
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -134,7 +153,7 @@ actor AppleASRClient: SpeechRecognizer {
             return await PermissionManager.requestSpeechRecognitionPermission()
         },
         recognitionSessionFactory: @escaping AppleRecognitionSessionFactory = { locale, callback in
-            await LiveAppleRecognitionSession.make(locale: locale, callback: callback)
+            try await LiveAppleRecognitionSession.make(locale: locale, callback: callback)
         },
         endAudioTimeout: Duration = .seconds(5)
     ) {
@@ -178,14 +197,23 @@ actor AppleASRClient: SpeechRecognizer {
         eventContinuation = continuation
 
         let factory = recognitionSessionFactory
-        let createdSession = await factory(locale) { [weak self] callback in
-            guard let self else { return }
-            Task {
-                await self.handleRecognitionCallback(
-                    sessionID: newSessionID,
-                    callback: callback
-                )
+        let createdSession: (any AppleRecognitionSessionControlling)?
+        do {
+            createdSession = try await factory(locale) { [weak self] callback in
+                guard let self else { return }
+                Task {
+                    await self.handleRecognitionCallback(
+                        sessionID: newSessionID,
+                        callback: callback
+                    )
+                }
             }
+        } catch {
+            guard sessionID == newSessionID else {
+                throw CancellationError()
+            }
+            invalidateCurrentSession(emitCompleted: false)
+            throw error
         }
 
         guard sessionID == newSessionID else {
@@ -366,6 +394,77 @@ actor AppleASRClient: SpeechRecognizer {
 
     static func preferredLocale(for config: AppleASRConfig) -> Locale {
         Locale(identifier: config.localeIdentifier)
+    }
+
+    fileprivate static func validateOnDeviceRecognizer(
+        requestedLocaleIdentifier: String,
+        resolvedLocaleIdentifier: String?,
+        isAvailable: Bool,
+        supportsOnDeviceRecognition: Bool
+    ) throws {
+        guard let resolvedLocaleIdentifier,
+              canonicalLocaleIdentifier(resolvedLocaleIdentifier)
+                == canonicalLocaleIdentifier(requestedLocaleIdentifier) else {
+            throw AppleASRError.onDeviceRecognitionUnsupported(
+                localeIdentifier: requestedLocaleIdentifier
+            )
+        }
+        guard supportsOnDeviceRecognition else {
+            throw AppleASRError.onDeviceRecognitionUnsupported(
+                localeIdentifier: requestedLocaleIdentifier
+            )
+        }
+        guard isAvailable else {
+            throw AppleASRError.recognizerUnavailable
+        }
+    }
+
+    private static func canonicalLocaleIdentifier(_ identifier: String) -> String {
+        identifier
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
+    }
+
+    @MainActor
+    fileprivate static func configureOnDeviceRequest(
+        _ request: SFSpeechAudioBufferRecognitionRequest,
+        supportsOnDeviceRecognition: Bool,
+        localeIdentifier: String
+    ) throws {
+        guard supportsOnDeviceRecognition else {
+            throw AppleASRError.onDeviceRecognitionUnsupported(
+                localeIdentifier: localeIdentifier
+            )
+        }
+        request.shouldReportPartialResults = true
+        request.requiresOnDeviceRecognition = true
+    }
+
+    @MainActor
+    static func configureOnDeviceRequestForTesting(
+        _ request: SFSpeechAudioBufferRecognitionRequest,
+        supportsOnDeviceRecognition: Bool,
+        localeIdentifier: String
+    ) throws {
+        try configureOnDeviceRequest(
+            request,
+            supportsOnDeviceRecognition: supportsOnDeviceRecognition,
+            localeIdentifier: localeIdentifier
+        )
+    }
+
+    static func validateOnDeviceRecognizerForTesting(
+        requestedLocaleIdentifier: String,
+        resolvedLocaleIdentifier: String?,
+        isAvailable: Bool,
+        supportsOnDeviceRecognition: Bool
+    ) throws {
+        try validateOnDeviceRecognizer(
+            requestedLocaleIdentifier: requestedLocaleIdentifier,
+            resolvedLocaleIdentifier: resolvedLocaleIdentifier,
+            isAvailable: isAvailable,
+            supportsOnDeviceRecognition: supportsOnDeviceRecognition
+        )
     }
 
     private static func makeTranscript(text: String, isFinal: Bool) -> RecognitionEvent {

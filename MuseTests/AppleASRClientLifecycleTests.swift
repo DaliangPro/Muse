@@ -143,6 +143,49 @@ final class AppleASRClientLifecycleTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testOlderFactoryFailureDoesNotInvalidateNewerSession() async throws {
+        let gate = AppleThrowingFactoryGate()
+        let second = AppleRecognitionSessionSpy()
+        let config = try XCTUnwrap(AppleASRConfig(credentials: [:]))
+        let client = AppleASRClient(
+            permissionProvider: { true },
+            recognitionSessionFactory: { _, callback in
+                try await gate.make(callback: callback, secondSession: second)
+            }
+        )
+        let firstConnect = Task {
+            try await client.connect(config: config, options: ASRRequestOptions())
+        }
+        let firstFactorySuspended = await waitUntil { await gate.firstFactoryIsSuspended }
+        XCTAssertTrue(firstFactorySuspended)
+
+        try await client.connect(config: config, options: ASRRequestOptions())
+        let stream = await client.events
+        let recorder = AppleEventRecorder()
+        let consumer = Task { await recorder.consume(stream) }
+        let readyArrived = await waitUntil { await recorder.contains("ready") }
+        XCTAssertTrue(readyArrived)
+
+        await gate.failFirstFactory()
+        do {
+            try await firstConnect.value
+            XCTFail("旧工厂失败应转换为取消，不能成功返回")
+        } catch is CancellationError {
+            // 旧连接已被更新连接取代，符合预期。
+        } catch {
+            XCTFail("旧工厂错误不应越过会话身份检查：\(error)")
+        }
+
+        XCTAssertEqual(second.cancelCount, 0)
+        second.emit(text: "新会话仍有效", isFinal: true)
+        let streamFinished = await waitUntil { await recorder.isFinished }
+        XCTAssertTrue(streamFinished)
+        await consumer.value
+        let values = await recorder.values
+        XCTAssertTrue(values.contains("transcript:新会话仍有效:true"), values.description)
+        await client.disconnect()
+    }
+
     private func makeClient(
         sessions: [AppleRecognitionSessionSpy],
         timeout: Duration = .seconds(5)
@@ -187,6 +230,38 @@ final class AppleASRClientLifecycleTests: XCTestCase {
 private enum AppleLifecycleTestError: Error {
     case oldSession
     case lateTerminal
+    case factoryFailure
+}
+
+private actor AppleThrowingFactoryGate {
+    private var invocationCount = 0
+    private var firstContinuation: CheckedContinuation<
+        (any AppleRecognitionSessionControlling)?,
+        Error
+    >?
+
+    var firstFactoryIsSuspended: Bool {
+        firstContinuation != nil
+    }
+
+    func make(
+        callback: @escaping @Sendable (AppleRecognitionCallback) -> Void,
+        secondSession: AppleRecognitionSessionSpy
+    ) async throws -> (any AppleRecognitionSessionControlling)? {
+        invocationCount += 1
+        if invocationCount == 1 {
+            return try await withCheckedThrowingContinuation { continuation in
+                firstContinuation = continuation
+            }
+        }
+        secondSession.install(callback: callback)
+        return secondSession
+    }
+
+    func failFirstFactory() {
+        firstContinuation?.resume(throwing: AppleLifecycleTestError.factoryFailure)
+        firstContinuation = nil
+    }
 }
 
 private final class AppleRecognitionSessionFactorySpy: @unchecked Sendable {

@@ -336,8 +336,9 @@ struct SetupWizardView: View {
 
     private var engineRows: some View {
         VStack(spacing: 16) {
-            engineRow(L("Apple 本机", "Apple on-device"),
-                      L("零配置、隐私、开箱即用", "Zero setup, private, ready to go"),
+            engineRow(L("Apple 端侧", "Apple on-device"),
+                      L("仅端侧识别，音频不上传；不支持时提示切换",
+                        "On-device only; no upload; switch language if unsupported"),
                       recommended: true)
             engineRow(L("火山云端", "Volcano cloud"),
                       L("高精度，需填 API 凭据", "High accuracy, needs an API key"),
@@ -488,8 +489,8 @@ struct SetupWizardView: View {
         step = 0
     }
 
-    /// 新手兜底：完成引导时若默认引擎仍是火山且无可用凭据，落到零配置的 Apple 本机，
-    /// 保证「只介绍不配置」路线下第一句话也能出。用户若已选别的引擎则尊重不动。
+    /// 新手兜底：完成引导时若默认引擎仍是火山且无可用凭据，落到零配置的 Apple 端侧。
+    /// 若当前 locale 不支持端侧识别，连接时会明确提示切换语言或引擎；已选其他引擎则尊重不动。
     private func applyDefaultEngineFallbackIfNeeded() {
         guard KeychainService.selectedASRProvider == .volcano else { return }
         let creds = KeychainService.loadASRCredentials(for: .volcano) ?? [:]
