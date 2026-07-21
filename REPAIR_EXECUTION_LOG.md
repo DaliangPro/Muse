@@ -167,3 +167,31 @@
 - 收口环境限制：`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按设计标记为 `SKIP`；未安装工具，也未降低构建或测试门槛。
 - 音频人工验收豁免：用户于 2026-07-20 明确要求停止并跳过剩余音频测试；USB 双声道声卡与聚合设备未通过，批次 A 仅按显式豁免继续推进，不代表原四设备门槛全部满足。
 - 待人工项：MUSE-030 真实火山断网/重连；MUSE-040 真实 Apple Speech 超时；MUSE-060 真实 SenseVoice 中断后 Qwen 终校。
+
+## 批次 B
+
+| 任务 | 状态 | 提交 | 备注 |
+|---|---|---|---|
+| MUSE-070 | ✅ 完成 | `b387d76` | 本地服务进程级 token 鉴权与 HTTP、LLM、WebSocket 输入边界完成。 |
+
+### MUSE-070：给本地 ASR 和 LLM 服务增加鉴权与输入上限
+
+- 状态：✅ 完成。
+- 提交：`b387d76`（`修复: 为本地推理服务增加会话鉴权和请求边界`）。
+- 测试优先：
+  - 先新增 `LocalServiceAuthTests`；修复前运行 `swift test --filter LocalServiceAuthTests` 明确失败，编译器报告找不到 `LocalServiceAuth`。
+  - 先新增 Python 共用安全合同与真实路由接线测试；修复前运行 `python3 -m unittest discover -s local-service-shared -p 'test_*.py'` 明确失败，报告缺少 `local_service_security` 模块。
+- 修改：
+  - Swift 使用 `SecRandomCopyBytes` 每进程生成 32 字节随机 token，编码为 base64url；token 仅保存在内存，经 `MUSE_LOCAL_AUTH_TOKEN` 传入 SenseVoice、Qwen 子进程，不持久化、不写日志。
+  - 为 `/ws`、两处 `/health`、`/transcribe`、`/llm/load`、`/llm/unload` 和 localQwen 的 `/v1/chat/completions` 补 `X-Muse-Local-Token`；Ollama 与云端请求不携带该 Header。
+  - 两套 Python 服务使用 `hmac.compare_digest` 校验 HTTP/WS token；WS 在 `accept` 前鉴权，继续执行原 Host/Origin 防护和单活动连接约束；主入口缺 token 时在模型加载前退出。
+  - 共用校验模块限制 HTTP PCM 为 octet-stream、偶数字节、最大 60 MB；LLM JSON 最大 2 MB，并统一校验 messages、总 content、temperature、max_tokens；WS 单帧最大 1 MB、累计音频最大 30 分钟，Qwen 越界帧仅追加剩余容量。
+  - 两份 PyInstaller 脚本加入共享模块搜索路径；健康检查新增 Python 语法与 12 项 unittest 的强制步骤。
+- 验证：
+  - `swift test --filter 'LocalServiceAuthTests|SenseVoiceWSLifecycleTests|DoubaoChatClientTests'`：11 项，0 失败。
+  - `python3 -m unittest discover -s local-service-shared -p 'test_*.py'`：12 项，0 失败。
+  - `swift test`：304 项，5 项按环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、全量 Swift 测试、Shell/Python 语法和 Python 服务测试全部通过。
+  - `git diff --check`：通过。
+- 遗留风险：测试通过 FastAPI TestClient、stub 模型和可控 WebSocket 验证，不加载真实 ASR/LLM 模型；当前环境未安装 PyInstaller，未执行冻结制品导入冒烟。启动 gate 以当前打包入口 `main()` 为边界，未来若改用 `uvicorn module:app` 需同步迁移到 lifespan/startup gate。`shellcheck`、`swiftlint`、`periphery` 未安装，按健康检查既有规则标记为跳过。未执行任何麦克风或音频设备测试。自动更新开关仍为 `false`。
