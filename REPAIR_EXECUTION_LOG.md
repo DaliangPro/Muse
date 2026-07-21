@@ -285,7 +285,7 @@
 | MUSE-120 | ✅ 完成 | `2c9a716` | 固定版本清单、逐文件 SHA256、ephemeral 下载、staging 原子安装与失败回滚完成。 |
 | MUSE-130 | ✅ 完成 | `2d9d915` | Provider 级 Endpoint 策略、共享 ephemeral 会话、重定向阻断及有界 SSE 完整性校验完成。 |
 | MUSE-140 | ✅ 完成 | `df15455` | 显式 schema 迁移、内置文件保护、用户词优先与 100 条严格下发上限完成。 |
-| MUSE-150 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-150 | ✅ 完成 | `a18762d` | Provider 能力统一门控、启动前回退说明与 Release 本地服务路径闭锁完成。 |
 | MUSE-160 | ⬜ 未开始 | — | 等待前置任务。 |
 
 ### MUSE-110：让候选入库和提炼提交具备事务性与幂等性
@@ -415,3 +415,35 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、428 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；独立只读终审未发现剩余 P0/P1。
 - 遗留风险：未在真实用户词库上执行迁移，未实际点击 Finder/UI 入口，也未联调真实本地 ASR 服务；损坏的现有新版 JSON 文件如何向用户恢复属于 MUSE-160 范围。本任务没有访问或修改 `~/Library/Application Support/Muse/`。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
+
+### MUSE-150：统一 Provider 可用性并封闭正式版开发路径
+
+- 状态：✅ 完成。
+- 提交：`a18762d`（`修复: 统一识别引擎可用性并封闭正式版开发路径`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `cb3ffad7df76cfad75c41a23ba432154e4e3f651`；仅保留既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入提交。基线 `swift build` 通过；`swift test` 执行 428 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 先扩充 Provider 能力、启动回退和服务入口解析测试；修复前运行 `swift test --filter 'ASRProviderRegistryTests|ServerExecutableResolutionTests'` 明确编译失败，报告缺少 capability 注入重载、启动回退 API、`ServerExecutableResolver`、构建策略、解析结果与错误类型。
+  - 随后补齐 Release 忽略显式开发根、DEBUG 无变量/相对变量拒绝、bundle 优先与 fail-closed、服务目录和脚本符号链接逃逸、缺脚本/缺 Python、非可执行或不可信 Python、合法 venv 外链、双服务同根及两 manager 策略一致等边界测试。
+- 修改：
+  - `ASRProviderRegistry.supports` 先统一检查 capability；不可用 Provider 的直出和自定义模式全部不可选，模式列表为空，`resolvedMode` 回退直出。ProviderEntry 的 UI 可用性也要求 capability 与 client 同时成立。
+  - Sherpa capability 同时要求编译支持和共享 resolver 能找到可信服务入口；启动迁移完成后、热键注册、本地服务启动和连通性探测之前，历史不可用选择按显式顺序回退到 Volcano/Apple，并先持久化再显示一次性说明。
+  - 新增共享 `ServerExecutableResolver`：bundle 永远优先；候选存在但越界或不可执行时直接失败，不回落开发目录。Release 构建不读取开发变量且只允许 bundle 内入口。
+  - DEBUG 仅接受绝对路径 `MUSE_DEV_SERVER_ROOT`，不再向上遍历或扫描 `~/muse`、`~/projects/muse`；开发根、服务目录和 `server.py` 必须归当前有效用户，canonical path 不得越界，脚本和 Python 必须为普通文件，Python 目标必须属于当前用户或 root 且可执行。
+  - venv Python 可合法链接到开发根之外的可信解释器，避免破坏 Homebrew/uv 创建的真实虚拟环境；SenseVoice 与 Qwen3 统一走相同解析器，ModelManager 的在位判断与 ServerManager 的实际启动结论一致。
+- 修改文件：
+  - `Muse/ASR/ASRProviderRegistry.swift`
+  - `Muse/AppStartupCoordinator.swift`
+  - `Muse/MuseApp.swift`
+  - `Muse/Services/ModelManager.swift`
+  - `Muse/Services/SenseVoiceServerManager.swift`
+  - `Muse/Services/ServerExecutableResolver.swift`
+  - `MuseTests/ASRProviderRegistryTests.swift`
+  - `MuseTests/ServerExecutableResolutionTests.swift`
+- 验证：
+  - `swift test --filter 'ASRProviderRegistryTests|ServerExecutableResolutionTests'`：25 项，0 失败。
+  - `swift test --filter 'ASRProviderRegistryTests|ServerExecutableResolutionTests|AppStateTests|RecognitionSessionTests|RecognitionSessionRaceTests|ModelArtifactVerificationTests|ServerProcessIdentityTests'`：87 项，0 失败。
+  - `swift test`：450 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、450 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；独立只读终审未发现 P0/P1 或阻断性测试缺口，并独立复跑 25 项定向测试与 Release 构建通过。
+- 遗留风险：未实际启动开发 Python 服务、未用带本地服务的签名 App bundle 验证包装脚本，也未目视验收启动回退 NSAlert；测试全部使用临时目录与注入的构建/所有者策略，未访问真实用户目录。默认 `scripts/package-app.sh` 构建 Release 且通常不带 `BUNDLE_LOCAL_ASR=1`，收紧后这类包不再执行仓库 venv，这是计划要求；本地制品必须显式打包服务，开发调试必须使用 DEBUG 并设置 `MUSE_DEV_SERVER_ROOT`。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
