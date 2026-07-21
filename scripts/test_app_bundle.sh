@@ -3,6 +3,11 @@ set -euo pipefail
 
 APP_PATH="${1:-${APP_PATH:-/Applications/Muse.app}}"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
+EXPECTED_BUNDLE_ID="${APP_BUNDLE_ID:-pro.daliang.muse}"
+EXPECTED_VERSION="${APP_VERSION:-1.7.4}"
+EXPECTED_BUILD="${APP_BUILD:-1}"
+EXPECTED_MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
+EXPECT_LOCAL_BUNDLE="${EXPECT_LOCAL_BUNDLE:-auto}"
 
 fail() {
     echo "FAIL: $1" >&2
@@ -20,16 +25,51 @@ read_plist() {
 [ -f "$APP_PATH/Contents/Resources/AppIcon.icns" ] || fail "app icon missing"
 
 [ "$(read_plist CFBundleExecutable)" = "Muse" ] || fail "CFBundleExecutable should be Muse"
-[ "$(read_plist CFBundleIdentifier)" = "pro.daliang.muse" ] || fail "CFBundleIdentifier should be pro.daliang.muse"
+[ "$(read_plist CFBundleIdentifier)" = "$EXPECTED_BUNDLE_ID" ] || fail "CFBundleIdentifier should be $EXPECTED_BUNDLE_ID"
 [ "$(read_plist CFBundleName)" = "Muse" ] || fail "CFBundleName should be Muse"
 [ "$(read_plist CFBundleDisplayName)" = "Muse" ] || fail "CFBundleDisplayName should be Muse"
 [ "$(read_plist CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType should be APPL"
-[ "$(read_plist CFBundleShortVersionString)" = "1.7.4" ] || fail "CFBundleShortVersionString should be 1.7.4"
-[ "$(read_plist CFBundleVersion)" = "1" ] || fail "CFBundleVersion should be 1"
+[ "$(read_plist CFBundleShortVersionString)" = "$EXPECTED_VERSION" ] || fail "CFBundleShortVersionString should be $EXPECTED_VERSION"
+[ "$(read_plist CFBundleVersion)" = "$EXPECTED_BUILD" ] || fail "CFBundleVersion should be $EXPECTED_BUILD"
 [ "$(read_plist CFBundleIconFile)" = "AppIcon" ] || fail "CFBundleIconFile should be AppIcon"
-[ "$(read_plist LSMinimumSystemVersion)" = "14.0" ] || fail "LSMinimumSystemVersion should be 14.0"
+[ "$(read_plist LSMinimumSystemVersion)" = "$EXPECTED_MIN_SYSTEM_VERSION" ] || fail "LSMinimumSystemVersion should be $EXPECTED_MIN_SYSTEM_VERSION"
 [ -n "$(read_plist NSMicrophoneUsageDescription)" ] || fail "NSMicrophoneUsageDescription should be present"
 [ -n "$(read_plist NSAppleEventsUsageDescription)" ] || fail "NSAppleEventsUsageDescription should be present"
 [ "$(read_plist LSUIElement)" = "true" ] || fail "LSUIElement should be true"
 
-echo "PASS: app bundle metadata looks correct"
+case "$EXPECT_LOCAL_BUNDLE" in
+    1)
+        [ -d "$APP_PATH/Contents/MacOS/sensevoice-server-dist" ] || fail "Local bundle missing sensevoice-server dist"
+        [ -L "$APP_PATH/Contents/MacOS/sensevoice-server" ] || fail "Local bundle missing sensevoice-server executable link"
+        [ -x "$APP_PATH/Contents/MacOS/sensevoice-server" ] || fail "sensevoice-server entry is not executable"
+        [ -d "$APP_PATH/Contents/MacOS/qwen3-asr-server-dist" ] || fail "Local bundle missing qwen3-asr-server dist"
+        [ -L "$APP_PATH/Contents/MacOS/qwen3-asr-server" ] || fail "Local bundle missing qwen3-asr-server executable link"
+        [ -x "$APP_PATH/Contents/MacOS/qwen3-asr-server" ] || fail "qwen3-asr-server entry is not executable"
+        [ -f "$APP_PATH/Contents/Resources/LocalServices/sensevoice-server-wrapper.sh" ] || fail "Local bundle missing sealed sensevoice wrapper resource"
+        [ -f "$APP_PATH/Contents/Resources/LocalServices/qwen3-asr-server-wrapper.sh" ] || fail "Local bundle missing sealed qwen3 wrapper resource"
+        ;;
+    0)
+        [ ! -e "$APP_PATH/Contents/MacOS/sensevoice-server-dist" ] || fail "Cloud bundle contains sensevoice-server dist"
+        [ ! -e "$APP_PATH/Contents/MacOS/sensevoice-server" ] || fail "Cloud bundle contains sensevoice-server wrapper"
+        [ ! -e "$APP_PATH/Contents/MacOS/qwen3-asr-server-dist" ] || fail "Cloud bundle contains qwen3-asr-server dist"
+        [ ! -e "$APP_PATH/Contents/MacOS/qwen3-asr-server" ] || fail "Cloud bundle contains qwen3-asr-server wrapper"
+        [ ! -e "$APP_PATH/Contents/Resources/LocalServices" ] || fail "Cloud bundle contains local service resources"
+        ;;
+    auto) ;;
+    *) fail "EXPECT_LOCAL_BUNDLE must be 0, 1, or auto" ;;
+esac
+
+if ! /usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH"; then
+    fail "strict code signature verification failed"
+fi
+
+SIGNED_DETAILS="$(/usr/bin/codesign -dvvv "$APP_PATH" 2>&1)"
+SIGNED_AUTHORITY="$(printf '%s\n' "$SIGNED_DETAILS" | /usr/bin/awk -F= '/^Authority=/{print $2; exit}')"
+case "$SIGNED_AUTHORITY" in
+    "Developer ID Application:"*)
+        /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH" \
+            || fail "Gatekeeper assessment failed"
+        ;;
+esac
+
+echo "PASS: app bundle metadata and strict signature are valid"

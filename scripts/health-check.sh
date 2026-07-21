@@ -94,6 +94,45 @@ model_artifact_policy() {
   fi
 }
 
+package_signing_policy() {
+  local package_script="scripts/package-app.sh"
+  local signing_script="scripts/sign-app-bundle.sh"
+  local validation_script="scripts/test_app_bundle.sh"
+
+  if grep -q 'SERVER_TEMP=' "$package_script"; then
+    echo "ERROR: package script still moves local services around the outer signature"
+    return 1
+  fi
+  if grep -E 'codesign[^|]*--sign[^|]*\|\|[[:space:]]*true' "$package_script" "$signing_script"; then
+    echo "ERROR: code signing failures must never be ignored"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/file' "$signing_script"; then
+    echo "ERROR: nested code detection must inspect Mach-O contents"
+    return 1
+  fi
+  if ! grep -Fq 'MetalLib\ executable' "$signing_script"; then
+    echo "ERROR: nested code detection must include MetalLib executables"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH"' "$signing_script"; then
+    echo "ERROR: outer app signature is missing"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH"' "$signing_script"; then
+    echo "ERROR: final strict signature verification is missing"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH"' "$validation_script"; then
+    echo "ERROR: bundle validation script is missing strict verification"
+    return 1
+  fi
+  if [ ! -f MuseTests/PackageScriptTests.swift ]; then
+    echo "ERROR: package signing regression tests are missing"
+    return 1
+  fi
+}
+
 run_optional_tool() {
   local name="$1"
   local command_name="$2"
@@ -114,6 +153,7 @@ run_step "swift-build-debug" swift build
 run_step "swift-build-release" swift build -c release
 run_step "swift-test" swift test
 run_step "model-artifact-policy" model_artifact_policy
+run_step "package-signing-policy" package_signing_policy
 run_step "bash-syntax" bash_syntax
 run_step "python-service-syntax" python_service_syntax
 run_step "python-service-tests" python_service_tests
