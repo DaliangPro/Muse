@@ -70,6 +70,30 @@ python_service_tests() {
   python3 -m unittest discover -s local-service-shared -p 'test_*.py'
 }
 
+model_artifact_policy() {
+  local sources=(
+    "Muse/Services/ModelArtifactManifest.swift"
+    "Muse/Services/ModelManager.swift"
+  )
+
+  if grep -Ein 'https?://[^"[:space:]]*/resolve/(main|master|latest)/' "${sources[@]}"; then
+    echo "ERROR: model artifact URL uses a floating revision"
+    return 1
+  fi
+  if grep -Ein 'URLSessionConfiguration\.default' "${sources[@]}"; then
+    echo "ERROR: model downloads must not use the default URLSession configuration"
+    return 1
+  fi
+  if ! grep -q 'URLSessionConfiguration\.ephemeral' "${sources[@]}"; then
+    echo "ERROR: model downloads are missing an ephemeral URLSession configuration"
+    return 1
+  fi
+  if ! grep -q 'ModelArtifactManifest\.all' MuseTests/ModelArtifactVerificationTests.swift; then
+    echo "ERROR: model artifact manifest integrity test is missing"
+    return 1
+  fi
+}
+
 run_optional_tool() {
   local name="$1"
   local command_name="$2"
@@ -89,6 +113,7 @@ echo "Date:    $(date '+%Y-%m-%d %H:%M:%S %Z')"
 run_step "swift-build-debug" swift build
 run_step "swift-build-release" swift build -c release
 run_step "swift-test" swift test
+run_step "model-artifact-policy" model_artifact_policy
 run_step "bash-syntax" bash_syntax
 run_step "python-service-syntax" python_service_syntax
 run_step "python-service-tests" python_service_tests
