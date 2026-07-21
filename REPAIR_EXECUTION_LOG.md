@@ -6,8 +6,14 @@
 - 审查基线：`7144781af818fd188eff0e67215b63deddcce660`
 - 工作分支：`codex/muse-hardening-v1`
 - 开始前工作区：仅有用户既有未跟踪文件 `CODEX_REPAIR_PLAN.md`；执行过程中不覆盖、不修改、不纳入提交。
-- 真实用户数据目录：未触碰 `~/Library/Application Support/Muse/`。
+- 真实用户数据目录：见下方 2026-07-21 审计更正；MUSE-160 隔离修复完成后的测试不再触碰真实 Muse 目录或系统钥匙串。
 - 自动更新开关：`UpdateChecker.updateChannelEnabled = false`，保持关闭。
+
+### 2026-07-21 真实数据测试隔离审计更正
+
+- MUSE-160 期间静态审计发现，既有 `AssetExtractionLowValueFilterTests` 使用默认 `AssetExtractionService()`，会在此前完整测试中打开默认 `history.db` / `language-assets.db`；既有 `KeychainServiceTests` 会访问真实系统钥匙串、`credentials.json` 与标准 UserDefaults。
+- 因而本日志在 MUSE-160 之前各任务中“完整测试未访问真实用户数据”的表述不准确，以本更正为准。相关测试通常在 teardown 恢复临时写入，但未再次读取真实目录或钥匙串核验持久影响，实际影响无法确认。
+- `b48b180` 已将低价值过滤测试改用内存数据库，并让 XCTest 下的 Keychain、遗留凭据 JSON、Provider 偏好和 debug log 使用进程内隔离；修复后的 467 项完整测试经独立静态复审，未发现默认路径继续访问真实 Muse 目录或系统钥匙串。
 
 ### 基线验证
 
@@ -286,7 +292,7 @@
 | MUSE-130 | ✅ 完成 | `2d9d915` | Provider 级 Endpoint 策略、共享 ephemeral 会话、重定向阻断及有界 SSE 完整性校验完成。 |
 | MUSE-140 | ✅ 完成 | `df15455` | 显式 schema 迁移、内置文件保护、用户词优先与 100 条严格下发上限完成。 |
 | MUSE-150 | ✅ 完成 | `a18762d` | Provider 能力统一门控、启动前回退说明与 Release 本地服务路径闭锁完成。 |
-| MUSE-160 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-160 | ✅ 完成 | `b48b180` | JSON 恢复态、数据库 throwing 查询、UI 故障提示、统一日志脱敏与测试数据隔离完成。 |
 
 ### MUSE-110：让候选入库和提炼提交具备事务性与幂等性
 
@@ -447,3 +453,42 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、450 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
   - `git diff --check`：通过；独立只读终审未发现 P0/P1 或阻断性测试缺口，并独立复跑 25 项定向测试与 Release 构建通过。
 - 遗留风险：未实际启动开发 Python 服务、未用带本地服务的签名 App bundle 验证包装脚本，也未目视验收启动回退 NSAlert；测试全部使用临时目录与注入的构建/所有者策略，未访问真实用户目录。默认 `scripts/package-app.sh` 构建 Release 且通常不带 `BUNDLE_LOCAL_ASR=1`，收紧后这类包不再执行仓库 venv，这是计划要求；本地制品必须显式打包服务，开发调试必须使用 DEBUG 并设置 `MUSE_DEV_SERVER_ROOT`。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
+
+### MUSE-160：显式传播存储故障并统一日志脱敏
+
+- 状态：✅ 完成。
+- 提交：`b48b180`（`修复: 显式传播存储故障并统一日志脱敏`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `678a2d9a5f2d620c8ed8e728353171db06b38dff`；保留执行日志中的进行中标记及既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入代码提交。基线 `swift build` 通过；`swift test` 执行 450 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 先新增 `JSONFileStoreRecoveryTests`、`DatabaseFailurePropagationTests`、`LogRedactionTests`；修复前定向测试明确编译失败，报告缺少显式 JSON 读取状态、throwing 查询、共享脱敏器及可注入 debug log writer。
+  - 随后以失败测试锁定隔离后恢复 URL 稳定、损坏 builtin 不推进 schema、恢复期间禁止保存、Basic/自定义 URL query/多行与转义 JSON、argv 多词敏感值、既有轮转权限、测试进程禁止写真实 debug.log；均先观察红灯再修复转绿。
+  - 独立审计发现结构化 Prompt/Transcript 数组或对象会泄漏后，先新增回归用例并观察 4 项断言失败，再对非字符串正文值执行 fail-closed 脱敏。
+  - 独立审计发现旧测试会构造真实数据库和访问系统钥匙串后，先新增 Keychain 隔离断言并观察编译失败，再将测试凭据、遗留 JSON 与 Provider 偏好改为加锁的进程内后端；低价值过滤测试改用两份内存数据库。
+- 修改：
+  - `JSONFileStore` 以 `missing/value/corrupt` 显式返回读取状态；解码失败串行移动到时间戳 `.corrupt-*` 备份并设为 `0600`，后续读取持续呈现恢复态，读取或隔离失败时也以进程内闸门禁止默认值回写。Mode、Hotword、Snippet 全部使用新状态，迁移不再覆盖损坏文件，设置页提供 Finder 恢复提示。
+  - `HistoryStore`、`LanguageAssetStore` 为核心读取增加 throwing API，prepare、step 与数据库不可用均向上传播；提炼服务和设置 UI 改用 throwing 链路，错误时保留旧快照，并分别显示历史库与资产库错误及重试入口。
+  - 新增共用 `LogRedactor`，覆盖 Authorization、API/access/local token、Prompt、语音正文、URL query、JSON 字符串/数组/对象及启动参数；`AppLogger` 默认 `.private`，识别日志仅公开固定状态与计数。
+  - debug log 写入和轮转提炼为可注入 writer；活动文件与 `.1` 均强制 `0600`，既有轮转文件也会修复权限。XCTest 下静态 debug logger 和 Keychain/credentials/UserDefaults 读写使用无真实目录副作用的隔离路径。
+- 修改文件：
+  - 存储与数据库：`Muse/Services/JSONFileStore.swift`、`ModeStorage.swift`、`HotwordStorage.swift`、`SnippetStorage.swift`、`StorageRecoveryNotice.swift`、`KeychainService.swift`、`Muse/Database/HistoryStore.swift`、`LanguageAssetStore.swift`。
+  - 日志与调用方：`Muse/Services/AppLogger.swift`、`DebugFileLogger.swift`、`LogRedactor.swift`、`AssetExtractionService.swift`、`ModelManager.swift`、`SenseVoiceServerManager.swift`、`Muse/LLM/LLMEndpointPolicy.swift`、`Muse/ASR/AppleASRClient.swift`、`Muse/Session/RecognitionSession.swift`、`Muse/MuseApp.swift`。
+  - UI：`Muse/UI/AppState.swift`、`Settings/AssetLibraryDataSnapshot.swift`、`AssetLibraryExtractionViewModel.swift`、`AssetLibraryTab.swift`、`GeneralSettingsTab.swift`、`SettingsView.swift`。
+  - 测试：`MuseTests/JSONFileStoreRecoveryTests.swift`、`DatabaseFailurePropagationTests.swift`、`LogRedactionTests.swift`、`KeychainServiceTests.swift`、`AssetExtractionNormalizerTests.swift`、`AppStateTests.swift`。
+- 验证：
+  - `swift test --filter 'JSONFileStoreRecoveryTests|DatabaseFailurePropagationTests|LogRedactionTests|KeychainServiceTests|AssetExtractionLowValueFilterTests|AppStateTests'`：38 项，0 失败。
+  - `swift test`：467 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、467 项 Swift 测试、模型制品策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；三轮独立只读审计确认默认测试不访问真实 Muse 目录或系统钥匙串，且未发现剩余 P0/P1。
+- 遗留风险：隔离前的既有完整测试曾打开默认数据库并访问真实系统钥匙串，测试虽设计为恢复临时写入，但未获授权再次检查真实目录或钥匙串，无法确认是否存在持久影响；此事实已在文首审计更正。未用真实损坏配置或真实数据库目视验收恢复提示与错误重试；同一次设置页打开只提示扫描到的第一份损坏文件，多个损坏文件需后续再次打开设置页处理；非 throwing Store API 为兼容边界继续保留并记录错误，核心生产链路已不再使用；显式 `MUSE_REAL_EXTRACTION=1` 的旧质量测试在安全隔离后无法读取真实钥匙串，后续应改用独立集成测试凭据。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，自动更新开关继续保持 `false`。
+
+## 批次 C 收口
+
+- 代码任务：MUSE-110 至 MUSE-160 已按依赖顺序实施，每项均先红灯、再修复、跑定向与全量测试、最后独立提交。
+- 当前代码 HEAD：`b48b180db68b37a9a6ded45c1d255ad6a9254a32`。
+- 自动更新：`UpdateChecker.updateChannelEnabled = false`，未改动；Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未完成，因此继续保持关闭。
+- 真实用户数据：审计确认隔离前的既有完整测试会打开默认数据库并访问系统钥匙串，纠正了此前“未访问”的错误记录；未获授权再次检查或回滚，持久影响无法确认。`b48b180` 已隔离默认数据库、debug log、凭据文件、Provider 偏好与系统钥匙串路径，之后的收口测试未再触碰。
+- 收口自动验收：`bash scripts/health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建通过，全量 `swift test` 执行 467 项、5 项按环境条件跳过、0 失败，模型制品策略、Shell/Python 语法和 12 项 Python 服务测试通过。
+- 收口环境限制：`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按设计标记为 `SKIP`；未安装工具，也未降低构建或测试门槛。
+- 音频测试：遵照用户指示，本批次未执行麦克风、AirPods 或其他音频真机测试；完整 `swift test` 中的纯单元音频缓冲测试仍按仓库硬门槛执行。
+- 待人工项：真实模型 CDN/安装恢复、真实云端与本地 LLM 联调、词库迁移和损坏恢复 UI、Provider 启动回退、冻结本地服务路径，以及 MUSE-120 要求的 Cloud/Local 双制品签名与 SHA256 验收。以上均继续作为发布前 gate，不据此开启自动更新。
