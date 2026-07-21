@@ -5,6 +5,19 @@ import XCTest
 @MainActor
 final class AppStateTests: XCTestCase {
 
+    private func withChineseAppLanguage(_ action: () -> Void) {
+        let savedLanguage = UserDefaults.standard.string(forKey: DefaultsKeys.language)
+        UserDefaults.standard.set(AppLanguage.zh.rawValue, forKey: DefaultsKeys.language)
+        defer {
+            if let savedLanguage {
+                UserDefaults.standard.set(savedLanguage, forKey: DefaultsKeys.language)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.language)
+            }
+        }
+        action()
+    }
+
     func testStartRecordingTransitionsToPreparing() {
         let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.startRecording()
@@ -93,37 +106,43 @@ final class AppStateTests: XCTestCase {
     }
 
     func testFinalizeShowsClipboardFallbackMessage() {
-        let appState = AppState(initialModes: ProcessingMode.defaults)
+        withChineseAppLanguage {
+            let appState = AppState(initialModes: ProcessingMode.defaults)
 
-        appState.finalize(text: "测试文本", outcome: .copiedToClipboard)
+            appState.finalize(text: "测试文本", outcome: .copiedToClipboard)
 
-        XCTAssertEqual(appState.barPhase, .done)
-        XCTAssertEqual(appState.feedbackMessage, "已粘贴到剪贴板")
-        XCTAssertEqual(appState.transcriptionText, "测试文本")
+            XCTAssertEqual(appState.barPhase, .done)
+            XCTAssertEqual(appState.feedbackMessage, "已粘贴到剪贴板")
+            XCTAssertEqual(appState.transcriptionText, "测试文本")
+        }
     }
 
     func testFinalizeWithoutFocusedInputShowsCopyFallbackCard() {
-        let appState = AppState(initialModes: ProcessingMode.defaults)
+        withChineseAppLanguage {
+            let appState = AppState(initialModes: ProcessingMode.defaults)
 
-        appState.finalize(text: "测试文本", outcome: .noFocusedInput(copiedToClipboard: false))
+            appState.finalize(text: "测试文本", outcome: .noFocusedInput(copiedToClipboard: false))
 
-        XCTAssertEqual(appState.barPhase, .copyFallback)
-        XCTAssertEqual(appState.feedbackMessage, "未找到输入位置")
-        XCTAssertFalse(appState.copyFallbackWasCopied)
-        XCTAssertEqual(appState.transcriptionText, "测试文本")
+            XCTAssertEqual(appState.barPhase, .copyFallback)
+            XCTAssertEqual(appState.feedbackMessage, "未找到输入位置")
+            XCTAssertFalse(appState.copyFallbackWasCopied)
+            XCTAssertEqual(appState.transcriptionText, "测试文本")
+        }
     }
 
     func testCopyFallbackCopiesTextAndMarksCopied() {
-        let snapshot = capturePasteboardItems()
-        defer { restorePasteboardItems(snapshot) }
-        let appState = AppState(initialModes: ProcessingMode.defaults)
-        appState.finalize(text: "测试文本", outcome: .noFocusedInput(copiedToClipboard: false))
+        withChineseAppLanguage {
+            let snapshot = capturePasteboardItems()
+            defer { restorePasteboardItems(snapshot) }
+            let appState = AppState(initialModes: ProcessingMode.defaults)
+            appState.finalize(text: "测试文本", outcome: .noFocusedInput(copiedToClipboard: false))
 
-        appState.copyFallbackToClipboard()
+            appState.copyFallbackToClipboard()
 
-        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "测试文本")
-        XCTAssertTrue(appState.copyFallbackWasCopied)
-        XCTAssertEqual(appState.feedbackMessage, "已复制")
+            XCTAssertEqual(NSPasteboard.general.string(forType: .string), "测试文本")
+            XCTAssertTrue(appState.copyFallbackWasCopied)
+            XCTAssertEqual(appState.feedbackMessage, "已复制")
+        }
     }
 
     func testShowErrorDisplaysErrorPhaseAndMessage() {
