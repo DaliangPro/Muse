@@ -20,6 +20,8 @@ enum AppleASRError: Error, LocalizedError {
     }
 }
 
+private struct AppleASREndAudioTimeout: Error {}
+
 actor AppleASRClient: SpeechRecognizer {
 
     private let logger = Logger(subsystem: "pro.daliang.muse.asr", category: "AppleASRClient")
@@ -114,25 +116,19 @@ actor AppleASRClient: SpeechRecognizer {
             request?.endAudio()
         }
 
-        let completed = await withTaskGroup(of: Bool.self) { group in
-            group.addTask { [weak self] in
-                guard let self else { return true }
+        do {
+            try await AsyncTimeout.throwingValue(
+                .seconds(5),
+                timeoutError: AppleASREndAudioTimeout()
+            ) { [weak self] in
+                guard let self else { return }
                 await self.waitForCompletion()
-                return true
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(5))
-                return false
-            }
-
-            let first = await group.next() ?? true
-            group.cancelAll()
-            return first
-        }
-
-        if !completed {
+        } catch is AppleASREndAudioTimeout {
             logger.error("Apple ASR endAudio timeout, using fallback transcript")
             finishStream(emitFallbackFinal: true, error: nil)
+        } catch {
+            throw error
         }
     }
 

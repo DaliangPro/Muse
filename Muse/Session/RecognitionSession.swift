@@ -6,6 +6,8 @@ private struct ASRTeardownResult: Sendable {
     let clean: Bool
 }
 
+private struct BatchFallbackTimeoutError: Error {}
+
 /// REPAIR_PLAN K4：ASR 连接的会话级超时（底层 URLSession 默认 60s 过长）
 struct ASRConnectTimeoutError: Error, LocalizedError {
     var errorDescription: String? {
@@ -1232,60 +1234,52 @@ actor RecognitionSession {
     /// Try to transcribe full audio via the same provider in a fresh connection.
     private func attemptBatchFallback(audio: Data, config: any ASRProviderConfig) async -> String? {
         let provider = activeProvider
-        let resultTask = Task.detached { () -> String? in
-            guard let client = ASRProviderRegistry.createClient(for: provider) else { return nil }
-            do {
-                let options = ASRRequestOptions(enablePunc: true, contextHistoryLength: 0)
-                try await client.connect(config: config, options: options)
-                // Send all audio at once, then signal end
-                try await client.sendAudio(audio)
-                try await client.endAudio()
+        do {
+            return try await AsyncTimeout.throwingValue(
+                .seconds(30),
+                timeoutError: BatchFallbackTimeoutError()
+            ) {
+                guard let client = ASRProviderRegistry.createClient(for: provider) else { return nil }
+                do {
+                    let options = ASRRequestOptions(enablePunc: true, contextHistoryLength: 0)
+                    try await client.connect(config: config, options: options)
+                    // Send all audio at once, then signal end
+                    try await client.sendAudio(audio)
+                    try await client.endAudio()
 
-                // Wait for final transcript
-                let events = await client.events
-                for await event in events {
-                    switch event {
-                    case .transcript(let transcript) where transcript.isFinal:
-                        await client.disconnect()
-                        // REPAIR_PLAN K2：批量 final 同样可能 auth 短于 composed，取长
-                        let text = RecognitionSession.effectiveTranscriptText(for: transcript)
-                        return text.isEmpty ? nil : text
-                    case .error:
-                        await client.disconnect()
-                        return nil
-                    case .completed:
-                        await client.disconnect()
-                        return nil
-                    default:
-                        continue
+                    // Wait for final transcript
+                    let events = await client.events
+                    for await event in events {
+                        switch event {
+                        case .transcript(let transcript) where transcript.isFinal:
+                            await client.disconnect()
+                            // REPAIR_PLAN K2：批量 final 同样可能 auth 短于 composed，取长
+                            let text = RecognitionSession.effectiveTranscriptText(for: transcript)
+                            return text.isEmpty ? nil : text
+                        case .error:
+                            await client.disconnect()
+                            return nil
+                        case .completed:
+                            await client.disconnect()
+                            return nil
+                        default:
+                            continue
+                        }
                     }
-                }
-                await client.disconnect()
-                return nil
-            } catch {
-                DebugFileLogger.log("batch fallback error: \(error)")
-                await client.disconnect()
-                return nil
-            }
-        }
-        // Hard timeout via withCheckedContinuation (same pattern as withTimeout).
-        // If resultTask is stuck in a non-cooperative await, we return nil after 30s.
-        return await withCheckedContinuation { continuation in
-            let finished = OSAllocatedUnfairLock(initialState: false)
-            Task.detached {
-                let result = await resultTask.value
-                if finished.withLock({ let old = $0; $0 = true; return !old }) {
-                    continuation.resume(returning: result)
+                    await client.disconnect()
+                    return nil
+                } catch {
+                    DebugFileLogger.log("batch fallback error: \(error)")
+                    await client.disconnect()
+                    return nil
                 }
             }
-            Task.detached {
-                try? await Task.sleep(for: .seconds(30))
-                if finished.withLock({ let old = $0; $0 = true; return !old }) {
-                    resultTask.cancel()
-                    DebugFileLogger.log("batch fallback timeout after 30s")
-                    continuation.resume(returning: nil)
-                }
-            }
+        } catch is BatchFallbackTimeoutError {
+            DebugFileLogger.log("batch fallback timeout after 30s")
+            return nil
+        } catch {
+            DebugFileLogger.log("batch fallback cancelled: \(error)")
+            return nil
         }
     }
 

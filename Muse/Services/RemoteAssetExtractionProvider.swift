@@ -102,24 +102,16 @@ actor RemoteAssetExtractionProvider: AssetExtractionProvider {
         }
     }
 
-    /// 超时竞速：操作与定时器谁先完成用谁；超时抛 AssetExtractionError.timeout，
-    /// 外部取消（Task.cancel）正常向下传播
+    /// 统一使用不会等待底层任务配合 cancellation 的硬超时工具。
     static func withTimeout<T: Sendable>(
         seconds: Double,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
-                throw AssetExtractionError.timeout(Int(seconds))
-            }
-            guard let first = try await group.next() else {
-                throw AssetExtractionError.timeout(Int(seconds))
-            }
-            group.cancelAll()
-            return first
-        }
+        try await AsyncTimeout.throwingValue(
+            .seconds(seconds),
+            timeoutError: AssetExtractionError.timeout(Int(seconds)),
+            operation: operation
+        )
     }
 
     private nonisolated static func buildInput(records: [HistoryRecord], configuration: AssetExtractionConfiguration) -> String {
