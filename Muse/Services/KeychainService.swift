@@ -7,6 +7,33 @@ enum KeychainService {
     private static let lock = NSLock()
     private static let keychainServiceName = "pro.daliang.muse.credentials"
 
+    /// XCTest 进程不得读取真实 Application Support、UserDefaults 或系统钥匙串。
+    /// 使用进程内后端还能让默认构造的业务对象在测试中保持安全，而无需全局目录开关。
+    private struct IsolatedTestStorage {
+        var secureData: [String: Data] = [:]
+        var legacyValues: [String: Any] = [:]
+        var preferences: [String: String] = [:]
+    }
+
+    private static let isolatedTestLock = NSLock()
+    private static var isolatedTestStorage = IsolatedTestStorage()
+    private static let isRunningTests: Bool = {
+        let process = ProcessInfo.processInfo
+        return process.environment["XCTestConfigurationFilePath"] != nil
+            || process.arguments.contains(where: { $0.contains(".xctest") })
+            || NSClassFromString("XCTestCase") != nil
+    }()
+
+    static var isUsingIsolatedTestStorage: Bool { isRunningTests }
+
+    private static func withIsolatedTestStorage<T>(
+        _ body: (inout IsolatedTestStorage) throws -> T
+    ) rethrows -> T {
+        isolatedTestLock.lock()
+        defer { isolatedTestLock.unlock() }
+        return try body(&isolatedTestStorage)
+    }
+
     private static var credentialsURL: URL {
         AppPaths.ensureSupportDir().appendingPathComponent("credentials.json")
     }
@@ -14,6 +41,9 @@ enum KeychainService {
     // MARK: - Core read/write (now supports nested objects)
 
     private static func loadAll() -> [String: Any] {
+        if isRunningTests {
+            return withIsolatedTestStorage { $0.legacyValues }
+        }
         guard let data = try? Data(contentsOf: credentialsURL),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return [:] }
@@ -21,6 +51,10 @@ enum KeychainService {
     }
 
     private static func saveAll(_ dict: [String: Any]) throws {
+        if isRunningTests {
+            withIsolatedTestStorage { $0.legacyValues = dict }
+            return
+        }
         // REPAIR_PLAN C2：credentials.json 只是历史明文凭证的迁移兜底，
         // 清空即删除文件、为空不再创建——新装环境不会出现该文件，
         // 老环境最后一个遗留键迁入钥匙串后文件自动消失
@@ -47,6 +81,10 @@ enum KeychainService {
     }
 
     private static func saveSecureData(_ data: Data, key: String) throws {
+        if isRunningTests {
+            withIsolatedTestStorage { $0.secureData[key] = data }
+            return
+        }
         let query = keychainQuery(for: key)
         let attributes = [kSecValueData as String: data]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
@@ -68,6 +106,9 @@ enum KeychainService {
     }
 
     private static func loadSecureData(key: String) -> Data? {
+        if isRunningTests {
+            return withIsolatedTestStorage { $0.secureData[key] }
+        }
         var query = keychainQuery(for: key)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -88,8 +129,36 @@ enum KeychainService {
 
     @discardableResult
     private static func deleteSecureData(key: String) -> Bool {
+        if isRunningTests {
+            return withIsolatedTestStorage {
+                $0.secureData.removeValue(forKey: key) != nil
+            }
+        }
         let status = SecItemDelete(keychainQuery(for: key) as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
+    }
+
+    private static func preferenceString(forKey key: String) -> String? {
+        if isRunningTests {
+            return withIsolatedTestStorage { $0.preferences[key] }
+        }
+        return UserDefaults.standard.string(forKey: key)
+    }
+
+    private static func setPreference(_ value: String, forKey key: String) {
+        if isRunningTests {
+            withIsolatedTestStorage { $0.preferences[key] = value }
+        } else {
+            UserDefaults.standard.set(value, forKey: key)
+        }
+    }
+
+    private static func removePreference(forKey key: String) {
+        if isRunningTests {
+            _ = withIsolatedTestStorage { $0.preferences.removeValue(forKey: key) }
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
     }
 
     private static func saveSecureString(_ value: String, key: String) throws {
@@ -145,14 +214,14 @@ enum KeychainService {
 
     static var selectedASRProvider: ASRProvider {
         get {
-            guard let raw = UserDefaults.standard.string(forKey: selectedProviderKey),
+            guard let raw = preferenceString(forKey: selectedProviderKey),
                   let provider = ASRProvider(rawValue: raw)
             else { return .volcano }
             return provider
         }
         set {
             let previous = selectedASRProvider
-            UserDefaults.standard.set(newValue.rawValue, forKey: selectedProviderKey)
+            setPreference(newValue.rawValue, forKey: selectedProviderKey)
             guard previous != newValue else { return }
             NotificationCenter.default.post(name: .asrProviderDidChange, object: newValue)
         }
@@ -226,30 +295,30 @@ enum KeychainService {
 
     static var selectedLLMProvider: LLMProvider {
         get {
-            guard let raw = UserDefaults.standard.string(forKey: selectedLLMProviderKey),
+            guard let raw = preferenceString(forKey: selectedLLMProviderKey),
                   let provider = LLMProvider(rawValue: raw)
             else { return .doubao }
             return provider
         }
         set {
-            UserDefaults.standard.set(newValue.rawValue, forKey: selectedLLMProviderKey)
+            setPreference(newValue.rawValue, forKey: selectedLLMProviderKey)
         }
     }
 
     static var selectedAssetExtractionLLMProvider: LLMProvider {
         get {
-            guard let raw = UserDefaults.standard.string(forKey: selectedAssetExtractionLLMProviderKey),
+            guard let raw = preferenceString(forKey: selectedAssetExtractionLLMProviderKey),
                   let provider = LLMProvider(rawValue: raw)
             else { return selectedLLMProvider }
             return provider
         }
         set {
-            UserDefaults.standard.set(newValue.rawValue, forKey: selectedAssetExtractionLLMProviderKey)
+            setPreference(newValue.rawValue, forKey: selectedAssetExtractionLLMProviderKey)
         }
     }
 
     static func resetAssetExtractionLLMProvider() {
-        UserDefaults.standard.removeObject(forKey: selectedAssetExtractionLLMProviderKey)
+        removePreference(forKey: selectedAssetExtractionLLMProviderKey)
     }
 
     // MARK: - LLM Credentials (provider-aware)
@@ -268,14 +337,32 @@ enum KeychainService {
         return sanitized
     }
 
+    static func normalizedLLMCredentialsForStorage(
+        provider: LLMProvider,
+        values: [String: String]
+    ) throws -> [String: String] {
+        var normalized = sanitizeLLMCredentials(values)
+        guard provider != .localQwen else {
+            normalized.removeValue(forKey: "baseURL")
+            return normalized
+        }
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: normalized["baseURL"] ?? "",
+            provider: provider
+        )
+        normalized["baseURL"] = baseURL.absoluteString
+        return normalized
+    }
+
     private static func assetExtractionModelOverrideKey(for provider: LLMProvider) -> String {
         "tf_assetExtractionModelOverride_\(provider.rawValue)"
     }
 
     static func saveLLMCredentials(for provider: LLMProvider, values: [String: String]) throws {
+        let normalized = try normalizedLLMCredentialsForStorage(provider: provider, values: values)
         lock.lock()
         defer { lock.unlock() }
-        try saveSecureDictionary(sanitizeLLMCredentials(values), key: llmStorageKey(for: provider))
+        try saveSecureDictionary(normalized, key: llmStorageKey(for: provider))
         var dict = loadAll()
         dict.removeValue(forKey: llmStorageKey(for: provider))
         try saveAll(dict)
@@ -366,6 +453,7 @@ enum KeychainService {
     /// Migrate legacy flat keys to provider-grouped format,
     /// move Application Support directory, and migrate UserDefaults from old bundle ID.
     static func migrateIfNeeded() {
+        guard !isRunningTests else { return }
         migrateAppSupportDirectory()
         migrateKeychainService()
         migrateUserDefaults()

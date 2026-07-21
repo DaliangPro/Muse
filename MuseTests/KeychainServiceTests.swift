@@ -25,6 +25,10 @@ final class KeychainServiceTests: XCTestCase {
         super.tearDown()
     }
 
+    func testTestProcessUsesIsolatedCredentialStorage() {
+        XCTAssertTrue(KeychainService.isUsingIsolatedTestStorage)
+    }
+
     func testSaveAndLoad() throws {
         try KeychainService.save(key: "test_key", value: "secret123")
         let loaded = KeychainService.load(key: "test_key")

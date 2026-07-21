@@ -92,7 +92,7 @@ struct LLMConfig: Sendable {
     }
 }
 
-protocol SpeechRecognizer: Sendable {
+protocol SpeechRecognizer: AnyObject, Sendable {
     func connect(config: any ASRProviderConfig, options: ASRRequestOptions) async throws
     func sendAudio(_ data: Data) async throws
     func sendAudioBuffer(_ buffer: AVAudioPCMBuffer) async throws

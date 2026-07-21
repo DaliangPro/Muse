@@ -26,6 +26,7 @@ enum LocalLLMServerControl {
                 var enableRequest = URLRequest(url: enableURL)
                 enableRequest.httpMethod = "POST"
                 enableRequest.timeoutInterval = 5
+                LocalServiceAuth.authorize(&enableRequest)
                 _ = try? await URLSession.shared.data(for: enableRequest)
             }
 
@@ -36,6 +37,7 @@ enum LocalLLMServerControl {
             request.timeoutInterval = 60
             let body = #"{"messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#
             request.httpBody = body.data(using: .utf8)
+            LocalServiceAuth.authorize(&request)
 
             AppLogger.log("[Settings] Preloading local LLM model...")
             _ = try? await URLSession.shared.data(for: request)
@@ -53,6 +55,7 @@ enum LocalLLMServerControl {
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.timeoutInterval = 10
+            LocalServiceAuth.authorize(&request)
             _ = try? await URLSession.shared.data(for: request)
         }
         DebugFileLogger.log("LLM unloaded via /llm/unload")

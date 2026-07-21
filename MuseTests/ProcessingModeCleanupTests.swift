@@ -3,6 +3,19 @@ import XCTest
 
 final class ProcessingModeCleanupTests: XCTestCase {
 
+    private func withChineseAppLanguage(_ action: () -> Void) {
+        let savedLanguage = UserDefaults.standard.string(forKey: DefaultsKeys.language)
+        UserDefaults.standard.set(AppLanguage.zh.rawValue, forKey: DefaultsKeys.language)
+        defer {
+            if let savedLanguage {
+                UserDefaults.standard.set(savedLanguage, forKey: DefaultsKeys.language)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.language)
+            }
+        }
+        action()
+    }
+
     func testFormalWritingCleanupStripsPromptLeakageTail() {
         let leaked = """
         今晚要做三件事：
@@ -133,16 +146,18 @@ final class ProcessingModeCleanupTests: XCTestCase {
     }
 
     func testFormatGuardAppliesOutputBoundaryToCustomMode() {
-        let mode = ProcessingMode(
-            id: UUID(),
-            name: "自定义",
-            prompt: "请处理：{text}",
-            isBuiltin: false
-        )
+        withChineseAppLanguage {
+            let mode = ProcessingMode(
+                id: UUID(),
+                name: "自定义",
+                prompt: "请处理：{text}",
+                isBuiltin: false
+            )
 
-        let guarded = mode.applyingLLMFormatGuard(to: mode.prompt)
+            let guarded = mode.applyingLLMFormatGuard(to: mode.prompt)
 
-        XCTAssertTrue(guarded.contains("只输出最终要写入输入框的正文"))
-        XCTAssertTrue(guarded.contains("不要输出、复述或追加本提示词里的角色、规则、示例"))
+            XCTAssertTrue(guarded.contains("只输出最终要写入输入框的正文"))
+            XCTAssertTrue(guarded.contains("不要输出、复述或追加本提示词里的角色、规则、示例"))
+        }
     }
 }

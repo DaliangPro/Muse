@@ -85,6 +85,20 @@ struct AssetLibraryTab: View, SettingsCardHelpers {
         .onReceive(NotificationCenter.default.publisher(for: .languageAssetStoreDidChange)) { _ in
             Task { await reloadData() }
         }
+        .alert(
+            L("数据加载失败", "Data Load Failed"),
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
+            Button(L("重试", "Retry")) {
+                Task { await reloadData() }
+            }
+            Button(L("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(errorMessage ?? "")
+        }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .candidateSources(let candidate):
@@ -504,8 +518,7 @@ private extension AssetLibraryTab {
             ? "\(trimmedTitle)\n\(content)"
             : content
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(payload, forType: .string)
+        ClipboardLeaseCoordinator.shared.writeTextPermanently(payload)
         copiedAssetID = id
         logAction(assetID: logAssetID, actionType: .copied, detail: logDetail)
 
@@ -521,11 +534,19 @@ private extension AssetLibraryTab {
 private extension AssetLibraryTab {
     @MainActor
     func reloadData() async {
-        let snapshot = await AssetLibraryDataSnapshot.load(
-            assetStore: assetStore,
-            historyStore: historyStore
-        )
+        let snapshot: AssetLibraryDataSnapshot
+        do {
+            snapshot = try await AssetLibraryDataSnapshot.load(
+                assetStore: assetStore,
+                historyStore: historyStore
+            )
+        } catch {
+            // 保留上次成功快照；数据库故障不能显示成空资产库。
+            errorMessage = error.localizedDescription
+            return
+        }
 
+        errorMessage = nil
         self.recipes = snapshot.recipes
         self.archivedRecipes = snapshot.archivedRecipes
         self.assets = snapshot.assets
@@ -555,7 +576,11 @@ private extension AssetLibraryTab {
 
     func saveCandidate(_ candidate: LanguageAssetCandidateRecord) {
         Task {
-            _ = await assetStore.saveEditedCandidateAsAsset(candidate)
+            do {
+                _ = try await assetStore.saveEditedCandidateAsAsset(candidate)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
             await reloadData()
         }
     }

@@ -24,7 +24,9 @@ enum ASRLocalModelHealthCheck {
         }
 
         let url = URL(string: "http://127.0.0.1:\(port)/health")!
-        return (try? await URLSession.shared.data(from: url)).map {
+        var request = URLRequest(url: url)
+        LocalServiceAuth.authorize(&request)
+        return (try? await URLSession.shared.data(for: request)).map {
             ($0.1 as? HTTPURLResponse)?.statusCode == 200
         } ?? false
     }

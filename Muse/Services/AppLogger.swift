@@ -9,14 +9,19 @@ import os
 ///
 /// 二者各司其职、互不重复。需要同时记录时，分别调用即可（与历史行为一致）。
 ///
-/// 说明：这里对插值内容显式标记 `.public`，以保持与 NSLog 等价的可见性
-/// （敏感信息已在各调用点脱敏，不会传入明文凭证）。
 enum AppLogger {
 
     private static let subsystem = "pro.daliang.muse"
+    static let logsMessagesAsPrivateByDefault = true
 
-    /// 记录一条信息级日志到系统统一日志。
+    /// 动态消息先统一脱敏，并默认以 private 写入系统日志。
     static func log(_ message: String, category: String = "app") {
-        Logger(subsystem: subsystem, category: category).log("\(message, privacy: .public)")
+        let redacted = LogRedactor.redact(message)
+        Logger(subsystem: subsystem, category: category).log("\(redacted, privacy: .private)")
+    }
+
+    /// 仅供测试验证 AppLogger 与 debug.log 共用同一脱敏入口。
+    static func redactedMessageForTesting(_ message: String) -> String {
+        LogRedactor.redact(message)
     }
 }

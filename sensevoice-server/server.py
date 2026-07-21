@@ -3,7 +3,7 @@
 
 import argparse
 import asyncio
-import json
+import os
 import struct
 import sys
 import socket
@@ -13,21 +13,47 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+_SHARED_SECURITY_DIR = Path(__file__).resolve().parent.parent / "local-service-shared"
+if str(_SHARED_SECURITY_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SECURITY_DIR))
+
+from local_service_security import (
+    AUTH_ENV_NAME,
+    MAX_AUDIO_BYTES,
+    MAX_JSON_BYTES,
+    MAX_WS_FRAME_BYTES,
+    MissingAuthToken,
+    RequestValidationError,
+    WebSocketValidationError,
+    decode_and_validate_llm_body,
+    load_required_token,
+    read_body_limited,
+    validate_http_headers,
+    validate_websocket_audio_frame,
+    validate_websocket_headers,
+)
 from sensevoice_model import load_model, StreamingSenseVoice
 
 app = FastAPI()
 
+_auth_token = os.environ.get(AUTH_ENV_NAME, "")
+
+
+def configure_auth_token(environment=None):
+    """读取本进程会话 token；校验失败时保留原有有效值。"""
+    token = load_required_token(os.environ if environment is None else environment)
+    global _auth_token
+    _auth_token = token
+    return token
+
 
 @app.middleware("http")
 async def _reject_non_local(request: Request, call_next):
-    # REPAIR_PLAN J6：本服务仅供本机 Muse 进程调用（URLSession 不带 Origin 头）。
-    # 浏览器跨站请求必带 Origin、DNS-rebinding 的 Host 非回环域——两类一律 403，
-    # 防恶意网页/本机第三方经 localhost 白嫖本地推理。
-    if request.headers.get("origin") is not None:
-        return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
-    host = (request.headers.get("host") or "").split(":")[0]
-    if host not in ("127.0.0.1", "localhost"):
-        return JSONResponse({"error": "invalid host"}, status_code=403)
+    # Host/Origin 与会话 token 统一校验，错误信息不得包含 token。
+    try:
+        validate_http_headers(request.headers, _auth_token)
+    except RequestValidationError as error:
+        return JSONResponse({"error": str(error)}, status_code=error.status_code)
     return await call_next(request)
 
 
@@ -46,18 +72,22 @@ def get_model():
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    # REPAIR_PLAN J6：浏览器发起的 WebSocket 必带 Origin——accept 前拒绝（403 握手失败），
-    # 仅服务本机进程（HTTP middleware 不覆盖 WS，需单独设防）
-    if ws.headers.get("origin") is not None:
-        await ws.close(code=4003, reason="cross-origin rejected")
+    # HTTP middleware 不覆盖 WS，鉴权及 Host/Origin 必须在 accept 前完成。
+    try:
+        validate_websocket_headers(ws.headers, _auth_token)
+    except WebSocketValidationError as error:
+        await ws.close(code=error.close_code, reason=str(error))
         return
     global _session_busy
-    await ws.accept()
     if _session_busy:
-        # REPAIR_PLAN B3: 已有活跃会话，明确拒绝而不是互相破坏状态
         await ws.close(code=4001, reason="another session is active")
         return
     _session_busy = True
+    try:
+        await ws.accept()
+    except Exception:
+        _session_busy = False
+        raise
     try:
         model = get_model()
         # Reset model state for new session
@@ -74,7 +104,6 @@ async def websocket_endpoint(ws: WebSocket):
     # REPAIR_PLAN J10：final 缓冲 30 分钟封顶（对齐 Swift 侧 B8/J10）。超限即清空并
     # 停止累积——流式结果已实时下发，final 走下方流式兜尾分支，不做半截全量推理
     # （半截 final 会覆盖完整的流式文本，比不做更糟）。
-    max_total_samples = 30 * 60 * 16000
     total_overflowed = False
 
     try:
@@ -102,18 +131,29 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "completed"})
                 break
 
+            try:
+                cumulative_bytes = (
+                    MAX_AUDIO_BYTES if total_overflowed else len(all_samples) * 2
+                )
+                frame = validate_websocket_audio_frame(
+                    len(data), cumulative_bytes=cumulative_bytes
+                )
+            except WebSocketValidationError as error:
+                await ws.close(code=error.close_code, reason=str(error))
+                return
+
             # Convert PCM16 little-endian bytes to int16-range float list
             sample_count = len(data) // 2
             samples = list(struct.unpack(f"<{sample_count}h", data))
-            # REPAIR_PLAN J10：超上限清空并停止累积，final 走流式兜尾
+            # 超限后停止 final 累积，但仍允许当前流式推理兜底。
             if not total_overflowed:
-                if len(all_samples) + sample_count > max_total_samples:
+                if frame.overflowed:
                     total_overflowed = True
                     all_samples.clear()
                     print("[sensevoice] audio buffer over limit; "
                           "final full inference disabled for this session", flush=True)
                 else:
-                    all_samples.extend(samples)
+                    all_samples.extend(samples[:frame.accepted_bytes // 2])
 
             # Run streaming inference (fast partial results)
             for result in model.streaming_inference(samples, is_last=False):
@@ -166,40 +206,20 @@ def _load_llm(model_path: str):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: dict):
+async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
+    try:
+        body = await read_body_limited(request, maximum_bytes=MAX_JSON_BYTES)
+        payload = decode_and_validate_llm_body(body)
+    except RequestValidationError as error:
+        return JSONResponse({"error": str(error)}, status_code=error.status_code)
+
     if _llm is None and not _llm_model_path:
         return JSONResponse({"error": "LLM not configured"}, status_code=503)
 
-    # 入参校验（J15）：仅供本机 Swift 客户端调用，但畸形入参此前会直穿到
-    # llama 推理层抛 500 traceback；类型/边界不合法一律 400 明确拒绝
-    messages = request.get("messages", [])
-    if (
-        not isinstance(messages, list)
-        or not messages
-        or not all(
-            isinstance(m, dict)
-            and isinstance(m.get("role"), str)
-            and isinstance(m.get("content"), str)
-            for m in messages
-        )
-    ):
-        return JSONResponse(
-            {"error": "messages must be a non-empty list of {role, content} strings"},
-            status_code=400,
-        )
-    if sum(len(m["content"]) for m in messages) > 200_000:
-        return JSONResponse({"error": "messages content too large"}, status_code=400)
-
-    temperature = request.get("temperature", 0.7)
-    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
-            or not (0 <= temperature <= 2):
-        return JSONResponse({"error": "temperature must be a number in [0, 2]"}, status_code=400)
-
-    max_tokens = request.get("max_tokens", 1024)
-    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) \
-            or not (1 <= max_tokens <= 8192):
-        return JSONResponse({"error": "max_tokens must be an integer in [1, 8192]"}, status_code=400)
+    messages = payload["messages"]
+    temperature = payload.get("temperature", 0.7)
+    max_tokens = payload.get("max_tokens", 1024)
 
     # Lazy load LLM on first request
     async with _llm_lock:
@@ -243,6 +263,11 @@ def find_free_port():
 
 
 def main():
+    try:
+        configure_auth_token()
+    except MissingAuthToken as error:
+        raise SystemExit(str(error)) from None
+
     parser = argparse.ArgumentParser(description="SenseVoice ASR Server")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--port", type=int, default=0, help="0 = auto-assign")
@@ -309,7 +334,13 @@ def main():
     # Print PORT line so Swift process can discover it
     print(f"PORT:{port}", flush=True)
 
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        ws_max_size=MAX_WS_FRAME_BYTES,
+    )
 
 
 if __name__ == "__main__":

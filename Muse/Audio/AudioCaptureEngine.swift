@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+@preconcurrency import CoreMedia
 
 enum AudioCaptureError: Error, LocalizedError {
     case converterCreationFailed
@@ -76,6 +77,77 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         pcmData.copyBytes(to: mData.assumingMemoryBound(to: UInt8.self), count: pcmData.count)
         buffer.mutableAudioBufferList.pointee.mBuffers.mDataByteSize = UInt32(pcmData.count)
         return buffer
+    }
+
+    static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else {
+            logSampleBufferConversionFailure("data not ready", sampleBuffer: sampleBuffer)
+            return nil
+        }
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+            logSampleBufferConversionFailure("missing format description", sampleBuffer: sampleBuffer)
+            return nil
+        }
+        guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            logSampleBufferConversionFailure("missing stream description", sampleBuffer: sampleBuffer)
+            return nil
+        }
+
+        let asbd = streamDescription.pointee
+        guard asbd.mFormatID == kAudioFormatLinearPCM,
+              let sourceFormat = AVAudioFormat(streamDescription: streamDescription),
+              sourceFormat.commonFormat == .pcmFormatFloat32 || sourceFormat.commonFormat == .pcmFormatInt16
+        else {
+            logSampleBufferConversionFailure("unsupported PCM format", sampleBuffer: sampleBuffer)
+            return nil
+        }
+
+        let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard sampleCount > 0, sampleCount <= CMItemCount(Int32.max) else {
+            logSampleBufferConversionFailure("invalid sample count", sampleBuffer: sampleBuffer)
+            return nil
+        }
+        let frameCount = AVAudioFrameCount(sampleCount)
+        guard let pcmBuffer = AVAudioPCMBuffer(
+            pcmFormat: sourceFormat,
+            frameCapacity: frameCount
+        ) else {
+            logSampleBufferConversionFailure("PCM buffer allocation failed", sampleBuffer: sampleBuffer)
+            return nil
+        }
+        pcmBuffer.frameLength = frameCount
+
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(pcmBuffer.mutableAudioBufferList)
+        let expectedBufferCount = sourceFormat.isInterleaved ? 1 : Int(sourceFormat.channelCount)
+        let expectedBytesPerBuffer = Int(frameCount) * Int(asbd.mBytesPerFrame)
+        guard destinationBuffers.count == expectedBufferCount,
+              expectedBytesPerBuffer > 0,
+              destinationBuffers.allSatisfy({ audioBuffer in
+                  audioBuffer.mData != nil && Int(audioBuffer.mDataByteSize) >= expectedBytesPerBuffer
+              })
+        else {
+            logSampleBufferConversionFailure(
+                "destination AudioBufferList layout mismatch",
+                sampleBuffer: sampleBuffer
+            )
+            return nil
+        }
+
+        let copyStatus = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(sampleCount),
+            into: pcmBuffer.mutableAudioBufferList
+        )
+        guard copyStatus == noErr else {
+            logSampleBufferConversionFailure(
+                "AudioBufferList copy failed status=\(copyStatus)",
+                sampleBuffer: sampleBuffer
+            )
+            return nil
+        }
+
+        return pcmBuffer
     }
 
     // MARK: - Public
@@ -327,7 +399,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     ) {
         let isActiveOutput = stateLock.withLock { activeOutput === output }
         guard isActiveOutput else { return }
-        guard let pcmBuffer = sampleBuffer.toPCMBuffer() else { return }
+        guard let pcmBuffer = Self.makePCMBuffer(from: sampleBuffer) else { return }
 
         // Emit audio level ~20 times/sec (every 3rd callback at typical 60Hz buffer rate)
         levelCounter += 1
@@ -357,14 +429,46 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     // MARK: - Internal
 
     private func convert(buffer pcmBuffer: AVAudioPCMBuffer, using converter: AVAudioConverter) {
-        let frameCapacity = AVAudioFrameCount(
-            Double(pcmBuffer.frameLength) * Self.sampleRate / pcmBuffer.format.sampleRate
-        )
-        guard frameCapacity > 0 else { return }
-        guard let convertedBuffer = AVAudioPCMBuffer(
-            pcmFormat: Self.targetFormat,
-            frameCapacity: frameCapacity
+        guard let convertedBuffer = Self.convertToTargetFormat(
+            pcmBuffer,
+            using: converter
         ) else { return }
+
+        let byteCount = Int(convertedBuffer.frameLength) * MemoryLayout<Int16>.size
+        guard byteCount > 0 else { return }
+
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(convertedBuffer.mutableAudioBufferList)
+        guard audioBuffers.count == 1,
+              let mData = audioBuffers[0].mData,
+              Int(audioBuffers[0].mDataByteSize) >= byteCount
+        else {
+            AppLogger.log("[Audio] Converted buffer has an invalid target AudioBufferList")
+            return
+        }
+        let chunk = Data(bytes: mData, count: byteCount)
+
+        ingest(chunk: chunk)
+    }
+
+    private static func convertToTargetFormat(
+        _ pcmBuffer: AVAudioPCMBuffer,
+        using converter: AVAudioConverter
+    ) -> AVAudioPCMBuffer? {
+        let sourceRate = pcmBuffer.format.sampleRate
+        let sourceFrames = Double(pcmBuffer.frameLength)
+        guard sourceRate.isFinite, sourceRate > 0, sourceFrames > 0 else { return nil }
+
+        let requiredFrames = ceil(sourceFrames * sampleRate / sourceRate) + 1
+        guard requiredFrames.isFinite,
+              requiredFrames > 0,
+              requiredFrames <= Double(AVAudioFrameCount.max)
+        else { return nil }
+
+        let frameCapacity = AVAudioFrameCount(requiredFrames)
+        guard let convertedBuffer = AVAudioPCMBuffer(
+            pcmFormat: targetFormat,
+            frameCapacity: frameCapacity
+        ) else { return nil }
 
         var error: NSError?
         nonisolated(unsafe) var hasData = true
@@ -378,16 +482,33 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
             return nil
         }
 
-        guard status != .error, error == nil else { return }
+        guard status != .error, error == nil else {
+            AppLogger.log(
+                "[Audio] Resampling failed: status=\(status.rawValue), error=\(String(describing: error))"
+            )
+            return nil
+        }
+        return convertedBuffer
+    }
 
-        let byteCount = Int(convertedBuffer.frameLength) * MemoryLayout<Int16>.size
-        guard byteCount > 0 else { return }
+    private static func logSampleBufferConversionFailure(
+        _ reason: String,
+        sampleBuffer: CMSampleBuffer
+    ) {
+        let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+        else {
+            AppLogger.log(
+                "[Audio] Dropped CMSampleBuffer: \(reason); frames=\(sampleCount), format=unknown"
+            )
+            return
+        }
 
-        let audioBuffer = convertedBuffer.audioBufferList.pointee.mBuffers
-        guard let mData = audioBuffer.mData else { return }
-        let chunk = Data(bytes: mData, count: byteCount)
-
-        ingest(chunk: chunk)
+        let asbd = streamDescription.pointee
+        AppLogger.log(
+            "[Audio] Dropped CMSampleBuffer: \(reason); frames=\(sampleCount), rate=\(asbd.mSampleRate), channels=\(asbd.mChannelsPerFrame), bytesPerFrame=\(asbd.mBytesPerFrame), flags=\(asbd.mFormatFlags)"
+        )
     }
 
     /// 转码后的统一入口：累积整段录音（带 B8 上限）+ 切块回调（B2 锁外调用）
@@ -439,6 +560,16 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     }
 
     #if DEBUG
+    static func convertToTargetFormatForTesting(
+        _ pcmBuffer: AVAudioPCMBuffer
+    ) -> AVAudioPCMBuffer? {
+        guard let converter = AVAudioConverter(
+            from: pcmBuffer.format,
+            to: targetFormat
+        ) else { return nil }
+        return convertToTargetFormat(pcmBuffer, using: converter)
+    }
+
     /// 测试入口：绕过采集设备直接灌入转码后的数据
     func ingestForTesting(_ chunk: Data) {
         ingest(chunk: chunk)
@@ -507,37 +638,5 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
     private func currentAudioLevelHandler() -> ((Float) -> Void)? {
         handlerLock.withLock { onAudioLevel }
-    }
-}
-
-// MARK: - CMSampleBuffer → AVAudioPCMBuffer
-
-private extension CMSampleBuffer {
-    func toPCMBuffer() -> AVAudioPCMBuffer? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(self),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)
-        else { return nil }
-
-        guard let avFormat = AVAudioFormat(streamDescription: asbd) else { return nil }
-
-        let frameCount = CMSampleBufferGetNumSamples(self)
-        guard frameCount > 0,
-              let pcmBuffer = AVAudioPCMBuffer(pcmFormat: avFormat, frameCapacity: AVAudioFrameCount(frameCount))
-        else { return nil }
-
-        pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
-
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(self) else { return nil }
-        let length = CMBlockBufferGetDataLength(blockBuffer)
-
-        if let floatData = pcmBuffer.floatChannelData {
-            CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: floatData[0])
-        } else if let int16Data = pcmBuffer.int16ChannelData {
-            CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: int16Data[0])
-        } else {
-            return nil
-        }
-
-        return pcmBuffer
     }
 }

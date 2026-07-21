@@ -1,5 +1,6 @@
 import AppKit
 import CommonCrypto
+import Darwin
 import os
 
 // MARK: - App Updater
@@ -27,6 +28,7 @@ final class AppUpdater {
     private var downloadTask: URLSessionDownloadTask?
     private var resumeData: Data?
     private var currentRelease: UpdateInfo?
+    private var currentArtifact: ResolvedUpdateArtifact?
 
     // MARK: - Directories
 
@@ -53,14 +55,28 @@ final class AppUpdater {
         default: return
         }
 
+        let artifact: ResolvedUpdateArtifact
+        do {
+            artifact = try release.resolvedArtifact(isLocalInstallation: isLocalInstallation)
+        } catch {
+            state = .failed(error.localizedDescription)
+            return
+        }
+
         currentRelease = release
+        currentArtifact = artifact
         downloadedVersion = release.version
-        let url = release.resolvedDmgURL
 
         // Ensure staging directory
-        try? FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        } catch {
+            state = .failed(L("无法创建更新目录: \(error.localizedDescription)",
+                              "Failed to create update directory: \(error.localizedDescription)"))
+            return
+        }
 
-        startDownload(url: url, release: release)
+        startDownload(artifact: artifact, release: release)
     }
 
     func cancelDownload() {
@@ -76,10 +92,10 @@ final class AppUpdater {
     }
 
     func retryDownload() {
-        guard let release = currentRelease else { return }
+        guard let release = currentRelease, let artifact = currentArtifact else { return }
         state = .idle
         if resumeData != nil {
-            startDownload(url: release.resolvedDmgURL, release: release)
+            startDownload(artifact: artifact, release: release)
         } else {
             downloadUpdate(release: release)
         }
@@ -90,15 +106,27 @@ final class AppUpdater {
         guard let version = downloadedVersion else { return }
 
         state = .installing
-        let dmgPath = dmgPath(for: version)
+        guard let artifact = currentArtifact else {
+            state = .failed(L("更新制品信息不存在", "Update artifact information is missing"))
+            return
+        }
+        let dmgPath = dmgPath(for: version, kind: artifact.kind)
 
         guard FileManager.default.fileExists(atPath: dmgPath.path) else {
             state = .failed(L("下载文件不存在", "Downloaded file not found"))
             return
         }
 
-        let signingIdentity = currentSigningIdentity() ?? "-"
+        guard let trashDirectory = FileManager.default.urls(
+            for: .trashDirectory,
+            in: .userDomainMask
+        ).first else {
+            state = .failed(L("无法定位废纸篓，更新已取消", "Unable to locate Trash; update cancelled"))
+            return
+        }
+
         let scriptURL = stagingDir.appendingPathComponent("updater.sh")
+        let updaterReadyURL = Self.makeUpdaterReadyURL(in: stagingDir)
 
         do {
             try Self.updaterScript.write(to: scriptURL, atomically: true, encoding: .utf8)
@@ -121,56 +149,232 @@ final class AppUpdater {
         process.environment = [
             "APP_PID": "\(ProcessInfo.processInfo.processIdentifier)",
             "APP_PATH": Bundle.main.bundlePath,
+            "ARTIFACT_KIND": artifact.kind.rawValue,
             "DMG_PATH": dmgPath.path,
-            "SIGNING_IDENTITY": signingIdentity,
-            "IS_LOCAL": isLocalInstallation ? "1" : "0",
+            "EXPECTED_SHA256": artifact.sha256,
+            "READY_PATH": updaterReadyURL.path,
             "STAGING_DIR": stagingDir.path,
+            "TARGET_VERSION": version,
+            "TRASH_DIR": trashDirectory.path,
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
         ]
         process.qualityOfService = .utility
 
+        var logHandle: FileHandle?
         do {
+            if Self.isSymbolicLink(updaterReadyURL) {
+                throw CocoaError(
+                    .fileWriteInvalidFileName,
+                    userInfo: [NSFilePathErrorKey: updaterReadyURL.path]
+                )
+            }
+            if FileManager.default.fileExists(atPath: updaterReadyURL.path) {
+                try FileManager.default.trashItem(at: updaterReadyURL, resultingItemURL: nil)
+            }
+            logHandle = try Self.configureUpdaterProcessLogging(
+                process,
+                logURL: updateLogURL
+            )
             try process.run()
+            try logHandle?.close()
+            logHandle = nil
             logger.info("Updater script launched, PID=\(process.processIdentifier)")
         } catch {
+            try? logHandle?.close()
             state = .failed(L("无法启动更新脚本: \(error.localizedDescription)",
                               "Failed to launch update script: \(error.localizedDescription)"))
             return
         }
 
-        // Quit the app
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            NSApplication.shared.terminate(nil)
+        // 更新器完成当前 App、制品与事务路径预检后才允许父进程退出。
+        // 若更新器在 ready 前失败，保留当前进程与诊断日志，避免用户陷入无 App 可用的状态。
+        let readyURL = updaterReadyURL
+        Task { @MainActor [weak self] in
+            let ready = await Self.waitForUpdaterReady(
+                process: process,
+                readyURL: readyURL,
+                attempts: 1_200,
+                pollNanoseconds: 100_000_000
+            )
+            if ready {
+                self?.logger.info("Updater preflight completed; terminating parent app")
+                NSApplication.shared.terminate(nil)
+                return
+            }
+
+            if process.isRunning {
+                process.terminate()
+            }
+            guard let self else { return }
+            let log = (try? String(contentsOf: self.updateLogURL, encoding: .utf8)) ?? ""
+            self.state = .failed(Self.postUpdateFailureSummary(log))
+            self.logger.error("Updater exited or timed out before ready; parent app remains running")
         }
+    }
+
+    nonisolated private static func configureUpdaterProcessLogging(
+        _ process: Process,
+        logURL: URL
+    ) throws -> FileHandle {
+        let fileManager = FileManager.default
+        if isSymbolicLink(logURL) {
+            throw CocoaError(
+                .fileWriteInvalidFileName,
+                userInfo: [NSFilePathErrorKey: logURL.path]
+            )
+        }
+        if fileManager.fileExists(atPath: logURL.path) {
+            try fileManager.trashItem(at: logURL, resultingItemURL: nil)
+        }
+        let descriptor = logURL.path.withCString { path in
+            Darwin.open(
+                path,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR
+            )
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        process.standardOutput = handle
+        process.standardError = handle
+        return handle
+    }
+
+    nonisolated private static func isSymbolicLink(_ url: URL) -> Bool {
+        var fileStatus = stat()
+        guard url.path.withCString({ Darwin.lstat($0, &fileStatus) }) == 0 else {
+            return false
+        }
+        return (fileStatus.st_mode & S_IFMT) == S_IFLNK
+    }
+
+    nonisolated private static func makeUpdaterReadyURL(in stagingURL: URL) -> URL {
+        stagingURL.appendingPathComponent("updater-\(UUID().uuidString).ready", isDirectory: true)
+    }
+
+    nonisolated static func updaterReadyURLForTesting(in stagingURL: URL) -> URL {
+        makeUpdaterReadyURL(in: stagingURL)
+    }
+
+    nonisolated static func configureUpdaterProcessLoggingForTesting(
+        _ process: Process,
+        logURL: URL
+    ) throws -> FileHandle {
+        try configureUpdaterProcessLogging(process, logURL: logURL)
+    }
+
+    private static func waitForUpdaterReady(
+        process: Process,
+        readyURL: URL,
+        attempts: Int,
+        pollNanoseconds: UInt64
+    ) async -> Bool {
+        for _ in 0..<attempts {
+            if !process.isRunning {
+                return false
+            }
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(
+                atPath: readyURL.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue, !isSymbolicLink(readyURL) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: pollNanoseconds)
+        }
+        return false
+    }
+
+    static func waitForUpdaterReadyForTesting(
+        process: Process,
+        readyURL: URL,
+        attempts: Int,
+        pollNanoseconds: UInt64
+    ) async -> Bool {
+        await waitForUpdaterReady(
+            process: process,
+            readyURL: readyURL,
+            attempts: attempts,
+            pollNanoseconds: pollNanoseconds
+        )
     }
 
     /// Check post-update status on launch (called from AppDelegate).
     func checkPostUpdateStatus() {
         guard FileManager.default.fileExists(atPath: updateLogURL.path) else { return }
-        defer { cleanupStaging() }
-
         guard let log = try? String(contentsOf: updateLogURL, encoding: .utf8) else { return }
-        if log.contains("SUCCESS") {
+        if Self.postUpdateTerminalStatus(log) == "SUCCESS" {
             logger.info("Post-update check: update succeeded")
-        } else if log.contains("FAILED") {
-            logger.error("Post-update check: update failed, see log")
+            cleanupStaging()
+        } else {
+            let summary = Self.postUpdateFailureSummary(log)
+            state = .failed(summary)
+            logger.error("Post-update check: update failed or incomplete; log retained")
+
+            let rollbackSucceeded = log
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "ROLLBACK_OK" }
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = rollbackSucceeded
+                ? L("Muse 更新失败，原版本已保留或恢复", "Muse update failed; the previous version was kept or restored")
+                : L("Muse 更新未完成，需要手动检查", "Muse update did not complete and needs manual review")
+            alert.informativeText = L(
+                "\(summary)\n\n诊断日志已保留在 Updates/update.log。",
+                "\(summary)\n\nThe diagnostic log remains at Updates/update.log."
+            )
+            alert.addButton(withTitle: L("好", "OK"))
+            alert.runModal()
         }
+    }
+
+    nonisolated private static func postUpdateTerminalStatus(_ log: String) -> String? {
+        log.split(separator: "\n", omittingEmptySubsequences: true)
+            .reversed()
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { $0 == "SUCCESS" || $0 == "FAILED" }
+    }
+
+    nonisolated private static func postUpdateFailureSummary(_ log: String) -> String {
+        let errorLine = log
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .reversed()
+            .first { $0.contains("ERROR:") }
+            .map(String.init)
+        let raw = errorLine?
+            .replacingOccurrences(of: "ERROR:", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = "更新事务未完成，请查看诊断日志确认当前安装状态。"
+        let summary = raw.flatMap { $0.isEmpty ? nil : $0 } ?? fallback
+        return String(summary.prefix(240))
+    }
+
+    nonisolated static func postUpdateFailureSummaryForTesting(_ log: String) -> String {
+        postUpdateFailureSummary(log)
+    }
+
+    nonisolated static func postUpdateTerminalStatusForTesting(_ log: String) -> String? {
+        postUpdateTerminalStatus(log)
     }
 
     func reset() {
         state = .idle
         downloadedVersion = nil
         currentRelease = nil
+        currentArtifact = nil
         resumeData = nil
     }
 
     // MARK: - Download
 
-    private func dmgPath(for version: String) -> URL {
-        stagingDir.appendingPathComponent("Muse-v\(version)-cloud.dmg")
+    private func dmgPath(for version: String, kind: UpdateArtifactKind) -> URL {
+        stagingDir.appendingPathComponent("Muse-v\(version)-\(kind.rawValue).dmg")
     }
 
-    private func startDownload(url: URL, release: UpdateInfo) {
+    private func startDownload(artifact: ResolvedUpdateArtifact, release: UpdateInfo) {
         state = .downloading(progress: 0)
 
         let delegate = UpdateDownloadDelegate(
@@ -197,7 +401,7 @@ final class AppUpdater {
                         self.state = .failed(L("下载失败", "Download failed"))
                         return
                     }
-                    self.finalizeDownload(tempURL: fileURL, release: release)
+                    self.finalizeDownload(tempURL: fileURL, release: release, artifact: artifact)
                 }
             }
         )
@@ -211,7 +415,7 @@ final class AppUpdater {
             self.resumeData = nil
             downloadTask = session.downloadTask(withResumeData: resumeData)
         } else {
-            downloadTask = session.downloadTask(with: url)
+            downloadTask = session.downloadTask(with: artifact.url)
         }
         downloadTask?.resume()
     }
@@ -237,11 +441,23 @@ final class AppUpdater {
         state = .failed(msg)
     }
 
-    private func finalizeDownload(tempURL: URL, release: UpdateInfo) {
-        let destination = dmgPath(for: release.version)
+    private func finalizeDownload(
+        tempURL: URL,
+        release: UpdateInfo,
+        artifact: ResolvedUpdateArtifact
+    ) {
+        let destination = dmgPath(for: release.version, kind: artifact.kind)
 
         // Move downloaded file to staging
-        try? FileManager.default.removeItem(at: destination)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            do {
+                try FileManager.default.trashItem(at: destination, resultingItemURL: nil)
+            } catch {
+                state = .failed(L("无法回收旧下载文件: \(error.localizedDescription)",
+                                  "Failed to move the previous download to Trash: \(error.localizedDescription)"))
+                return
+            }
+        }
         do {
             try FileManager.default.moveItem(at: tempURL, to: destination)
         } catch {
@@ -253,14 +469,11 @@ final class AppUpdater {
         // SHA256 verification（REPAIR_PLAN A2：缺校验值一律拒绝安装，不允许静默跳过）
         state = .verifying
         guard Self.isChecksumAcceptable(
-            expected: release.cloudDmgSHA256,
+            expected: artifact.sha256,
             actual: sha256(fileAt: destination)
         ) else {
-            try? FileManager.default.removeItem(at: destination)
-            let reason = (release.cloudDmgSHA256?.isEmpty ?? true)
-                ? L("更新包缺少校验信息，已拒绝安装", "Update is missing its checksum; installation refused")
-                : L("文件校验失败，请重新下载", "File verification failed, please retry")
-            state = .failed(reason)
+            try? FileManager.default.trashItem(at: destination, resultingItemURL: nil)
+            state = .failed(L("文件校验失败，请重新下载", "File verification failed, please retry"))
             return
         }
 
@@ -273,29 +486,6 @@ final class AppUpdater {
         guard let expected, !expected.isEmpty,
               let actual, !actual.isEmpty else { return false }
         return expected.lowercased() == actual.lowercased()
-    }
-
-    // MARK: - Signing Identity
-
-    private func currentSigningIdentity() -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        proc.arguments = ["-dvvv", Bundle.main.bundlePath]
-        let pipe = Pipe()
-        proc.standardError = pipe
-        proc.standardOutput = FileHandle.nullDevice
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch { return nil }
-
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        for line in output.split(separator: "\n") {
-            if line.hasPrefix("Authority=") {
-                return String(line.dropFirst("Authority=".count))
-            }
-        }
-        return nil
     }
 
     // MARK: - SHA256
@@ -326,8 +516,7 @@ final class AppUpdater {
 
     // MARK: - Updater Script
 
-    /// 纯常量脚本：全部参数经环境变量传入（J15 收口——原先 stagingDir 以字符串
-    /// 插值写进脚本文本，路径含引号/特殊字符时会破坏脚本语法）
+    /// 纯常量脚本：下载制品保持不可变，只通过同目录临时 App 和 rename 事务安装。
     private nonisolated static let updaterScript = """
         #!/bin/bash
         set -euo pipefail
@@ -365,22 +554,24 @@ final class AppUpdater {
         require_env APP_PID
         require_env APP_PATH
         require_env DMG_PATH
-        require_env IS_LOCAL
-        require_env SIGNING_IDENTITY
         require_env STAGING_DIR
+        require_env EXPECTED_SHA256
+        require_env READY_PATH
+        require_env TARGET_VERSION
+        require_env ARTIFACT_KIND
+        require_env TRASH_DIR
 
         require_absolute_path STAGING_DIR "$STAGING_DIR"
-        reject_dangerous_root STAGING_DIR "$STAGING_DIR"
-        mkdir -p "$STAGING_DIR"
-
-        LOG="$STAGING_DIR/update.log"
-        exec > "$LOG" 2>&1
-        echo "Muse updater started at $(date)"
-
         require_absolute_path APP_PATH "$APP_PATH"
         require_absolute_path DMG_PATH "$DMG_PATH"
+        require_absolute_path READY_PATH "$READY_PATH"
+        require_absolute_path TRASH_DIR "$TRASH_DIR"
+        reject_dangerous_root STAGING_DIR "$STAGING_DIR"
         reject_dangerous_root APP_PATH "$APP_PATH"
         reject_dangerous_root DMG_PATH "$DMG_PATH"
+        reject_dangerous_root READY_PATH "$READY_PATH"
+        reject_dangerous_root TRASH_DIR "$TRASH_DIR"
+
         case "$APP_PID" in
             ''|*[!0-9]*) die "APP_PID must be numeric: $APP_PID" ;;
         esac
@@ -389,186 +580,378 @@ final class AppUpdater {
             *) die "APP_PATH must point to an .app bundle: $APP_PATH" ;;
         esac
         [ -d "$APP_PATH/Contents" ] || die "APP_PATH is not an app bundle: $APP_PATH"
+        [ ! -L "$APP_PATH" ] || die "APP_PATH must not be a symbolic link"
+        [ -d "$STAGING_DIR" ] || die "STAGING_DIR does not exist: $STAGING_DIR"
+        [ ! -L "$STAGING_DIR" ] || die "STAGING_DIR must not be a symbolic link"
+        [ -f "$DMG_PATH" ] || die "DMG_PATH is not a regular file: $DMG_PATH"
+        [ ! -L "$DMG_PATH" ] || die "DMG_PATH must not be a symbolic link"
+        [ -d "$TRASH_DIR" ] || die "TRASH_DIR does not exist: $TRASH_DIR"
+        [ ! -L "$TRASH_DIR" ] || die "TRASH_DIR must not be a symbolic link"
+
+        APP_BASENAME="$(/usr/bin/basename "$APP_PATH")"
+        APP_PARENT="$(cd "$(/usr/bin/dirname "$APP_PATH")" && /bin/pwd -P)"
+        [ "$APP_PATH" = "$APP_PARENT/$APP_BASENAME" ] || die "APP_PATH must be canonical"
+        STAGING_REAL="$(cd "$STAGING_DIR" && /bin/pwd -P)"
+        [ "$STAGING_DIR" = "$STAGING_REAL" ] || die "STAGING_DIR must be canonical"
+        TRASH_REAL="$(cd "$TRASH_DIR" && /bin/pwd -P)"
+        [ "$TRASH_DIR" = "$TRASH_REAL" ] || die "TRASH_DIR must be canonical"
+        DMG_PARENT="$(cd "$(/usr/bin/dirname "$DMG_PATH")" && /bin/pwd -P)"
+        [ "$DMG_PARENT" = "$STAGING_REAL" ] || die "DMG_PATH must be a direct child of STAGING_DIR"
+        READY_PARENT="$(cd "$(/usr/bin/dirname "$READY_PATH")" && /bin/pwd -P)"
+        [ "$READY_PARENT" = "$STAGING_REAL" ] \
+            || die "READY_PATH must be a direct child of STAGING_DIR"
+        READY_NAME="$(/usr/bin/basename "$READY_PATH")"
+        case "$READY_PATH" in
+            "$STAGING_REAL"/updater-*.ready) ;;
+            *) die "READY_PATH must be a randomized updater marker inside STAGING_DIR" ;;
+        esac
+        READY_TOKEN="${READY_NAME#updater-}"
+        READY_TOKEN="${READY_TOKEN%.ready}"
+        [ "${#READY_TOKEN}" -eq 36 ] \
+            || die "READY_PATH token must be a UUID"
+        case "$READY_TOKEN" in
+            *[!0-9A-Fa-f-]*) die "READY_PATH token must be a UUID" ;;
+        esac
+        [ ! -e "$READY_PATH" ] && [ ! -L "$READY_PATH" ] \
+            || die "READY_PATH already exists: $READY_PATH"
         case "$DMG_PATH" in
-            "$STAGING_DIR"/*.dmg) ;;
+            "$STAGING_REAL"/*.dmg) ;;
             *) die "DMG_PATH must be a .dmg inside STAGING_DIR: $DMG_PATH" ;;
         esac
-        case "$IS_LOCAL" in
-            0|1) ;;
-            *) die "IS_LOCAL must be 0 or 1: $IS_LOCAL" ;;
+        case "$ARTIFACT_KIND" in
+            cloud|local) ;;
+            *) die "ARTIFACT_KIND must be cloud or local: $ARTIFACT_KIND" ;;
+        esac
+        case "$TARGET_VERSION" in
+            ''|.*|*.|*..*|*[!0-9.]*) die "TARGET_VERSION must be numeric dot-separated: $TARGET_VERSION" ;;
+        esac
+        if [ "${#EXPECTED_SHA256}" -ne 64 ]; then
+            die "EXPECTED_SHA256 must contain 64 hexadecimal characters"
+        fi
+        case "$EXPECTED_SHA256" in
+            *[!0-9A-Fa-f]*) die "EXPECTED_SHA256 must contain 64 hexadecimal characters" ;;
         esac
 
-        BACKUP_PATH="$STAGING_DIR/Muse-backup.app"
-
-        safe_rm_rf() {
-            local target="$1"
-            [ -n "$target" ] || die "refusing rm -rf on empty path"
-            require_absolute_path "rm target" "$target"
-            reject_dangerous_root "rm target" "$target"
-            case "$target" in
-                "$APP_PATH"|"$BACKUP_PATH"|"${TEMP_LOCAL:-__muse_no_temp__}"|"${SERVER_TEMP:-__muse_no_server_temp__}"|"$STAGING_DIR"/*)
-                    rm -rf "$target"
-                    ;;
-                *)
-                    die "refusing rm -rf outside updater-owned paths: $target"
-                    ;;
-            esac
-        }
-
-        safe_rm_file() {
-            local target="$1"
-            [ -n "$target" ] || die "refusing rm -f on empty path"
-            require_absolute_path "rm file target" "$target"
-            case "$target" in
-                "$STAGING_DIR"/*.dmg)
-                    rm -f "$target"
-                    ;;
-                *)
-                    die "refusing rm -f outside updater-owned files: $target"
-                    ;;
-            esac
-        }
+        HDIUTIL_BIN="/usr/bin/hdiutil"
+        CODESIGN_BIN="/usr/bin/codesign"
+        OPEN_BIN="/usr/bin/open"
+        DITTO_BIN="/usr/bin/ditto"
+        MV_BIN="/bin/mv"
+        if [ "${MUSE_UPDATER_TEST_MODE:-0}" = "1" ]; then
+            HDIUTIL_BIN="${MUSE_UPDATER_HDIUTIL_BIN:-$HDIUTIL_BIN}"
+            CODESIGN_BIN="${MUSE_UPDATER_CODESIGN_BIN:-$CODESIGN_BIN}"
+            OPEN_BIN="${MUSE_UPDATER_OPEN_BIN:-$OPEN_BIN}"
+            DITTO_BIN="${MUSE_UPDATER_DITTO_BIN:-$DITTO_BIN}"
+            MV_BIN="${MUSE_UPDATER_MV_BIN:-$MV_BIN}"
+            [ -x "$HDIUTIL_BIN" ] || die "test hdiutil shim is not executable"
+            [ -x "$CODESIGN_BIN" ] || die "test codesign shim is not executable"
+            [ -x "$OPEN_BIN" ] || die "test open shim is not executable"
+            [ -x "$DITTO_BIN" ] || die "test ditto shim is not executable"
+            [ -x "$MV_BIN" ] || die "test mv shim is not executable"
+        fi
 
         if [ "${MUSE_UPDATER_DRY_RUN:-0}" = "1" ]; then
             echo "DRY_RUN: updater environment validated"
             exit 0
         fi
 
-        # Wait for app to exit
-        while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.2; done
-        sleep 0.5
-        echo "App exited."
+        echo "Muse updater started at $(/bin/date)"
 
-        # Mount DMG
-        echo "Mounting DMG..."
-        MOUNT_OUTPUT=$(hdiutil attach -nobrowse -noverify -mountrandom /tmp "$DMG_PATH" 2>&1)
-        MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | awk '/\\/tmp\\// {print $NF; exit}')
-        [ -n "$MOUNT_POINT" ] || die "failed to resolve DMG mount point"
-        echo "Mounted at $MOUNT_POINT"
+        TX_ID="${APP_PID}-$(/usr/bin/uuidgen)"
+        TEMP_APP="$APP_PARENT/.Muse-update-$TX_ID.app"
+        BACKUP_PATH="$APP_PARENT/.Muse-backup-$TX_ID.app"
+        FAILED_SIBLING="$APP_PARENT/.Muse-failed-$TX_ID.app"
+        FAILED_DIR="$STAGING_REAL/failed-$TX_ID"
+        FAILED_APP="$FAILED_DIR/candidate-bundle"
+        TRASHED_BACKUP="$TRASH_REAL/Muse-backup-$TX_ID.app"
+        TRASHED_DMG="$TRASH_REAL/Muse-update-$TX_ID.dmg"
+        [ ! -e "$TEMP_APP" ] && [ ! -L "$TEMP_APP" ] \
+            || die "temporary app path already exists: $TEMP_APP"
+        [ ! -e "$BACKUP_PATH" ] && [ ! -L "$BACKUP_PATH" ] \
+            || die "backup app path already exists: $BACKUP_PATH"
+        [ ! -e "$FAILED_SIBLING" ] && [ ! -L "$FAILED_SIBLING" ] \
+            || die "failed app sibling already exists: $FAILED_SIBLING"
+        [ ! -e "$FAILED_DIR" ] && [ ! -L "$FAILED_DIR" ] \
+            || die "failed app path already exists: $FAILED_DIR"
+        [ ! -e "$TRASHED_BACKUP" ] && [ ! -L "$TRASHED_BACKUP" ] \
+            || die "trash backup path already exists: $TRASHED_BACKUP"
+        [ ! -e "$TRASHED_DMG" ] && [ ! -L "$TRASHED_DMG" ] \
+            || die "trash DMG path already exists: $TRASHED_DMG"
+
+        is_numeric_version() {
+            case "$1" in
+                ''|.*|*.|*..*|*[!0-9.]*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        version_is_greater() {
+            local candidate="$1"
+            local current="$2"
+            local old_ifs="$IFS"
+            local i candidate_part current_part count
+            local -a candidate_parts current_parts
+            IFS='.' read -r -a candidate_parts <<< "$candidate"
+            IFS='.' read -r -a current_parts <<< "$current"
+            IFS="$old_ifs"
+            count="${#candidate_parts[@]}"
+            if [ "${#current_parts[@]}" -gt "$count" ]; then
+                count="${#current_parts[@]}"
+            fi
+            i=0
+            while [ "$i" -lt "$count" ]; do
+                candidate_part="${candidate_parts[$i]:-0}"
+                current_part="${current_parts[$i]:-0}"
+                if [ "$candidate_part" -gt "$current_part" ]; then
+                    return 0
+                fi
+                if [ "$candidate_part" -lt "$current_part" ]; then
+                    return 1
+                fi
+                i=$((i + 1))
+            done
+            return 1
+        }
+
+        plist_value() {
+            local app="$1"
+            local key="$2"
+            /usr/libexec/PlistBuddy -c "Print :$key" "$app/Contents/Info.plist" 2>/dev/null
+        }
+
+        team_identifier() {
+            local app="$1"
+            local details
+            details="$("$CODESIGN_BIN" -dvvv "$app" 2>&1)" || return 1
+            echo "$details" | /usr/bin/awk -F= '/^TeamIdentifier=/ {print $2; exit}'
+        }
+
+        validate_artifact_shape() {
+            local app="$1"
+            if [ "$ARTIFACT_KIND" = "local" ]; then
+                [ -d "$app/Contents/MacOS/sensevoice-server-dist" ] || die "Local artifact is missing sensevoice-server-dist"
+                [ -d "$app/Contents/MacOS/qwen3-asr-server-dist" ] || die "Local artifact is missing qwen3-asr-server-dist"
+            else
+                [ ! -e "$app/Contents/MacOS/sensevoice-server-dist" ] || die "Cloud artifact contains sensevoice-server-dist"
+                [ ! -e "$app/Contents/MacOS/qwen3-asr-server-dist" ] || die "Cloud artifact contains qwen3-asr-server-dist"
+            fi
+        }
+
+        validate_candidate() {
+            local app="$1"
+            local phase="$2"
+            local candidate_bundle candidate_version candidate_team
+            [ -d "$app/Contents" ] || die "$phase is not an app bundle"
+            [ ! -L "$app" ] || die "$phase must not be a symbolic link"
+            "$CODESIGN_BIN" --verify --deep --strict --verbose=4 "$app" \
+                || die "$phase strict signature verification failed"
+            candidate_bundle="$(plist_value "$app" CFBundleIdentifier)"
+            candidate_version="$(plist_value "$app" CFBundleShortVersionString)"
+            candidate_team="$(team_identifier "$app")" || die "unable to read $phase TeamIdentifier"
+            [ "$candidate_bundle" = "$CURRENT_BUNDLE_ID" ] \
+                || die "bundle id mismatch: current=$CURRENT_BUNDLE_ID candidate=$candidate_bundle"
+            if [ -z "$candidate_team" ] || [ "$candidate_team" = "not set" ]; then
+                die "$phase has no TeamIdentifier"
+            fi
+            [ "$candidate_team" = "$CURRENT_TEAM" ] \
+                || die "signing team mismatch: current=$CURRENT_TEAM candidate=$candidate_team"
+            [ "$candidate_version" = "$TARGET_VERSION" ] \
+                || die "$phase version does not match manifest: expected=$TARGET_VERSION actual=$candidate_version"
+            version_is_greater "$candidate_version" "$CURRENT_VERSION" \
+                || die "new version must be greater than current version: current=$CURRENT_VERSION new=$candidate_version"
+            validate_artifact_shape "$app"
+        }
+
+        MOUNT_POINT=""
+        MOUNT_ATTACHED=0
+        COMMITTED=0
+        OLD_MOVE_STARTED=0
+        OLD_MOVED=0
 
         cleanup_mount() {
-            [ -n "${MOUNT_POINT:-}" ] && hdiutil detach "$MOUNT_POINT" 2>/dev/null || true
+            if [ "$MOUNT_ATTACHED" -eq 1 ] && [ -n "$MOUNT_POINT" ]; then
+                "$HDIUTIL_BIN" detach "$MOUNT_POINT" >/dev/null 2>&1 \
+                    || echo "WARNING: failed to detach $MOUNT_POINT"
+                MOUNT_ATTACHED=0
+            fi
         }
-        trap cleanup_mount EXIT
 
-        # Find .app in DMG
-        NEW_APP=$(find "$MOUNT_POINT" -maxdepth 1 -name "*.app" -type d | head -1)
-        if [ -z "$NEW_APP" ] || [ ! -d "$NEW_APP" ]; then
-            echo "ERROR: Muse.app not found in DMG"
-            exit 1
-        fi
-        echo "Found: $NEW_APP"
-
-        CURRENT_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP_PATH/Contents/Info.plist")
-        NEW_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$NEW_APP/Contents/Info.plist")
-        if [ "$CURRENT_BUNDLE_ID" != "$NEW_BUNDLE_ID" ]; then
-            echo "ERROR: bundle id mismatch: current=$CURRENT_BUNDLE_ID new=$NEW_BUNDLE_ID"
-            exit 1
-        fi
-
-        echo "Verifying new app signature..."
-        codesign --verify --deep --strict "$NEW_APP"
-
-        CURRENT_TEAM=$(codesign -dvvv "$APP_PATH" 2>&1 | awk -F= '/^TeamIdentifier=/ {print $2; exit}')
-        NEW_TEAM=$(codesign -dvvv "$NEW_APP" 2>&1 | awk -F= '/^TeamIdentifier=/ {print $2; exit}')
-        # REPAIR_PLAN J7：当前安装无 TeamIdentifier（ad-hoc/自签）时更新链没有身份锚点，
-        # 任何能过 codesign --verify 的自签 DMG 都会被接受——此前这里整体跳过比对即静默放行。
-        # 改为直接拒绝自动更新：ad-hoc 安装的用户须手动安装带真实开发者签名的版本后，
-        # 自动更新方可恢复（A1 重开更新通道的前置条件之一）。
-        if [ -z "$CURRENT_TEAM" ] || [ "$CURRENT_TEAM" = "not set" ]; then
-            echo "ERROR: current install has no TeamIdentifier (ad-hoc/self-signed); auto-update refused"
-            exit 1
-        fi
-        if [ "$CURRENT_TEAM" != "$NEW_TEAM" ]; then
-            echo "ERROR: signing team mismatch: current=$CURRENT_TEAM new=$NEW_TEAM"
-            exit 1
-        fi
-        echo "New app passed identity checks."
-
-        # Backup current app
-        safe_rm_rf "$BACKUP_PATH"
-        echo "Backing up $APP_PATH..."
-        cp -R "$APP_PATH" "$BACKUP_PATH"
-
-        # Rollback on error
-        rollback() {
+        finish_transaction() {
+            local status="$?"
+            local rollback_ok=0
+            local quarantine_ready=0
+            local backup_source=""
+            trap - EXIT HUP INT TERM
             set +e
-            echo "ERROR: Update failed, rolling back..."
-            if [ -d "$BACKUP_PATH" ]; then
-                safe_rm_rf "$APP_PATH" 2>/dev/null || true
-                mv "$BACKUP_PATH" "$APP_PATH"
-                echo "Rolled back to backup."
+            if [ "$status" -ne 0 ] && [ "$COMMITTED" -ne 1 ]; then
+                echo "Update failed; checking rollback state..."
+                if /bin/mkdir -p "$FAILED_DIR"; then
+                    quarantine_ready=1
+                else
+                    echo "ERROR: unable to create failed-candidate quarantine at $FAILED_DIR"
+                fi
+
+                if [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; then
+                    backup_source="$BACKUP_PATH"
+                elif [ -e "$TRASHED_BACKUP" ] || [ -L "$TRASHED_BACKUP" ]; then
+                    backup_source="$TRASHED_BACKUP"
+                fi
+
+                if [ -n "$backup_source" ]; then
+                    if [ -e "$APP_PATH" ] || [ -L "$APP_PATH" ]; then
+                        if ! "$MV_BIN" "$APP_PATH" "$FAILED_SIBLING"; then
+                            echo "ERROR: unable to isolate failed installed app at $FAILED_SIBLING"
+                        fi
+                    fi
+                    if [ ! -e "$APP_PATH" ] && [ ! -L "$APP_PATH" ]; then
+                        if "$MV_BIN" "$backup_source" "$APP_PATH"; then
+                            if "$CODESIGN_BIN" --verify --deep --strict --verbose=4 "$APP_PATH"; then
+                                rollback_ok=1
+                            else
+                                echo "ERROR: restored app signature verification failed"
+                            fi
+                        else
+                            echo "ERROR: unable to restore backup from $backup_source"
+                        fi
+                    fi
+                elif [ "$OLD_MOVED" -eq 0 ] && [ -d "$APP_PATH" ] && [ ! -L "$APP_PATH" ]; then
+                    if "$CODESIGN_BIN" --verify --deep --strict --verbose=4 "$APP_PATH"; then
+                        rollback_ok=1
+                    else
+                        echo "ERROR: unchanged current app failed strict signature verification"
+                    fi
+                else
+                    echo "ERROR: backup unavailable; automatic rollback could not be proven"
+                fi
+
+                if [ "$quarantine_ready" -eq 1 ]; then
+                    if [ -e "$FAILED_SIBLING" ] || [ -L "$FAILED_SIBLING" ]; then
+                        "$MV_BIN" "$FAILED_SIBLING" "$FAILED_APP" \
+                            || echo "WARNING: failed candidate remains at $FAILED_SIBLING"
+                    elif [ -e "$TEMP_APP" ] || [ -L "$TEMP_APP" ]; then
+                        "$MV_BIN" "$TEMP_APP" "$FAILED_APP" \
+                            || echo "WARNING: temporary candidate remains at $TEMP_APP"
+                    fi
+                fi
+
+                if [ "$rollback_ok" -eq 1 ]; then
+                    echo "ROLLBACK_OK"
+                    echo "FAILED"
+                    if [ -e "$READY_PATH" ] && [ ! -L "$READY_PATH" ]; then
+                        while kill -0 "$APP_PID" 2>/dev/null; do /bin/sleep 0.2; done
+                        "$OPEN_BIN" "$APP_PATH" >/dev/null 2>&1 \
+                            || echo "WARNING: restored app could not be reopened automatically"
+                    fi
+                else
+                    echo "ROLLBACK_FAILED"
+                    echo "FAILED"
+                fi
             fi
-            open "$APP_PATH" &
-            echo "FAILED"
+            cleanup_mount
+            exit "$status"
         }
-        trap 'rollback; cleanup_mount' ERR
+        handle_termination_signal() {
+            local signal_name="$1"
+            echo "ERROR: updater interrupted by $signal_name" >&2
+            exit 1
+        }
+        trap 'handle_termination_signal HUP' HUP
+        trap 'handle_termination_signal INT' INT
+        trap 'handle_termination_signal TERM' TERM
+        trap finish_transaction EXIT
 
-        # Preserve local components (server dists + models)
-        TEMP_LOCAL=""
-        if [ "$IS_LOCAL" = "1" ]; then
-            TEMP_LOCAL="$(mktemp -d)"
-            echo "Preserving local components to $TEMP_LOCAL..."
-            for item in sensevoice-server-dist sensevoice-server qwen3-asr-server-dist qwen3-asr-server; do
-                [ -e "$APP_PATH/Contents/MacOS/$item" ] && mv "$APP_PATH/Contents/MacOS/$item" "$TEMP_LOCAL/"
-            done
-            [ -d "$APP_PATH/Contents/Resources/Models" ] && mv "$APP_PATH/Contents/Resources/Models" "$TEMP_LOCAL/"
+        "$CODESIGN_BIN" --verify --deep --strict --verbose=4 "$APP_PATH" \
+            || die "current app strict signature verification failed"
+        CURRENT_BUNDLE_ID="$(plist_value "$APP_PATH" CFBundleIdentifier)" \
+            || die "unable to read current Bundle ID"
+        [ -n "$CURRENT_BUNDLE_ID" ] || die "current Bundle ID is empty"
+        CURRENT_VERSION="$(plist_value "$APP_PATH" CFBundleShortVersionString)" \
+            || die "unable to read current version"
+        is_numeric_version "$CURRENT_VERSION" || die "current version is invalid: $CURRENT_VERSION"
+        CURRENT_TEAM="$(team_identifier "$APP_PATH")" || die "unable to read current TeamIdentifier"
+        if [ -z "$CURRENT_TEAM" ] || [ "$CURRENT_TEAM" = "not set" ]; then
+            die "current install has no TeamIdentifier; automatic update refused"
         fi
 
-        # Replace app
-        echo "Replacing app bundle..."
-        safe_rm_rf "$APP_PATH"
-        cp -R "$NEW_APP" "$APP_PATH"
+        EXPECTED_SHA256="$(echo "$EXPECTED_SHA256" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+        ACTUAL_SHA256="$(/usr/bin/shasum -a 256 "$DMG_PATH" | /usr/bin/awk '{print $1}')"
+        ACTUAL_SHA256="$(echo "$ACTUAL_SHA256" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+        [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] \
+            || die "DMG SHA256 mismatch"
 
-        # Restore local components
-        if [ "$IS_LOCAL" = "1" ] && [ -n "$TEMP_LOCAL" ] && [ -d "$TEMP_LOCAL" ]; then
-            echo "Restoring local components..."
-            for item in sensevoice-server-dist sensevoice-server qwen3-asr-server-dist qwen3-asr-server; do
-                [ -e "$TEMP_LOCAL/$item" ] && mv "$TEMP_LOCAL/$item" "$APP_PATH/Contents/MacOS/"
-            done
-            [ -d "$TEMP_LOCAL/Models" ] && mv "$TEMP_LOCAL/Models" "$APP_PATH/Contents/Resources/"
-            safe_rm_rf "$TEMP_LOCAL"
-        fi
+        /bin/mkdir -m 0700 "$READY_PATH" \
+            || die "unable to create updater ready marker"
 
-        # Code sign only if a real signing identity is available (not ad-hoc).
-        # The DMG already contains a properly signed app; re-signing with "-"
-        # would strip the original signature and trigger Gatekeeper "damaged" errors.
-        if [ "$SIGNING_IDENTITY" != "-" ] && [ -n "$SIGNING_IDENTITY" ]; then
-            echo "Signing with identity: $SIGNING_IDENTITY"
-            SERVER_TEMP=""
-            if [ -d "$APP_PATH/Contents/MacOS/sensevoice-server-dist" ]; then
-                SERVER_TEMP="$(mktemp -d)"
-                for item in sensevoice-server-dist sensevoice-server qwen3-asr-server-dist qwen3-asr-server; do
-                    [ -e "$APP_PATH/Contents/MacOS/$item" ] && mv "$APP_PATH/Contents/MacOS/$item" "$SERVER_TEMP/"
-                done
-            fi
+        # Wait for app to exit
+        while kill -0 "$APP_PID" 2>/dev/null; do /bin/sleep 0.2; done
+        echo "App exited."
 
-            codesign -f -s "$SIGNING_IDENTITY" "$APP_PATH"
+        "$CODESIGN_BIN" --verify --deep --strict --verbose=4 "$APP_PATH" \
+            || die "current app changed or its signature became invalid before replacement"
+        CURRENT_BUNDLE_ID_NOW="$(plist_value "$APP_PATH" CFBundleIdentifier)" \
+            || die "unable to re-read current Bundle ID"
+        CURRENT_VERSION_NOW="$(plist_value "$APP_PATH" CFBundleShortVersionString)" \
+            || die "unable to re-read current version"
+        CURRENT_TEAM_NOW="$(team_identifier "$APP_PATH")" \
+            || die "unable to re-read current TeamIdentifier"
+        [ "$CURRENT_BUNDLE_ID_NOW" = "$CURRENT_BUNDLE_ID" ] \
+            || die "current Bundle ID changed before replacement"
+        [ "$CURRENT_VERSION_NOW" = "$CURRENT_VERSION" ] \
+            || die "current version changed before replacement"
+        [ -n "$CURRENT_TEAM_NOW" ] && [ "$CURRENT_TEAM_NOW" = "$CURRENT_TEAM" ] \
+            || die "current TeamIdentifier changed before replacement"
 
-            if [ -n "$SERVER_TEMP" ] && [ -d "$SERVER_TEMP" ]; then
-                for item in sensevoice-server-dist sensevoice-server qwen3-asr-server-dist qwen3-asr-server; do
-                    [ -e "$SERVER_TEMP/$item" ] && mv "$SERVER_TEMP/$item" "$APP_PATH/Contents/MacOS/"
-                done
-                safe_rm_rf "$SERVER_TEMP"
-            fi
+        ACTUAL_SHA256="$(/usr/bin/shasum -a 256 "$DMG_PATH" | /usr/bin/awk '{print $1}')"
+        ACTUAL_SHA256="$(echo "$ACTUAL_SHA256" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+        [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] \
+            || die "DMG SHA256 changed before mount"
+
+        echo "Mounting DMG read-only..."
+        if [ "${MUSE_UPDATER_TEST_MODE:-0}" = "1" ]; then
+            MOUNT_POINT="${MUSE_TEST_MOUNT_POINT:-}"
+            [ -n "$MOUNT_POINT" ] && [ -d "$MOUNT_POINT" ] && [ ! -L "$MOUNT_POINT" ] \
+                || die "test mount point is invalid"
         else
-            echo "Skipping code signing (no developer identity, preserving original signature)"
+            MOUNT_POINT="$STAGING_REAL/mount-$TX_ID"
+            [ ! -e "$MOUNT_POINT" ] && [ ! -L "$MOUNT_POINT" ] \
+                || die "mount point already exists: $MOUNT_POINT"
+            /bin/mkdir -m 0700 "$MOUNT_POINT"
         fi
+        if "$HDIUTIL_BIN" attach -readonly -nobrowse -mountpoint "$MOUNT_POINT" "$DMG_PATH"; then
+            MOUNT_ATTACHED=1
+        else
+            die "failed to mount DMG read-only"
+        fi
+        NEW_APP="$MOUNT_POINT/Muse.app"
+        [ -d "$NEW_APP" ] && [ ! -L "$NEW_APP" ] || die "exact Muse.app not found in DMG"
 
-        # Remove quarantine
-        xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
+        validate_candidate "$NEW_APP" "mounted Muse.app"
 
-        # Cleanup
-        echo "Cleaning up..."
-        safe_rm_file "$DMG_PATH"
-        safe_rm_rf "$BACKUP_PATH"
+        echo "Copying immutable app to same-volume temporary path..."
+        "$DITTO_BIN" "$NEW_APP" "$TEMP_APP"
+        validate_candidate "$TEMP_APP" "copied temporary app"
 
-        # Relaunch
-        echo "Relaunching..."
-        open "$APP_PATH" &
+        echo "Replacing app with same-volume renames..."
+        OLD_MOVE_STARTED=1
+        if "$MV_BIN" "$APP_PATH" "$BACKUP_PATH"; then
+            OLD_MOVED=1
+        else
+            die "failed to rename current app to backup"
+        fi
+        "$MV_BIN" "$TEMP_APP" "$APP_PATH" || die "failed to rename temporary app into place"
+        validate_candidate "$APP_PATH" "installed app"
 
-        echo "Update completed successfully at $(date)"
+        cleanup_mount
+        "$MV_BIN" "$BACKUP_PATH" "$TRASHED_BACKUP" \
+            || die "failed to move verified backup to Trash"
+        "$MV_BIN" "$DMG_PATH" "$TRASHED_DMG" \
+            || die "failed to move installed DMG to Trash"
+        COMMITTED=1
+
+        echo "Update completed successfully at $(/bin/date)"
         echo "SUCCESS"
+        "$OPEN_BIN" "$APP_PATH" >/dev/null 2>&1 \
+            || echo "WARNING: updated app could not be reopened automatically"
         """
 
     nonisolated static var updaterScriptForTesting: String { updaterScript }
@@ -576,7 +959,7 @@ final class AppUpdater {
     // MARK: - Cleanup
 
     private func cleanupStaging() {
-        try? FileManager.default.removeItem(at: stagingDir)
+        try? FileManager.default.trashItem(at: stagingDir, resultingItemURL: nil)
     }
 }
 

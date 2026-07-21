@@ -20,19 +20,19 @@ struct AssetLibraryDataSnapshot {
     static func load(
         assetStore: LanguageAssetStore,
         historyStore: HistoryStore
-    ) async -> AssetLibraryDataSnapshot {
-        let recipes = await assetStore.fetchRecipes()
-        let archivedRecipes = await assetStore.fetchRecipes(status: .archived)
-        let assets = await assetStore.fetchAll()
-        let extractionResults = await assetStore.fetchResults()
-        let pendingCandidates = await assetStore.fetchCandidates()
-        let ignoredCandidates = await assetStore.fetchCandidates(status: .ignored)
-        let pendingResults = await assetStore.fetchResults(status: .pending)
-        let savedResults = await assetStore.fetchResults(status: .saved)
-        let rejectedResults = await assetStore.fetchResults(status: .rejected)
-        let recentRuns = await assetStore.fetchRuns(limit: 20)
+    ) async throws -> AssetLibraryDataSnapshot {
+        let recipes = try await assetStore.fetchRecipesOrThrow()
+        let archivedRecipes = try await assetStore.fetchRecipesOrThrow(status: .archived)
+        let assets = try await assetStore.fetchAllOrThrow()
+        let extractionResults = try await assetStore.fetchResultsOrThrow()
+        let pendingCandidates = try await assetStore.fetchCandidatesOrThrow()
+        let ignoredCandidates = try await assetStore.fetchCandidatesOrThrow(status: .ignored)
+        let pendingResults = try await assetStore.fetchResultsOrThrow(status: .pending)
+        let savedResults = try await assetStore.fetchResultsOrThrow(status: .saved)
+        let rejectedResults = try await assetStore.fetchResultsOrThrow(status: .rejected)
+        let recentRuns = try await assetStore.fetchRunsOrThrow(limit: 20)
         // 语料池计数与提炼输入同口径(completed 且有正文)，COUNT 查询不拉全行
-        let totalExtractable = await historyStore.extractableRecordCount()
+        let totalExtractable = try await historyStore.extractableRecordCountOrThrow()
         var sourceIDSet = Set<String>()
         sourceIDSet.formUnion(assets.flatMap(\.sourceRecordIDs))
         sourceIDSet.formUnion(extractionResults.flatMap(\.sourceRecordIDs))
@@ -41,7 +41,9 @@ struct AssetLibraryDataSnapshot {
         sourceIDSet.formUnion(pendingResults.flatMap(\.sourceRecordIDs))
         sourceIDSet.formUnion(savedResults.flatMap(\.sourceRecordIDs))
         let sourceIDs = Array(sourceIDSet)
-        let sourceRecords = sourceIDs.isEmpty ? [] : await historyStore.fetch(ids: sourceIDs)
+        let sourceRecords = sourceIDs.isEmpty
+            ? []
+            : try await historyStore.fetchOrThrow(ids: sourceIDs)
 
         return AssetLibraryDataSnapshot(
             recipes: recipes,

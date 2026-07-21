@@ -7,6 +7,21 @@ final class LanguageAssetStoreTests: XCTestCase {
     private var store: LanguageAssetStore!
     private var testPath: String!
 
+    private func withChineseAppLanguage(
+        _ action: () async throws -> Void
+    ) async rethrows {
+        let savedLanguage = UserDefaults.standard.string(forKey: DefaultsKeys.language)
+        UserDefaults.standard.set(AppLanguage.zh.rawValue, forKey: DefaultsKeys.language)
+        defer {
+            if let savedLanguage {
+                UserDefaults.standard.set(savedLanguage, forKey: DefaultsKeys.language)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.language)
+            }
+        }
+        try await action()
+    }
+
     override func setUp() async throws {
         testPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("muse-assets-\(UUID().uuidString).db").path
@@ -18,7 +33,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: testPath)
     }
 
-    func testInsertJobAndFetchLatestJob() async {
+    func testInsertJobAndFetchLatestJob() async throws {
         let job = AssetExtractionJob(
             id: UUID().uuidString,
             createdAt: Date(),
@@ -32,7 +47,7 @@ final class LanguageAssetStoreTests: XCTestCase {
             errorMessage: nil
         )
 
-        await store.insert(job: job)
+        try await store.insert(job: job)
         let latest = await store.latestJob()
 
         XCTAssertEqual(latest?.id, job.id)
@@ -188,7 +203,7 @@ final class LanguageAssetStoreTests: XCTestCase {
             status: .active
         )
 
-        await store.insert(run: run)
+        try await store.insert(run: run)
         try await store.saveResultsOrThrow([result])
 
         let latestRun = await store.latestRun()
@@ -242,7 +257,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         XCTAssertTrue(assets.isEmpty)
     }
 
-    func testSaveCandidateAsAssetMarksCandidateSavedAndLogsAction() async {
+    func testSaveCandidateAsAssetMarksCandidateSavedAndLogsAction() async throws {
         let candidate = makeCandidate(
             id: "candidate-1",
             scenes: ["标题选题", "内容结构"],
@@ -250,7 +265,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         )
         await store.saveCandidates([candidate])
 
-        let asset = await store.saveCandidateAsAsset(id: candidate.id)
+        let asset = try await store.saveCandidateAsAsset(id: candidate.id)
 
         XCTAssertNotNil(asset)
         XCTAssertEqual(asset?.content, candidate.content)
@@ -263,7 +278,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         XCTAssertEqual(assets.map(\.id), [asset?.id])
     }
 
-    func testSaveEditedCandidateAsAssetUsesEditedFields() async {
+    func testSaveEditedCandidateAsAssetUsesEditedFields() async throws {
         let candidate = makeCandidate(id: "candidate-edit")
         await store.saveCandidates([candidate])
 
@@ -286,7 +301,7 @@ final class LanguageAssetStoreTests: XCTestCase {
             status: .pending
         )
 
-        let asset = await store.saveEditedCandidateAsAsset(edited)
+        let asset = try await store.saveEditedCandidateAsAsset(edited)
 
         XCTAssertNotNil(asset)
         XCTAssertEqual(asset?.assetType, .quote)
@@ -316,7 +331,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         XCTAssertEqual(ignoredCandidateIDs, [candidate.id])
     }
 
-    func testClearPendingCandidatesKeepsIgnoredSavedAndAssets() async {
+    func testClearPendingCandidatesKeepsIgnoredSavedAndAssets() async throws {
         let pendingOne = makeCandidate(id: "candidate-pending-1")
         let pendingTwo = makeCandidate(id: "candidate-pending-2")
         let ignored = makeCandidate(id: "candidate-ignored")
@@ -324,7 +339,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         await store.saveCandidates([pendingOne, pendingTwo, ignored, saved])
 
         await store.ignoreCandidate(id: ignored.id)
-        let asset = await store.saveCandidateAsAsset(id: saved.id)
+        let asset = try await store.saveCandidateAsAsset(id: saved.id)
 
         let deletedCount = await store.clearCandidates(status: .pending)
         let pendingCandidates = await store.fetchCandidates(status: .pending)
@@ -448,52 +463,54 @@ final class LanguageAssetStoreTests: XCTestCase {
     }
 
     func testTwoStageReviewDropsFailingResults() async throws {
-        let historyStore = HistoryStore(path: testPath)
-        let record = HistoryRecord(
-            id: "todo-source-2",
-            createdAt: Date(),
-            durationSeconds: 2,
-            rawText: "原始文本",
-            processingMode: nil,
-            processedText: nil,
-            finalText: "今天要做完结果页，还要验证提炼流程。对了今天天气不错。",
-            status: "completed",
-            characterCount: 28
-        )
-        await historyStore.insert(record)
-        let service = AssetExtractionService(
-            historyStore: historyStore,
-            assetStore: store,
-            provider: MockAssetExtractionProvider(),
-            recipeProvider: MockMultiDraftRecipeProvider(),
-            reviewProvider: MockExtractionReviewProvider(verdicts: [
-                ExtractionReviewVerdict(index: 0, keep: true, score: 88, reason: "明确待办"),
-                ExtractionReviewVerdict(index: 1, keep: true, score: 82, reason: "明确待办"),
-                ExtractionReviewVerdict(index: 2, keep: false, score: 20, reason: "命中忽略标准：闲聊无行动语义"),
-            ])
-        )
+        try await withChineseAppLanguage {
+            let historyStore = HistoryStore(path: testPath)
+            let record = HistoryRecord(
+                id: "todo-source-2",
+                createdAt: Date(),
+                durationSeconds: 2,
+                rawText: "原始文本",
+                processingMode: nil,
+                processedText: nil,
+                finalText: "今天要做完结果页，还要验证提炼流程。对了今天天气不错。",
+                status: "completed",
+                characterCount: 28
+            )
+            await historyStore.insert(record)
+            let service = AssetExtractionService(
+                historyStore: historyStore,
+                assetStore: store,
+                provider: MockAssetExtractionProvider(),
+                recipeProvider: MockMultiDraftRecipeProvider(),
+                reviewProvider: MockExtractionReviewProvider(verdicts: [
+                    ExtractionReviewVerdict(index: 0, keep: true, score: 88, reason: "明确待办"),
+                    ExtractionReviewVerdict(index: 1, keep: true, score: 82, reason: "明确待办"),
+                    ExtractionReviewVerdict(index: 2, keep: false, score: 20, reason: "命中忽略标准：闲聊无行动语义"),
+                ])
+            )
 
-        let result = try await service.extractRecipeResults(
-            configuration: AssetExtractionConfiguration
-                .recent(limit: 10)
-                .applying(recipeID: ExtractionRecipe.todayTodosID)
-        )
-        let pending = await store.fetchResults(runID: result.run.id, status: .pending)
+            let result = try await service.extractRecipeResults(
+                configuration: AssetExtractionConfiguration
+                    .recent(limit: 10)
+                    .applying(recipeID: ExtractionRecipe.todayTodosID)
+            )
+            let pending = await store.fetchResults(runID: result.run.id, status: .pending)
 
-        XCTAssertEqual(result.run.resultCount, 2, "严审应砍掉 1 条不达标产物")
-        XCTAssertEqual(pending.count, 2)
-        XCTAssertFalse(pending.contains { $0.title == "闲聊" }, "被严审砍掉的产物不应进待确认")
-        XCTAssertTrue(result.run.summary?.contains("宽提 3") ?? false, "run 摘要应含两段统计: \(result.run.summary ?? "nil")")
-        XCTAssertTrue(result.run.summary?.contains("砍 1") ?? false)
+            XCTAssertEqual(result.run.resultCount, 2, "严审应砍掉 1 条不达标产物")
+            XCTAssertEqual(pending.count, 2)
+            XCTAssertFalse(pending.contains { $0.title == "闲聊" }, "被严审砍掉的产物不应进待确认")
+            XCTAssertTrue(result.run.summary?.contains("宽提 3") ?? false, "run 摘要应含两段统计: \(result.run.summary ?? "nil")")
+            XCTAssertTrue(result.run.summary?.contains("砍 1") ?? false)
 
-        // 砍单也落库(rejected)：可翻、可捞回，捞回后回到待确认
-        let rejected = await store.fetchResults(runID: result.run.id, status: .rejected)
-        XCTAssertEqual(rejected.map(\.title), ["闲聊"])
-        XCTAssertEqual(rejected.first?.reviewReason, "命中忽略标准：闲聊无行动语义")
-        if let rejectedID = rejected.first?.id {
-            await store.updateResultStatus(id: rejectedID, to: .pending)
-            let restored = await store.fetchResults(runID: result.run.id, status: .pending)
-            XCTAssertEqual(restored.count, 3, "捞回后应回到待确认")
+            // 砍单也落库(rejected)：可翻、可捞回，捞回后回到待确认
+            let rejected = await store.fetchResults(runID: result.run.id, status: .rejected)
+            XCTAssertEqual(rejected.map(\.title), ["闲聊"])
+            XCTAssertEqual(rejected.first?.reviewReason, "命中忽略标准：闲聊无行动语义")
+            if let rejectedID = rejected.first?.id {
+                await store.updateResultStatus(id: rejectedID, to: .pending)
+                let restored = await store.fetchResults(runID: result.run.id, status: .pending)
+                XCTAssertEqual(restored.count, 3, "捞回后应回到待确认")
+            }
         }
     }
 

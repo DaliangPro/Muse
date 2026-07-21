@@ -13,6 +13,25 @@ enum VolcASRError: Error, LocalizedError {
     }
 }
 
+protocol VolcWebSocketTasking: AnyObject, Sendable {
+    func resume()
+    func send(_ message: URLSessionWebSocketTask.Message) async throws
+    func receive() async throws -> URLSessionWebSocketTask.Message
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+}
+
+extension URLSessionWebSocketTask: VolcWebSocketTasking {}
+
+struct VolcDialResources: Sendable {
+    let task: any VolcWebSocketTasking
+    let invalidateSession: @Sendable () -> Void
+}
+
+typealias VolcDialFactory = @Sendable (
+    _ request: URLRequest,
+    _ configuration: URLSessionConfiguration
+) -> VolcDialResources
+
 actor VolcASRClient: WebSocketASRClient {
 
     private static let endpoint =
@@ -20,20 +39,47 @@ actor VolcASRClient: WebSocketASRClient {
 
     // MARK: - State
 
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var session: URLSession?
+    private let dialFactory: VolcDialFactory
+    private var webSocketTask: (any VolcWebSocketTasking)?
+    private var invalidateSession: (@Sendable () -> Void)?
+    private var connectionID: UUID?
     private var receiveTask: Task<Void, Never>?
+    private var receiveTaskConnectionID: UUID?
     private var didRequestEndAudio = false
     private var didEmitTerminalEvent = false
+    private var staleReceiveLoopExitCount = 0
 
     var eventContinuation: AsyncStream<RecognitionEvent>.Continuation?
     var _events: AsyncStream<RecognitionEvent>?
+
+    init(dialFactory: @escaping VolcDialFactory = { request, configuration in
+        let session = URLSession(configuration: configuration)
+        let task = session.webSocketTask(with: request)
+        return VolcDialResources(
+            task: task,
+            invalidateSession: { session.invalidateAndCancel() }
+        )
+    }) {
+        self.dialFactory = dialFactory
+    }
+
+    private func ownsWebSocketTask(
+        _ task: any VolcWebSocketTasking,
+        connectionID expectedConnectionID: UUID
+    ) -> Bool {
+        guard connectionID == expectedConnectionID,
+              let currentTask = webSocketTask else { return false }
+        return ObjectIdentifier(currentTask) == ObjectIdentifier(task)
+    }
 
     // MARK: - Connect
 
     func connect(config: any ASRProviderConfig, options: ASRRequestOptions = ASRRequestOptions()) async throws {
         guard let volcConfig = config as? VolcanoASRConfig else {
             throw VolcASRError.unsupportedProvider
+        }
+        if connectionID != nil || receiveTask != nil || webSocketTask != nil {
+            disconnect()
         }
 
         // Ensure fresh event stream
@@ -48,6 +94,7 @@ actor VolcASRClient: WebSocketASRClient {
         didAttemptReconnect = false
         didRequestEndAudio = false
         didEmitTerminalEvent = false
+        staleReceiveLoopExitCount = 0
 
         lastTranscript = .empty
         audioPacketCount = 0
@@ -61,6 +108,7 @@ actor VolcASRClient: WebSocketASRClient {
     /// 拨号 + 握手 + 启动接收循环（connect 与重连共用；不触碰事件流与计数状态）
     private func dial(config volcConfig: VolcanoASRConfig, options: ASRRequestOptions) async throws {
         let connectId = UUID().uuidString
+        let newConnectionID = UUID()
 
         var request = URLRequest(url: Self.endpoint)
         request.setValue(volcConfig.appKey, forHTTPHeaderField: "X-Api-App-Key")
@@ -68,11 +116,12 @@ actor VolcASRClient: WebSocketASRClient {
         request.setValue(volcConfig.resourceId, forHTTPHeaderField: "X-Api-Resource-Id")
         request.setValue(connectId, forHTTPHeaderField: "X-Api-Connect-Id")
 
-        let session = URLSession(configuration: options.urlSessionConfiguration)
-        let task = session.webSocketTask(with: request)
+        let resources = dialFactory(request, options.urlSessionConfiguration)
+        let task = resources.task
         task.resume()
-        self.session = session
+        connectionID = newConnectionID
         self.webSocketTask = task
+        invalidateSession = resources.invalidateSession
 
         // Send full_client_request (no compression, plain JSON)
         let payload = VolcProtocol.buildClientRequest(uid: volcConfig.uid, options: options)
@@ -89,6 +138,18 @@ actor VolcASRClient: WebSocketASRClient {
         do {
             try await task.send(.data(message))
         } catch {
+            let failedCurrentConnection = ownsWebSocketTask(
+                task,
+                connectionID: newConnectionID
+            )
+            task.cancel(with: .abnormalClosure, reason: nil)
+            resources.invalidateSession()
+            if failedCurrentConnection {
+                connectionID = nil
+                webSocketTask = nil
+                invalidateSession = nil
+            }
+            guard failedCurrentConnection else { throw CancellationError() }
             // WebSocket handshake failed — probe with HTTP to get the real error
             AppLogger.log("[ASR] WebSocket send failed: \(String(describing: error)), probing for server error...")
             if let serverError = await Self.probeServerError(request: request) {
@@ -98,9 +159,15 @@ actor VolcASRClient: WebSocketASRClient {
         }
 
         AppLogger.log("[ASR] full_client_request sent OK")
+        guard connectionID == newConnectionID,
+              ownsWebSocketTask(task, connectionID: newConnectionID) else {
+            task.cancel(with: .goingAway, reason: nil)
+            resources.invalidateSession()
+            throw CancellationError()
+        }
 
         // Start receive loop
-        startReceiveLoop()
+        startReceiveLoop(connectionID: newConnectionID, task: task)
     }
 
     /// When WebSocket handshake is rejected, make a plain HTTPS request to get the actual error body.
@@ -165,21 +232,34 @@ actor VolcASRClient: WebSocketASRClient {
     private var didAttemptReconnect = false
 
     func sendAudio(_ data: Data) async throws {
-        guard let task = webSocketTask else { return }
+        guard let task = webSocketTask,
+              let sendingConnectionID = connectionID else { return }
         let packet = VolcProtocol.encodeAudioPacket(
             audioData: data,
             isLast: false
         )
         do {
             try await task.send(.data(packet))
+            guard ownsWebSocketTask(task, connectionID: sendingConnectionID) else {
+                throw CancellationError()
+            }
         } catch {
             // REPAIR_PLAN B7b：发送失败先尝试一次静默重连再重发本包；
             // 重连失败则抛出原错误，走既有失败路径（批量兜底）
-            guard !didAttemptReconnect else { throw error }
+            guard ownsWebSocketTask(task, connectionID: sendingConnectionID),
+                  !didAttemptReconnect else { throw error }
             didAttemptReconnect = true
-            try await reconnectOnce(afterError: error)
-            guard let newTask = webSocketTask else { throw error }
+            try await reconnectOnce(
+                afterError: error,
+                expectedConnectionID: sendingConnectionID
+            )
+            guard let newTask = webSocketTask,
+                  let newConnectionID = connectionID,
+                  ownsWebSocketTask(newTask, connectionID: newConnectionID) else { throw error }
             try await newTask.send(.data(packet))
+            guard ownsWebSocketTask(newTask, connectionID: newConnectionID) else {
+                throw CancellationError()
+            }
             // 告知会话层本次流式已降级：停止后仍需批量复核全文
             // （断线到重连之间的语音服务端没听到，实时字幕只是显示连续）
             emitEvent(.streamingInterrupted)
@@ -189,16 +269,31 @@ actor VolcASRClient: WebSocketASRClient {
     }
 
     /// 重拨一次：冻结已确认文本 → 撤旧连接 → 重新握手。失败抛出原错误
-    private func reconnectOnce(afterError underlying: Error) async throws {
+    private func reconnectOnce(
+        afterError underlying: Error,
+        expectedConnectionID: UUID
+    ) async throws {
+        guard connectionID == expectedConnectionID else { throw underlying }
         AppLogger.log("[ASR] 连接中断，尝试静默重连…")
         carriedSegments = lastTranscript.confirmedSegments
             + (lastTranscript.partialText.isEmpty ? [] : [lastTranscript.partialText])
-        receiveTask?.cancel()
+
+        let oldReceiveTask = receiveTaskConnectionID == expectedConnectionID
+            ? receiveTask
+            : nil
+        let oldWebSocketTask = webSocketTask
+        let oldInvalidateSession = invalidateSession
+
+        // 先使旧连接身份失效，再取消资源；旧 receive loop 晚到退出时无权触碰新连接。
+        connectionID = nil
         receiveTask = nil
-        webSocketTask?.cancel(with: .abnormalClosure, reason: nil)
+        receiveTaskConnectionID = nil
         webSocketTask = nil
-        session?.invalidateAndCancel()
-        session = nil
+        invalidateSession = nil
+
+        oldReceiveTask?.cancel()
+        oldWebSocketTask?.cancel(with: .abnormalClosure, reason: nil)
+        oldInvalidateSession?()
         guard let config = savedConfig, let options = savedOptions else { throw underlying }
         do {
             try await dial(config: config, options: options)
@@ -225,51 +320,93 @@ actor VolcASRClient: WebSocketASRClient {
     // MARK: - Disconnect
 
     func disconnect() {
-        receiveTask?.cancel()
+        let oldReceiveTask = receiveTask
+        let oldWebSocketTask = webSocketTask
+        let oldInvalidateSession = invalidateSession
+
+        // 身份先失效，随后才取消旧任务；任何迟到回调都会被 connectionID 守卫拒绝。
+        connectionID = nil
         receiveTask = nil
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        receiveTaskConnectionID = nil
         webSocketTask = nil
-        session?.invalidateAndCancel()
-        session = nil
+        invalidateSession = nil
+
+        oldReceiveTask?.cancel()
+        oldWebSocketTask?.cancel(with: .normalClosure, reason: nil)
+        oldInvalidateSession?()
         eventContinuation?.finish()
         eventContinuation = nil
-        _events = nil
         AppLogger.log("[ASR] Disconnected")
     }
 
     // MARK: - Receive Loop
 
-    private func startReceiveLoop() {
-        receiveTask = Task { [weak self] in
+    private func startReceiveLoop(
+        connectionID: UUID,
+        task: any VolcWebSocketTasking
+    ) {
+        let loopTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 do {
-                    guard let task = await self.webSocketTask else { break }
                     let message = try await task.receive()
-                    await self.handleMessage(message)
+                    await self.handleMessage(message, connectionID: connectionID)
                 } catch {
-                    AppLogger.log("[ASR] Receive loop error: \(String(describing: error))")
-                    if !Task.isCancelled {
-                        if await self.didRequestEndAudio {
-                            await self.emitCompletedOnce()
-                        } else if await self.audioPacketCount == 0 {
-                            // No audio sent yet — real connection/auth error.
-                            await self.emitTerminalError(error)
-                        } else {
-                            AppLogger.log("[ASR] Receive loop interrupted while recording (sent \(await self.audioPacketCount) packets)")
-                            await self.emitEvent(.streamingInterrupted)
-                        }
-                    }
+                    await self.handleReceiveError(
+                        error,
+                        connectionID: connectionID,
+                        wasCancelled: Task.isCancelled
+                    )
                     break
                 }
             }
-            AppLogger.log("[ASR] Receive loop ended")
-            // Finish the event stream so consumers (eventConsumptionTask) can complete.
-            await self.eventContinuation?.finish()
+            await self.receiveLoopDidEnd(connectionID: connectionID)
+        }
+        receiveTask = loopTask
+        receiveTaskConnectionID = connectionID
+    }
+
+    private func handleReceiveError(
+        _ error: Error,
+        connectionID: UUID,
+        wasCancelled: Bool
+    ) {
+        guard self.connectionID == connectionID else { return }
+        AppLogger.log("[ASR] Receive loop error: \(String(describing: error))")
+        guard !wasCancelled, !didEmitTerminalEvent else { return }
+
+        if didRequestEndAudio {
+            emitCompletedOnce()
+        } else if audioPacketCount == 0 {
+            // No audio sent yet — real connection/auth error.
+            emitTerminalError(error)
+        } else {
+            AppLogger.log("[ASR] Receive loop interrupted while recording (sent \(audioPacketCount) packets)")
+            emitEvent(.streamingInterrupted)
         }
     }
 
-    private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
+    private func receiveLoopDidEnd(connectionID: UUID) {
+        guard self.connectionID == connectionID else {
+            staleReceiveLoopExitCount += 1
+            AppLogger.log("[ASR] Ignored stale receive loop exit connection=\(connectionID)")
+            return
+        }
+        if receiveTaskConnectionID == connectionID {
+            receiveTask = nil
+            receiveTaskConnectionID = nil
+        }
+        AppLogger.log("[ASR] Receive loop ended connection=\(connectionID)")
+    }
+
+    private func handleMessage(
+        _ message: URLSessionWebSocketTask.Message,
+        connectionID: UUID
+    ) {
+        guard self.connectionID == connectionID, !didEmitTerminalEvent else {
+            AppLogger.log("[ASR] Ignored inactive message connection=\(connectionID)")
+            return
+        }
         switch message {
         case .data(let data):
             let headerByte1 = data.count > 1 ? data[1] : 0
@@ -278,9 +415,11 @@ actor VolcASRClient: WebSocketASRClient {
             // Server error (0xF): could be a real error or just
             // bigmodel_async's "session complete" signal.
             if msgType == 0x0F {
+                var isTerminal = false
                 if didRequestEndAudio {
                     AppLogger.log("[ASR] Session ended by server after endAudio (\(audioPacketCount) audio packets)")
                     emitCompletedOnce()
+                    isTerminal = true
                 } else if audioPacketCount == 0 {
                     // No audio was sent yet — this is a real setup/auth error.
                     do {
@@ -288,13 +427,18 @@ actor VolcASRClient: WebSocketASRClient {
                     } catch {
                         AppLogger.log("[ASR] Server error: \(String(describing: error))")
                         emitTerminalError(error)
+                        isTerminal = true
                     }
                 } else {
                     AppLogger.log("[ASR] Server closed stream before endAudio after \(audioPacketCount) packets")
                     emitEvent(.streamingInterrupted)
                 }
-                webSocketTask?.cancel(with: .normalClosure, reason: nil)
-                webSocketTask = nil
+                if isTerminal {
+                    closeWebSocketIfCurrent(
+                        connectionID: connectionID,
+                        closeCode: .normalClosure
+                    )
+                }
                 return
             }
 
@@ -326,6 +470,10 @@ actor VolcASRClient: WebSocketASRClient {
             } catch {
                 AppLogger.log("[ASR] Decode error: \(String(describing: error))")
                 emitTerminalError(error)
+                closeWebSocketIfCurrent(
+                    connectionID: connectionID,
+                    closeCode: .protocolError
+                )
             }
 
         case .string(let text):
@@ -336,6 +484,19 @@ actor VolcASRClient: WebSocketASRClient {
         }
     }
 
+    private func closeWebSocketIfCurrent(
+        connectionID: UUID,
+        closeCode: URLSessionWebSocketTask.CloseCode
+    ) {
+        guard self.connectionID == connectionID else { return }
+        let task = webSocketTask
+        let invalidate = invalidateSession
+        webSocketTask = nil
+        invalidateSession = nil
+        task?.cancel(with: closeCode, reason: nil)
+        invalidate?()
+    }
+
 
     private func makeTranscript(from result: VolcASRResult, isFinal: Bool) -> RecognitionTranscript {
         Self.transcript(from: result, isFinal: isFinal, carriedSegments: carriedSegments)
@@ -344,13 +505,17 @@ actor VolcASRClient: WebSocketASRClient {
     private func emitCompletedOnce() {
         guard !didEmitTerminalEvent else { return }
         didEmitTerminalEvent = true
-        emitEvent(.completed)
+        eventContinuation?.yield(.completed)
+        eventContinuation?.finish()
+        eventContinuation = nil
     }
 
     private func emitTerminalError(_ error: Error) {
         guard !didEmitTerminalEvent else { return }
         didEmitTerminalEvent = true
-        emitEvent(.error(error))
+        eventContinuation?.yield(.error(error))
+        eventContinuation?.finish()
+        eventContinuation = nil
     }
 
     /// 纯函数：服务端结果 + 重连前冻结前缀 → 统一转写（REPAIR_PLAN B7b，可单测）
@@ -376,3 +541,19 @@ actor VolcASRClient: WebSocketASRClient {
         )
     }
 }
+
+#if DEBUG
+extension VolcASRClient {
+    var staleReceiveLoopExitCountForTesting: Int {
+        staleReceiveLoopExitCount
+    }
+
+    func emitCompletedForTesting() {
+        emitCompletedOnce()
+    }
+
+    func emitTerminalErrorForTesting(_ error: Error) {
+        emitTerminalError(error)
+    }
+}
+#endif

@@ -47,7 +47,11 @@ import sys
 
 paths = [
     pathlib.Path("sensevoice-server/server.py"),
+    pathlib.Path("sensevoice-server/sensevoice_model.py"),
     pathlib.Path("qwen3-asr-server/server.py"),
+    pathlib.Path("local-service-shared/local_service_security.py"),
+    pathlib.Path("local-service-shared/test_local_service_security.py"),
+    pathlib.Path("local-service-shared/test_server_security_wiring.py"),
 ]
 
 failed = False
@@ -61,6 +65,106 @@ for path in paths:
 
 sys.exit(1 if failed else 0)
 PY
+}
+
+python_service_tests() {
+  python3 -m unittest discover -s local-service-shared -p 'test_*.py'
+}
+
+model_artifact_policy() {
+  local sources=(
+    "Muse/Services/ModelArtifactManifest.swift"
+    "Muse/Services/ModelManager.swift"
+  )
+
+  if grep -Ein 'https?://[^"[:space:]]*/resolve/(main|master|latest)/' "${sources[@]}"; then
+    echo "ERROR: model artifact URL uses a floating revision"
+    return 1
+  fi
+  if grep -Ein 'URLSessionConfiguration\.default' "${sources[@]}"; then
+    echo "ERROR: model downloads must not use the default URLSession configuration"
+    return 1
+  fi
+  if ! grep -q 'URLSessionConfiguration\.ephemeral' "${sources[@]}"; then
+    echo "ERROR: model downloads are missing an ephemeral URLSession configuration"
+    return 1
+  fi
+  if ! grep -q 'ModelArtifactManifest\.all' MuseTests/ModelArtifactVerificationTests.swift; then
+    echo "ERROR: model artifact manifest integrity test is missing"
+    return 1
+  fi
+}
+
+package_signing_policy() {
+  local package_script="scripts/package-app.sh"
+  local signing_script="scripts/sign-app-bundle.sh"
+  local validation_script="scripts/test_app_bundle.sh"
+
+  if grep -q 'SERVER_TEMP=' "$package_script"; then
+    echo "ERROR: package script still moves local services around the outer signature"
+    return 1
+  fi
+  if grep -E 'codesign[^|]*--sign[^|]*\|\|[[:space:]]*true' "$package_script" "$signing_script"; then
+    echo "ERROR: code signing failures must never be ignored"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/file' "$signing_script"; then
+    echo "ERROR: nested code detection must inspect Mach-O contents"
+    return 1
+  fi
+  if ! grep -Fq 'MetalLib\ executable' "$signing_script"; then
+    echo "ERROR: nested code detection must include MetalLib executables"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH"' "$signing_script"; then
+    echo "ERROR: outer app signature is missing"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH"' "$signing_script"; then
+    echo "ERROR: final strict signature verification is missing"
+    return 1
+  fi
+  if ! grep -Fq '/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH"' "$validation_script"; then
+    echo "ERROR: bundle validation script is missing strict verification"
+    return 1
+  fi
+  if [ ! -f MuseTests/PackageScriptTests.swift ]; then
+    echo "ERROR: package signing regression tests are missing"
+    return 1
+  fi
+}
+
+ci_release_policy() {
+  local required_files=(
+    ".github/workflows/ci.yml"
+    ".github/workflows/release-verify.yml"
+    "scripts/notarize-release-artifacts.sh"
+    "scripts/release-verify.sh"
+    "scripts/prepare-release-binary.sh"
+    "scripts/run-signed-release-build.sh"
+    "scripts/verify-release-artifact.sh"
+    "scripts/verify-release-environments.sh"
+    "scripts/verify-release-version.sh"
+    ".swiftlint.yml"
+    ".swiftlint-baseline.json"
+    "MuseTests/CIWorkflowTests.swift"
+    "MuseTests/ReleaseVerifyScriptTests.swift"
+  )
+  local file
+  for file in "${required_files[@]}"; do
+    if [ ! -f "$file" ]; then
+      echo "ERROR: required CI/release gate is missing: $file"
+      return 1
+    fi
+  done
+  if ! grep -Fq 'static let updateChannelEnabled = false' Muse/Services/UpdateChecker.swift; then
+    echo "ERROR: automatic updates must remain disabled until real dual-artifact acceptance"
+    return 1
+  fi
+  if grep -Fq 'static let updateChannelEnabled = true' Muse/Services/UpdateChecker.swift; then
+    echo "ERROR: automatic update channel was enabled before real acceptance"
+    return 1
+  fi
 }
 
 run_optional_tool() {
@@ -82,11 +186,15 @@ echo "Date:    $(date '+%Y-%m-%d %H:%M:%S %Z')"
 run_step "swift-build-debug" swift build
 run_step "swift-build-release" swift build -c release
 run_step "swift-test" swift test
+run_step "model-artifact-policy" model_artifact_policy
+run_step "package-signing-policy" package_signing_policy
+run_step "ci-release-policy" ci_release_policy
 run_step "bash-syntax" bash_syntax
 run_step "python-service-syntax" python_service_syntax
+run_step "python-service-tests" python_service_tests
 
 run_optional_tool "shellcheck" shellcheck shellcheck scripts/*.sh
-run_optional_tool "swiftlint" swiftlint swiftlint
+run_optional_tool "swiftlint" swiftlint swiftlint lint --strict --config .swiftlint.yml
 run_optional_tool "periphery" periphery periphery scan
 
 echo

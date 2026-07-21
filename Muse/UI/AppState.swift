@@ -79,8 +79,9 @@ final class AppState {
         set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.hasCompletedSetup) }
     }
 
-    init() {
-        let modes = ModeStorage().load()
+    init(initialModes: [ProcessingMode]? = nil) {
+        // 测试必须注入内存模式，避免读取或隔离真实用户的 modes.json。
+        let modes = initialModes ?? ModeStorage().load()
         availableModes = modes
         currentMode = modes.first(where: { $0.id == ProcessingMode.smartDirectId })
             ?? modes.first
@@ -229,9 +230,7 @@ final class AppState {
             return
         }
 
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        ClipboardLeaseCoordinator.shared.writeTextPermanently(text)
         copyFallbackWasCopied = true
         feedbackMessage = L("已复制", "Copied")
         scheduleAutoHide(for: .copyFallback, delay: .seconds(0.9))

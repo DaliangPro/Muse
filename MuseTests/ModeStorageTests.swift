@@ -6,6 +6,19 @@ final class ModeStorageTests: XCTestCase {
     private let testURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("muse-test-modes.json")
 
+    private func withChineseAppLanguage(_ action: () -> Void) {
+        let savedLanguage = UserDefaults.standard.string(forKey: DefaultsKeys.language)
+        UserDefaults.standard.set(AppLanguage.zh.rawValue, forKey: DefaultsKeys.language)
+        defer {
+            if let savedLanguage {
+                UserDefaults.standard.set(savedLanguage, forKey: DefaultsKeys.language)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.language)
+            }
+        }
+        action()
+    }
+
     override func tearDown() {
         try? FileManager.default.removeItem(at: testURL)
     }
@@ -156,27 +169,31 @@ final class ModeStorageTests: XCTestCase {
     }
 
     func testFormalWritingModeAppliesListFormatGuardToCustomPrompt() {
-        var mode = ProcessingMode.formalWriting
-        mode.prompt = "请润色：{text}"
+        withChineseAppLanguage {
+            var mode = ProcessingMode.formalWriting
+            mode.prompt = "请润色：{text}"
 
-        let guardedPrompt = mode.applyingLLMFormatGuard(to: mode.prompt)
+            let guardedPrompt = mode.applyingLLMFormatGuard(to: mode.prompt)
 
-        XCTAssertTrue(guardedPrompt.contains("枚举事项强制规则"))
-        XCTAssertTrue(guardedPrompt.contains("必须整理成编号列表"))
-        XCTAssertTrue(guardedPrompt.contains("自然分段与口语清理强制规则"))
-        XCTAssertTrue(guardedPrompt.contains("优先级高于前面的自定义 prompt"))
-        XCTAssertTrue(guardedPrompt.contains("必须清理无意义口语填充词"))
-        XCTAssertTrue(guardedPrompt.contains("最终输出中默认不要出现“就是”"))
-        XCTAssertTrue(guardedPrompt.contains("CodeX 写作 Codex"))
+            XCTAssertTrue(guardedPrompt.contains("枚举事项强制规则"))
+            XCTAssertTrue(guardedPrompt.contains("必须整理成编号列表"))
+            XCTAssertTrue(guardedPrompt.contains("自然分段与口语清理强制规则"))
+            XCTAssertTrue(guardedPrompt.contains("优先级高于前面的自定义 prompt"))
+            XCTAssertTrue(guardedPrompt.contains("必须清理无意义口语填充词"))
+            XCTAssertTrue(guardedPrompt.contains("最终输出中默认不要出现“就是”"))
+            XCTAssertTrue(guardedPrompt.contains("CodeX 写作 Codex"))
+        }
     }
 
     func testDirectModeDoesNotApplyListFormatGuard() {
-        let prompt = "原样输出：{text}"
-        let guardedPrompt = ProcessingMode.direct.applyingLLMFormatGuard(to: prompt)
+        withChineseAppLanguage {
+            let prompt = "原样输出：{text}"
+            let guardedPrompt = ProcessingMode.direct.applyingLLMFormatGuard(to: prompt)
 
-        XCTAssertTrue(guardedPrompt.contains(prompt))
-        XCTAssertFalse(guardedPrompt.contains("枚举事项强制规则"))
-        XCTAssertTrue(guardedPrompt.contains("只输出最终要写入输入框的正文"))
+            XCTAssertTrue(guardedPrompt.contains(prompt))
+            XCTAssertFalse(guardedPrompt.contains("枚举事项强制规则"))
+            XCTAssertTrue(guardedPrompt.contains("只输出最终要写入输入框的正文"))
+        }
     }
 
     func testFormalWritingModeCleansLLMResultFillerWords() {

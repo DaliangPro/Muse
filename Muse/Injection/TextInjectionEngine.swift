@@ -17,8 +17,10 @@ final class TextInjectionEngine: @unchecked Sendable {
         let changeCount: Int
         let canRestore: Bool
 
-        static func capture() -> ClipboardSnapshot {
-            let pasteboard = NSPasteboard.general
+        static func capture(
+            from pasteboard: NSPasteboard = .general,
+            logger: (String) -> Void = DebugFileLogger.log
+        ) -> ClipboardSnapshot {
             let changeCount = pasteboard.changeCount
             var items: [Item] = []
             var totalBytes = 0
@@ -35,12 +37,12 @@ final class TextInjectionEngine: @unchecked Sendable {
                         // 2026-07-09 大梁老师实测：微信复制后剪贴板带自家懒加载格式
                         // （com.trolltech.anymime.WeChat_RichEdit_Format data=nil），
                         // 此前一个类型失败即放弃整个快照 → 微信场景恢复永不发生。
-                        DebugFileLogger.log("clipboard capture: skip unreadable type=\(type.rawValue)")
+                        logger("clipboard capture: skip unreadable type=\(type.rawValue)")
                         continue
                     }
                     totalBytes += itemData.count
                     guard totalBytes <= maxSnapshotBytes else {
-                        DebugFileLogger.log("clipboard capture FAIL: over \(maxSnapshotBytes) bytes")
+                        logger("clipboard capture FAIL: over \(maxSnapshotBytes) bytes")
                         return ClipboardSnapshot(items: [], changeCount: changeCount, canRestore: false)
                     }
                     data[type] = itemData
@@ -54,8 +56,13 @@ final class TextInjectionEngine: @unchecked Sendable {
             return ClipboardSnapshot(items: items, changeCount: changeCount, canRestore: true)
         }
 
-        func restore(expectedChangeCount: Int, injectedText: String? = nil) {
-            let pasteboard = NSPasteboard.general
+        @discardableResult
+        func restore(
+            expectedChangeCount: Int,
+            injectedText: String? = nil,
+            on pasteboard: NSPasteboard = .general,
+            logger: (String) -> Void = DebugFileLogger.log
+        ) -> Bool {
             let ccMatch = pasteboard.changeCount == expectedChangeCount
             if !ccMatch {
                 // REPAIR_PLAN J2 回归修复（2026-07-09 大梁老师实测报告）：部分 app
@@ -65,16 +72,16 @@ final class TextInjectionEngine: @unchecked Sendable {
                 let current = pasteboard.string(forType: .string)
                 let textMatch = injectedText != nil && current == injectedText
                 guard textMatch else {
-                    DebugFileLogger.log("clipboard restore SKIP: ccDelta=\(pasteboard.changeCount - expectedChangeCount) currentIsNil=\(current == nil) textMatch=false")
-                    return
+                    logger("clipboard restore SKIP: ccDelta=\(pasteboard.changeCount - expectedChangeCount) currentIsNil=\(current == nil) textMatch=false")
+                    return false
                 }
-                DebugFileLogger.log("clipboard restore: cc moved but text matches, proceeding")
+                logger("clipboard restore: cc moved but text matches, proceeding")
             }
             guard canRestore else {
-                DebugFileLogger.log("clipboard restore SKIP: canRestore=false (snapshot capture had failed)")
-                return
+                logger("clipboard restore SKIP: canRestore=false (snapshot capture had failed)")
+                return false
             }
-            DebugFileLogger.log("clipboard restore OK: items=\(items.count) ccMatch=\(ccMatch)")
+            logger("clipboard restore OK: items=\(items.count) ccMatch=\(ccMatch)")
 
             // 原剪贴板为空时 items 为空——此时仍需 clearContents 清掉刚写入的
             // 识别文本、恢复成「空」的原状；不能因 items 空就直接 return，否则识别文本残留（关了自动复制也留）。
@@ -93,7 +100,28 @@ final class TextInjectionEngine: @unchecked Sendable {
             if !restoredItems.isEmpty {
                 pasteboard.writeObjects(restoredItems)
             }
+            return true
         }
+    }
+
+    private let pasteboard: NSPasteboard
+    private let clipboardLeaseCoordinator: ClipboardLeaseCoordinator
+    private let pasteSimulator: () -> Bool
+    private let sleepForMicroseconds: (useconds_t) -> Void
+    private let logger: (String) -> Void
+
+    init(
+        pasteboard: NSPasteboard = .general,
+        clipboardLeaseCoordinator: ClipboardLeaseCoordinator = .shared,
+        pasteSimulator: (() -> Bool)? = nil,
+        sleep: ((useconds_t) -> Void)? = nil,
+        logger: @escaping (String) -> Void = DebugFileLogger.log
+    ) {
+        self.pasteboard = pasteboard
+        self.clipboardLeaseCoordinator = clipboardLeaseCoordinator
+        self.pasteSimulator = pasteSimulator ?? Self.postPasteKeyboardShortcut
+        self.sleepForMicroseconds = sleep ?? { usleep($0) }
+        self.logger = logger
     }
 
     // MARK: - Public
@@ -347,9 +375,7 @@ final class TextInjectionEngine: @unchecked Sendable {
     }
 
     func copyToClipboard(_ text: String) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        clipboardLeaseCoordinator.writeTextPermanently(text, on: pasteboard)
     }
 
     /// 注入通道的临时写入：内容同 copyToClipboard，但额外标 org.nspasteboard.TransientType——
@@ -360,7 +386,6 @@ final class TextInjectionEngine: @unchecked Sendable {
     /// 注意：不改 copyToClipboard 本身——它还用于「无权限/无输入框」时故意留给用户手动粘贴，
     /// 那些场景若标 transient，管理器会跳过、用户反而找不到。
     private func writeInjectionText(_ text: String) {
-        let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         let item = NSPasteboardItem()
         item.setString(text, forType: .string)
@@ -377,43 +402,71 @@ final class TextInjectionEngine: @unchecked Sendable {
     /// 余量放到已知最慢客户端实测值（300ms）的两倍，统一覆盖未知慢 app，微信特例并入。
     static let clipboardRestoreDelay: TimeInterval = 0.6
 
-    private func injectViaClipboard(_ text: String) -> InjectionOutcome {
-        let savedClipboard = preserveClipboard ? ClipboardSnapshot.capture() : nil
-        let hasFrontmostApplication = NSWorkspace.shared.frontmostApplication != nil
+    func injectViaClipboard(
+        _ text: String,
+        hasFrontmostApplication: Bool? = nil
+    ) -> InjectionOutcome {
+        clipboardLeaseCoordinator.performInjectionTransaction {
+            let hasPasteTarget = hasFrontmostApplication
+                ?? (NSWorkspace.shared.frontmostApplication != nil)
 
-        writeInjectionText(text)
-        let postWriteChangeCount = NSPasteboard.general.changeCount
-
-        usleep(50_000)
-        simulatePaste()
-        usleep(100_000)
-
-        let outcome: InjectionOutcome = hasFrontmostApplication ? .inserted : .copiedToClipboard
-
-        if outcome == .inserted, let savedClipboard {
-            // 延迟异步恢复（REPAIR_PLAN J2）：不阻塞本方法返回。安全性由
-            // restore 的 changeCount 守卫背书——延迟期间用户/其他 app 写过剪贴板，
-            // 或下一次注入已写入新识别文本时，本次恢复自动放弃，不覆盖新内容。
-            DispatchQueue.global().asyncAfter(deadline: .now() + Self.clipboardRestoreDelay) {
-                savedClipboard.restore(expectedChangeCount: postWriteChangeCount, injectedText: text)
+            guard hasPasteTarget else {
+                clipboardLeaseCoordinator.writePermanently(on: pasteboard) {
+                    writeInjectionText(text)
+                }
+                return .copiedToClipboard
             }
-        }
 
-        return outcome
+            let ticket: ClipboardLeaseCoordinator.Ticket?
+            if preserveClipboard {
+                ticket = clipboardLeaseCoordinator.stageInjection(text: text, on: pasteboard) {
+                    writeInjectionText(text)
+                }
+            } else {
+                clipboardLeaseCoordinator.writePermanently(on: pasteboard) {
+                    writeInjectionText(text)
+                }
+                ticket = nil
+            }
+
+            sleepForMicroseconds(50_000)
+            guard simulatePaste() else {
+                if let ticket {
+                    clipboardLeaseCoordinator.abandon(ticket)
+                }
+                logger("inject: Cmd+V event creation failed, keeping text in clipboard")
+                return .copiedToClipboard
+            }
+            sleepForMicroseconds(100_000)
+
+            if let ticket {
+                clipboardLeaseCoordinator.scheduleRestore(
+                    for: ticket,
+                    on: pasteboard,
+                    after: Self.clipboardRestoreDelay
+                )
+            }
+            return .inserted
+        }
     }
 
-    private func simulatePaste() {
+    private func simulatePaste() -> Bool {
+        pasteSimulator()
+    }
+
+    private static func postPasteKeyboardShortcut() -> Bool {
         let vKeyCode: CGKeyCode = 9
 
         guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: false)
-        else { return }
+        else { return false }
 
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
 
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
+        return true
     }
 
     // MARK: - Focus Detection

@@ -21,6 +21,11 @@ struct VolcServerResponse: Sendable, Equatable {
 // MARK: - Protocol Functions
 
 enum VolcProtocol: Sendable {
+    static let maximumCompressedPayloadBytes = 4 * 1_024 * 1_024
+    static let maximumDecompressedPayloadBytes = 16 * 1_024 * 1_024
+    static let maximumUtteranceCount = 10_000
+    static let maximumTextBytes = 1 * 1_024 * 1_024
+    static let maximumServerErrorMessageBytes = 4 * 1_024
 
     // MARK: - Build Client Request JSON
 
@@ -238,44 +243,63 @@ enum VolcProtocol: Sendable {
         var offset = headerBytes
 
         // Skip sequence number if present
-        if header.flags == .positiveSequence || header.flags == .negativeSequenceLast {
+        if header.flags.hasSequence {
+            guard data.count - offset >= 4 else {
+                throw VolcProtocolError.truncatedSequence
+            }
             offset += 4
         }
 
-        guard data.count >= offset + 4 else {
+        guard data.count - offset >= 4 else {
             throw VolcProtocolError.invalidPayload
         }
 
-        // Read payload size
-        let sizeBytes = data[data.startIndex + offset ..< data.startIndex + offset + 4]
-        let payloadSize = Int(UInt32(bigEndian: sizeBytes.withUnsafeBytes { $0.load(as: UInt32.self) }))
+        // 逐字节组合，避免 Data slice 的起始地址未对齐时触发 load(as:) 崩溃。
+        let payloadSize = Int(readBigEndianUInt32(from: data, offset: offset))
         offset += 4
 
-        guard data.count >= offset + payloadSize else {
+        let maximumWirePayloadBytes = header.compression == .gzip
+            ? maximumCompressedPayloadBytes
+            : maximumDecompressedPayloadBytes
+        guard payloadSize <= maximumWirePayloadBytes else {
+            throw VolcProtocolError.payloadTooLarge(
+                limit: maximumWirePayloadBytes,
+                actual: payloadSize
+            )
+        }
+
+        // 使用减法比较，避免 offset + payloadSize 的整数溢出。
+        guard payloadSize <= data.count - offset else {
             throw VolcProtocolError.invalidPayload
         }
 
-        var payload = data[data.startIndex + offset ..< data.startIndex + offset + payloadSize]
+        let payloadStart = data.index(data.startIndex, offsetBy: offset)
+        let payloadEnd = data.index(payloadStart, offsetBy: payloadSize)
+        var payload = Data(data[payloadStart ..< payloadEnd])
+
+        if header.compression == .gzip {
+            payload = try gzipDecompress(
+                payload,
+                maximumOutputBytes: maximumDecompressedPayloadBytes
+            )
+        }
+
+        try validateDecodedPayloadSize(payload)
 
         // Handle server error
         if header.messageType == .serverError {
-            // Error payload may also be compressed/JSON
-            if header.compression == .gzip {
-                payload = try gzipDecompress(Data(payload))
-            }
             if header.serialization == .json, !payload.isEmpty {
-                if let json = try? JSONSerialization.jsonObject(with: Data(payload)) as? [String: Any] {
+                try validateDecodedPayloadSize(payload)
+                if let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
                     let code = json["code"] as? Int
-                    let message = json["message"] as? String
+                    let message = (json["message"] as? String).map(boundedServerErrorMessage)
                     throw VolcProtocolError.serverError(code: code, message: message)
                 }
             }
-            throw VolcProtocolError.serverError(code: nil, message: nil)
-        }
-
-        // Decompress if needed
-        if header.compression == .gzip {
-            payload = try gzipDecompress(Data(payload))
+            throw VolcProtocolError.serverError(
+                code: nil,
+                message: boundedServerErrorBody(payload)
+            )
         }
 
         // Parse JSON
@@ -283,22 +307,35 @@ enum VolcProtocol: Sendable {
             throw VolcProtocolError.invalidPayload
         }
 
-        guard let json = try JSONSerialization.jsonObject(with: Data(payload)) as? [String: Any] else {
+        try validateDecodedPayloadSize(payload)
+        guard let json = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
             throw VolcProtocolError.invalidPayload
         }
 
         // Response format: {"result": {"text": "...", "utterances": [...]}, "audio_info": {...}}
         let resultObj = json["result"] as? [String: Any]
         let text = resultObj?["text"] as? String ?? json["text"] as? String ?? ""
+        try validateTextSize(text)
         var utterances: [VolcUtterance] = []
 
         let uttsSource = resultObj?["utterances"] as? [[String: Any]]
             ?? json["utterances"] as? [[String: Any]]
         if let utts = uttsSource {
-            utterances = utts.map { u in
-                VolcUtterance(
-                    text: u["text"] as? String ?? "",
-                    definite: u["definite"] as? Bool ?? false
+            guard utts.count <= maximumUtteranceCount else {
+                throw VolcProtocolError.tooManyUtterances(
+                    limit: maximumUtteranceCount,
+                    actual: utts.count
+                )
+            }
+            utterances.reserveCapacity(utts.count)
+            for utterance in utts {
+                let utteranceText = utterance["text"] as? String ?? ""
+                try validateTextSize(utteranceText)
+                utterances.append(
+                    VolcUtterance(
+                        text: utteranceText,
+                        definite: utterance["definite"] as? Bool ?? false
+                    )
                 )
             }
         }
@@ -311,10 +348,57 @@ enum VolcProtocol: Sendable {
 
     // MARK: - Gzip
 
+    private static func readBigEndianUInt32(from data: Data, offset: Int) -> UInt32 {
+        let start = data.index(data.startIndex, offsetBy: offset)
+        let byte0 = UInt32(data[start])
+        let byte1 = UInt32(data[data.index(start, offsetBy: 1)])
+        let byte2 = UInt32(data[data.index(start, offsetBy: 2)])
+        let byte3 = UInt32(data[data.index(start, offsetBy: 3)])
+        return (byte0 << 24) | (byte1 << 16) | (byte2 << 8) | byte3
+    }
+
+    private static func validateDecodedPayloadSize(_ payload: Data) throws {
+        guard payload.count <= maximumDecompressedPayloadBytes else {
+            throw VolcProtocolError.payloadTooLarge(
+                limit: maximumDecompressedPayloadBytes,
+                actual: payload.count
+            )
+        }
+    }
+
+    private static func validateTextSize(_ text: String) throws {
+        guard text.utf8.count <= maximumTextBytes else {
+            throw VolcProtocolError.textTooLarge(limit: maximumTextBytes)
+        }
+    }
+
+    private static func boundedServerErrorMessage(_ message: String) -> String {
+        guard message.utf8.count > maximumServerErrorMessageBytes else {
+            return message
+        }
+
+        var prefix = Data(message.utf8.prefix(maximumServerErrorMessageBytes))
+        while !prefix.isEmpty, String(data: prefix, encoding: .utf8) == nil {
+            prefix.removeLast()
+        }
+        return String(data: prefix, encoding: .utf8) ?? ""
+    }
+
+    private static func boundedServerErrorBody(_ payload: Data) -> String? {
+        guard !payload.isEmpty else { return nil }
+        let boundedBytes = payload.prefix(maximumServerErrorMessageBytes)
+        return boundedServerErrorMessage(String(decoding: boundedBytes, as: UTF8.self))
+    }
+
     private static func processStream(
         operation: compression_stream_operation,
-        source: Data
-    ) -> Data? {
+        source: Data,
+        maximumOutputBytes: Int
+    ) throws -> Data {
+        guard maximumOutputBytes >= 0 else {
+            throw VolcProtocolError.invalidPayload
+        }
+
         let pageSize = 16384
         let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: pageSize)
         defer { dstBuffer.deallocate() }
@@ -323,11 +407,15 @@ enum VolcProtocol: Sendable {
         defer { streamPtr.deallocate() }
 
         let initStatus = compression_stream_init(streamPtr, operation, COMPRESSION_ZLIB)
-        guard initStatus == COMPRESSION_STATUS_OK else { return nil }
+        guard initStatus == COMPRESSION_STATUS_OK else {
+            throw VolcProtocolError.decompressionFailed
+        }
         defer { compression_stream_destroy(streamPtr) }
 
-        return source.withUnsafeBytes { (srcPointer: UnsafeRawBufferPointer) -> Data? in
-            guard let srcBase = srcPointer.baseAddress else { return nil }
+        return try source.withUnsafeBytes { (srcPointer: UnsafeRawBufferPointer) throws -> Data in
+            guard let srcBase = srcPointer.baseAddress else {
+                throw VolcProtocolError.decompressionFailed
+            }
 
             streamPtr.pointee.src_ptr = srcBase.assumingMemoryBound(to: UInt8.self)
             streamPtr.pointee.src_size = source.count
@@ -337,31 +425,43 @@ enum VolcProtocol: Sendable {
             repeat {
                 streamPtr.pointee.dst_ptr = dstBuffer
                 streamPtr.pointee.dst_size = pageSize
+                let sourceBytesBefore = streamPtr.pointee.src_size
 
                 let status = compression_stream_process(streamPtr, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
 
                 let produced = pageSize - streamPtr.pointee.dst_size
                 if produced > 0 {
+                    guard produced <= maximumOutputBytes - output.count else {
+                        throw VolcProtocolError.payloadTooLarge(
+                            limit: maximumOutputBytes,
+                            actual: output.count + produced
+                        )
+                    }
                     output.append(dstBuffer, count: produced)
                 }
 
                 if status == COMPRESSION_STATUS_END {
-                    break
+                    return output
                 }
                 if status == COMPRESSION_STATUS_ERROR {
-                    return nil
+                    throw VolcProtocolError.decompressionFailed
+                }
+                if produced == 0, streamPtr.pointee.src_size == sourceBytesBefore {
+                    throw VolcProtocolError.decompressionFailed
                 }
             } while true
-
-            return output
         }
     }
 
-    static func gzipDecompress(_ data: Data) throws -> Data {
+    static func gzipDecompress(
+        _ data: Data,
+        maximumOutputBytes: Int
+    ) throws -> Data {
         guard !data.isEmpty else { return Data() }
-        guard let result = processStream(operation: COMPRESSION_STREAM_DECODE, source: data) else {
-            throw VolcProtocolError.decompressionFailed
-        }
-        return result
+        return try processStream(
+            operation: COMPRESSION_STREAM_DECODE,
+            source: data,
+            maximumOutputBytes: maximumOutputBytes
+        )
     }
 }

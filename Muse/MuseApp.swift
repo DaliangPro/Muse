@@ -79,10 +79,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppStartupCoordinator.configureActivationPolicy()
         AppearanceController.start()  // 启动即设 app 级外观，让窗口创建前就定好，避免设置窗口首帧深色
         AppStartupCoordinator.runMigrations()
+        AppStartupCoordinator.reconcileSelectedASRProviderIfNeeded()
 
         DebugFileLogger.startSession()
         DebugFileLogger.log("applicationDidFinishLaunching")
-        DebugFileLogger.log("launch args=\(ProcessInfo.processInfo.arguments.joined(separator: " "))")
+        let filteredArguments = LogRedactor.redactedArguments(ProcessInfo.processInfo.arguments)
+        DebugFileLogger.log("launch args=\(filteredArguments.joined(separator: " "))")
         floatingBarController = FloatingBarController(state: appState)
         appState.onCopyFallbackVisibilityChange = { [weak self] isVisible in
             self?.hotkeyManager.isCopyFallbackVisible = isVisible

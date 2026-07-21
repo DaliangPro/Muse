@@ -65,7 +65,8 @@ struct OpenAICompatibleLLMConfig<Tag: OpenAICompatibleLLMTag>: LLMProviderConfig
         let rawURL = (credentials["baseURL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = LLMBaseURLValidator.normalizedURL(
             rawValue: rawURL,
-            defaultValue: Tag.provider.defaultBaseURL
+            defaultValue: Tag.provider.defaultBaseURL,
+            provider: Tag.provider
         ) else { return nil }
         self.baseURL = url
     }

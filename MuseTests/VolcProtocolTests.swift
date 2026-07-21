@@ -1,4 +1,5 @@
 import XCTest
+import Compression
 @testable import Muse
 
 final class VolcProtocolTests: XCTestCase {
@@ -86,6 +87,42 @@ final class VolcProtocolTests: XCTestCase {
     func testHeaderDecoding_tooShort() {
         let raw = Data([0x11, 0x90])
         XCTAssertThrowsError(try VolcHeader.decode(from: raw))
+    }
+
+    func testHeaderDecodingRejectsUnsupportedVersion() {
+        let raw = Data([0x21, 0x90, 0x10, 0x00])
+
+        XCTAssertThrowsError(try VolcHeader.decode(from: raw)) { error in
+            guard case VolcProtocolError.unsupportedVersion(let version) = error else {
+                XCTFail("Expected unsupportedVersion, got \(error)")
+                return
+            }
+            XCTAssertEqual(version, 2)
+        }
+    }
+
+    func testHeaderDecodingRejectsZeroHeaderSize() {
+        let raw = Data([0x10, 0x90, 0x10, 0x00])
+
+        XCTAssertThrowsError(try VolcHeader.decode(from: raw)) { error in
+            guard case VolcProtocolError.invalidHeaderSize(let headerSize) = error else {
+                XCTFail("Expected invalidHeaderSize, got \(error)")
+                return
+            }
+            XCTAssertEqual(headerSize, 0)
+        }
+    }
+
+    func testHeaderDecodingRejectsHeaderSizeBeyondInput() {
+        let raw = Data([0x12, 0x90, 0x10, 0x00])
+
+        XCTAssertThrowsError(try VolcHeader.decode(from: raw)) { error in
+            guard case VolcProtocolError.invalidHeaderSize(let headerSize) = error else {
+                XCTFail("Expected invalidHeaderSize, got \(error)")
+                return
+            }
+            XCTAssertEqual(headerSize, 2)
+        }
     }
 
     // MARK: - Client Request JSON
@@ -275,6 +312,178 @@ final class VolcProtocolTests: XCTestCase {
 
     // MARK: - Server Response Decoding
 
+    func testDecodeServerResponseSupportsUnalignedDataSlice() throws {
+        let payload = try JSONSerialization.data(withJSONObject: ["text": "unaligned"])
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+        let message = VolcProtocol.encodeMessage(header: header, payload: payload)
+        let storage = Data([0xFF]) + message
+        let unaligned = storage.dropFirst()
+
+        XCTAssertEqual(unaligned.startIndex, 1)
+        let pointerAlignment = unaligned.withUnsafeBytes { bytes in
+            Int(bitPattern: bytes.baseAddress!) % MemoryLayout<UInt32>.alignment
+        }
+        XCTAssertNotEqual(pointerAlignment, 0, "fixture 必须真实覆盖未对齐读取")
+
+        let response = try VolcProtocol.decodeServerResponse(unaligned)
+        XCTAssertEqual(response.result.text, "unaligned")
+    }
+
+    func testCompressedPayloadBeyondWireLimitIsRejected() {
+        let validCompressedJSON = Data([
+            0xAB, 0x56, 0x2A, 0x49, 0xAD, 0x28, 0x51, 0xB2, 0x52, 0xCA, 0x48, 0xCD, 0xC9, 0xC9, 0x57, 0x28,
+            0xCF, 0x2F, 0xCA, 0x49, 0x51, 0xD2, 0x51, 0x2A, 0x2D, 0x29, 0x49, 0x2D, 0x4A, 0xCC, 0x4B, 0x4E,
+            0x2D, 0x56, 0xB2, 0x8A, 0xAE, 0x46, 0x51, 0x03, 0x94, 0x4D, 0x49, 0x4D, 0xCB, 0xCC, 0xCB, 0x2C,
+            0x49, 0x55, 0xB2, 0x2A, 0x29, 0x2A, 0x4D, 0xAD, 0xD5, 0x81, 0x2B, 0x80, 0x69, 0x47, 0x28, 0x48,
+            0x4B, 0xCC, 0x29, 0x4E, 0xAD, 0x8D, 0xAD, 0x05, 0x00
+        ])
+        var oversizedPayload = validCompressedJSON
+        oversizedPayload.append(
+            Data(
+                repeating: 0,
+                count: VolcProtocol.maximumCompressedPayloadBytes + 1 - validCompressedJSON.count
+            )
+        )
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .gzip
+        )
+        let message = VolcProtocol.encodeMessage(header: header, payload: oversizedPayload)
+
+        assertPayloadTooLarge(
+            try VolcProtocol.decodeServerResponse(message),
+            expectedLimit: VolcProtocol.maximumCompressedPayloadBytes
+        )
+    }
+
+    func testDeclaredPayloadSizeOverflowIsRejectedBeforeSlicing() {
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .gzip
+        )
+        var message = header.encode()
+        var declaredSize = UInt32.max.bigEndian
+        message.append(Data(bytes: &declaredSize, count: MemoryLayout<UInt32>.size))
+
+        assertPayloadTooLarge(
+            try VolcProtocol.decodeServerResponse(message),
+            expectedLimit: VolcProtocol.maximumCompressedPayloadBytes
+        )
+    }
+
+    func testGzipOutputBeyondProtocolLimitIsRejected() throws {
+        var oversizedJSON = Data("{\"result\":{\"text\":\"ok\",\"utterances\":[]},\"padding\":\"".utf8)
+        oversizedJSON.append(
+            Data(repeating: 0x61, count: VolcProtocol.maximumDecompressedPayloadBytes)
+        )
+        oversizedJSON.append(Data("\"}".utf8))
+        let compressed = try zlibCompress(oversizedJSON)
+        XCTAssertLessThan(compressed.count, VolcProtocol.maximumCompressedPayloadBytes)
+
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .gzip
+        )
+        let message = VolcProtocol.encodeMessage(header: header, payload: compressed)
+
+        assertPayloadTooLarge(
+            try VolcProtocol.decodeServerResponse(message),
+            expectedLimit: VolcProtocol.maximumDecompressedPayloadBytes
+        )
+    }
+
+    func testGzipDecompressHonorsInjectedOutputLimit() throws {
+        let compressed = try zlibCompress(Data(repeating: 0x41, count: 1_025))
+
+        assertPayloadTooLarge(
+            try VolcProtocol.gzipDecompress(compressed, maximumOutputBytes: 1_024),
+            expectedLimit: 1_024
+        )
+    }
+
+    func testTruncatedSequenceNumberIsRejected() {
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .positiveSequence,
+            serialization: .json,
+            compression: .none
+        )
+        var message = header.encode()
+        message.append(contentsOf: [0x00, 0x00, 0x00])
+
+        XCTAssertThrowsError(try VolcProtocol.decodeServerResponse(message)) { error in
+            guard case VolcProtocolError.truncatedSequence = error else {
+                XCTFail("Expected truncatedSequence, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testUtteranceCountBeyondLimitIsRejected() throws {
+        let utterances = (0...VolcProtocol.maximumUtteranceCount).map { index in
+            ["text": "u\(index)", "definite": true] as [String: Any]
+        }
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "result": ["text": "ok", "utterances": utterances]
+        ])
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+
+        XCTAssertThrowsError(
+            try VolcProtocol.decodeServerResponse(
+                VolcProtocol.encodeMessage(header: header, payload: payload)
+            )
+        ) { error in
+            guard case VolcProtocolError.tooManyUtterances(let limit, let actual) = error else {
+                XCTFail("Expected tooManyUtterances, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, VolcProtocol.maximumUtteranceCount)
+            XCTAssertEqual(actual, VolcProtocol.maximumUtteranceCount + 1)
+        }
+    }
+
+    func testSingleTextBeyondLimitIsRejected() throws {
+        let oversizedText = String(
+            repeating: "a",
+            count: VolcProtocol.maximumTextBytes + 1
+        )
+        let payload = try JSONSerialization.data(withJSONObject: ["text": oversizedText])
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+
+        XCTAssertThrowsError(
+            try VolcProtocol.decodeServerResponse(
+                VolcProtocol.encodeMessage(header: header, payload: payload)
+            )
+        ) { error in
+            guard case VolcProtocolError.textTooLarge(let limit) = error else {
+                XCTFail("Expected textTooLarge, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, VolcProtocol.maximumTextBytes)
+        }
+    }
+
     func testDecodeServerMessage_withGzip() throws {
         // 预压缩好的 zlib(COMPRESSION_ZLIB) 字节,解压后为:
         // {"text":"hello world","utterances":[{"text":"hello","definite":true},{"text":"world","definite":false}]}
@@ -368,5 +577,109 @@ final class VolcProtocolTests: XCTestCase {
             XCTAssertEqual(code, 1001)
             XCTAssertEqual(msg, "auth failed")
         }
+    }
+
+    func testDecodeServerMessage_gzipJSONServerError() throws {
+        let compressed = Data([
+            0xAB, 0x56, 0x4A, 0xCE, 0x4F, 0x49, 0x55, 0xB2, 0x32, 0x34, 0x30, 0x30, 0xD4,
+            0x51, 0xCA, 0x4D, 0x2D, 0x2E, 0x4E, 0x4C, 0x07, 0x72, 0x95, 0x12, 0x4B, 0x4B,
+            0x32, 0x14, 0xD2, 0x12, 0x33, 0x73, 0x52, 0x53, 0x94, 0x6A, 0x01
+        ])
+        let header = VolcHeader(
+            messageType: .serverError,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .gzip
+        )
+
+        XCTAssertThrowsError(
+            try VolcProtocol.decodeServerResponse(
+                VolcProtocol.encodeMessage(header: header, payload: compressed)
+            )
+        ) { error in
+            guard case VolcProtocolError.serverError(let code, let message) = error else {
+                XCTFail("Expected serverError, got \(error)")
+                return
+            }
+            XCTAssertEqual(code, 1001)
+            XCTAssertEqual(message, "auth failed")
+        }
+    }
+
+    func testServerErrorMessageIsBoundedBeforePropagation() throws {
+        let oversizedMessage = String(
+            repeating: "a",
+            count: VolcProtocol.maximumServerErrorMessageBytes * 2
+        )
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "code": 500,
+            "message": oversizedMessage,
+        ])
+        let header = VolcHeader(
+            messageType: .serverError,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+
+        XCTAssertThrowsError(
+            try VolcProtocol.decodeServerResponse(
+                VolcProtocol.encodeMessage(header: header, payload: payload)
+            )
+        ) { error in
+            guard case VolcProtocolError.serverError(let code, let message) = error else {
+                XCTFail("Expected serverError, got \(error)")
+                return
+            }
+            XCTAssertEqual(code, 500)
+            XCTAssertEqual(message?.utf8.count, VolcProtocol.maximumServerErrorMessageBytes)
+            XCTAssertEqual(message, String(repeating: "a", count: VolcProtocol.maximumServerErrorMessageBytes))
+        }
+    }
+
+    private func assertPayloadTooLarge<T>(
+        _ expression: @autoclosure () throws -> T,
+        expectedLimit: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(try expression(), file: file, line: line) { error in
+            guard case VolcProtocolError.payloadTooLarge(let limit, let actual) = error else {
+                XCTFail("Expected payloadTooLarge, got \(error)", file: file, line: line)
+                return
+            }
+            XCTAssertEqual(limit, expectedLimit, file: file, line: line)
+            XCTAssertGreaterThan(actual, limit, file: file, line: line)
+        }
+    }
+
+    private func zlibCompress(_ source: Data) throws -> Data {
+        var output = Data(count: max(source.count, 256))
+        let encodedSize = output.withUnsafeMutableBytes { destinationBytes in
+            source.withUnsafeBytes { sourceBytes in
+                guard let destination = destinationBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let source = sourceBytes.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                else {
+                    return 0
+                }
+                return compression_encode_buffer(
+                    destination,
+                    destinationBytes.count,
+                    source,
+                    sourceBytes.count,
+                    nil,
+                    COMPRESSION_ZLIB
+                )
+            }
+        }
+        guard encodedSize > 0 else {
+            throw TestFixtureError.compressionFailed
+        }
+        output.count = encodedSize
+        return output
+    }
+
+    private enum TestFixtureError: Error {
+        case compressionFailed
     }
 }

@@ -1,7 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && /bin/pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && /bin/pwd -P)"
+if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+    [ -n "${MUSE_PACKAGE_PROJECT_DIR:-}" ] || {
+        echo "MUSE_PACKAGE_PROJECT_DIR is required in package test mode" >&2
+        exit 1
+    }
+    PROJECT_DIR="$(cd "$MUSE_PACKAGE_PROJECT_DIR" && /bin/pwd -P)"
+else
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)"
+fi
 APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/Muse.app}"
 APP_NAME="${APP_NAME:-Muse}"
 APP_EXECUTABLE="Muse"
@@ -14,6 +23,24 @@ MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-Muse 需要访问�
 SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-Muse 需要语音识别权限以将你的语音转写为文字。}"
 APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-Muse 需要辅助功能权限来注入转写文字到其他应用}"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
+SENSEVOICE_DIST="$PROJECT_DIR/sensevoice-server/dist/sensevoice-server"
+QWEN3_DIST="$PROJECT_DIR/qwen3-asr-server/dist/qwen3-asr-server"
+
+# Local packaging must fail before building or replacing an existing Bundle when
+# either frozen service distribution is unavailable.
+if [ "${BUNDLE_LOCAL_ASR:-0}" = "1" ] \
+    && { [ ! -d "$SENSEVOICE_DIST" ] || [ ! -d "$QWEN3_DIST" ]; }; then
+    echo "Local bundle requested, but both frozen service distributions are required." >&2
+    exit 1
+fi
+if [ "${BUNDLE_LOCAL_ASR:-0}" = "1" ] \
+    && { [ ! -f "$SENSEVOICE_DIST/sensevoice-server" ] \
+        || [ ! -x "$SENSEVOICE_DIST/sensevoice-server" ] \
+        || [ ! -f "$QWEN3_DIST/qwen3-asr-server" ] \
+        || [ ! -x "$QWEN3_DIST/qwen3-asr-server" ]; }; then
+    echo "Local bundle requested, but both frozen service launchers are required and must be executable." >&2
+    exit 1
+fi
 
 trash_path() {
     local path="$1"
@@ -28,13 +55,6 @@ trash_path() {
         target="$HOME/.Trash/${base}-${stamp}"
     done
     /bin/mv "$path" "$target"
-}
-
-trash_paths() {
-    local path
-    for path in "$@"; do
-        trash_path "$path"
-    done
 }
 
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
@@ -113,21 +133,51 @@ run_swift_build() {
     fi
 }
 
-XCBUILD_BIN="/Library/Developer/SharedFrameworks/XCBuild.framework/Versions/A/Support/xcbuild"
-if [ -x "$XCBUILD_BIN" ]; then
-    echo "Building universal release (arm64 + x86_64)..."
-    run_swift_build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64
-else
-    echo "xcbuild not found, falling back to single-arch release build..."
-    run_swift_build -c release --package-path "$PROJECT_DIR"
-fi
+MUSE_PACKAGE_REQUIRE_PREBUILT="${MUSE_PACKAGE_REQUIRE_PREBUILT:-0}"
+case "$MUSE_PACKAGE_REQUIRE_PREBUILT" in
+    0|1) ;;
+    *) echo "MUSE_PACKAGE_REQUIRE_PREBUILT must be 0 or 1" >&2; exit 1 ;;
+esac
 
-if [ -f "$PROJECT_DIR/.build/apple/Products/Release/Muse" ]; then
-    BINARY="$PROJECT_DIR/.build/apple/Products/Release/Muse"
-elif [ -f "$PROJECT_DIR/.build/release/Muse" ]; then
-    BINARY="$PROJECT_DIR/.build/release/Muse"
+if [ "$MUSE_PACKAGE_REQUIRE_PREBUILT" = "1" ]; then
+    BINARY="${MUSE_PACKAGE_PREBUILT_BINARY:-}"
+    EXPECTED_BINARY_SHA256="${MUSE_PACKAGE_PREBUILT_SHA256:-}"
+    [ -n "$BINARY" ] && [ -f "$BINARY" ] && [ ! -L "$BINARY" ] && [ -x "$BINARY" ] || {
+        echo "Signing-window packaging requires an executable regular prebuilt binary" >&2
+        exit 1
+    }
+    [[ "$EXPECTED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "MUSE_PACKAGE_PREBUILT_SHA256 must be 64 lowercase hexadecimal characters" >&2
+        exit 1
+    }
+    ACTUAL_BINARY_SHA256="$(/usr/bin/shasum -a 256 "$BINARY" | /usr/bin/awk '{print $1}')"
+    [ "$ACTUAL_BINARY_SHA256" = "$EXPECTED_BINARY_SHA256" ] || {
+        echo "Prebuilt release binary SHA256 mismatch" >&2
+        exit 1
+    }
+elif [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+    BINARY="${MUSE_PACKAGE_BINARY:-}"
+    [ -f "$BINARY" ] || {
+        echo "MUSE_PACKAGE_BINARY must point to a fixture executable" >&2
+        exit 1
+    }
 else
-    BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Muse' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    XCBUILD_BIN="/Library/Developer/SharedFrameworks/XCBuild.framework/Versions/A/Support/xcbuild"
+    if [ -x "$XCBUILD_BIN" ]; then
+        echo "Building universal release (arm64 + x86_64)..."
+        run_swift_build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64
+    else
+        echo "xcbuild not found, falling back to single-arch release build..."
+        run_swift_build -c release --package-path "$PROJECT_DIR"
+    fi
+
+    if [ -f "$PROJECT_DIR/.build/apple/Products/Release/Muse" ]; then
+        BINARY="$PROJECT_DIR/.build/apple/Products/Release/Muse"
+    elif [ -f "$PROJECT_DIR/.build/release/Muse" ]; then
+        BINARY="$PROJECT_DIR/.build/release/Muse"
+    else
+        BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Muse' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    fi
 fi
 
 if [ ! -f "$BINARY" ]; then
@@ -136,9 +186,10 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 echo "Packaging app bundle at $APP_PATH..."
-trash_path "$APP_PATH/Contents/Resources/THIRD_PARTY_LICENSES.txt"
+trash_path "$APP_PATH/Contents"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
+/bin/chmod 755 "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
 cp "$PROJECT_DIR/Muse/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
 cp "$PROJECT_DIR/Muse/Resources/BrandLogo.png" "$APP_PATH/Contents/Resources/BrandLogo.png" 2>/dev/null || true
 
@@ -223,43 +274,32 @@ if [ "${BUNDLE_SENSEVOICE_MODEL:-0}" = "1" ] && [ -d "$QWEN3_MODEL_CACHE" ]; the
     echo "Qwen3-ASR model bundled."
 fi
 
-# Copy sensevoice-server if built and BUNDLE_LOCAL_ASR is set
-SENSEVOICE_DIST="$PROJECT_DIR/sensevoice-server/dist/sensevoice-server"
-if [ "${BUNDLE_LOCAL_ASR:-0}" = "1" ] && [ -d "$SENSEVOICE_DIST" ]; then
+# Copy both local services only for the Local product. A requested Local build
+# must never silently degrade into a Cloud bundle.
+if [ "${BUNDLE_LOCAL_ASR:-0}" = "1" ]; then
     echo "Bundling sensevoice-server..."
-    trash_paths "$APP_PATH/Contents/MacOS/sensevoice-server-dist" "$APP_PATH/Contents/MacOS/sensevoice-server"
     cp -R "$SENSEVOICE_DIST" "$APP_PATH/Contents/MacOS/sensevoice-server-dist"
-    # Create a wrapper script at the expected path
-    cat > "$APP_PATH/Contents/MacOS/sensevoice-server" << 'WRAPPER'
+    mkdir -p "$APP_PATH/Contents/Resources/LocalServices"
+    # Shell wrapper remains a sealed resource. The executable entry is an in-bundle
+    # symlink to the signed PyInstaller Mach-O, so codesign does not treat a shell
+    # script under Contents/MacOS as unsigned nested code.
+    cat > "$APP_PATH/Contents/Resources/LocalServices/sensevoice-server-wrapper.sh" << 'WRAPPER'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/sensevoice-server-dist/sensevoice-server" "$@"
+exec "$DIR/../../MacOS/sensevoice-server-dist/sensevoice-server" "$@"
 WRAPPER
-    chmod +x "$APP_PATH/Contents/MacOS/sensevoice-server"
-    # Sign all binaries in the server dist for Gatekeeper
-    find "$APP_PATH/Contents/MacOS/sensevoice-server-dist" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) \
-        -exec codesign --force --sign "${SIGNING_IDENTITY}" {} \; 2>/dev/null || true
-    codesign --force --sign "${SIGNING_IDENTITY}" "$APP_PATH/Contents/MacOS/sensevoice-server" 2>/dev/null || true
-    echo "sensevoice-server bundled and signed."
-fi
+    ln -s "sensevoice-server-dist/sensevoice-server" "$APP_PATH/Contents/MacOS/sensevoice-server"
+    echo "sensevoice-server bundled."
 
-# Copy qwen3-asr-server if built and BUNDLE_LOCAL_ASR is set
-QWEN3_DIST="$PROJECT_DIR/qwen3-asr-server/dist/qwen3-asr-server"
-if [ "${BUNDLE_LOCAL_ASR:-0}" = "1" ] && [ -d "$QWEN3_DIST" ]; then
     echo "Bundling qwen3-asr-server..."
-    trash_paths "$APP_PATH/Contents/MacOS/qwen3-asr-server-dist" "$APP_PATH/Contents/MacOS/qwen3-asr-server"
     cp -R "$QWEN3_DIST" "$APP_PATH/Contents/MacOS/qwen3-asr-server-dist"
-    # Create a wrapper script at the expected path
-    cat > "$APP_PATH/Contents/MacOS/qwen3-asr-server" << 'WRAPPER'
+    cat > "$APP_PATH/Contents/Resources/LocalServices/qwen3-asr-server-wrapper.sh" << 'WRAPPER'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/qwen3-asr-server-dist/qwen3-asr-server" "$@"
+exec "$DIR/../../MacOS/qwen3-asr-server-dist/qwen3-asr-server" "$@"
 WRAPPER
-    chmod +x "$APP_PATH/Contents/MacOS/qwen3-asr-server"
-    # Sign all binaries in the server dist for Gatekeeper
-    find "$APP_PATH/Contents/MacOS/qwen3-asr-server-dist" -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.metallib" -o -perm +111 \) \
-        -exec codesign --force --sign "${SIGNING_IDENTITY}" {} \; 2>/dev/null || true
-    echo "qwen3-asr-server bundled and signed."
+    ln -s "qwen3-asr-server-dist/qwen3-asr-server" "$APP_PATH/Contents/MacOS/qwen3-asr-server"
+    echo "qwen3-asr-server bundled."
 fi
 
 # Copy LLM model if available (for local LLM DMG builds)
@@ -272,49 +312,31 @@ if [ "$LLM_MODEL_SIZE" = "9b" ] && [ -f "$LLM_MODEL_DIR/Qwen3.5-9B-Q4_K_M.gguf" 
     echo "Qwen3.5-9B model bundled."
 fi
 
-echo "Signing with '${SIGNING_IDENTITY}'..."
-# PyInstaller dist dirs contain .dylibs and dist-info dirs that confuse
-# codesign's bundle detection. Move server files out temporarily.
-SERVER_TEMP=""
-SV_DIST="$APP_PATH/Contents/MacOS/sensevoice-server-dist"
-SV_WRAPPER="$APP_PATH/Contents/MacOS/sensevoice-server"
-Q3_DIST="$APP_PATH/Contents/MacOS/qwen3-asr-server-dist"
-Q3_WRAPPER="$APP_PATH/Contents/MacOS/qwen3-asr-server"
-if [ -d "$SV_DIST" ] || [ -f "$SV_WRAPPER" ] || [ -d "$Q3_DIST" ] || [ -f "$Q3_WRAPPER" ]; then
-    SERVER_TEMP="$(mktemp -d)"
-    [ -d "$SV_DIST" ] && mv "$SV_DIST" "$SERVER_TEMP/sensevoice-server-dist"
-    [ -f "$SV_WRAPPER" ] && mv "$SV_WRAPPER" "$SERVER_TEMP/sensevoice-server"
-    [ -d "$Q3_DIST" ] && mv "$Q3_DIST" "$SERVER_TEMP/qwen3-asr-server-dist"
-    [ -f "$Q3_WRAPPER" ] && mv "$Q3_WRAPPER" "$SERVER_TEMP/qwen3-asr-server"
-fi
-if ! codesign -f -s "$SIGNING_IDENTITY" "$APP_PATH"; then
-    echo "Signing failed with identity '${SIGNING_IDENTITY}'. Refusing to produce an unstable app bundle."
-    exit 1
-fi
-echo "Signed."
-if [ -n "$SERVER_TEMP" ]; then
-    [ -d "$SERVER_TEMP/sensevoice-server-dist" ] && mv "$SERVER_TEMP/sensevoice-server-dist" "$SV_DIST"
-    [ -f "$SERVER_TEMP/sensevoice-server" ] && mv "$SERVER_TEMP/sensevoice-server" "$SV_WRAPPER"
-    [ -d "$SERVER_TEMP/qwen3-asr-server-dist" ] && mv "$SERVER_TEMP/qwen3-asr-server-dist" "$Q3_DIST"
-    [ -f "$SERVER_TEMP/qwen3-asr-server" ] && mv "$SERVER_TEMP/qwen3-asr-server" "$Q3_WRAPPER"
-    trash_path "$SERVER_TEMP"
-fi
+# Normalize distributable Bundle permissions before the final signature. The release
+# wrapper intentionally protects credentials with umask 077, but those private modes
+# must never leak into an App copied for other macOS accounts.
+/usr/bin/find "$APP_PATH" -type d -exec /bin/chmod 755 {} +
+while IFS= read -r -d '' bundle_file; do
+    if [ -x "$bundle_file" ]; then
+        /bin/chmod 755 "$bundle_file"
+    else
+        /bin/chmod 644 "$bundle_file"
+    fi
+done < <(/usr/bin/find "$APP_PATH" -type f -print0)
 
 # Remove quarantine flag that macOS adds to downloaded apps.
-# This flag can silently prevent Accessibility permission from working.
-xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
+# This must happen before the final outer signature; after that the Bundle is read-only.
+/usr/bin/xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
 
-SIGNED_DETAILS="$(codesign -dvvv "$APP_PATH" 2>&1)"
-SIGNED_IDENTIFIER="$(printf '%s\n' "$SIGNED_DETAILS" | awk -F= '/^Identifier=/{print $2; exit}')"
-SIGNED_AUTHORITY="$(printf '%s\n' "$SIGNED_DETAILS" | awk -F= '/^Authority=/{print $2; exit}')"
-if [ "$SIGNED_IDENTIFIER" != "$APP_BUNDLE_ID" ]; then
-    echo "Signing validation failed: expected bundle id '$APP_BUNDLE_ID', got '$SIGNED_IDENTIFIER'."
-    exit 1
-fi
-if [ "$SIGNING_IDENTITY" != "-" ] && [ "$SIGNED_AUTHORITY" != "$SIGNING_IDENTITY" ]; then
-    echo "Signing validation failed: expected authority '$SIGNING_IDENTITY', got '$SIGNED_AUTHORITY'."
-    exit 1
-fi
-echo "Signing validated: $SIGNED_IDENTIFIER / ${SIGNED_AUTHORITY:-ad-hoc}"
+echo "Signing with '${SIGNING_IDENTITY}'..."
+SIGNING_IDENTITY="$SIGNING_IDENTITY" APP_BUNDLE_ID="$APP_BUNDLE_ID" \
+    /bin/bash "$SCRIPT_DIR/sign-app-bundle.sh" "$APP_PATH"
+
+EXPECT_LOCAL_BUNDLE="${BUNDLE_LOCAL_ASR:-0}" \
+APP_BUNDLE_ID="$APP_BUNDLE_ID" \
+APP_VERSION="$APP_VERSION" \
+APP_BUILD="$APP_BUILD" \
+MIN_SYSTEM_VERSION="$MIN_SYSTEM_VERSION" \
+    /bin/bash "$SCRIPT_DIR/test_app_bundle.sh" "$APP_PATH"
 
 echo "App bundle ready at $APP_PATH"

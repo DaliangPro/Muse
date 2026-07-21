@@ -34,7 +34,7 @@ private extension ASRSettingsFooter {
             Text(footerHintText)
                 .font(TF.settingsFontMetadata)
                 .foregroundStyle(TF.settingsTextTertiary)
-                .lineLimit(selectedProvider.isLocal ? 2 : 1)
+                .lineLimit(selectedProvider.isLocal || selectedProvider == .apple ? 2 : 1)
                 .layoutPriority(1)
 
             if let link = inlineGuideLink {
@@ -47,6 +47,12 @@ private extension ASRSettingsFooter {
     var footerHintText: String {
         if selectedProvider.isLocal {
             return L("当前已切换为本地识别，运行状态与启停操作在下方“本地模型”中管理。", "Local ASR is selected. Runtime status and controls are managed in the local models card below.")
+        }
+        if selectedProvider == .apple {
+            return L(
+                "Apple 仅使用端侧识别，音频不上传；若当前语言不支持，请切换语言或改用火山引擎。",
+                "Apple uses on-device recognition only; audio is not uploaded. Switch language or use Volcano Speech if unsupported."
+            )
         }
         if isZeroCredentialProvider {
             return L("该引擎无需额外凭证，可直接测试与使用。", "This provider needs no additional credentials and can be used directly.")

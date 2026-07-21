@@ -58,24 +58,30 @@ final class AssetLibraryExtractionViewModel {
         progressPhase = .preparing
 
         var configurations: [AssetExtractionConfiguration] = []
-        for recipeID in orderedIDs {
-            guard let base = makeExtractionConfiguration(
-                recipeID: recipeID,
-                range: range,
-                includesProcessedRecords: false
-            ) else { continue }
+        do {
+            for recipeID in orderedIDs {
+                guard let base = makeExtractionConfiguration(
+                    recipeID: recipeID,
+                    range: range,
+                    includesProcessedRecords: false
+                ) else { continue }
 
-            let preview = await extractionService.previewExtraction(
-                configuration: base.applying(ruleConfig: ruleConfig)
-            )
-            guard !preview.records.isEmpty else { continue }
+                let preview = try await extractionService.previewExtraction(
+                    configuration: base.applying(ruleConfig: ruleConfig)
+                )
+                guard !preview.records.isEmpty else { continue }
 
-            configurations.append(
-                AssetExtractionConfiguration
-                    .manualSelection(ids: preview.records.map(\.id))
-                    .applying(recipeID: recipeID)
-                    .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
-            )
+                configurations.append(
+                    AssetExtractionConfiguration
+                        .manualSelection(ids: preview.records.map(\.id))
+                        .applying(recipeID: recipeID)
+                        .adaptedForAssetExtractionProvider(KeychainService.selectedAssetExtractionLLMProvider)
+                )
+            }
+        } catch {
+            isExtracting = false
+            emptyNotice = nil
+            return .failed(error.localizedDescription)
         }
 
         guard !configurations.isEmpty else {

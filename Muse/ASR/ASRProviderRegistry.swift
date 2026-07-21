@@ -33,7 +33,9 @@ enum ASRProviderRegistry {
         let createClient: (@Sendable () -> any SpeechRecognizer)?
         let capabilities: ASRProviderCapabilities
 
-        var isAvailable: Bool { createClient != nil }
+        var isAvailable: Bool {
+            capabilities.isAvailable && createClient != nil
+        }
 
         init(
             configType: any ASRProviderConfig.Type,
@@ -60,11 +62,15 @@ enum ASRProviderRegistry {
             ),
         ]
         #if HAS_SHERPA_ONNX
-        dict[.sherpa] = ProviderEntry(
-            configType: SherpaASRConfig.self,
-            createClient: { SenseVoiceWSClient() },
-            capabilities: .batch()  // full_inference at end takes 3-5s, needs longer timeout
-        )
+        if ServerExecutableResolver.live.isAvailable(name: "sensevoice-server") {
+            dict[.sherpa] = ProviderEntry(
+                configType: SherpaASRConfig.self,
+                createClient: { SenseVoiceWSClient() },
+                capabilities: .batch()  // full_inference at end takes 3-5s, needs longer timeout
+            )
+        } else {
+            dict[.sherpa] = ProviderEntry(configType: SherpaASRConfig.self, createClient: nil)
+        }
         #else
         dict[.sherpa] = ProviderEntry(configType: SherpaASRConfig.self, createClient: nil)
         #endif
@@ -88,18 +94,64 @@ enum ASRProviderRegistry {
     }
 
     static func supports(_ mode: ProcessingMode, for provider: ASRProvider) -> Bool {
-        if mode.id == ProcessingMode.directId {
-            return capabilities(for: provider).isAvailable
-        }
+        supports(mode, for: provider, capabilities: capabilities(for: provider))
+    }
+
+    static func supports(
+        _ mode: ProcessingMode,
+        for provider: ASRProvider,
+        capabilities: ASRProviderCapabilities
+    ) -> Bool {
+        guard capabilities.isAvailable else { return false }
+        if mode.id == ProcessingMode.directId { return true }
         return true
     }
 
     static func supportedModes(from modes: [ProcessingMode], for provider: ASRProvider) -> [ProcessingMode] {
-        modes.filter { supports($0, for: provider) }
+        supportedModes(
+            from: modes,
+            for: provider,
+            capabilities: capabilities(for: provider)
+        )
+    }
+
+    static func supportedModes(
+        from modes: [ProcessingMode],
+        for provider: ASRProvider,
+        capabilities: ASRProviderCapabilities
+    ) -> [ProcessingMode] {
+        modes.filter { supports($0, for: provider, capabilities: capabilities) }
     }
 
     static func resolvedMode(for mode: ProcessingMode, provider: ASRProvider) -> ProcessingMode {
-        supports(mode, for: provider) ? mode : .direct
+        resolvedMode(
+            for: mode,
+            provider: provider,
+            capabilities: capabilities(for: provider)
+        )
+    }
+
+    static func resolvedMode(
+        for mode: ProcessingMode,
+        provider: ASRProvider,
+        capabilities: ASRProviderCapabilities
+    ) -> ProcessingMode {
+        supports(mode, for: provider, capabilities: capabilities) ? mode : .direct
+    }
+
+    /// 显式固定回退优先级，避免依赖 `allCases` 的声明顺序。
+    static func resolvedProvider(
+        for requested: ASRProvider,
+        capabilities: (ASRProvider) -> ASRProviderCapabilities = {
+            ASRProviderRegistry.capabilities(for: $0)
+        }
+    ) -> ASRProvider {
+        if capabilities(requested).isAvailable {
+            return requested
+        }
+        return [ASRProvider.volcano, .apple, .sherpa]
+            .first { capabilities($0).isAvailable }
+            ?? requested
     }
 
 }

@@ -35,7 +35,8 @@ struct ClaudeLLMConfig: LLMProviderConfig, Sendable {
         let rawURL = (credentials["baseURL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard let baseURL = LLMBaseURLValidator.normalizedURL(
             rawValue: rawURL,
-            defaultValue: LLMProvider.claude.defaultBaseURL
+            defaultValue: LLMProvider.claude.defaultBaseURL,
+            provider: .claude
         ) else { return nil }
         self.baseURL = baseURL
     }

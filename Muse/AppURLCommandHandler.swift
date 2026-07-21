@@ -7,7 +7,8 @@ enum AppURLCommandHandler {
             switch url.host {
             case "reload-vocabulary":
                 AppLogger.log("[Muse] URL command: reload-vocabulary")
-                SenseVoiceServerManager.syncHotwordsAndRestart()
+                SnippetStorage.reloadFromDisk()
+                HotwordStorage.reloadFromDisk()
             default:
                 AppLogger.log("[Muse] Unknown URL command: \(url)")
             }
