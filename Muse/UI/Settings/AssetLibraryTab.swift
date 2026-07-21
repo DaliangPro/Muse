@@ -554,7 +554,11 @@ private extension AssetLibraryTab {
 
     func saveCandidate(_ candidate: LanguageAssetCandidateRecord) {
         Task {
-            _ = await assetStore.saveEditedCandidateAsAsset(candidate)
+            do {
+                _ = try await assetStore.saveEditedCandidateAsAsset(candidate)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
             await reloadData()
         }
     }

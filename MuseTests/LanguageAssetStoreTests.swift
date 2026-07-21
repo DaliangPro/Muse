@@ -18,7 +18,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: testPath)
     }
 
-    func testInsertJobAndFetchLatestJob() async {
+    func testInsertJobAndFetchLatestJob() async throws {
         let job = AssetExtractionJob(
             id: UUID().uuidString,
             createdAt: Date(),
@@ -32,7 +32,7 @@ final class LanguageAssetStoreTests: XCTestCase {
             errorMessage: nil
         )
 
-        await store.insert(job: job)
+        try await store.insert(job: job)
         let latest = await store.latestJob()
 
         XCTAssertEqual(latest?.id, job.id)
@@ -188,7 +188,7 @@ final class LanguageAssetStoreTests: XCTestCase {
             status: .active
         )
 
-        await store.insert(run: run)
+        try await store.insert(run: run)
         try await store.saveResultsOrThrow([result])
 
         let latestRun = await store.latestRun()
@@ -242,7 +242,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         XCTAssertTrue(assets.isEmpty)
     }
 
-    func testSaveCandidateAsAssetMarksCandidateSavedAndLogsAction() async {
+    func testSaveCandidateAsAssetMarksCandidateSavedAndLogsAction() async throws {
         let candidate = makeCandidate(
             id: "candidate-1",
             scenes: ["标题选题", "内容结构"],
@@ -250,7 +250,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         )
         await store.saveCandidates([candidate])
 
-        let asset = await store.saveCandidateAsAsset(id: candidate.id)
+        let asset = try await store.saveCandidateAsAsset(id: candidate.id)
 
         XCTAssertNotNil(asset)
         XCTAssertEqual(asset?.content, candidate.content)
@@ -263,7 +263,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         XCTAssertEqual(assets.map(\.id), [asset?.id])
     }
 
-    func testSaveEditedCandidateAsAssetUsesEditedFields() async {
+    func testSaveEditedCandidateAsAssetUsesEditedFields() async throws {
         let candidate = makeCandidate(id: "candidate-edit")
         await store.saveCandidates([candidate])
 
@@ -286,7 +286,7 @@ final class LanguageAssetStoreTests: XCTestCase {
             status: .pending
         )
 
-        let asset = await store.saveEditedCandidateAsAsset(edited)
+        let asset = try await store.saveEditedCandidateAsAsset(edited)
 
         XCTAssertNotNil(asset)
         XCTAssertEqual(asset?.assetType, .quote)
@@ -316,7 +316,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         XCTAssertEqual(ignoredCandidateIDs, [candidate.id])
     }
 
-    func testClearPendingCandidatesKeepsIgnoredSavedAndAssets() async {
+    func testClearPendingCandidatesKeepsIgnoredSavedAndAssets() async throws {
         let pendingOne = makeCandidate(id: "candidate-pending-1")
         let pendingTwo = makeCandidate(id: "candidate-pending-2")
         let ignored = makeCandidate(id: "candidate-ignored")
@@ -324,7 +324,7 @@ final class LanguageAssetStoreTests: XCTestCase {
         await store.saveCandidates([pendingOne, pendingTwo, ignored, saved])
 
         await store.ignoreCandidate(id: ignored.id)
-        let asset = await store.saveCandidateAsAsset(id: saved.id)
+        let asset = try await store.saveCandidateAsAsset(id: saved.id)
 
         let deletedCount = await store.clearCandidates(status: .pending)
         let pendingCandidates = await store.fetchCandidates(status: .pending)

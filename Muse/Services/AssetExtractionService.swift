@@ -302,7 +302,6 @@ actor AssetExtractionService {
             summary: nil,
             errorMessage: nil
         )
-        await assetStore.insert(job: createdJob)
         let queuedRun = ExtractionRun(
             id: createdJob.id,
             recipeID: recipe.id,
@@ -318,11 +317,17 @@ actor AssetExtractionService {
             summary: nil,
             errorMessage: nil
         )
-        await assetStore.insert(run: queuedRun)
-
         var loadedSourceRecordCount = 0
 
         do {
+            try await assetStore.commitExtraction(
+                candidates: [],
+                results: [],
+                job: createdJob,
+                run: queuedRun,
+                actionType: nil,
+                actionDetail: nil
+            )
             await progress(.loadingRecords)
             let sourceRecords = await loadFreshSourceRecords(configuration: configuration).records
             loadedSourceRecordCount = sourceRecords.count
@@ -338,7 +343,6 @@ actor AssetExtractionService {
                 summary: nil,
                 errorMessage: nil
             )
-            await assetStore.insert(job: runningJob)
             let runningRun = ExtractionRun(
                 id: queuedRun.id,
                 recipeID: queuedRun.recipeID,
@@ -354,14 +358,17 @@ actor AssetExtractionService {
                 summary: nil,
                 errorMessage: nil
             )
-            await assetStore.insert(run: runningRun)
 
             await progress(.filteringInputs)
             let filterOutcome = candidateRecords(from: sourceRecords, configuration: configuration)
             let candidateRecords = filterOutcome.records
-            await assetStore.logAction(
+            try await assetStore.commitExtraction(
+                candidates: [],
+                results: [],
+                job: runningJob,
+                run: runningRun,
                 actionType: .extractionStarted,
-                detail: extractionStartedDetail(
+                actionDetail: extractionStartedDetail(
                     configuration: configuration,
                     sourceCount: sourceRecords.count,
                     candidateCount: candidateRecords.count
@@ -380,8 +387,7 @@ actor AssetExtractionService {
                     summary: L("本次范围内没有足够明确的高价值语料", "No high-value source material found in this range"),
                     errorMessage: nil
                 )
-                await assetStore.insert(job: finishedJob)
-                await assetStore.insert(run: ExtractionRun(
+                let finishedRun = ExtractionRun(
                     id: runningRun.id,
                     recipeID: runningRun.recipeID,
                     recipeName: runningRun.recipeName,
@@ -395,10 +401,14 @@ actor AssetExtractionService {
                     resultCount: 0,
                     summary: finishedJob.summary,
                     errorMessage: nil
-                ))
-                await assetStore.logAction(
+                )
+                try await assetStore.commitExtraction(
+                    candidates: [],
+                    results: [],
+                    job: finishedJob,
+                    run: finishedRun,
                     actionType: .extractionSucceeded,
-                    detail: finishedJob.summary
+                    actionDetail: finishedJob.summary
                 )
                 return AssetExtractionRunResult(job: finishedJob, candidates: [])
             }
@@ -416,17 +426,11 @@ actor AssetExtractionService {
             )
 
             await progress(.savingCandidates)
-            try await assetStore.saveCandidatesOrThrow(candidates)
-            try await assetStore.saveResultsOrThrow(
-                extractionResults(
-                    from: candidates,
-                    run: runningRun,
-                    outputKind: recipe.outputKind
-                )
+            let results = extractionResults(
+                from: candidates,
+                run: runningRun,
+                outputKind: recipe.outputKind
             )
-            // 候选表保留策略（改造方案 #14）：已处理候选超龄/超量顺手裁剪
-            await assetStore.pruneFinishedCandidates()
-
             var summary = buildSummary(for: candidates)
             if filterOutcome.truncatedCount > 0 {
                 summary += L(
@@ -446,8 +450,7 @@ actor AssetExtractionService {
                 summary: summary,
                 errorMessage: nil
             )
-            await assetStore.insert(job: finishedJob)
-            await assetStore.insert(run: ExtractionRun(
+            let finishedRun = ExtractionRun(
                 id: runningRun.id,
                 recipeID: runningRun.recipeID,
                 recipeName: runningRun.recipeName,
@@ -461,14 +464,21 @@ actor AssetExtractionService {
                 resultCount: candidates.count,
                 summary: finishedJob.summary,
                 errorMessage: nil
-            ))
-            await assetStore.logAction(
-                actionType: .extractionSucceeded,
-                detail: finishedJob.summary
             )
+            try await assetStore.commitExtraction(
+                candidates: candidates,
+                results: results,
+                job: finishedJob,
+                run: finishedRun,
+                actionType: .extractionSucceeded,
+                actionDetail: finishedJob.summary
+            )
+            // 候选表保留策略（改造方案 #14）：最终事务提交后再顺手裁剪已处理候选。
+            await assetStore.pruneFinishedCandidates()
             logger.info("Asset extraction succeeded with \(candidates.count) candidates")
             return AssetExtractionRunResult(job: finishedJob, candidates: candidates)
         } catch {
+            let originalError = error
             let message = error is CancellationError
                 ? L("已取消", "Cancelled")
                 : error.localizedDescription
@@ -484,8 +494,7 @@ actor AssetExtractionService {
                 summary: nil,
                 errorMessage: message
             )
-            await assetStore.insert(job: failedJob)
-            await assetStore.insert(run: ExtractionRun(
+            let failedRun = ExtractionRun(
                 id: createdJob.id,
                 recipeID: recipe.id,
                 recipeName: recipe.name,
@@ -499,13 +508,11 @@ actor AssetExtractionService {
                 resultCount: 0,
                 summary: nil,
                 errorMessage: message
-            ))
-            await assetStore.logAction(
-                actionType: .extractionFailed,
-                detail: message
             )
-            logger.error("Asset extraction failed: \(error.localizedDescription)")
-            throw error
+            // 成功事务失败后，以独立新事务落 failed，禁止 succeeded 与半套数据并存。
+            await commitFailureState(job: failedJob, run: failedRun, detail: message)
+            logger.error("Asset extraction failed: \(originalError.localizedDescription)")
+            throw originalError
         }
     }
 
@@ -534,10 +541,16 @@ actor AssetExtractionService {
             summary: nil,
             errorMessage: nil
         )
-        await assetStore.insert(run: createdRun)
-
         var loadedSourceRecordCount = 0
         do {
+            try await assetStore.commitExtraction(
+                candidates: [],
+                results: [],
+                job: nil,
+                run: createdRun,
+                actionType: nil,
+                actionDetail: nil
+            )
             await progress(.loadingRecords)
             let loadedRecords = await loadSourceRecords(configuration: configuration)
             // mapReduce(金句/素材类逐条淘金)全量不截断,片级再拆;whole(日报/待办整体阅读)维持单次上限
@@ -555,10 +568,13 @@ actor AssetExtractionService {
                 sourceRecordCount: sourceRecords.count,
                 status: .running
             )
-            await assetStore.insert(run: runningRun)
-            await assetStore.logAction(
+            try await assetStore.commitExtraction(
+                candidates: [],
+                results: [],
+                job: nil,
+                run: runningRun,
                 actionType: .extractionStarted,
-                detail: recipeExtractionStartedDetail(
+                actionDetail: recipeExtractionStartedDetail(
                     recipe: recipe,
                     configuration: configuration,
                     sourceCount: loadedRecords.count,
@@ -572,7 +588,14 @@ actor AssetExtractionService {
                     status: .succeeded,
                     summary: L("本次范围内没有可用于提炼的语料", "No source material found in this range")
                 )
-                await assetStore.insert(run: finishedRun)
+                try await assetStore.commitExtraction(
+                    candidates: [],
+                    results: [],
+                    job: nil,
+                    run: finishedRun,
+                    actionType: .extractionSucceeded,
+                    actionDetail: finishedRun.summary
+                )
                 return RecipeExtractionRunResult(run: finishedRun, results: [])
             }
 
@@ -598,7 +621,6 @@ actor AssetExtractionService {
 
             await progress(.savingCandidates)
             // 留的落待确认，砍的落 rejected——两边都有账可查
-            try await assetStore.saveResultsOrThrow(results + reviewOutcome.dropped)
             let summary = recipeRunSummary(
                 output: output,
                 resultCount: results.count,
@@ -613,14 +635,18 @@ actor AssetExtractionService {
                 resultCount: results.count,
                 summary: summary
             )
-            await assetStore.insert(run: finishedRun)
-            await assetStore.logAction(
+            try await assetStore.commitExtraction(
+                candidates: [],
+                results: results + reviewOutcome.dropped,
+                job: nil,
+                run: finishedRun,
                 actionType: .extractionSucceeded,
-                detail: summary
+                actionDetail: summary
             )
             logger.info("Recipe extraction succeeded with \(results.count) results")
             return RecipeExtractionRunResult(run: finishedRun, results: results)
         } catch {
+            let originalError = error
             let message = error is CancellationError
                 ? L("已取消", "Cancelled")
                 : error.localizedDescription
@@ -631,13 +657,47 @@ actor AssetExtractionService {
                 status: .failed,
                 errorMessage: message
             )
-            await assetStore.insert(run: failedRun)
-            await assetStore.logAction(
+            await commitFailureState(job: nil, run: failedRun, detail: message)
+            logger.error("Recipe extraction failed: \(originalError.localizedDescription)")
+            throw originalError
+        }
+    }
+
+    /// 失败状态必须优先于审计日志落库。若日志表/触发器本身故障，
+    /// 再用不含 action log 的独立事务保存 failed，避免任务永久停在 queued/running。
+    private func commitFailureState(
+        job: AssetExtractionJob?,
+        run: ExtractionRun,
+        detail: String
+    ) async {
+        do {
+            try await assetStore.commitExtraction(
+                candidates: [],
+                results: [],
+                job: job,
+                run: run,
                 actionType: .extractionFailed,
-                detail: message
+                actionDetail: detail
             )
-            logger.error("Recipe extraction failed: \(error.localizedDescription)")
-            throw error
+        } catch {
+            let failureLogError = error
+            do {
+                try await assetStore.commitExtraction(
+                    candidates: [],
+                    results: [],
+                    job: job,
+                    run: run,
+                    actionType: nil,
+                    actionDetail: nil
+                )
+                logger.error(
+                    "Extraction failed state committed without action log: \(failureLogError.localizedDescription)"
+                )
+            } catch {
+                logger.error(
+                    "Extraction failure-state commit failed: \(error.localizedDescription); action-log attempt: \(failureLogError.localizedDescription)"
+                )
+            }
         }
     }
 
