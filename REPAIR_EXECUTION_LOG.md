@@ -276,3 +276,44 @@
 - 收口环境限制：`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按设计标记为 `SKIP`；未安装工具，也未降低构建或测试门槛。
 - 音频测试：遵照用户指示，本批次未执行任何麦克风、音频设备或真机音频测试。
 - 待人工项：MUSE-070 冻结后的真实本地 ASR/LLM 制品鉴权与模型加载；MUSE-080 真实服务进程停止与既有 PID 台账迁移；MUSE-090 真实火山异常帧；MUSE-100 TextEdit、微信剪贴板 fallback、Electron 与 nonactivatingPanel 连续注入。以上不影响本批次自动验收结论，仍须在发布前真机 gate 中完成。
+
+## 批次 C
+
+| 任务 | 状态 | 提交 | 备注 |
+|---|---|---|---|
+| MUSE-110 | ✅ 完成 | `ef60ef4` | 候选转资产幂等事务、提炼最终状态原子提交及失败状态独立兜底完成。 |
+| MUSE-120 | ⬜ 未开始 | — | 等待 MUSE-110 完成后执行。 |
+| MUSE-130 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-140 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-150 | ⬜ 未开始 | — | 等待前置任务。 |
+| MUSE-160 | ⬜ 未开始 | — | 等待前置任务。 |
+
+### MUSE-110：让候选入库和提炼提交具备事务性与幂等性
+
+- 状态：✅ 完成。
+- 提交：`ef60ef4`（`修复: 原子提交语料候选、资产和提炼运行状态`）。
+- 测试优先：
+  - 修改前先运行既有相关基线：`swift test --filter 'LanguageAssetStoreTests|AssetExtractionRetryTests|AssetExtractionNormalizerTests'`，32 项、0 失败。
+  - 先新增 Candidate 首次入库/重试、更新失败回滚、编辑入库、COMMIT 失败和通知时序，以及提炼第二条结果失败、finished run 失败、配方结果原子提交、action-log prepare 失败等测试；修复前运行 `swift test --filter 'LanguageAssetTransactionTests|AssetExtractionCommitTests'` 明确编译失败，报告缺少可注入 `NotificationCenter`、`commitExtraction` 与 throwing Candidate 入库接口。
+  - 独立审查发现 queued 提交和 action log 故障兜底缺口后，再先新增两条服务级失败测试；修复前 `AssetExtractionCommitTests` 明确失败：queued 失败后 job/run 不存在，action-log 不可用时 job/run 仍停在 queued。
+- 修改：
+  - 新增统一 `BEGIN IMMEDIATE → body → COMMIT` 事务 helper；body 或 COMMIT 任一失败均 ROLLBACK 并透传原始 SQLite 错误，批量 recipe/result/asset/candidate 写入统一复用无事务 row helper。
+  - Candidate 转 Asset 在同一事务内读取候选、以 `candidate.id` 执行 `INSERT OR IGNORE`、读取持久化 Asset、更新 Candidate 为 saved 并幂等写入 action log；编辑后的 Candidate、Asset 与状态同样整体提交。
+  - 老 `extractAssets` 将 candidates、results、finished job/run 与成功日志一次提交；`extractRecipeResults` 将 kept/rejected results、finished run 与成功日志一次提交，提交成功后才裁剪和通知。
+  - queued/running 状态也纳入错误处理；任一数据/状态提交失败后，用独立事务保存 failed。若 action log 自身不可用，自动退化为不含日志的 failed 状态事务，避免任务永久停在 queued/running，并始终向调用方重抛原始错误。
+  - `insert(job:)`、`insert(run:)` 与 Candidate 入库接口改为 throwing；UI 捕获并展示错误。Store 支持注入 `NotificationCenter`，事务成功后仅发送一次通知，并启用、校验 SQLite foreign keys 以覆盖真实 COMMIT 失败。
+- 修改文件：
+  - `Muse/Database/LanguageAssetStore.swift`
+  - `Muse/Services/AssetExtractionService.swift`
+  - `Muse/UI/Settings/AssetLibraryTab.swift`
+  - `MuseTests/LanguageAssetStoreTests.swift`
+  - `MuseTests/LanguageAssetTransactionTests.swift`
+  - `MuseTests/AssetExtractionCommitTests.swift`
+- 验证：
+  - `swift test --filter 'LanguageAssetTransactionTests|AssetExtractionCommitTests|LanguageAssetStoreTests|AssetExtractionRetryTests|AssetExtractionNormalizerTests'`：44 项，0 失败。
+  - `swift test --sanitize thread --filter 'LanguageAssetTransactionTests|AssetExtractionCommitTests'`：12 项，0 失败，未报告数据竞争。
+  - `swift test`：356 项，5 项按既有环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、356 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；独立只读复审未发现 MUSE-110 阻断问题。
+- 遗留风险：旧版本曾为同一 Candidate 生成随机 Asset UUID，现有历史库没有可靠映射字段，本次不扫描或迁移真实用户数据，因此历史内容级重复无法自动合并；`commitExtraction` 的最终提交显式重放时仍会以 `OR REPLACE` 覆盖后来人工修改的 Candidate/Result 状态并新增一条 action log，正常服务流程不会重放同一 final commit，后续若引入自动重试需增加 run 级提交幂等键；action-log 表损坏时优先保证 failed job/run 落库，因此该次失败可能只有应用日志而没有数据库 action log。测试全部使用临时数据库和 SQLite trigger 注入，未在真实用户库验证迁移或多进程锁竞争。按用户指示未执行任何音频测试。自动更新开关仍为 `false`。
