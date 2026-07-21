@@ -492,3 +492,42 @@
 - 收口环境限制：`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按设计标记为 `SKIP`；未安装工具，也未降低构建或测试门槛。
 - 音频测试：遵照用户指示，本批次未执行麦克风、AirPods 或其他音频真机测试；完整 `swift test` 中的纯单元音频缓冲测试仍按仓库硬门槛执行。
 - 待人工项：真实模型 CDN/安装恢复、真实云端与本地 LLM 联调、词库迁移和损坏恢复 UI、Provider 启动回退、冻结本地服务路径，以及 MUSE-120 要求的 Cloud/Local 双制品签名与 SHA256 验收。以上均继续作为发布前 gate，不据此开启自动更新。
+
+## 批次 D
+
+| 任务 | 状态 | 提交 | 备注 |
+|---|---|---|---|
+| MUSE-170 | ✅ 完成 | `828c726` | 外层签名保持最后；Mach-O/MetalLib 嵌套代码、Cloud/Local 内容和严格验签均有自动回归门槛。 |
+| MUSE-180 | ⬜ 未开始 | — | 等待 MUSE-170 完成。 |
+
+### MUSE-170：修复 App Bundle 最终签名顺序
+
+- 状态：✅ 完成。
+- 提交：`828c726`（`修复: 调整应用签名顺序并验证最终 Bundle`）。
+- 开始状态：分支 `codex/muse-hardening-v1`，HEAD `537d50220d3d8ce397f3eb26e9fab991de0ce530`；保留执行日志中的进行中标记及既有未跟踪文件 `CODEX_REPAIR_PLAN.md`，未覆盖或纳入代码提交。基线 `swift build` 通过；`swift test` 执行 467 项、5 项按既有环境条件跳过、0 失败。
+- 测试优先：
+  - 先新增脚本语法、嵌套签名失败、签名后禁写、Cloud/Local 内容、严格验签与篡改失效测试；首个策略测试在缺少 `scripts/sign-app-bundle.sh` 时明确失败，实施后逐项转绿。
+  - 独立测试审计指出原 fixture 未执行真实 `package-app.sh`、嵌套失败由测试分支制造、篡改未走正式验证脚本等假绿风险；测试随后改为在临时项目中执行真实打包链，用可注入失败 signer、无扩展且无执行位的 Mach-O、正式 `test_app_bundle.sh` 与篡改制品锁定行为。
+  - 终审发现真实 MLX `mlx.metallib` 被 `/usr/bin/file` 识别为 `MetalLib executable` 而非 Mach-O；先新增最小 MetalLib 内容 fixture 并观察脚本错误进入外层签名，再扩展内容检测，目标测试转绿。随后将仓库现有 150 MB 真实 MLX MetalLib 只读克隆到临时 App，确认嵌套签名、单体严格验签与外层严格验签均通过。
+  - 再以两个失败哨兵测试锁定 Local 缺 dist、目录存在但 launcher 缺失时不得替换既有 Bundle；预检提升到构建和 Bundle 写入之前，并要求两套命名 launcher 均为可执行普通文件。
+- 修改：
+  - 新增独立签名阶段，遍历最终 `Contents` 并以 `/usr/bin/file` 内容识别所有 Mach-O 与 MetalLib code object；任一嵌套签名失败立即终止，最后才签外层 App，之后仅允许严格验签、元数据读取和 Gatekeeper 评估。
+  - Local 服务直接复制到最终目录；可执行入口改为指向已签名冻结 launcher 的 Bundle 内相对符号链接，shell wrapper 作为非可执行资源由外层 seal 覆盖。Cloud 每次重建完整 `Contents`，不会残留旧 Local 文件。
+  - Local 构建在任何构建或替换既有 Bundle 之前验证两套 dist 和可执行 launcher，缺件明确失败且保留原 Contents。
+  - `test_app_bundle.sh` 对 Cloud/Local 执行同一 `codesign --verify --deep --strict --verbose=4` 门槛；Developer ID authority 继续执行 `spctl --assess`。健康检查新增签名策略静态门槛。
+- 修改文件：
+  - `MuseTests/PackageScriptTests.swift`
+  - `scripts/health-check.sh`
+  - `scripts/package-app.sh`
+  - `scripts/sign-app-bundle.sh`
+  - `scripts/test_app_bundle.sh`
+- 验证：
+  - `swift test --filter PackageScriptTests`：10 项，0 失败。
+  - `bash -n scripts/package-app.sh scripts/sign-app-bundle.sh scripts/test_app_bundle.sh scripts/health-check.sh`：通过。
+  - 临时真实 Cloud 打包：ad-hoc 外层签名与两次严格验证通过；第一次额外手工复验误传旧 bundle id `com.haujet.muse` 而失败，改用仓库实际 `pro.daliang.muse` 后重跑通过，属于验收命令参数错误而非制品失败。
+  - 真实 MLX `mlx.metallib` 临时验收：脚本明确输出嵌套签名，MetalLib 单体和最终 App 严格验签均通过；临时目录均已移入废纸篓，可恢复。
+  - `swift build`、`swift build -c release`：通过。
+  - `swift test`：477 项，5 项按既有环境条件跳过，0 失败。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、477 项 Swift 测试、模型与签名策略、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过；独立只读终审确认无剩余 P0/P1。
+- 遗留风险：仓库当前没有两套完整冻结服务 dist，因此真实 Local 成品未能在本机打包；Local 自动验收使用执行真实打包脚本的隔离 fixture，真实 Qwen MetalLib 另行完成签名验证。没有 Developer ID identity，故只验证 ad-hoc 严格签名，`spctl` 的发布证书路径仍是发布前 gate；未生成/公证 DMG，也未做 Cloud/Local 真机安装。`shellcheck`、`swiftlint`、`periphery` 未安装，健康检查按既有规则跳过。测试均使用临时目录和隔离 HOME，未访问真实 Muse 用户数据目录或系统钥匙串；但 MUSE-160 已披露的更早测试隔离事故仍无法确认持久影响。按用户指示未执行麦克风、AirPods 或其他音频真机测试。Cloud、Local 双制品签名、SHA256、更新与回滚真机验收尚未全部完成，自动更新开关仍为 `false`。
