@@ -173,6 +173,7 @@
 | 任务 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | MUSE-070 | ✅ 完成 | `b387d76` | 本地服务进程级 token 鉴权与 HTTP、LLM、WebSocket 输入边界完成。 |
+| MUSE-080 | ✅ 完成 | `aad11af` | 本地服务进程身份校验、可靠停止和增量端口解析完成。 |
 
 ### MUSE-070：给本地 ASR 和 LLM 服务增加鉴权与输入上限
 
@@ -195,3 +196,24 @@
   - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、全量 Swift 测试、Shell/Python 语法和 Python 服务测试全部通过。
   - `git diff --check`：通过。
 - 遗留风险：测试通过 FastAPI TestClient、stub 模型和可控 WebSocket 验证，不加载真实 ASR/LLM 模型；当前环境未安装 PyInstaller，未执行冻结制品导入冒烟。启动 gate 以当前打包入口 `main()` 为边界，未来若改用 `uvicorn module:app` 需同步迁移到 lifespan/startup gate。`shellcheck`、`swiftlint`、`periphery` 未安装，按健康检查既有规则标记为跳过。未执行任何麦克风或音频设备测试。自动更新开关仍为 `false`。
+
+### MUSE-080：修复本地服务 PID 误杀、停止泄漏和端口解析
+
+- 状态：✅ 完成。
+- 提交：`aad11af`（`修复: 校验本地服务进程身份并可靠回收子进程`）。
+- 测试优先：
+  - 先新增进程身份与端口解析回归测试；修复前运行 `swift test --filter 'ServerProcessIdentityTests|ServerPortParserTests'` 明确编译失败，报告缺少 `ServerProcessController`、`ServerProcessIdentity`、`ServerProcessIdentityLedger`、`PortLineParser` 与 `ServerPortReader`。
+  - 补充“台账中的进程已退出”用例后，该用例先得到错误的 `.refused`；随后将身份校验改为区分进程不存在、读取失败和身份不匹配，红灯转绿。
+- 修改：
+  - PID 台账改为 JSON 身份记录，保存服务类型、PID、真实可执行路径和进程启动时间；旧纯文本或损坏台账只记录安全日志，不据此发送信号。
+  - 使用 `proc_pidpath` 与 `proc_pidinfo` 在发信号前后核对进程仍存活、路径、启动时间和服务类型；身份不一致时拒绝终止并保留未确认台账，避免 PID 复用导致误杀。
+  - 主动停止与孤儿清理统一先移除 Pipe handler、发送 TERM、等待约 3 秒，再重新校验身份并按需发送 KILL；只有确认进程退出后才清除 actor 状态与台账。
+  - 为 `Process` 安装永久退出闩锁，等待采用独立 continuation 与硬截止时间，不阻塞 manager actor；并发停止复用同一进程身份与退出闩锁。
+  - 端口读取改为增量解析，只处理换行完成的日志行；支持标记跨 2/3/4 个数据块，并在成功、EOF 或超时后移除 `readabilityHandler`。
+- 验证：
+  - `swift test --filter 'ServerProcessIdentityTests|ServerPortParserTests'`：18 项，0 失败。
+  - `swift test`：322 项，5 项按环境条件跳过，0 失败。
+  - `swift build`、`swift build -c release`：通过。
+  - `bash scripts/health-check.sh`：`HEALTH_CHECK_RESULT: PASS`；Debug/Release 构建、322 项 Swift 测试、Shell/Python 语法和 12 项 Python 服务测试全部通过。
+  - `git diff --check`：通过。
+- 遗留风险：进程测试只终止测试自身创建的 `/bin/sleep` 与忽略 TERM 的 Python fixture，未启动真实 ASR/LLM 模型，也未读取或迁移真实用户数据目录中的既有 PID 台账；Python 服务类型属于 manager 持有的逻辑身份，操作系统层仅能再次证明解释器路径。`proc_pidinfo` 复核与 `kill` 之间仍存在极小的系统调用竞态窗口，当前实现已按任务要求在每次信号前重复校验。按用户指示未执行任何麦克风、音频设备或真机音频测试。自动更新开关仍为 `false`。
