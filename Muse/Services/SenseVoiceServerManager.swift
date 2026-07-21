@@ -614,8 +614,6 @@ actor SenseVoiceServerManager {
 
     private func configureQwen3Server(proc: Process, args: inout [String]) throws {
         let resolved = try resolveServerExecutable(name: "qwen3-asr-server")
-        let executable = resolved.executable
-        let serverScript = resolved.serverScript
 
         // ASR 模型可选：缺省时让 server 进入 LLM-only 模式（本地 LLM 不依赖 Qwen3-ASR 独立运行）。
         // 但 ASR 与 LLM 至少要有一个，否则这个 server 没什么可服务。
@@ -633,9 +631,9 @@ actor SenseVoiceServerManager {
         let hotwordsPath = AppPaths.support("hotwords.txt")
         let hotwordsFile = FileManager.default.fileExists(atPath: hotwordsPath.path) ? hotwordsPath.path : ""
 
-        proc.executableURL = URL(fileURLWithPath: executable)
-        if !serverScript.isEmpty {
-            args.append(serverScript)
+        proc.executableURL = resolved.executableURL
+        if let serverScript = resolved.serverScriptURL {
+            args.append(serverScript.path)
         }
         args += [
             "--model-path", modelPath ?? "",
@@ -671,8 +669,6 @@ actor SenseVoiceServerManager {
 
     private func configureSenseVoiceServer(proc: Process, args: inout [String]) throws {
         let resolved = try resolveServerExecutable(name: "sensevoice-server")
-        let executable = resolved.executable
-        let serverScript = resolved.serverScript
 
         let bundledModel = Bundle.main.resourceURL?
             .appendingPathComponent("Models")
@@ -703,9 +699,9 @@ actor SenseVoiceServerManager {
         let hotwordsPath = AppPaths.support("hotwords.txt")
         let hotwordsFile = FileManager.default.fileExists(atPath: hotwordsPath.path) ? hotwordsPath.path : ""
 
-        proc.executableURL = URL(fileURLWithPath: executable)
-        if !serverScript.isEmpty {
-            args.append(serverScript)
+        proc.executableURL = resolved.executableURL
+        if let serverScript = resolved.serverScriptURL {
+            args.append(serverScript.path)
         }
         args += [
             "--model-dir", modelDir,
@@ -722,62 +718,33 @@ actor SenseVoiceServerManager {
         logger.info("Starting SenseVoice server")
     }
 
-    // MARK: - Dev server discovery
+    // MARK: - Server executable resolution
 
-    private struct ServerExecutable {
-        let executable: String
-        /// 空字符串 = bundle 内 PyInstaller 二进制（自带入口，无需脚本参数）
-        let serverScript: String
+    /// ServerManager 与 ModelManager 共用同一 resolver；测试可注入构建策略和
+    /// 文件元数据，不依赖当前测试二进制究竟是 Debug 还是 Release。
+    nonisolated static func resolveServerExecutable(
+        name: String,
+        using resolver: ServerExecutableResolver = .live
+    ) throws -> ResolvedServerExecutable {
+        try resolver.resolve(name: name)
     }
 
-    /// REPAIR_PLAN J5：解析顺序为 bundle 内打包二进制优先、开发目录兜底。
-    /// 此前 dev 目录优先且无门控——正式签名 App 会执行家目录同名工程里
-    /// 用户可写的 Python（植入面）。调换后：完整分发包（BUNDLE_LOCAL_ASR=1
-    /// 打包了服务二进制）不再看家目录；仅开发构建（bundle 无二进制，
-    /// 本机日用 swift build 即此形态，B10 场景）才回落 findDevServerDir，
-    /// 且选中 dev 路径时记警示日志留痕，异常植入可审计。
-    private func resolveServerExecutable(name: String) throws -> ServerExecutable {
-        let bundledBinary = Bundle.main.executableURL?
-            .deletingLastPathComponent()
-            .appendingPathComponent(name)
-            .path
-        if let bin = bundledBinary, FileManager.default.fileExists(atPath: bin) {
-            return ServerExecutable(executable: bin, serverScript: "")
-        }
-        guard let dir = findDevServerDir(name: name) else {
-            throw ServerError.serverNotFound
-        }
-        let python = (dir as NSString).appendingPathComponent(".venv/bin/python")
-        guard FileManager.default.fileExists(atPath: python) else {
-            throw ServerError.venvNotFound
-        }
-        logger.warning("\(name) resolved to dev directory (bundle has no packaged binary): \(dir)")
-        return ServerExecutable(
-            executable: python,
-            serverScript: (dir as NSString).appendingPathComponent("server.py")
-        )
-    }
-
-    private func findDevServerDir(name: String) -> String? {
-        // Walk up from binary location to find server directory
-        var dir = Bundle.main.bundlePath
-        for _ in 0..<5 {
-            dir = (dir as NSString).deletingLastPathComponent
-            let candidate = (dir as NSString).appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: (candidate as NSString).appendingPathComponent("server.py")) {
-                return candidate
+    private func resolveServerExecutable(name: String) throws -> ResolvedServerExecutable {
+        do {
+            let resolved = try Self.resolveServerExecutable(name: name)
+            if resolved.source == .development {
+                logger.warning("\(name) resolved from explicit DEBUG development root")
+            }
+            return resolved
+        } catch let error as ServerExecutableResolutionError {
+            Self.securityLog("拒绝解析本地服务 \(name)：\(String(describing: error))")
+            switch error {
+            case .pythonMissing, .pythonNotExecutable:
+                throw ServerError.venvNotFound
+            default:
+                throw ServerError.serverNotFound
             }
         }
-        // 安装到 /Applications 时向上遍历到不了工程目录，靠家目录常见位置兜底
-        // （工程实际在 ~/muse；曾只写死 ~/projects/muse 导致本地引擎 serverNotFound）
-        let home = NSHomeDirectory()
-        for relative in ["muse/\(name)", "projects/muse/\(name)"] {
-            let fallback = (home as NSString).appendingPathComponent(relative)
-            if FileManager.default.fileExists(atPath: (fallback as NSString).appendingPathComponent("server.py")) {
-                return fallback
-            }
-        }
-        return nil
     }
 
     nonisolated private static func captureLaunchedIdentity(

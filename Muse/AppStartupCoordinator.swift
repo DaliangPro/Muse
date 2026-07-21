@@ -15,6 +15,52 @@ enum AppStartupCoordinator {
         removeOrphanHistoryFileIfNeeded()
     }
 
+    /// 在任何模式解析、热键注册、本地服务启动和连通性探测之前，修正历史中
+    /// 已不可用的 ASR Provider。先持久化，再展示一次说明；持久化后的第二次
+    /// 调用自然不会重复提示。
+    @discardableResult
+    static func reconcileSelectedASRProviderIfNeeded(
+        readSelection: () -> ASRProvider = { KeychainService.selectedASRProvider },
+        writeSelection: (ASRProvider) -> Void = { KeychainService.selectedASRProvider = $0 },
+        capabilities: (ASRProvider) -> ASRProviderCapabilities = {
+            ASRProviderRegistry.capabilities(for: $0)
+        },
+        presentNotice: @MainActor (ASRProvider, ASRProvider) -> Void = {
+            presentASRProviderFallbackNotice(unavailable: $0, replacement: $1)
+        }
+    ) -> ASRProvider {
+        let requested = readSelection()
+        let resolved = ASRProviderRegistry.resolvedProvider(
+            for: requested,
+            capabilities: capabilities
+        )
+        guard resolved != requested else { return requested }
+
+        writeSelection(resolved)
+        presentNotice(requested, resolved)
+        return resolved
+    }
+
+    private static func presentASRProviderFallbackNotice(
+        unavailable: ASRProvider,
+        replacement: ASRProvider
+    ) {
+        AppLogger.log(
+            "[App] ASR provider unavailable; switched from \(unavailable.rawValue) to \(replacement.rawValue)"
+        )
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = L("语音识别引擎已切换", "Speech recognizer changed")
+            alert.informativeText = L(
+                "此前选择的“\(unavailable.displayName)”在当前版本中不可用，Muse 已切换到“\(replacement.displayName)”。您可以稍后在设置中更改。",
+                "The previously selected \(unavailable.displayName) is unavailable in this build. Muse switched to \(replacement.displayName). You can change it later in Settings."
+            )
+            alert.addButton(withTitle: L("知道了", "OK"))
+            alert.runModal()
+        }
+    }
+
     /// REPAIR_PLAN C1：清理历史遗留的 0 字节孤儿库文件 history.sqlite
     /// （代码早已只用 history.db）。仅在文件为空时移入废纸篓，绝不动有内容的文件
     private static func removeOrphanHistoryFileIfNeeded() {
@@ -98,8 +144,7 @@ enum AppStartupCoordinator {
                 }
             }
         } else if KeychainService.selectedASRProvider == .sherpa {
-            AppLogger.log("[App] Local ASR not available (cloud build), switching to volcano")
-            KeychainService.selectedASRProvider = .volcano
+            AppLogger.log("[App] Local ASR model is not available; server was not started")
         }
 
         // 润色/提炼选了本地千问但模型未下载时，服务即使为 ASR 拉起也无法服务 LLM，

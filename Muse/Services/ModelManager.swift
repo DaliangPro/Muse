@@ -99,17 +99,13 @@ actor ModelManager {
     // MARK: - SenseVoice 可用性
 
     nonisolated static var isSenseVoiceBundled: Bool {
-        if let bundled = Bundle.main.executableURL?
-            .deletingLastPathComponent()
-            .appendingPathComponent("sensevoice-server"),
-           FileManager.default.fileExists(atPath: bundled.path) {
-            return true
-        }
+        isSenseVoiceBundled(using: .live)
+    }
 
-        let home = NSHomeDirectory()
-        let devPath = (home as NSString)
-            .appendingPathComponent("projects/muse/sensevoice-server/server.py")
-        return FileManager.default.fileExists(atPath: devPath)
+    nonisolated static func isSenseVoiceBundled(
+        using resolver: ServerExecutableResolver
+    ) -> Bool {
+        resolver.isAvailable(name: "sensevoice-server")
     }
 
     // MARK: - 辅助模型

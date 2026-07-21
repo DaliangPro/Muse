@@ -79,6 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppStartupCoordinator.configureActivationPolicy()
         AppearanceController.start()  // 启动即设 app 级外观，让窗口创建前就定好，避免设置窗口首帧深色
         AppStartupCoordinator.runMigrations()
+        AppStartupCoordinator.reconcileSelectedASRProviderIfNeeded()
 
         DebugFileLogger.startSession()
         DebugFileLogger.log("applicationDidFinishLaunching")
