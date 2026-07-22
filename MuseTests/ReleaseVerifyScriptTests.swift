@@ -12,6 +12,28 @@ final class ReleaseVerifyScriptTests: XCTestCase {
         }
     }
 
+    func testReleaseCandidateDefaultsAndNotesTargetVersionTwo() throws {
+        let expectedDefaults = [
+            ("scripts/package-app.sh", #"APP_VERSION="${APP_VERSION:-2.0.0}""#),
+            ("scripts/build-dmg.sh", #"APP_VERSION="${APP_VERSION:-2.0.0}""#),
+            ("scripts/test_app_bundle.sh", #"EXPECTED_VERSION="${APP_VERSION:-2.0.0}""#),
+        ]
+
+        for (path, expectedDefault) in expectedDefaults {
+            let content = try String(
+                contentsOf: repositoryRoot.appendingPathComponent(path),
+                encoding: .utf8
+            )
+            XCTAssertTrue(content.contains(expectedDefault), "\(path) 应默认构建 2.0.0")
+        }
+
+        let notesURL = repositoryRoot
+            .appendingPathComponent("docs/2026-07-21-Muse-v2.0.0-发布说明.md")
+        let notes = try String(contentsOf: notesURL, encoding: .utf8)
+        XCTAssertTrue(notes.contains("# Muse 2.0.0"))
+        XCTAssertTrue(notes.contains("自动更新仍保持关闭"))
+    }
+
     func testBuildModeUsesBothActualDMGsAndGeneratesValidatedManifest() throws {
         let fixture = try makeFixture()
         defer { trash(fixture.rootURL) }
