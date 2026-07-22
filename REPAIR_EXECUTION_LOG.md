@@ -666,6 +666,7 @@
 - 2.0.0 发布准备：提交 `983e2ceb4f580f85cf6e6d538d85ecb47904be5e` 将本地打包、DMG 构建和应用包验收的默认版本统一为 `2.0.0`，新增中文发布说明及回归测试；PR [#2](https://github.com/DaliangPro/Muse/pull/2) 已合并，合并提交 `e551e0a536a84225ea33604f7da2b7caf783848d`。
 - 测试优先：发布版本回归测试在实施前出现 4 个预期失败；实施后单项测试、51 项相关测试均通过。隔离英文环境完整 `swift test` 执行 555 项，5 项按环境条件跳过，0 失败；`bash scripts/health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`。
 - GitHub 验收：发布准备分支的 push CI [29879645023](https://github.com/DaliangPro/Muse/actions/runs/29879645023) 与 PR CI [29879660827](https://github.com/DaliangPro/Muse/actions/runs/29879660827) 均通过；合并后的主分支 CI [29879945587](https://github.com/DaliangPro/Muse/actions/runs/29879945587) 通过。
-- 发布状态：GitHub 当前公开最新版仍为 `v1.7.4`；`updates.json` 仍指向 `1.7.4`，`UpdateChecker.updateChannelEnabled` 继续保持 `false`，未提前创建 `v2.0.0` tag 或 Release。
-- 外部门槛：仓库当前没有 `release-signing`、`release` 环境及 Actions secrets/variables，且只有 `DaliangPro` 一位协作者；本机没有 Developer ID Application 身份。正式发布需要第二位 GitHub 审核人、Developer ID `.p12`、App Store Connect API `.p8`、Key ID、Issuer ID、Team ID 和签名身份名称。
-- 真机门槛：遵照用户指示不再执行音频测试，因此不得把工作流的音频真机 gate 虚报为已完成；Cloud/Local 双制品签名、公证、SHA256、下载复验、真实更新与回滚仍未完成，不公开 2.0.0，也不开启自动更新。
+- GitHub 发布：按 `v1.7.4` 的普通开源项目发布方式创建轻量 tag `v2.0.0`，指向 `17551ec1ff5cca0eeb3196e7e0f3a27fd4f6abef`；[Muse v2.0.0](https://github.com/DaliangPro/Muse/releases/tag/v2.0.0) 已作为稳定版公开发布，附件为 Apple Silicon（arm64）`Muse-v2.0.0.dmg`。
+- 制品验证：应用使用既有 `Muse Local` 本地证书签名，严格代码签名验证、Bundle 元数据测试和 DMG 完整性验证通过。上传后重新下载的文件与本地候选逐字节一致，GitHub 记录及本地复算 SHA256 均为 `b9b37d1d6ce11ed90b9d5a8f2e45d2a4b8e24ac11db018c27b3e3eb87e0aa9a9`。
+- 分发边界：本次是与 `v1.7.4` 相同的 GitHub 手动下载发布，不是 Developer ID 公证制品，也不声称受保护的 Cloud/Local 正式发布链或真机 gate 已完成。遵照用户指示未执行音频测试。
+- 自动更新：`updates.json` 仍指向 `1.7.4`，`UpdateChecker.updateChannelEnabled` 继续保持 `false`；2.0.0 仅通过 GitHub Release 手动下载，不进入自动更新通道。
