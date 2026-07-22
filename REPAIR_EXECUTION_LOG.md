@@ -658,3 +658,14 @@
 - 自动更新：仓库内双制品签名、公证、SHA256 和发布 fail-closed 链已建立，但真实 Developer ID/Notary 制品、GitHub 受保护环境、10 项真机更新与回滚验收尚未完成，开关继续保持 `false`。
 - 外部阻断：需要仓库管理员配置 `release-signing`、`release` 受保护环境及签名/公证 secrets/variables，再用正式候选执行 Cloud/Local 公证、Gatekeeper、更新和回滚验收；在此之前不得公开发布或开启自动更新。
 - 用户数据与音频：本批次未访问真实 Muse 用户数据目录；遵照用户明确指示，未执行麦克风、AirPods、Apple Speech 或其他音频真机测试。
+
+## GitHub 合入与 Muse 2.0.0 发布准备
+
+- 日期：2026-07-21。
+- 安全加固主分支合入：PR [#1](https://github.com/DaliangPro/Muse/pull/1) 已合并，合并提交 `d75da1d3a8d2948d359ff49356adfc8c3f1e14cb`；对应主分支 CI [29878764682](https://github.com/DaliangPro/Muse/actions/runs/29878764682) 通过。
+- 2.0.0 发布准备：提交 `983e2ceb4f580f85cf6e6d538d85ecb47904be5e` 将本地打包、DMG 构建和应用包验收的默认版本统一为 `2.0.0`，新增中文发布说明及回归测试；PR [#2](https://github.com/DaliangPro/Muse/pull/2) 已合并，合并提交 `e551e0a536a84225ea33604f7da2b7caf783848d`。
+- 测试优先：发布版本回归测试在实施前出现 4 个预期失败；实施后单项测试、51 项相关测试均通过。隔离英文环境完整 `swift test` 执行 555 项，5 项按环境条件跳过，0 失败；`bash scripts/health-check.sh` 返回 `HEALTH_CHECK_RESULT: PASS`。
+- GitHub 验收：发布准备分支的 push CI [29879645023](https://github.com/DaliangPro/Muse/actions/runs/29879645023) 与 PR CI [29879660827](https://github.com/DaliangPro/Muse/actions/runs/29879660827) 均通过；合并后的主分支 CI [29879945587](https://github.com/DaliangPro/Muse/actions/runs/29879945587) 通过。
+- 发布状态：GitHub 当前公开最新版仍为 `v1.7.4`；`updates.json` 仍指向 `1.7.4`，`UpdateChecker.updateChannelEnabled` 继续保持 `false`，未提前创建 `v2.0.0` tag 或 Release。
+- 外部门槛：仓库当前没有 `release-signing`、`release` 环境及 Actions secrets/variables，且只有 `DaliangPro` 一位协作者；本机没有 Developer ID Application 身份。正式发布需要第二位 GitHub 审核人、Developer ID `.p12`、App Store Connect API `.p8`、Key ID、Issuer ID、Team ID 和签名身份名称。
+- 真机门槛：遵照用户指示不再执行音频测试，因此不得把工作流的音频真机 gate 虚报为已完成；Cloud/Local 双制品签名、公证、SHA256、下载复验、真实更新与回滚仍未完成，不公开 2.0.0，也不开启自动更新。
