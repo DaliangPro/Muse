@@ -72,12 +72,12 @@ enum TF {
         light: (0.900, 0.910, 0.920),
         dark:  (0.188, 0.188, 0.188)
     )
-    /// 侧栏选中行底色（2026-06-11 用户三轮微调定稿）：深浅都用半透白，
-    /// 亮度恒为「比周围玻璃亮一档」，随背后背景自适应，不再出现深块压亮底
+    /// 侧栏选中行底色：浅色侧栏已是实色，使用暖灰平色建立清晰层级；
+    /// 深色继续用半透白提亮，保持原有明度关系。
     static let settingsSidebarActiveFill = adaptiveColor(
-        light: (1.000, 1.000, 1.000),
+        light: (0.918, 0.914, 0.906),
         dark:  (1.000, 1.000, 1.000),
-        lightAlpha: 0.45,
+        lightAlpha: 1.0,
         darkAlpha: 0.12
     )
     /// 毛玻璃侧栏专用悬停底：同选中的半透白体系、再轻一档；
@@ -355,6 +355,7 @@ enum TF {
 
     // 侧栏导航（与 BodyLarge 同值别名；13pt 档 2026-06-12 起开放给「主角信息」类正文）
     static let settingsFontNavigation = settingsFontBodyLarge
+    static let settingsFontNavigationSelected = Font.system(size: 13, weight: .medium)
 
     // 图标字体四档（Image(systemName:) 专用，文字不得使用）
     static let settingsFontIconMicro = Font.system(size: 8, weight: .medium)

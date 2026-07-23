@@ -10,6 +10,7 @@ enum SettingsSidebarLayout {
     static let navItemVerticalPadding: CGFloat = 0
     static let navItemCornerRadius: CGFloat = 8
     static let navItemTextFont = TF.settingsFontNavigation
+    static let navItemSelectedTextFont = TF.settingsFontNavigationSelected
 
     static let settingsLeadingInset: CGFloat = SettingsLayout.sidebarLeadingInset
     static let settingsBottomInset: CGFloat = 12

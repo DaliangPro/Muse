@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// 墨色一体侧栏（2026-06-11 用户拍板方案一）：与内容区同底色，纯文字导航，
-/// 选中态为贴左缘的琥珀短竖线；关于与设置沉底。
+/// 墨色一体侧栏：纯文字导航以暖灰层级和墨色字重表达选中态；
+/// 关于与设置沉底。
 struct SettingsSidebarView: View {
     let width: CGFloat
     @Binding var selectedTab: SettingsTab
@@ -70,8 +70,7 @@ private extension SettingsSidebarView {
             textLeadingInset: SettingsSidebarLayout.navTextLeadingInset,
             verticalPadding: SettingsSidebarLayout.navItemVerticalPadding,
             cornerRadius: SettingsSidebarLayout.navItemCornerRadius,
-            controlWidth: SettingsSidebarLayout.controlWidth,
-            accentLineLeadingOffset: -SettingsSidebarLayout.leadingInset
+            controlWidth: SettingsSidebarLayout.controlWidth
         ) {
             closeSettingsPanel(animated: false)
             selectedTab = tab
