@@ -80,12 +80,12 @@ enum TF {
         lightAlpha: 1.0,
         darkAlpha: 0.12
     )
-    /// 毛玻璃侧栏专用悬停底：同选中的半透白体系、再轻一档；
-    /// 常用词页等实色区仍用 settingsSidebarRowHoverFill，互不影响
-    static let settingsSidebarGlassHoverFill = adaptiveColor(
-        light: (1.000, 1.000, 1.000),
+    /// 实色侧栏悬停底：浅色使用介于侧栏底与选中底之间的暖灰平色，
+    /// 保留鼠标跟随感；深色继续用半透白提亮。
+    static let settingsSidebarHoverFill = adaptiveColor(
+        light: (0.938, 0.935, 0.928),
         dark:  (1.000, 1.000, 1.000),
-        lightAlpha: 0.22,
+        lightAlpha: 1.0,
         darkAlpha: 0.07
     )
     /// 毛玻璃调色罩（2026-06-11 用户两轮微调）：深色叠半黑压暗、浅色叠淡白提亮

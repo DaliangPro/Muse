@@ -112,7 +112,7 @@ private extension SettingsSidebarView {
             // 仅未展开、悬停「设置」时给一道微亮行
             Group {
                 if isSettingsControlHovered && !isSettingsPanelOpen {
-                    Rectangle().fill(TF.settingsSidebarGlassHoverFill)
+                    Rectangle().fill(TF.settingsSidebarHoverFill)
                         .clipShape(shape)
                 }
             }

@@ -28,7 +28,7 @@ struct SettingsSidebarNavItem: View {
             return TF.settingsSidebarActiveFill
         }
         if isHovered {
-            return TF.settingsSidebarGlassHoverFill
+            return TF.settingsSidebarHoverFill
         }
         return .clear
     }
