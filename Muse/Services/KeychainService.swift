@@ -481,7 +481,8 @@ enum KeychainService {
             AppLogger.log("[KeychainService] Migrated legacy ASR credentials to tf_asr_volcano")
         }
 
-        // （原 aliyun→bailian 凭证迁移随两厂商一并移除，REPAIR_PLAN G1）
+        // 旧 aliyun→bailian 凭证格式与当前百炼 API Key 配置不兼容，不自动迁移；
+        // 用户在设置页保存后会写入新的 tf_asr_aliyun 钥匙串项。
 
         // Migrate LLM: tf_llmEndpointId → tf_llmModel
         if let endpointId = dict["tf_llmEndpointId"] as? String, !endpointId.isEmpty,

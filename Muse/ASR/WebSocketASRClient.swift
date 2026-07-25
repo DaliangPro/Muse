@@ -2,8 +2,7 @@ import Foundation
 
 /// 流式 WebSocket ASR 客户端的共享协议。
 ///
-/// 6 个流式客户端（Volcano/Deepgram/AssemblyAI/Soniox/Bailian/Baidu）此前各自逐字
-/// 重复了同一套事件流懒加载（`events`）与发射（`emitEvent`）样板。这里用协议默认
+/// 流式客户端共享同一套事件流懒加载（`events`）与发射（`emitEvent`）样板。这里用协议默认
 /// 实现统一收口，客户端只需声明两个存储属性并标注遵循。
 ///
 /// 说明：receive loop / 消息解包 / close 判定等仍因各 provider 协议差异保留在各客户端，

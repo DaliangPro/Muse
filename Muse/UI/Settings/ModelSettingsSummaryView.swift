@@ -61,6 +61,9 @@ enum ModelSettingsSummary {
                 return "Doubao 2.0"
             }
             return resourceID
+        case .aliyun:
+            return (AliyunASRConfig(credentials: credentials)?.model
+                ?? AliyunASRModel.defaultModel).displayName
         case .sherpa:
             return "SenseVoice"
         case .apple:

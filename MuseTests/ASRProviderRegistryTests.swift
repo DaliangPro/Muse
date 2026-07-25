@@ -4,9 +4,18 @@ import XCTest
 final class ASRProviderRegistryTests: XCTestCase {
 
     func testAvailableProvidersSupportDirectMode() {
-        for provider in [ASRProvider.volcano] {
+        for provider in [ASRProvider.volcano, .aliyun] {
             XCTAssertTrue(ASRProviderRegistry.supports(.direct, for: provider))
         }
+    }
+
+    func testAliyunProviderIsRegisteredAsStreamingPCM() {
+        let entry = ASRProviderRegistry.entry(for: .aliyun)
+
+        XCTAssertTrue(entry?.isAvailable == true)
+        XCTAssertEqual(entry?.configType.provider, .aliyun)
+        XCTAssertEqual(entry?.capabilities, .streaming())
+        XCTAssertTrue(ASRProviderRegistry.createClient(for: .aliyun) is AliyunASRClient)
     }
 
     func testResolvedModeFallsBackToDirectForUnavailableProvider() {

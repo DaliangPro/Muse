@@ -12,6 +12,7 @@ enum AppStartupCoordinator {
         KeychainService.migrateIfNeeded()
         HotwordStorage.migrateIfNeeded()
         SnippetStorage.migrateIfNeeded()
+        AliyunVocabularySyncCoordinator.schedule(after: .seconds(1))
         removeOrphanHistoryFileIfNeeded()
     }
 

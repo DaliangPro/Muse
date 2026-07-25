@@ -18,7 +18,7 @@ struct SetupWizardView: View {
 
     private let lastStep = 6
     private let permissionsContentHeight: CGFloat = 132
-    private let enginesContentHeight: CGFloat = 158
+    private let enginesContentHeight: CGFloat = 216
     private let readyDescriptionHeight: CGFloat = 58
 
     var body: some View {
@@ -312,7 +312,7 @@ struct SetupWizardView: View {
 
             ZStack(alignment: .top) {
                 setupTitleBlock(
-                    title: L("三种识别引擎", "Recognition engines"),
+                    title: L("四种识别引擎", "Recognition engines"),
                     subtitle: L("先开箱即用，后自由配置", "Ready out of the box, configure freely later")
                 )
                 .frame(maxWidth: .infinity)
@@ -342,6 +342,9 @@ struct SetupWizardView: View {
                       recommended: true)
             engineRow(L("火山云端", "Volcano cloud"),
                       L("高精度，需填 API 凭据", "High accuracy, needs an API key"),
+                      recommended: false)
+            engineRow(L("阿里云百炼", "Alibaba Cloud"),
+                      L("Fun-ASR / Paraformer 流式识别，需填 API Key", "Fun-ASR / Paraformer streaming, needs an API key"),
                       recommended: false)
             engineRow(L("本地离线", "Local offline"),
                       L("支持 SenseVoice + Qwen3 本地离线识别",

@@ -60,6 +60,11 @@ enum ASRProviderRegistry {
                 createClient: { VolcASRClient() },
                 capabilities: .streaming()
             ),
+            .aliyun: ProviderEntry(
+                configType: AliyunASRConfig.self,
+                createClient: { AliyunASRClient() },
+                capabilities: .streaming()
+            ),
         ]
         #if HAS_SHERPA_ONNX
         if ServerExecutableResolver.live.isAvailable(name: "sensevoice-server") {
@@ -149,7 +154,7 @@ enum ASRProviderRegistry {
         if capabilities(requested).isAvailable {
             return requested
         }
-        return [ASRProvider.volcano, .apple, .sherpa]
+        return [ASRProvider.volcano, .aliyun, .apple, .sherpa]
             .first { capabilities($0).isAvailable }
             ?? requested
     }

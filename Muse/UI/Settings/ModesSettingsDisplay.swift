@@ -81,6 +81,10 @@ extension ModesSettingsTab {
         switch selectedASRProvider {
         case .volcano:
             return volcanoASRShortName
+        case .aliyun:
+            let model = (KeychainService.loadASRConfig(for: .aliyun) as? AliyunASRConfig)?.model
+                ?? AliyunASRModel.defaultModel
+            return model == .funASRRealtime ? "Fun-ASR" : "Paraformer v2"
         case .sherpa:
             return "SenseVoice"
         case .apple:
