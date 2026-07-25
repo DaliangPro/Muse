@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 struct MenuBarContent: View {
 
     @Environment(\.openWindow) private var openWindow
@@ -25,7 +26,12 @@ struct MenuBarContent: View {
         }
 
         Button(L("检查更新", "Check for Updates")) {
-            showUpdatePlaceholder()
+            openWindow(id: "settings")
+            NSApp.activate(ignoringOtherApps: true)
+            NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.about)
+            Task {
+                await GitHubReleaseChecker.shared.checkForUpdates()
+            }
         }
 
         Divider()
@@ -49,15 +55,4 @@ struct MenuBarContent: View {
         }()
     }
 
-    /// 检查更新随正式发布开放（当前 UpdateChecker.updateChannelEnabled=false，更新源仓库尚未发布）；
-    /// 在此之前点击给出友好提示（2026-06-22 大梁老师拍板）
-    private func showUpdatePlaceholder() {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = L("检查更新", "Check for Updates")
-        alert.informativeText = L("更新功能将随正式发布开放，敬请期待。",
-                                  "Update checking will be available with the official release.")
-        alert.addButton(withTitle: L("好的", "OK"))
-        alert.runModal()
-    }
 }
