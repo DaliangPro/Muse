@@ -22,6 +22,16 @@ extension ProcessingMode {
             """
         }
 
+        let hasTaskBoundaryGuard = guardedPrompt.contains(Self.formalWritingTaskBoundaryGuardZH)
+            || guardedPrompt.contains(Self.formalWritingTaskBoundaryGuardEN)
+        if isFormalWritingMode && !hasTaskBoundaryGuard {
+            guardedPrompt = """
+            \(guardedPrompt)
+
+            \(Self.formalWritingTaskBoundaryGuard)
+            """
+        }
+
         let hasBoundaryGuard = guardedPrompt.contains(Self.llmOutputBoundaryGuardZH)
             || guardedPrompt.contains(Self.llmOutputBoundaryGuardEN)
         if !hasBoundaryGuard {

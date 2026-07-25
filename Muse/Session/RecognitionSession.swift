@@ -943,6 +943,7 @@ actor RecognitionSession {
         let prompt = mode.applyingLLMFormatGuard(
             to: promptContext.expandContextVariables(mode.prompt)
         )
+        let llmInput = mode.llmInputMessage(for: finalASRText)
         let client = currentLLMClient()
         state = .postProcessing
         if finalASRText != speculativeLLMText {
@@ -953,7 +954,7 @@ actor RecognitionSession {
         let task: Task<String?, Never> = Task {
             do {
                 let result = try await client.process(
-                    text: finalASRText, prompt: prompt, config: llmConfig
+                    text: llmInput, prompt: prompt, config: llmConfig
                 )
                 let cleanedResult = mode.applyingLLMResultCleanup(to: result)
                 DebugFileLogger.log("stop: fresh LLM done \(cleanedResult.count) chars +\(ContinuousClock.now - stopT0)")
@@ -1029,7 +1030,7 @@ actor RecognitionSession {
                 do {
                     let client = currentLLMClient()
                     // REPAIR_PLAN J12：同 early 路径，包会话级硬超时防涓流拖死
-                    let textForLLM = finalText
+                    let textForLLM = mode.llmInputMessage(for: finalText)
                     let timed = await AsyncTimeout.asyncValue(Self.llmPostProcessTimeout) {
                         () -> Result<String, Error> in
                         do {
@@ -1551,13 +1552,14 @@ actor RecognitionSession {
         let prompt = mode.applyingLLMFormatGuard(
             to: promptContext.expandContextVariables(mode.prompt)
         )
+        let llmInput = mode.llmInputMessage(for: text)
 
         let client = currentLLMClient()
         DebugFileLogger.log("speculative LLM: firing mode=\(mode.name) model=\(llmConfig.model) with \(text.count) chars")
         let task: Task<String?, Never> = Task {
             do {
                 let result = try await client.process(
-                    text: text, prompt: prompt, config: llmConfig
+                    text: llmInput, prompt: prompt, config: llmConfig
                 )
                 let cleanedResult = mode.applyingLLMResultCleanup(to: result)
                 DebugFileLogger.log("speculative LLM: done \(cleanedResult.count) chars")
