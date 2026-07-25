@@ -63,30 +63,51 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
         self != .ollama && self != .localQwen
     }
 
-    /// Thinking/reasoning disable strategy for this provider.
-    /// Each provider uses a different field name to turn off chain-of-thought.
-    /// Returns nil for providers where no explicit disable is needed or possible.
-    var thinkingDisableField: ThinkingDisableField? {
+    /// 各服务商表达深度思考开关的字段不同，统一在请求层按此策略编码。
+    func thinkingRequestField(for model: String) -> LLMThinkingRequestField {
+        if self == .kimi, isKimiAlwaysThinkingModel(model) {
+            // Kimi K3 / K2.7 Code 固定思考且会拒绝 thinking 参数，直接走模型默认行为。
+            return .none
+        }
+
         switch self {
-        case .doubao, .kimi, .deepseek:
-            // thinking: { type: "disabled" }
+        case .doubao, .kimi, .deepseek, .zhipu:
+            // thinking: { type: "enabled" | "disabled" }
             return .thinking
         case .bailian:
-            // enable_thinking: false (Qwen models)
+            // enable_thinking: true | false
             return .enableThinking
-        case .zhipu:
-            // reasoning_effort: "none" (GLM-4.5+)
+        case .openai, .gemini, .ollama:
+            // reasoning_effort: "medium" | "none"
             return .reasoningEffort
-        case .ollama:
-            // think: false
+        case .openrouter:
+            // reasoning: { effort: "medium" | "none" }
+            return .reasoningObject
+        case .localQwen:
+            // Muse 内置 Qwen 服务使用自定义 think 布尔字段
             return .think
+        case .claude:
+            // Anthropic Messages API 的 thinking 配置由独立客户端编码
+            return .claudeThinking
         default:
-            // OpenAI: defaults to none already for GPT-5.2+, risky for o3
-            // Gemini: OpenAI-compat layer doesn't reliably support it
-            // MiniMax: API doesn't support disabling reasoning (use needsReasoningSplit instead)
-            // OpenRouter: proxy, can't generically handle
-            return nil
+            // MiniMax M2+ 强制推理，不能通过请求字段关闭
+            return .none
         }
+    }
+
+    /// 未保存过新开关的老配置沿用此前实际行为，避免升级后静默改变输出。
+    func defaultThinkingMode(for model: String) -> LLMThinkingMode {
+        fixedThinkingMode(for: model) ?? .disabled
+    }
+
+    /// 已知只能固定在某个状态的服务商；仍会在“测试连接”中真实请求一次后才判定通过。
+    func fixedThinkingMode(for model: String) -> LLMThinkingMode? {
+        if needsReasoningSplit
+            || (self == .kimi && isKimiAlwaysThinkingModel(model))
+            || (self == .gemini && isGeminiAlwaysThinkingModel(model)) {
+            return .enabled
+        }
+        return nil
     }
 
     /// MiniMax M2+ models always reason and can't be turned off.
@@ -95,19 +116,47 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
     var needsReasoningSplit: Bool {
         self == .minimaxCN || self == .minimaxIntl
     }
+
+    private func isKimiAlwaysThinkingModel(_ model: String) -> Bool {
+        let normalized = normalizedModelName(model)
+        return normalized.hasPrefix("kimi-k3")
+            || normalized.hasPrefix("kimi-k2.7-code")
+    }
+
+    private func isGeminiAlwaysThinkingModel(_ model: String) -> Bool {
+        let normalized = normalizedModelName(model)
+        return normalized.hasPrefix("gemini-3")
+            || normalized.hasPrefix("gemini-2.5-pro")
+    }
+
+    private func normalizedModelName(_ model: String) -> String {
+        model
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
 }
 
 // MARK: - Thinking Disable Strategy
 
-enum ThinkingDisableField {
-    /// `thinking: { type: "disabled" }` — Doubao, Kimi, DeepSeek
+enum LLMThinkingRequestField: Equatable, Sendable {
+    /// `thinking: { type: "enabled" | "disabled" }` — Doubao, Kimi, DeepSeek, Zhipu
     case thinking
-    /// `enable_thinking: false` — Bailian (Qwen)
+    /// `enable_thinking: Bool` — Bailian (Qwen)
     case enableThinking
-    /// `reasoning_effort: "none"` — Zhipu (GLM)
+    /// `reasoning_effort: "medium" | "none"` — OpenAI compatible reasoning models
     case reasoningEffort
-    /// `think: false` — Ollama
+    /// `reasoning: { effort: ... }` — OpenRouter unified reasoning API
+    case reasoningObject
+    /// `think: Bool` — Muse bundled Qwen service
     case think
+    /// Anthropic Messages API extended thinking
+    case claudeThinking
+    /// No switch field; provider/model is fixed or unverifiable
+    case none
+
+    var isExplicitlyControllable: Bool {
+        self != .none
+    }
 }
 
 // MARK: - Provider Config Protocol

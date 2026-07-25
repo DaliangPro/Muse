@@ -352,6 +352,7 @@ struct LLMStreamingParser: Sendable {
     private var resultBytes = 0
     private let maxResponseBytes: Int
     private(set) var isComplete = false
+    private(set) var reasoningObserved = false
 
     init(
         maxResponseBytes: Int = defaultMaximumResponseBytes,
@@ -411,8 +412,17 @@ struct LLMStreamingParser: Sendable {
               let chunk = try? JSONDecoder().decode(ChatStreamChunk.self, from: data)
         else { return }
 
+        if (chunk.usage?.completion_tokens_details?.reasoning_tokens ?? 0) > 0 {
+            reasoningObserved = true
+        }
         for choice in chunk.choices {
+            if choice.delta?.reasoningObserved == true {
+                reasoningObserved = true
+            }
             if let content = choice.delta?.content, !content.isEmpty {
+                if content.contains("<think>") {
+                    reasoningObserved = true
+                }
                 let additionalBytes = content.utf8.count
                 guard additionalBytes <= maxResponseBytes - resultBytes else {
                     throw LLMError.responseTooLarge(maxResponseBytes)

@@ -54,19 +54,38 @@ enum ModelConnectivityProber {
 
     private static func probeLLMAndAsset() async {
         let llmProvider = KeychainService.selectedLLMProvider
-        let llmStatus = await probeLLM(provider: llmProvider, config: KeychainService.loadLLMConfig())
-        ModelConnectivityCache.llm = (llmProvider, llmStatus)
-
-        // 沉淀与文本处理同服务商（凭证共享）时复用结果，省一次真实调用
-        let assetProvider = KeychainService.selectedAssetExtractionLLMProvider
-        if assetProvider == llmProvider {
-            ModelConnectivityCache.asset = (assetProvider, llmStatus)
-        } else {
-            let status = await probeLLM(
-                provider: assetProvider,
-                config: KeychainService.loadAssetExtractionLLMConfig()
+        let llmConfig = KeychainService.loadLLMConfig()
+        let llmStatus = await probeLLM(provider: llmProvider, config: llmConfig)
+        if let llmConfig {
+            ModelConnectivityCache.llm = LLMConnectivityCacheEntry(
+                signature: LLMConnectivitySignature(provider: llmProvider, config: llmConfig),
+                status: llmStatus
             )
-            ModelConnectivityCache.asset = (assetProvider, status)
+        } else {
+            ModelConnectivityCache.llm = nil
+        }
+
+        let assetProvider = KeychainService.selectedAssetExtractionLLMProvider
+        let assetConfig = KeychainService.loadAssetExtractionLLMConfig()
+        if let assetConfig,
+           let llmConfig,
+           LLMConnectivitySignature(provider: assetProvider, config: assetConfig)
+            == LLMConnectivitySignature(provider: llmProvider, config: llmConfig) {
+            // 完整执行配置一致时才复用，不能只按服务商复用。
+            ModelConnectivityCache.asset = LLMConnectivityCacheEntry(
+                signature: LLMConnectivitySignature(provider: assetProvider, config: assetConfig),
+                status: llmStatus
+            )
+        } else {
+            let status = await probeLLM(provider: assetProvider, config: assetConfig)
+            if let assetConfig {
+                ModelConnectivityCache.asset = LLMConnectivityCacheEntry(
+                    signature: LLMConnectivitySignature(provider: assetProvider, config: assetConfig),
+                    status: status
+                )
+            } else {
+                ModelConnectivityCache.asset = nil
+            }
         }
     }
 
@@ -77,11 +96,21 @@ enum ModelConnectivityProber {
                 : L("待配置", "Needs setup"))
         }
         let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-        do {
-            _ = try await client.process(text: "hi", prompt: "{text}", config: config)
+        let result = await LLMThinkingModeValidator.validate(
+            provider: provider,
+            config: config,
+            client: client
+        )
+        switch result {
+        case .valid:
             return .success
-        } catch {
-            return .failed(error.localizedDescription)
+        case .adjusted(let mode, _):
+            return .failed(L(
+                "深度思考状态需要调整为“\(mode.displayName)”，请打开模型配置后重新测试",
+                "Reasoning must be set to \(mode.displayName). Open model settings and test again."
+            ))
+        case .failed(let message):
+            return .failed(message)
         }
     }
 }

@@ -145,4 +145,64 @@ final class LLMStreamingParserTests: XCTestCase {
 
         XCTAssertEqual(try parser.finish(), "ok")
     }
+
+    func testReasoningContentIsObservedButNotIncludedInFinalText() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"reasoning_content":"内部推理"},"finish_reason":null}]}"#
+        )
+        try parser.consume(line: "")
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"703"},"finish_reason":"stop"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertEqual(try parser.finish(), "703")
+        XCTAssertTrue(parser.reasoningObserved)
+    }
+
+    func testThinkingFieldIsObservedButNotIncludedInFinalText() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"thinking":"内部推理"},"finish_reason":null}]}"#
+        )
+        try parser.consume(line: "")
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"703"},"finish_reason":"stop"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertEqual(try parser.finish(), "703")
+        XCTAssertTrue(parser.reasoningObserved)
+    }
+
+    func testReasoningTokenUsageIsObserved() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[],"usage":{"completion_tokens_details":{"reasoning_tokens":12}}}"#
+        )
+        try parser.consume(line: "")
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"703"},"finish_reason":"stop"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertEqual(try parser.finish(), "703")
+        XCTAssertTrue(parser.reasoningObserved)
+    }
+
+    func testNonStreamingReasoningDetailsRequireAtLeastOneEntry() throws {
+        let emptyData = Data(
+            #"{"choices":[{"message":{"content":"703","reasoning_details":[]}}]}"#.utf8
+        )
+        let populatedData = Data(
+            #"{"choices":[{"message":{"content":"703","reasoning_details":[{"type":"text"}]}}]}"#.utf8
+        )
+
+        let empty = try JSONDecoder().decode(ChatCompletionResponse.self, from: emptyData)
+        let populated = try JSONDecoder().decode(ChatCompletionResponse.self, from: populatedData)
+
+        XCTAssertNil(empty.thinkingEvidence.reasoningObserved)
+        XCTAssertEqual(populated.thinkingEvidence.reasoningObserved, true)
+    }
 }

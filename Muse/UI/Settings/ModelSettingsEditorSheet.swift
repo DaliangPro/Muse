@@ -68,6 +68,10 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
     @State private var fetchedModels: [String] = []
     @State private var modelFetchStatus: SettingsTestStatus = .idle
     @State private var modelFetchTask: Task<Void, Never>?
+    @State private var thinkingMode: LLMThinkingMode = .disabled
+    @State private var lockedThinkingMode: LLMThinkingMode?
+    @State private var thinkingFeedback: String?
+    @State private var thinkingFeedbackIsFailure = false
 
     init(onClose: (() -> Void)? = nil) {
         self.onClose = onClose
@@ -186,6 +190,31 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
                 }
                 .zIndex(1)
 
+                settingsInspectorRow(
+                    L("深度思考", "Reasoning"),
+                    labelWidth: ModelSettingsStyle.inspectorLabelWidth,
+                    rowHeight: ModelSettingsStyle.inspectorRowHeight,
+                    horizontalPadding: 0
+                ) {
+                    LLMThinkingModePicker(
+                        mode: thinkingModeSelection,
+                        width: controlWidth,
+                        isLocked: lockedThinkingMode != nil
+                    )
+                }
+
+                if let thinkingFeedback {
+                    HStack(spacing: 12) {
+                        Color.clear
+                            .frame(width: ModelSettingsStyle.inspectorLabelWidth)
+                        LLMThinkingFeedbackText(
+                            message: thinkingFeedback,
+                            isFailure: thinkingFeedbackIsFailure
+                        )
+                        .frame(width: controlWidth, alignment: .leading)
+                    }
+                }
+
                 if selectedProvider != .localQwen, !fetchedModels.isEmpty {
                     settingsInspectorRow(
                         L("可选模型", "Models"),
@@ -262,6 +291,15 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
             modelFetchStatus = .idle
             loadCredentials(for: newProvider)
         }
+        .onChange(of: modelOverride) { _, _ in
+            loadThinkingMode()
+            saveStatus = .idle
+        }
+        .onChange(of: effectiveValues) { oldValues, newValues in
+            guard oldValues != newValues else { return }
+            invalidateThinkingValidation()
+            saveStatus = .idle
+        }
     }
 
     @ViewBuilder
@@ -314,6 +352,46 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
             savedValues = [:]
             hasStoredCreds = false
         }
+        loadThinkingMode()
+    }
+
+    private var effectiveModelName: String {
+        let override = modelOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !override.isEmpty { return override }
+        if selectedProvider == .localQwen {
+            return LocalQwenLLMConfig.availableModel?.name ?? "qwen3.5-9b"
+        }
+        return (effectiveValues["model"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var thinkingModeSelection: Binding<LLMThinkingMode> {
+        Binding(
+            get: { thinkingMode },
+            set: { newMode in
+                guard lockedThinkingMode == nil else { return }
+                thinkingMode = newMode
+                invalidateThinkingValidation()
+                saveStatus = .idle
+            }
+        )
+    }
+
+    private func loadThinkingMode() {
+        thinkingMode = KeychainService.loadLLMThinkingMode(
+            role: .assetExtraction,
+            provider: selectedProvider,
+            model: effectiveModelName
+        )
+        invalidateThinkingValidation()
+    }
+
+    private func invalidateThinkingValidation() {
+        testTask?.cancel()
+        testStatus = .idle
+        lockedThinkingMode = nil
+        thinkingFeedback = nil
+        thinkingFeedbackIsFailure = false
     }
 
     private func testConnection() {
@@ -324,14 +402,30 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
 
         var config: LLMConfig?
         if provider == .localQwen {
-            config = KeychainService.loadAssetExtractionLLMConfig()
+            let port = SenseVoiceServerManager.currentQwen3Port
+                ?? SenseVoiceServerManager.currentPort
+            if let port {
+                config = LLMConfig(
+                    apiKey: "",
+                    model: effectiveModelName,
+                    baseURL: "http://127.0.0.1:\(port)/v1",
+                    thinkingMode: thinkingMode
+                )
+            }
         } else {
             config = LLMProviderRegistry.configType(for: provider)?
                 .init(credentials: effectiveValues)?.toLLMConfig()
         }
         if var resolved = config, !override.isEmpty {
-            resolved = LLMConfig(apiKey: resolved.apiKey, model: override, baseURL: resolved.baseURL)
+            resolved = LLMConfig(
+                apiKey: resolved.apiKey,
+                model: override,
+                baseURL: resolved.baseURL,
+                thinkingMode: thinkingMode
+            )
             config = resolved
+        } else {
+            config = config?.withThinkingMode(thinkingMode)
         }
 
         testTask = Task {
@@ -339,24 +433,65 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
                 await MainActor.run {
                     recordTestOutcome(.failed(provider == .localQwen
                         ? L("本地引擎未启动", "Local engine not running")
-                        : L("请先填写必填凭证", "Fill required credentials first")), provider: provider)
+                        : L("请先填写必填凭证", "Fill required credentials first")),
+                        provider: provider,
+                        config: nil)
                 }
                 return
             }
-            do {
-                let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-                _ = try await client.process(text: "hi", prompt: "{text}", config: config)
-                await MainActor.run { recordTestOutcome(.success, provider: provider) }
-            } catch {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { recordTestOutcome(.failed(error.localizedDescription), provider: provider) }
+            let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
+            let result = await LLMThinkingModeValidator.validate(
+                provider: provider,
+                config: config,
+                client: client
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                switch result {
+                case .valid:
+                    lockedThinkingMode = nil
+                    thinkingFeedback = nil
+                    thinkingFeedbackIsFailure = false
+                    recordTestOutcome(.success, provider: provider, config: config)
+                case .adjusted(let mode, let message):
+                    thinkingMode = mode
+                    lockedThinkingMode = mode
+                    thinkingFeedback = message
+                    thinkingFeedbackIsFailure = false
+                    KeychainService.saveLLMThinkingMode(
+                        mode,
+                        role: .assetExtraction,
+                        provider: provider,
+                        model: config.model
+                    )
+                    recordTestOutcome(
+                        .success,
+                        provider: provider,
+                        config: config.withThinkingMode(mode)
+                    )
+                case .failed(let message):
+                    thinkingFeedback = message
+                    thinkingFeedbackIsFailure = true
+                    recordTestOutcome(.failed(message), provider: provider, config: config)
+                }
             }
         }
     }
 
-    private func recordTestOutcome(_ status: SettingsTestStatus, provider: LLMProvider) {
+    private func recordTestOutcome(
+        _ status: SettingsTestStatus,
+        provider: LLMProvider,
+        config: LLMConfig?
+    ) {
         testStatus = status
-        ModelConnectivityCache.asset = (provider, status)
+        if let config {
+            ModelConnectivityCache.asset = LLMConnectivityCacheEntry(
+                signature: LLMConnectivitySignature(provider: provider, config: config),
+                status: status
+            )
+        } else {
+            ModelConnectivityCache.asset = nil
+        }
     }
 
     private func fetchModelList() {
@@ -401,12 +536,17 @@ struct AssetExtractionModelSettingsCard: View, SettingsCardHelpers {
             }
             KeychainService.selectedAssetExtractionLLMProvider = selectedProvider
             try KeychainService.saveAssetExtractionModelOverride(modelOverride, for: selectedProvider)
+            KeychainService.saveLLMThinkingMode(
+                thinkingMode,
+                role: .assetExtraction,
+                provider: selectedProvider,
+                model: effectiveModelName
+            )
             testStatus = .idle
             saveStatus = .idle
             Task { @MainActor in saveStatus = .saved }
-            if previousProvider != selectedProvider,
-               ModelConnectivityCache.asset?.provider != selectedProvider {
-                ModelConnectivityCache.asset = (selectedProvider, .idle)
+            if previousProvider != selectedProvider {
+                ModelConnectivityCache.asset = nil
             }
             AppStartupCoordinator.startLocalServerIfNeeded()
         } catch {

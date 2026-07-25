@@ -220,6 +220,7 @@ async def chat_completions(request: Request):
     messages = payload["messages"]
     temperature = payload.get("temperature", 0.7)
     max_tokens = payload.get("max_tokens", 1024)
+    thinking_enabled = payload.get("think", False)
 
     # Lazy load LLM on first request
     async with _llm_lock:
@@ -227,12 +228,17 @@ async def chat_completions(request: Request):
             None, _load_llm, _llm_model_path
         )
 
-    # Disable Qwen3 thinking mode for faster direct responses
+    # Qwen3 通过用户消息前缀切换思考模式；请求字段由 Muse 的模型配置开关传入。
     if messages and messages[-1].get("role") == "user":
         content = messages[-1]["content"]
-        if not content.startswith("/no_think"):
-            messages = messages.copy()
-            messages[-1] = {**messages[-1], "content": f"/no_think\n{content}"}
+        for existing_directive in ("/think", "/no_think"):
+            if content == existing_directive:
+                content = ""
+            elif content.startswith(f"{existing_directive}\n"):
+                content = content[len(existing_directive) + 1:]
+        directive = "/think" if thinking_enabled else "/no_think"
+        messages = messages.copy()
+        messages[-1] = {**messages[-1], "content": f"{directive}\n{content}"}
 
     # Run inference in thread pool to not block event loop
     def _generate():
@@ -247,6 +253,8 @@ async def chat_completions(request: Request):
             import re
             text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             result["choices"][0]["message"]["content"] = text
+        # 仅回报实际采用的模式，不返回或记录思考内容；测试连接据此严格核对开关。
+        result["muse_thinking_mode"] = "enabled" if thinking_enabled else "disabled"
         return result
 
     result = await asyncio.get_event_loop().run_in_executor(None, _generate)

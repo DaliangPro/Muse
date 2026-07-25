@@ -36,6 +36,21 @@ class _FakeWebSocket:
         self.closed.append((code, reason))
 
 
+class _FakeLLM:
+    def __init__(self):
+        self.last_messages = None
+
+    def create_chat_completion(self, *, messages, temperature, max_tokens):
+        self.last_messages = messages
+        return {
+            "choices": [{
+                "message": {
+                    "content": "<think>不会返回给客户端的推理</think>703",
+                },
+            }],
+        }
+
+
 def _load_server(relative_path, module_name, stub_sensevoice=False):
     if stub_sensevoice:
         stub = types.ModuleType("sensevoice_model")
@@ -152,6 +167,53 @@ class ServerSecurityWiringTests(unittest.TestCase):
                     ).status_code,
                     413,
                 )
+
+    def test_both_local_llm_routes_apply_and_report_thinking_mode(self):
+        for module in (self.sensevoice, self.qwen):
+            with self.subTest(module=module.__name__):
+                original_llm = module._llm
+                original_disabled = getattr(module, "_llm_disabled", None)
+                fake_llm = _FakeLLM()
+                module._llm = fake_llm
+                if hasattr(module, "_llm_disabled"):
+                    module._llm_disabled = False
+                try:
+                    with TestClient(
+                        module.app,
+                        base_url="http://127.0.0.1",
+                    ) as client:
+                        headers = {
+                            AUTH_HEADER_NAME: _TOKEN,
+                            "Content-Type": "application/json",
+                        }
+                        for enabled, directive, reported in [
+                            (False, "/no_think", "disabled"),
+                            (True, "/think", "enabled"),
+                        ]:
+                            response = client.post(
+                                "/v1/chat/completions",
+                                headers=headers,
+                                json={
+                                    "messages": [{"role": "user", "content": "37 × 19"}],
+                                    "think": enabled,
+                                },
+                            )
+                            self.assertEqual(response.status_code, 200)
+                            self.assertTrue(
+                                fake_llm.last_messages[-1]["content"].startswith(
+                                    f"{directive}\n"
+                                )
+                            )
+                            payload = response.json()
+                            self.assertEqual(payload["muse_thinking_mode"], reported)
+                            self.assertEqual(
+                                payload["choices"][0]["message"]["content"],
+                                "703",
+                            )
+                finally:
+                    module._llm = original_llm
+                    if hasattr(module, "_llm_disabled"):
+                        module._llm_disabled = original_disabled
 
     def test_startup_gate_and_auth_failures_do_not_log_token(self):
         for module in (self.sensevoice, self.qwen):

@@ -363,6 +363,7 @@ async def chat_completions(request: Request):
     messages = payload["messages"]
     temperature = payload.get("temperature", 0.7)
     max_tokens = payload.get("max_tokens", 1024)
+    thinking_enabled = payload.get("think", False)
 
     async with _llm_lock:
         llm = await asyncio.get_event_loop().run_in_executor(
@@ -373,9 +374,14 @@ async def chat_completions(request: Request):
 
     if messages and messages[-1].get("role") == "user":
         content = messages[-1]["content"]
-        if not content.startswith("/no_think"):
-            messages = messages.copy()
-            messages[-1] = {**messages[-1], "content": f"/no_think\n{content}"}
+        for existing_directive in ("/think", "/no_think"):
+            if content == existing_directive:
+                content = ""
+            elif content.startswith(f"{existing_directive}\n"):
+                content = content[len(existing_directive) + 1:]
+        directive = "/think" if thinking_enabled else "/no_think"
+        messages = messages.copy()
+        messages[-1] = {**messages[-1], "content": f"{directive}\n{content}"}
 
     def _generate():
         import re
@@ -390,6 +396,7 @@ async def chat_completions(request: Request):
             text = result["choices"][0]["message"]["content"]
             text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             result["choices"][0]["message"]["content"] = text
+        result["muse_thinking_mode"] = "enabled" if thinking_enabled else "disabled"
         return result
 
     result = await asyncio.get_event_loop().run_in_executor(None, _generate)

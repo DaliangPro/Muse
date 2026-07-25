@@ -7,6 +7,7 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
     @State private var llmTestStatus: SettingsTestStatus = .idle
     @State private var assetTestStatus: SettingsTestStatus = .idle
     @State private var testTask: Task<Void, Never>?
+    @State private var thinkingAdjustmentNotice: String?
 
     var body: some View {
         // 2026-07-08 大梁老师拍板：四块矩形之间用弹性 Spacer 均分页面剩余高度，
@@ -30,6 +31,18 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
             // 自动探测只点亮色点（body 直读缓存），不触碰按钮状态
             refreshID = UUID()
         }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .llmThinkingValidationInvalidated)
+        ) { _ in
+            // 真实调用中的兼容降级只让旧测试状态静默失效，不弹窗、不打断输入。
+            if ModelConnectivityCache.llm?.isCurrent == false {
+                llmTestStatus = .idle
+            }
+            if ModelConnectivityCache.asset?.isCurrent == false {
+                assetTestStatus = .idle
+            }
+            refreshID = UUID()
+        }
         .sheet(item: $activeEditor, onDismiss: {
             refreshID = UUID()
         }) { editor in
@@ -37,6 +50,19 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
         }
         .onDisappear {
             testTask?.cancel()
+        }
+        .alert(
+            L("深度思考设置已调整", "Reasoning setting adjusted"),
+            isPresented: Binding(
+                get: { thinkingAdjustmentNotice != nil },
+                set: { if !$0 { thinkingAdjustmentNotice = nil } }
+            )
+        ) {
+            Button(L("知道了", "OK")) {
+                thinkingAdjustmentNotice = nil
+            }
+        } message: {
+            Text(thinkingAdjustmentNotice ?? "")
         }
     }
 
@@ -120,13 +146,25 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
 
     private var cachedLLMStatus: SettingsTestStatus? {
         guard let cached = ModelConnectivityCache.llm,
-              cached.provider == KeychainService.selectedLLMProvider else { return nil }
+              cached.isCurrent,
+              let config = KeychainService.loadLLMConfig(),
+              cached.signature == LLMConnectivitySignature(
+                provider: KeychainService.selectedLLMProvider,
+                config: config
+              )
+        else { return nil }
         return cached.status
     }
 
     private var cachedAssetStatus: SettingsTestStatus? {
         guard let cached = ModelConnectivityCache.asset,
-              cached.provider == KeychainService.selectedAssetExtractionLLMProvider else { return nil }
+              cached.isCurrent,
+              let config = KeychainService.loadAssetExtractionLLMConfig(),
+              cached.signature == LLMConnectivitySignature(
+                provider: KeychainService.selectedAssetExtractionLLMProvider,
+                config: config
+              )
+        else { return nil }
         return cached.status
     }
 
@@ -171,13 +209,22 @@ private extension ModelSettingsTab {
         ModelConnectivityCache.asr = (provider, status)
     }
 
-    func recordLLMStatus(_ status: SettingsTestStatus, provider: LLMProvider, forAssetExtraction: Bool) {
+    func recordLLMStatus(
+        _ status: SettingsTestStatus,
+        provider: LLMProvider,
+        config: LLMConfig,
+        forAssetExtraction: Bool
+    ) {
+        let entry = LLMConnectivityCacheEntry(
+            signature: LLMConnectivitySignature(provider: provider, config: config),
+            status: status
+        )
         if forAssetExtraction {
             assetTestStatus = status
-            ModelConnectivityCache.asset = (provider, status)
+            ModelConnectivityCache.asset = entry
         } else {
             llmTestStatus = status
-            ModelConnectivityCache.llm = (provider, status)
+            ModelConnectivityCache.llm = entry
         }
     }
 
@@ -204,19 +251,62 @@ private extension ModelSettingsTab {
                     let message = provider == .localQwen
                         ? L("本地引擎未启动", "Local engine not running")
                         : L("待配置", "Needs setup")
-                    recordLLMStatus(.failed(message), provider: provider, forAssetExtraction: forAssetExtraction)
+                    if forAssetExtraction {
+                        assetTestStatus = .failed(message)
+                        ModelConnectivityCache.asset = nil
+                    } else {
+                        llmTestStatus = .failed(message)
+                        ModelConnectivityCache.llm = nil
+                    }
                     return
                 }
 
                 let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-                let reply = try await client.process(text: "hi", prompt: "{text}", config: config)
+                let result = await LLMThinkingModeValidator.validate(
+                    provider: provider,
+                    config: config,
+                    client: client
+                )
                 guard !Task.isCancelled else { return }
-                recordLLMStatus(.success, provider: provider, forAssetExtraction: forAssetExtraction)
-                AppLogger.log("[Settings] Model summary LLM test OK (\(provider.rawValue)) replyLen=\(reply.count)")
-            } catch {
-                guard !Task.isCancelled else { return }
-                recordLLMStatus(.failed(error.localizedDescription), provider: provider, forAssetExtraction: forAssetExtraction)
-                AppLogger.log("[Settings] Model summary LLM test failed (\(provider.rawValue)): \(String(describing: error))")
+                switch result {
+                case .valid:
+                    recordLLMStatus(
+                        .success,
+                        provider: provider,
+                        config: config,
+                        forAssetExtraction: forAssetExtraction
+                    )
+                    AppLogger.log("[Settings] Model summary LLM test OK (\(provider.rawValue))")
+                case .adjusted(let mode, let message):
+                    let role: LLMConfigurationRole = forAssetExtraction
+                        ? .assetExtraction
+                        : .textProcessing
+                    KeychainService.saveLLMThinkingMode(
+                        mode,
+                        role: role,
+                        provider: provider,
+                        model: config.model
+                    )
+                    let correctedConfig = config.withThinkingMode(mode)
+                    recordLLMStatus(
+                        .success,
+                        provider: provider,
+                        config: correctedConfig,
+                        forAssetExtraction: forAssetExtraction
+                    )
+                    thinkingAdjustmentNotice = message
+                    AppLogger.log(
+                        "[Settings] Model summary adjusted thinking \(config.thinkingMode.rawValue) -> \(mode.rawValue) (\(provider.rawValue))"
+                    )
+                case .failed(let message):
+                    recordLLMStatus(
+                        .failed(message),
+                        provider: provider,
+                        config: config,
+                        forAssetExtraction: forAssetExtraction
+                    )
+                    AppLogger.log("[Settings] Model summary LLM test failed (\(provider.rawValue)): \(message)")
+                }
             }
         }
     }

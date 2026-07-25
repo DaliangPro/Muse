@@ -3,7 +3,21 @@ import Foundation
 /// Common interface for LLM clients (OpenAI-compatible and Claude).
 protocol LLMClient: Sendable {
     func process(text: String, prompt: String, config: LLMConfig) async throws -> String
+    func probeThinkingMode(config: LLMConfig) async throws -> LLMThinkingProbeEvidence
     func warmUp(baseURL: String) async
+}
+
+extension LLMClient {
+    /// 测试替身及不提供结构化推理信息的客户端可复用基础连通测试；
+    /// 正式云端客户端会覆盖此实现并返回推理证据。
+    func probeThinkingMode(config: LLMConfig) async throws -> LLMThinkingProbeEvidence {
+        _ = try await process(
+            text: LLMThinkingModeValidator.probeText,
+            prompt: "{text}",
+            config: config
+        )
+        return .unknown
+    }
 }
 
 extension String {

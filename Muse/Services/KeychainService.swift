@@ -5,6 +5,7 @@ import Security
 enum KeychainService {
 
     private static let lock = NSLock()
+    private static let llmThinkingPreferenceLock = NSLock()
     private static let keychainServiceName = "pro.daliang.muse.credentials"
 
     /// XCTest 进程不得读取真实 Application Support、UserDefaults 或系统钥匙串。
@@ -358,6 +359,86 @@ enum KeychainService {
         "tf_assetExtractionModelOverride_\(provider.rawValue)"
     }
 
+    private static let llmThinkingModesPreferenceKey = "tf_llmThinkingModes"
+
+    private static func llmThinkingModeStorageKey(
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) -> String {
+        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = [role.rawValue, provider.rawValue, normalizedModel].joined(separator: "\u{1F}")
+        return Data(identity.utf8).base64EncodedString()
+    }
+
+    private static func loadLLMThinkingModeDictionary() -> [String: String] {
+        guard let raw = preferenceString(forKey: llmThinkingModesPreferenceKey),
+              let data = raw.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return [:] }
+        return values
+    }
+
+    static func loadLLMThinkingMode(
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) -> LLMThinkingMode {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            return provider.defaultThinkingMode(for: trimmedModel)
+        }
+
+        llmThinkingPreferenceLock.lock()
+        defer { llmThinkingPreferenceLock.unlock() }
+        let key = llmThinkingModeStorageKey(role: role, provider: provider, model: trimmedModel)
+        guard let raw = loadLLMThinkingModeDictionary()[key],
+              let mode = LLMThinkingMode(rawValue: raw)
+        else { return provider.defaultThinkingMode(for: trimmedModel) }
+        return mode
+    }
+
+    static func saveLLMThinkingMode(
+        _ mode: LLMThinkingMode,
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return }
+
+        llmThinkingPreferenceLock.lock()
+        defer { llmThinkingPreferenceLock.unlock() }
+        var values = loadLLMThinkingModeDictionary()
+        let key = llmThinkingModeStorageKey(role: role, provider: provider, model: trimmedModel)
+        values[key] = mode.rawValue
+        guard let data = try? JSONEncoder().encode(values),
+              let raw = String(data: data, encoding: .utf8)
+        else { return }
+        setPreference(raw, forKey: llmThinkingModesPreferenceKey)
+    }
+
+    static func removeLLMThinkingMode(
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return }
+
+        llmThinkingPreferenceLock.lock()
+        defer { llmThinkingPreferenceLock.unlock() }
+        var values = loadLLMThinkingModeDictionary()
+        let key = llmThinkingModeStorageKey(role: role, provider: provider, model: trimmedModel)
+        values.removeValue(forKey: key)
+        if values.isEmpty {
+            removePreference(forKey: llmThinkingModesPreferenceKey)
+        } else if let data = try? JSONEncoder().encode(values),
+                  let raw = String(data: data, encoding: .utf8) {
+            setPreference(raw, forKey: llmThinkingModesPreferenceKey)
+        }
+    }
+
     static func saveLLMCredentials(for provider: LLMProvider, values: [String: String]) throws {
         let normalized = try normalizedLLMCredentialsForStorage(provider: provider, values: values)
         lock.lock()
@@ -394,12 +475,16 @@ enum KeychainService {
 
     /// Load LLMConfig for the currently selected provider.
     static func loadLLMConfig() -> LLMConfig? {
-        resolvedLLMConfig(for: selectedLLMProvider)
+        resolvedLLMConfig(for: selectedLLMProvider, role: .textProcessing)
     }
 
     static func loadAssetExtractionLLMConfig() -> LLMConfig? {
         let provider = selectedAssetExtractionLLMProvider
-        return resolvedLLMConfig(for: provider, modelOverride: loadAssetExtractionModelOverride(for: provider))
+        return resolvedLLMConfig(
+            for: provider,
+            role: .assetExtraction,
+            modelOverride: loadAssetExtractionModelOverride(for: provider)
+        )
     }
 
     static func saveAssetExtractionModelOverride(_ model: String?, for provider: LLMProvider) throws {
@@ -426,6 +511,7 @@ enum KeychainService {
 
     private static func resolvedLLMConfig(
         for provider: LLMProvider,
+        role: LLMConfigurationRole,
         modelOverride: String? = nil
     ) -> LLMConfig? {
         if provider == .localQwen {
@@ -439,13 +525,25 @@ enum KeychainService {
             guard let port else { return nil }
             let trimmedOverride = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let model = trimmedOverride.isEmpty ? "qwen3.5-9b" : trimmedOverride
-            return LLMConfig(apiKey: "", model: model, baseURL: "http://127.0.0.1:\(port)/v1")
+            let thinkingMode = loadLLMThinkingMode(role: role, provider: provider, model: model)
+            return LLMConfig(
+                apiKey: "",
+                model: model,
+                baseURL: "http://127.0.0.1:\(port)/v1",
+                thinkingMode: thinkingMode
+            )
         }
 
         guard let config = loadLLMProviderConfig(for: provider)?.toLLMConfig() else { return nil }
         let trimmedOverride = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trimmedOverride.isEmpty else { return config }
-        return LLMConfig(apiKey: config.apiKey, model: trimmedOverride, baseURL: config.baseURL)
+        let model = trimmedOverride.isEmpty ? config.model : trimmedOverride
+        let thinkingMode = loadLLMThinkingMode(role: role, provider: provider, model: model)
+        return LLMConfig(
+            apiKey: config.apiKey,
+            model: model,
+            baseURL: config.baseURL,
+            thinkingMode: thinkingMode
+        )
     }
 
     // MARK: - Migration (call once at app launch)

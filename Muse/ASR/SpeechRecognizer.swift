@@ -84,11 +84,27 @@ struct LLMConfig: Sendable {
     let apiKey: String
     let model: String
     let baseURL: String
+    let thinkingMode: LLMThinkingMode
 
-    init(apiKey: String, model: String, baseURL: String = "") {
+    init(
+        apiKey: String,
+        model: String,
+        baseURL: String = "",
+        thinkingMode: LLMThinkingMode = .disabled
+    ) {
         self.apiKey = apiKey
         self.model = model
         self.baseURL = baseURL
+        self.thinkingMode = thinkingMode
+    }
+
+    func withThinkingMode(_ mode: LLMThinkingMode) -> LLMConfig {
+        LLMConfig(
+            apiKey: apiKey,
+            model: model,
+            baseURL: baseURL,
+            thinkingMode: mode
+        )
     }
 }
 

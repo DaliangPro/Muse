@@ -118,6 +118,7 @@ class LocalServiceSecurityTests(unittest.TestCase):
             "messages": [{"role": "user", "content": "hello"}],
             "temperature": 0.7,
             "max_tokens": 128,
+            "think": True,
         }
         self.assertEqual(
             decode_and_validate_llm_body(json.dumps(valid).encode("utf-8")),
@@ -135,6 +136,8 @@ class LocalServiceSecurityTests(unittest.TestCase):
             {"messages": [{"role": "user", "content": "x"}], "max_tokens": True},
             {"messages": [{"role": "user", "content": "x"}], "max_tokens": 0},
             {"messages": [{"role": "user", "content": "x"}], "max_tokens": 8193},
+            {"messages": [{"role": "user", "content": "x"}], "think": 1},
+            {"messages": [{"role": "user", "content": "x"}], "think": "true"},
         ]
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
