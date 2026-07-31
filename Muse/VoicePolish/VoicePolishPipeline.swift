@@ -23,8 +23,11 @@ struct VoicePolishPipeline: Sendable {
         self.repairTimeout = repairTimeout
     }
 
-    func process(_ request: VoicePolishRequest) async -> VoicePolishResult {
-        let startedAt = ContinuousClock.now
+    func process(
+        _ request: VoicePolishRequest,
+        startedAt suppliedStart: ContinuousClock.Instant? = nil
+    ) async -> VoicePolishResult {
+        let startedAt = suppliedStart ?? ContinuousClock.now
         let sourceFacts = ProtectedFactExtractor.extract(from: request.input.segments)
         let decision = VoicePolishComplexityRouter.decide(
             request: request,
@@ -68,7 +71,8 @@ struct VoicePolishPipeline: Sendable {
                 detectedRoute: decision.route,
                 executedRoute: executedRoute,
                 attempts: 0,
-                codes: [.emptyOutput]
+                codes: [.emptyOutput],
+                reason: .setupFailed
             )
         }
     }
@@ -80,7 +84,13 @@ struct VoicePolishPipeline: Sendable {
         detectedRoute: VoicePolishRoute,
         startedAt: ContinuousClock.Instant
     ) async -> VoicePolishResult {
+        var attempts = 0
         do {
+            let timeout = try availableTimeout(
+                stageLimit: firstRequestTimeout,
+                startedAt: startedAt
+            )
+            attempts = 1
             let response = try await generate(
                 LLMRequest(
                     context: .processingMode,
@@ -92,8 +102,7 @@ struct VoicePolishPipeline: Sendable {
                         responseFormat: .text
                     )
                 ),
-                timeout: firstRequestTimeout,
-                startedAt: startedAt
+                timeout: timeout
             )
             guard let output = VoicePolishOutputNormalizer.plainText(
                 response.text,
@@ -103,7 +112,7 @@ struct VoicePolishPipeline: Sendable {
                     request: request,
                     detectedRoute: detectedRoute,
                     executedRoute: .fast,
-                    attempts: 1,
+                    attempts: attempts,
                     codes: [.abnormalLength]
                 )
             }
@@ -117,7 +126,7 @@ struct VoicePolishPipeline: Sendable {
                     request: request,
                     detectedRoute: detectedRoute,
                     executedRoute: .fast,
-                    attempts: 1,
+                    attempts: attempts,
                     codes: validation.codes
                 )
             }
@@ -125,7 +134,7 @@ struct VoicePolishPipeline: Sendable {
                 text: output,
                 detectedRoute: detectedRoute,
                 executedRoute: .fast,
-                attempts: 1,
+                attempts: attempts,
                 codes: validation.codes
             )
         } catch {
@@ -133,8 +142,9 @@ struct VoicePolishPipeline: Sendable {
                 request: request,
                 detectedRoute: detectedRoute,
                 executedRoute: .fast,
-                attempts: 1,
-                codes: [.emptyOutput]
+                attempts: attempts,
+                codes: [.emptyOutput],
+                reason: failureReason(for: error)
             )
         }
     }
@@ -150,6 +160,10 @@ struct VoicePolishPipeline: Sendable {
         var attempts = 0
         let firstRaw: String
         do {
+            let timeout = try availableTimeout(
+                stageLimit: firstRequestTimeout,
+                startedAt: startedAt
+            )
             attempts += 1
             firstRaw = try await generate(
                 LLMRequest(
@@ -162,8 +176,7 @@ struct VoicePolishPipeline: Sendable {
                         responseFormat: .jsonObject
                     )
                 ),
-                timeout: firstRequestTimeout,
-                startedAt: startedAt
+                timeout: timeout
             ).text
         } catch {
             return fallback(
@@ -171,7 +184,8 @@ struct VoicePolishPipeline: Sendable {
                 detectedRoute: detectedRoute,
                 executedRoute: .structured,
                 attempts: attempts,
-                codes: [.invalidStructuredResponse]
+                codes: [.invalidStructuredResponse],
+                reason: failureReason(for: error)
             )
         }
 
@@ -194,6 +208,10 @@ struct VoicePolishPipeline: Sendable {
                 )
             }
             do {
+                let timeout = try availableTimeout(
+                    stageLimit: repairTimeout,
+                    startedAt: startedAt
+                )
                 attempts += 1
                 let repairPayload = try VoicePolishPrompts.repairPayload(
                     originalPayload: payload,
@@ -211,8 +229,7 @@ struct VoicePolishPipeline: Sendable {
                             responseFormat: .jsonObject
                         )
                     ),
-                    timeout: repairTimeout,
-                    startedAt: startedAt
+                    timeout: timeout
                 ).text
                 let repaired = try StructuredLLMDecoder.decode(
                     StructuredVoicePolishResponse.self,
@@ -245,7 +262,8 @@ struct VoicePolishPipeline: Sendable {
                     detectedRoute: detectedRoute,
                     executedRoute: .structured,
                     attempts: attempts,
-                    codes: [validationCode(for: error)]
+                    codes: [validationCode(for: error)],
+                    reason: failureReason(for: error)
                 )
             }
         }
@@ -277,6 +295,10 @@ struct VoicePolishPipeline: Sendable {
         // 内容 Repair 与格式 Repair 共享最后一次预算；当前分支只在首次 JSON
         // 已有效时进入，因此不会出现“格式修复后再内容修复”的第三次调用。
         do {
+            let timeout = try availableTimeout(
+                stageLimit: repairTimeout,
+                startedAt: startedAt
+            )
             attempts += 1
             let repairPayload = try VoicePolishPrompts.repairPayload(
                 originalPayload: payload,
@@ -294,8 +316,7 @@ struct VoicePolishPipeline: Sendable {
                         responseFormat: .jsonObject
                     )
                 ),
-                timeout: repairTimeout,
-                startedAt: startedAt
+                timeout: timeout
             ).text
             let repaired = try StructuredLLMDecoder.decode(
                 StructuredVoicePolishResponse.self,
@@ -328,27 +349,34 @@ struct VoicePolishPipeline: Sendable {
                 detectedRoute: detectedRoute,
                 executedRoute: .structured,
                 attempts: attempts,
-                codes: [validationCode(for: error)]
+                codes: [validationCode(for: error)],
+                reason: failureReason(for: error)
             )
         }
     }
 
     private func generate(
         _ request: LLMRequest,
-        timeout: Duration,
-        startedAt: ContinuousClock.Instant
+        timeout: Duration
     ) async throws -> LLMResponse {
+        try await AsyncTimeout.throwingValue(
+            timeout,
+            timeoutError: VoicePolishStageTimeoutError()
+        ) {
+            try await client.generate(request, config: config)
+        }
+    }
+
+    private func availableTimeout(
+        stageLimit: Duration,
+        startedAt: ContinuousClock.Instant
+    ) throws -> Duration {
         let elapsed = ContinuousClock.now - startedAt
         let remaining = totalTimeout - elapsed
         guard remaining >= .seconds(2) else {
             throw VoicePolishStageTimeoutError()
         }
-        return try await AsyncTimeout.throwingValue(
-            min(timeout, remaining),
-            timeoutError: VoicePolishStageTimeoutError()
-        ) {
-            try await client.generate(request, config: config)
-        }
+        return min(stageLimit, remaining)
     }
 
     private func validationCode(for error: Error) -> VoicePolishValidationCode {
@@ -363,6 +391,16 @@ struct VoicePolishPipeline: Sendable {
             }
         }
         return .invalidStructuredResponse
+    }
+
+    private func failureReason(for error: Error) -> VoicePolishFailureReason {
+        if error is VoicePolishStageTimeoutError || error is CancellationError {
+            return .timeout
+        }
+        if error is StructuredLLMDecoderError {
+            return .validationFailed
+        }
+        return .requestFailed
     }
 
     private func success(
@@ -381,7 +419,8 @@ struct VoicePolishPipeline: Sendable {
             executedRoute: executedRoute,
             llmAttemptCount: attempts,
             validationCodes: codes,
-            usedFallback: false
+            usedFallback: false,
+            failureReason: nil
         )
     }
 
@@ -390,7 +429,8 @@ struct VoicePolishPipeline: Sendable {
         detectedRoute: VoicePolishRoute,
         executedRoute: VoicePolishRoute,
         attempts: Int,
-        codes: [VoicePolishValidationCode]
+        codes: [VoicePolishValidationCode],
+        reason: VoicePolishFailureReason = .validationFailed
     ) -> VoicePolishResult {
         let fallbackText = request.input.fallbackText
         DebugFileLogger.log(
@@ -402,7 +442,8 @@ struct VoicePolishPipeline: Sendable {
             executedRoute: executedRoute,
             llmAttemptCount: attempts,
             validationCodes: codes,
-            usedFallback: true
+            usedFallback: true,
+            failureReason: reason
         )
     }
 }

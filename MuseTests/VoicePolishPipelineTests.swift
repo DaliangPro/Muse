@@ -98,6 +98,7 @@ final class VoicePolishPipelineTests: XCTestCase {
 
         XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .validationFailed)
         XCTAssertEqual(result.text, source)
         let requestCount = await client.requestCount()
         XCTAssertEqual(requestCount, 2)
@@ -193,6 +194,25 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
     }
 
+    func testStructuredRejectsNewNumericFactOutsideSourceAndPlan() async throws {
+        let source = "报价 49800 元，" + String(repeating: "请按原文整理。", count: 20)
+        let invalid = structuredResponse(
+            source: source,
+            finalText: source + "另加 500 元。"
+        )
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(try encoded(invalid)),
+            .response(try encoded(invalid)),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .validationFailed)
+        XCTAssertEqual(result.text, source)
+        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
     func testTimeoutFallsBackAndDoesNotLeakPastFastBudget() async {
         let source = "明天下午开会。"
         let client = ScriptedVoicePolishLLM(steps: [.delayedResponse(source, .milliseconds(200))])
@@ -207,10 +227,28 @@ final class VoicePolishPipelineTests: XCTestCase {
         let result = await pipeline.process(makeRequest(source))
 
         XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .timeout)
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(result.llmAttemptCount, 1)
         let requestCount = await client.requestCount()
         XCTAssertEqual(requestCount, 1)
+    }
+
+    func testExpiredSessionDeadlineDoesNotStartARequest() async {
+        let source = "明天下午开会。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(source)])
+        let pipeline = VoicePolishPipeline(client: client, config: config)
+
+        let result = await pipeline.process(
+            makeRequest(source),
+            startedAt: ContinuousClock.now - .seconds(44)
+        )
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .timeout)
+        XCTAssertEqual(result.llmAttemptCount, 0)
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 0)
     }
 
     private func pipeline(_ client: ScriptedVoicePolishLLM) -> VoicePolishPipeline {

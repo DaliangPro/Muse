@@ -55,7 +55,12 @@ enum ProtectedFactExtractor {
                 }
             }
         }
-        return candidates
+        var seen: Set<String> = []
+        return candidates.filter { candidate in
+            let semanticValue = candidate.canonicalValue ?? candidate.sourceText
+            let key = "\(candidate.kind.rawValue)|\(semanticValue)|\(candidate.sourceSegmentIDs.sorted().joined(separator: ","))"
+            return seen.insert(key).inserted
+        }
     }
 
     static func canonicalValue(

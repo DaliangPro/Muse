@@ -106,6 +106,14 @@ struct VoicePolishResult: Sendable, Equatable {
     let llmAttemptCount: Int
     let validationCodes: [VoicePolishValidationCode]
     let usedFallback: Bool
+    let failureReason: VoicePolishFailureReason?
+}
+
+enum VoicePolishFailureReason: String, Sendable, Equatable {
+    case timeout
+    case requestFailed
+    case validationFailed
+    case setupFailed
 }
 
 struct VoicePolishPlan: Codable, Sendable, Equatable {

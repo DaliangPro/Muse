@@ -49,6 +49,17 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertTrue(facts.contains { $0.kind == .url && $0.canonicalValue == "https://example.com/a" })
     }
 
+    func testFactExtractorDeduplicatesSameSemanticFactWithinOneSegment() {
+        let facts = ProtectedFactExtractor.extract(from: [
+            segment("预算 49,800 元，最后仍按 4.98 万执行。"),
+        ])
+
+        XCTAssertEqual(
+            facts.filter { $0.kind == .amount && $0.canonicalValue == "49800" }.count,
+            1
+        )
+    }
+
     func testStructuredDecoderAcceptsFencePrefixThinkUnicodeAndTrailingComma() throws {
         let value = SimplePayload(message: "你好")
         let json = try encoded(value)

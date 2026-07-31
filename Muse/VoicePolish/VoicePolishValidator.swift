@@ -46,6 +46,11 @@ enum VoicePolishValidator {
 
         if plan.version != VoicePolishPrompts.version
             || !(0...1).contains(plan.confidence)
+            || plan.scene != request.context.scene
+            || plan.finalIntent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || plan.orderedBlocks.isEmpty
+            || Set(plan.orderedBlocks.map(\.id)).count != plan.orderedBlocks.count
+            || plan.uncertainEntities.contains(where: { !(0...1).contains($0.confidence) })
             || hasInvalidSourceIDs(plan: plan, validIDs: validSegmentIDs) {
             append(.planIntegrityFailure, to: &codes)
         }
@@ -111,6 +116,11 @@ enum VoicePolishValidator {
         }
 
         let outputFacts = ProtectedFactExtractor.extract(from: [outputSegment(output)])
+        if outputFacts.contains(where: { outputFact in
+            !sourceFacts.contains(where: { equivalent($0, outputFact) })
+        }) {
+            append(.planIntegrityFailure, to: &codes)
+        }
         let protectedCanonicalValues = Set(planFacts.compactMap { fact -> String? in
             guard fact.disposition == .mustPreserve || fact.disposition == .uncertain else { return nil }
             return canonicalValue(for: fact)
