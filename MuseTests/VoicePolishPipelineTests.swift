@@ -41,6 +41,31 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    func testFallbackAppliesOnlyConfirmedCanonicalEntityCorrection() async {
+        let source = "请用 Cloud Code 修改。"
+        let client = ScriptedVoicePolishLLM(steps: [.response("")])
+        let base = makeRequest(source)
+        let request = VoicePolishRequest(
+            input: base.input,
+            context: base.context,
+            preferences: base.preferences,
+            qualityMode: base.qualityMode,
+            resolvedEntities: [ResolvedEntity(
+                surfaceText: "Cloud Code",
+                canonical: "Claude Code",
+                sourceSegmentIDs: ["s1"],
+                candidateSource: .personalLexicon,
+                confidence: 1
+            )]
+        )
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.text, "请用 Claude Code 修改。")
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
     func testStructuredCorrectionSucceedsWithProtectedFinalFacts() async throws {
         let source = "第一期一万六千八，不对，最终每期一万六，总价四万八。"
         let response = structuredResponse(

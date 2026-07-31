@@ -19,7 +19,7 @@ enum VoicePolishValidator {
         // Analyzer 尚未产生成稿，因此不能在此判断事实是否已进入最终正文。
         let provisional = StructuredVoicePolishResponse(
             plan: plan,
-            finalText: request.input.fallbackText
+            finalText: request.fallbackText
         )
         let codes = validateStructured(
             response: provisional,
@@ -34,7 +34,7 @@ enum VoicePolishValidator {
         request: VoicePolishRequest,
         sourceFacts: [SourceFactCandidate]
     ) -> VoicePolishValidationResult {
-        var codes = commonCodes(output: output, sourceText: request.input.fallbackText)
+        var codes = commonCodes(output: output, sourceText: request.fallbackText)
         let outputFacts = ProtectedFactExtractor.extract(from: [outputSegment(output)])
 
         if sourceFacts.contains(where: { !containsEquivalent($0, in: outputFacts, output: output) }) {
@@ -54,7 +54,7 @@ enum VoicePolishValidator {
         sourceFacts: [SourceFactCandidate]
     ) -> VoicePolishValidationResult {
         let output = response.finalText
-        var codes = commonCodes(output: output, sourceText: request.input.fallbackText)
+        var codes = commonCodes(output: output, sourceText: request.fallbackText)
         let plan = response.plan
         let validSegmentIDs = Set(request.input.segments.map(\.id))
         let sourceByID = Dictionary(uniqueKeysWithValues: request.input.segments.map { ($0.id, $0.text) })
@@ -275,6 +275,9 @@ enum VoicePolishValidator {
         in outputFacts: [SourceFactCandidate],
         output: String
     ) -> Bool {
+        if candidate.kind == .lexiconEntity, let canonical = candidate.canonicalValue {
+            return normalizedNaturalText(output).contains(normalizedNaturalText(canonical))
+        }
         if let canonical = candidate.canonicalValue {
             return outputFacts.contains {
                 $0.kind == candidate.kind && $0.canonicalValue == canonical
@@ -288,6 +291,9 @@ enum VoicePolishValidator {
         in outputFacts: [SourceFactCandidate],
         output: String
     ) -> Bool {
+        if fact.kind == .lexiconEntity, let canonical = canonicalValue(for: fact) {
+            return normalizedNaturalText(output).contains(normalizedNaturalText(canonical))
+        }
         if let canonical = canonicalValue(for: fact) {
             return outputFacts.contains {
                 $0.kind == fact.kind && $0.canonicalValue == canonical

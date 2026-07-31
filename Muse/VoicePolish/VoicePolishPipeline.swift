@@ -35,6 +35,14 @@ struct VoicePolishPipeline: Sendable {
     ) async -> VoicePolishResult {
         let startedAt = suppliedStart ?? ContinuousClock.now
         let sourceFacts = ProtectedFactExtractor.extract(from: request.input.segments)
+            + request.resolvedEntities.map {
+                SourceFactCandidate(
+                    sourceText: $0.surfaceText,
+                    canonicalValue: $0.canonical,
+                    kind: .lexiconEntity,
+                    sourceSegmentIDs: $0.sourceSegmentIDs
+                )
+            }
         let decision = VoicePolishComplexityRouter.decide(
             request: request,
             factCandidates: sourceFacts
@@ -54,7 +62,7 @@ struct VoicePolishPipeline: Sendable {
         }
 
         DebugFileLogger.log(
-            "voice polish start route=\(decision.route.rawValue) executed=\(executedRoute.rawValue) quality=\(request.qualityMode.rawValue) input=\(request.input.fallbackText.count)chars facts=\(sourceFacts.count)"
+            "voice polish start route=\(decision.route.rawValue) executed=\(executedRoute.rawValue) quality=\(request.qualityMode.rawValue) input=\(request.fallbackText.count)chars facts=\(sourceFacts.count)"
         )
 
         do {
@@ -234,7 +242,7 @@ struct VoicePolishPipeline: Sendable {
 
         guard let rendered = VoicePolishOutputNormalizer.plainText(
             renderRaw,
-            sourceText: request.input.fallbackText
+            sourceText: request.fallbackText
         ) else {
             return fallback(
                 request: request,
@@ -293,7 +301,7 @@ struct VoicePolishPipeline: Sendable {
             ).text
             guard let repaired = VoicePolishOutputNormalizer.plainText(
                 repairedRaw,
-                sourceText: request.input.fallbackText
+                sourceText: request.fallbackText
             ) else {
                 throw StructuredLLMDecoderError.invalidJSON
             }
@@ -359,7 +367,7 @@ struct VoicePolishPipeline: Sendable {
             )
             guard let output = VoicePolishOutputNormalizer.plainText(
                 response.text,
-                sourceText: request.input.fallbackText
+                sourceText: request.fallbackText
             ) else {
                 return fallback(
                     request: request,
@@ -685,7 +693,7 @@ struct VoicePolishPipeline: Sendable {
         codes: [VoicePolishValidationCode],
         reason: VoicePolishFailureReason = .validationFailed
     ) -> VoicePolishResult {
-        let fallbackText = request.input.fallbackText
+        let fallbackText = request.fallbackText
         DebugFileLogger.log(
             "voice polish done route=\(detectedRoute.rawValue) executed=\(executedRoute.rawValue) attempts=\(attempts) output=\(fallbackText.count)chars codes=\(codes.map(\.rawValue).joined(separator: ",")) fallback=true"
         )

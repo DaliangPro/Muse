@@ -1176,13 +1176,21 @@ actor RecognitionSession {
                 DebugFileLogger.log(
                     "voice polish context scene=\(writingContext.scene.rawValue) level=\(writingContext.level.rawValue) safety=\(writingContext.safety.rawValue) selected=\(writingContext.selectedText?.count ?? 0) before=\(writingContext.textBeforeCursor?.count ?? 0) after=\(writingContext.textAfterCursor?.count ?? 0)"
                 )
+                let resolvedEntities = EntityResolver.resolve(
+                    segments: envelope.segments,
+                    lexicon: PersonalLexiconStorage.load(),
+                    snippets: SnippetStorage.load(),
+                    hotwords: HotwordStorage.loadEffective(),
+                    context: writingContext
+                )
                 let request = VoicePolishRequest(
                     input: envelope,
                     context: writingContext,
                     preferences: UserPolishPreferences(
                         additionalRequirements: mode.prompt
                     ),
-                    qualityMode: VoicePolishSettings.qualityMode()
+                    qualityMode: VoicePolishSettings.qualityMode(),
+                    resolvedEntities: resolvedEntities
                 )
                 let pipeline = VoicePolishPipeline(
                     client: currentLLMClient(),

@@ -92,11 +92,54 @@ struct UserPolishPreferences: Sendable, Equatable {
     }
 }
 
+enum EntityCandidateSource: String, Codable, Sendable, Equatable {
+    case personalLexicon
+    case snippet
+    case hotword
+    case authorizedContext
+
+    var priority: Int {
+        switch self {
+        case .personalLexicon: return 4
+        case .snippet: return 3
+        case .hotword: return 2
+        case .authorizedContext: return 1
+        }
+    }
+}
+
+struct ResolvedEntity: Codable, Sendable, Equatable {
+    let surfaceText: String
+    let canonical: String
+    let sourceSegmentIDs: [String]
+    let candidateSource: EntityCandidateSource
+    let confidence: Double
+}
+
 struct VoicePolishRequest: Sendable, Equatable {
     let input: VoiceInputEnvelope
     let context: WritingContext
     let preferences: UserPolishPreferences
     let qualityMode: VoicePolishQualityMode
+    let resolvedEntities: [ResolvedEntity]
+
+    init(
+        input: VoiceInputEnvelope,
+        context: WritingContext,
+        preferences: UserPolishPreferences,
+        qualityMode: VoicePolishQualityMode,
+        resolvedEntities: [ResolvedEntity] = []
+    ) {
+        self.input = input
+        self.context = context
+        self.preferences = preferences
+        self.qualityMode = qualityMode
+        self.resolvedEntities = resolvedEntities
+    }
+
+    var fallbackText: String {
+        EntityResolver.applying(resolvedEntities, to: input.fallbackText)
+    }
 }
 
 struct VoicePolishResult: Sendable, Equatable {

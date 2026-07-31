@@ -91,6 +91,7 @@ enum VoicePolishPrompts {
             context: request.context,
             userPreferences: request.preferences.additionalRequirements,
             sourceFacts: sourceFacts,
+            resolvedEntities: request.resolvedEntities,
             deepDeferred: deepDeferred
         ))
     }
@@ -154,6 +155,7 @@ private struct VoicePolishPayload: Encodable {
     let context: WritingContext
     let userPreferences: String
     let sourceFacts: [SourceFactCandidate]
+    let resolvedEntities: [ResolvedEntity]
     let deepDeferred: Bool
 }
 
