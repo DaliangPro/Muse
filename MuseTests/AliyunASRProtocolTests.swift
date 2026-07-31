@@ -126,6 +126,24 @@ final class AliyunASRProtocolTests: XCTestCase {
         )
     }
 
+    func testTranscriptAccumulatorFreezesPartialBeforeReconnect() {
+        var accumulator = AliyunTranscriptAccumulator()
+        _ = accumulator.apply(
+            AliyunSentence(text: "断流前半句", isFinal: false, isHeartbeat: false)
+        )
+
+        accumulator.freezePartialAsConfirmed()
+        let afterReconnect = accumulator.apply(
+            AliyunSentence(text: "重连后半句", isFinal: true, isHeartbeat: false)
+        )
+
+        XCTAssertEqual(
+            afterReconnect?.confirmedSegments,
+            ["断流前半句", "重连后半句"]
+        )
+        XCTAssertEqual(afterReconnect?.composedText, "断流前半句重连后半句")
+    }
+
     private func jsonObject(_ text: String) throws -> [String: Any] {
         let data = try XCTUnwrap(text.data(using: .utf8))
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

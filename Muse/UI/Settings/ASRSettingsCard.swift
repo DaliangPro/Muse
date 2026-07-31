@@ -72,6 +72,13 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
         showsInlineGuideLink ? currentASRGuideLinks.first : nil
     }
 
+    private var showsAliyunWorkspaceHint: Bool {
+        guard selectedASRProvider == .aliyun else { return false }
+        return (effectiveASRValues["workspaceId"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
+
     private var providerOptions: [(value: String, label: String)] {
         // 只列真实可用的厂商：本地识别不再无条件出现——cloud 构建
         // （无本地引擎）的下拉里不显示它，避免选了被静默切回火山的困惑
@@ -180,6 +187,18 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                 Text(hint)
                     .font(TF.settingsFontCaption)
                     .foregroundStyle(TF.settingsTextTertiary)
+                    .padding(.top, 6)
+                    .zIndex(0)
+            }
+
+            if showsAliyunWorkspaceHint {
+                Text(L(
+                    "建议填写 Workspace ID 使用专属域名，以提高连接稳定性；未填写仍可正常使用。",
+                    "Add a Workspace ID to use a dedicated endpoint for better connection stability; it remains optional."
+                ))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 6)
                     .zIndex(0)
             }

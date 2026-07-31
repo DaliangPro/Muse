@@ -132,7 +132,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(state, .idle)
     }
 
-    func testASRErrorWhileRecordingResetsSessionAndCompletesUI() async {
+    func testASRErrorWhileRecordingPreservesSessionForStopTimeRecovery() async {
         let session = makeSession()
         let recorder = RecognitionEventRecorder()
         await session.setOnASREvent { recorder.record($0) }
@@ -145,7 +145,20 @@ final class RecognitionSessionTests: XCTestCase {
         )))
         try? await Task.sleep(for: .milliseconds(100))
 
-        XCTAssertEqual(recorder.values, ["error:ASR failed", "completed"])
+        XCTAssertEqual(recorder.values, ["streamingInterrupted"])
+        let state = await session.state
+        XCTAssertEqual(state, .recording)
+    }
+
+    func testStopDuringStartingEmitsCompletedForUICleanup() async {
+        let session = makeSession()
+        let recorder = RecognitionEventRecorder()
+        await session.setOnASREvent { recorder.record($0) }
+        await session.setState(.starting)
+
+        await session.stopRecording()
+
+        XCTAssertEqual(recorder.values, ["completed"])
         let state = await session.state
         XCTAssertEqual(state, .idle)
     }
@@ -236,7 +249,7 @@ final class RecognitionSessionTests: XCTestCase {
     }
 
     func testImplausiblyShortIgnoresEmptyText() {
-        // 0 字=没说话，走 empty 路径，不应触发批量兜底
+        // 这个旧启发式只看时长/字数，0 字交给 K7 的 PCM 活动摘要另行判断。
         XCTAssertFalse(RecognitionSession.isTranscriptImplausiblyShort(
             textCount: 0, durationSeconds: 30.0
         ))
@@ -253,6 +266,55 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
             textCount: 3, durationSeconds: 19.0
         ))
+    }
+
+    func testImplausiblyShortUsesVoicedDurationInsteadOfWallClockDuration() {
+        // 2026-07-31 现场：57.2 秒录音中只有 269 个 20ms 有声帧（约 5.38 秒），
+        // 27 字是完整的正常语速，不应因长停顿触发近一分钟全文重识别。
+        let summary = PCMAudioActivitySummary(
+            validByteCount: 1_812_980,
+            analyzedFrameCount: 2_833,
+            voicedFrameCount: 269,
+            peakAmplitude: 20_196
+        )
+
+        XCTAssertEqual(summary.voicedDurationSeconds, 5.38, accuracy: 0.001)
+        XCTAssertFalse(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 27,
+            audioSummary: summary
+        ))
+    }
+
+    func testImplausiblyShortStillCatchesLongVoicedAudioWithTooLittleText() {
+        let summary = PCMAudioActivitySummary(
+            validByteCount: 710_400,
+            analyzedFrameCount: 1_110,
+            voicedFrameCount: 1_110,
+            peakAmplitude: 8_000
+        )
+
+        XCTAssertTrue(RecognitionSession.isTranscriptImplausiblyShort(
+            textCount: 5,
+            audioSummary: summary
+        ))
+    }
+
+    func testPacedFallbackTimeoutCoversRealtimeReplayDuration() {
+        // 60 秒 PCM + 15 秒服务端收尾余量
+        XCTAssertEqual(
+            RecognitionSession.batchFallbackTimeout(
+                provider: .aliyun,
+                audioByteCount: 60 * 16_000 * MemoryLayout<Int16>.size
+            ),
+            .seconds(75)
+        )
+        XCTAssertEqual(
+            RecognitionSession.batchFallbackTimeout(
+                provider: .volcano,
+                audioByteCount: 60 * 16_000 * MemoryLayout<Int16>.size
+            ),
+            .seconds(75)
+        )
     }
 
     private func makeSession() -> RecognitionSession {

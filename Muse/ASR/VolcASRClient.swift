@@ -32,6 +32,33 @@ typealias VolcDialFactory = @Sendable (
     _ configuration: URLSessionConfiguration
 ) -> VolcDialResources
 
+/// 火山全文重识别必须模拟实时流按 200ms 发包；整段 PCM 单包发送会触发服务端限流、
+/// 等包超时或直接断流，表现为二次识别连接成功却始终没有 final。
+enum VolcanoAudioReplay {
+    static let chunkByteSize = AudioCaptureEngine.chunkByteSize
+    static let chunkInterval: Duration = .milliseconds(AudioCaptureEngine.chunkDurationMs)
+
+    static func send(
+        audio: Data,
+        to client: any SpeechRecognizer,
+        sleep: @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
+    ) async throws {
+        guard !audio.isEmpty else { return }
+
+        var offset = 0
+        while offset < audio.count {
+            let end = min(offset + chunkByteSize, audio.count)
+            try await client.sendAudio(audio.subdata(in: offset ..< end))
+            offset = end
+            if offset < audio.count {
+                try await sleep(chunkInterval)
+            }
+        }
+    }
+}
+
 actor VolcASRClient: WebSocketASRClient {
 
     private static let endpoint =
@@ -412,33 +439,23 @@ actor VolcASRClient: WebSocketASRClient {
             let headerByte1 = data.count > 1 ? data[1] : 0
             let msgType = (headerByte1 >> 4) & 0x0F
 
-            // Server error (0xF): could be a real error or just
-            // bigmodel_async's "session complete" signal.
+            // 官方协议中 0xF 始终是错误帧；成功结束由 0x9 final 或正常关闭表示。
+            // 旧逻辑在 endAudio 后把所有 0xF 都伪装成 completed，导致全文重识别
+            // 失败时既没有文本，也看不到真实错误码。
             if msgType == 0x0F {
-                var isTerminal = false
-                if didRequestEndAudio {
-                    AppLogger.log("[ASR] Session ended by server after endAudio (\(audioPacketCount) audio packets)")
-                    emitCompletedOnce()
-                    isTerminal = true
-                } else if audioPacketCount == 0 {
-                    // No audio was sent yet — this is a real setup/auth error.
-                    do {
-                        _ = try VolcProtocol.decodeServerResponse(data)
-                    } catch {
-                        AppLogger.log("[ASR] Server error: \(String(describing: error))")
-                        emitTerminalError(error)
-                        isTerminal = true
-                    }
-                } else {
-                    AppLogger.log("[ASR] Server closed stream before endAudio after \(audioPacketCount) packets")
-                    emitEvent(.streamingInterrupted)
+                let serverError: Error
+                do {
+                    _ = try VolcProtocol.decodeServerResponse(data)
+                    serverError = VolcProtocolError.invalidPayload
+                } catch {
+                    serverError = error
                 }
-                if isTerminal {
-                    closeWebSocketIfCurrent(
-                        connectionID: connectionID,
-                        closeCode: .normalClosure
-                    )
-                }
+                AppLogger.log("[ASR] Server error: \(String(describing: serverError))")
+                emitTerminalError(serverError)
+                closeWebSocketIfCurrent(
+                    connectionID: connectionID,
+                    closeCode: .protocolError
+                )
                 return
             }
 

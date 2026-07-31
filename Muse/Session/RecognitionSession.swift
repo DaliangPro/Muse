@@ -3,10 +3,41 @@ import os
 
 private struct ASRTeardownResult: Sendable {
     let providerIsStreaming: Bool
-    let clean: Bool
+    let endAudioSucceeded: Bool
+    let eventStreamDrained: Bool
+
+    var clean: Bool {
+        endAudioSucceeded && eventStreamDrained
+    }
 }
 
 private struct BatchFallbackTimeoutError: Error {}
+
+private enum TranscriptRecoveryResult: Sendable, Equatable {
+    case notNeeded
+    case succeeded
+    case failed
+}
+
+private enum ASRRecoveryError: Error, LocalizedError {
+    case partialTextPreserved(provider: String)
+    case noTranscript(provider: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .partialTextPreserved(let provider):
+            return L(
+                "\(provider) 全文重识别失败，已保留现有文字，内容可能不完整",
+                "\(provider) full re-recognition failed. Existing text was preserved and may be incomplete."
+            )
+        case .noTranscript(let provider):
+            return L(
+                "\(provider) 未返回识别结果，请重试或暂时切换到豆包",
+                "\(provider) returned no transcript. Try again or temporarily switch to Doubao."
+            )
+        }
+    }
+}
 
 struct RecognitionSessionID: Hashable, Sendable {
     let rawValue: UInt64
@@ -67,6 +98,7 @@ actor RecognitionSession {
         options: ASRRequestOptions,
         hotwordCount: Int
     ))?
+    private let aliyunReplaySleep: @Sendable (Duration) async throws -> Void
     private var asrClient: (any SpeechRecognizer)?
     private var asrClientSessionID: RecognitionSessionID?
 
@@ -88,7 +120,10 @@ actor RecognitionSession {
         requestOptionsProvider: (@Sendable (ProcessingMode) -> (
             options: ASRRequestOptions,
             hotwordCount: Int
-        ))? = nil
+        ))? = nil,
+        aliyunReplaySleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
     ) {
         self.audioEngine = audioEngine
         self.injectionEngine = injectionEngine
@@ -99,6 +134,7 @@ actor RecognitionSession {
         self.microphonePermission = microphonePermission
         self.promptContextCapture = promptContextCapture
         self.requestOptionsProvider = requestOptionsProvider
+        self.aliyunReplaySleep = aliyunReplaySleep
     }
 
     private let logger = Logger(
@@ -758,6 +794,7 @@ actor RecognitionSession {
         if state == .starting {
             DebugFileLogger.log("stopRecording during starting: cancelling pending session")
             forceReset()
+            onASREvent?(.completed)
             return
         }
         guard state == .recording, let sessionID = currentSessionID else {
@@ -779,7 +816,13 @@ actor RecognitionSession {
         state = .finishing
 
         let stopT0 = ContinuousClock.now
-        SoundFeedback.playStop()
+
+        // 用户主动松开热键时保留 300ms 收声窗口，避免最后一两个字仍在麦克风/HAL
+        // 缓冲区中就被截断。服务端自动停录带 expectedSessionID，不额外延迟。
+        if expectedSessionID == nil, audioCaptureSessionID == sessionID {
+            await audioEngine.captureReleaseTail()
+            guard ensureCurrent("release tail capture") else { return }
+        }
 
         // Stop capture first so flushRemaining() can emit the tail audio chunk.
         if audioCaptureSessionID == sessionID {
@@ -787,7 +830,14 @@ actor RecognitionSession {
             audioEngine.stop()
             audioEngine.clearAudioHandlers()
         }
+        // 停止提示音必须在麦克风真正关闭后播放，否则尾音保护会把提示音录进去。
+        SoundFeedback.playStop()
         let uploadFailed = await finishAudioChunkPipeline(sessionID: sessionID)
+        let recordedAudio = audioEngine.getRecordedAudio()
+        let audioSummary = PCMAudioActivitySummary.analyze(recordedAudio)
+        DebugFileLogger.log(
+            "stop: audio summary bytes=\(audioSummary.validByteCount) frames=\(audioSummary.analyzedFrameCount) voiced=\(audioSummary.voicedFrameCount) peak=\(audioSummary.peakAmplitude) meaningful=\(audioSummary.hasMeaningfulSpeech)"
+        )
         DebugFileLogger.log("stop: audio stopped +\(ContinuousClock.now - stopT0)")
         guard ensureCurrent("audio pipeline") else {
             DebugFileLogger.log("stopRecording: zombie after audio pipeline, bailing")
@@ -819,27 +869,50 @@ actor RecognitionSession {
             return
         }
 
-        // Batch fallback: if streaming broke mid-session, always retry with
-        // the full local recording to get complete text, even if we have partial.
+        // Batch fallback: retry only when the audio/transcript itself may be incomplete.
+        // A provider that accepted endAudio but did not close its event stream in time
+        // is a lifecycle anomaly, not automatically a content failure. For Volcano,
+        // preserve already-valid text instead of creating a second real-time replay.
         // REPAIR_PLAN K2：转写严重滞后时服务端可能只 final 了开头段就正常关流
         //（实测说 8s 首包 7.4s 才到、注入仅 3 字），clean 关闭不代表文本完整——
         // 长录音字数低到不合理时同样强制批量复核。
         let recordedDuration = recordingStartSessionID == sessionID
             ? recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
             : 0
+        let transcriptTextCount = Self.effectiveTranscriptText(for: currentTranscript).count
         let implausiblyShort = Self.isTranscriptImplausiblyShort(
-            textCount: Self.effectiveTranscriptText(for: currentTranscript).count,
-            durationSeconds: recordedDuration
+            textCount: transcriptTextCount,
+            audioSummary: audioSummary
         )
+        let voicedButEmpty = provider == .aliyun
+            && transcriptTextCount == 0
+            && audioSummary.hasMeaningfulSpeech
         if implausiblyShort {
             DebugFileLogger.log(
-                "stop: transcript implausibly short for \(String(format: "%.1f", recordedDuration))s recording, forcing batch fallback"
+                "stop: transcript implausibly short for voiced=\(String(format: "%.1f", audioSummary.voicedDurationSeconds))s wall=\(String(format: "%.1f", recordedDuration))s, forcing batch fallback"
             )
         }
-        let streamingFailed = uploadFailed || !asrTeardown.clean
-            || streamingDegraded || implausiblyShort
-        await recoverTranscriptAfterStreamingFailureIfNeeded(
+        if voicedButEmpty {
+            DebugFileLogger.log(
+                "stop: Aliyun returned zero text for voiced audio, forcing paced full replay"
+            )
+        }
+        let volcanoCloseTimeoutWithValidText = provider == .volcano
+            && asrTeardown.endAudioSucceeded
+            && !asrTeardown.eventStreamDrained
+            && transcriptTextCount > 0
+        if volcanoCloseTimeoutWithValidText {
+            DebugFileLogger.log(
+                "stop: volcano event stream close timed out with valid text (\(transcriptTextCount) chars); skipping full replay"
+            )
+        }
+        let teardownRequiresRecovery = !asrTeardown.clean
+            && !volcanoCloseTimeoutWithValidText
+        let streamingFailed = uploadFailed || teardownRequiresRecovery
+            || streamingDegraded || implausiblyShort || voicedButEmpty
+        let recoveryResult = await recoverTranscriptAfterStreamingFailureIfNeeded(
             streamingFailed: streamingFailed,
+            audio: recordedAudio,
             sessionID: sessionID
         )
         guard ensureCurrent("batch fallback") else { return }
@@ -868,6 +941,11 @@ actor RecognitionSession {
             )
             guard ensureCurrent("post-injection") else { return }
             onASREvent?(.finalized(text: llmResult.finalText, injection: injectionOutcome))
+            if recoveryResult == .failed {
+                onASREvent?(.error(ASRRecoveryError.partialTextPreserved(
+                    provider: provider.displayName
+                )))
+            }
 
             await saveSuccessfulHistory(
                 rawText: rawText,
@@ -886,8 +964,14 @@ actor RecognitionSession {
                 sessionID: sessionID
             )
             guard ensureCurrent("empty completion") else { return }
-            onASREvent?(.processingResult(text: ""))
-            onASREvent?(.completed)
+            if recoveryResult == .failed, audioSummary.hasMeaningfulSpeech {
+                onASREvent?(.error(ASRRecoveryError.noTranscript(
+                    provider: provider.displayName
+                )))
+            } else {
+                onASREvent?(.processingResult(text: ""))
+                onASREvent?(.completed)
+            }
         }
 
         // Only reset to idle if this is still the active session.
@@ -1212,12 +1296,16 @@ actor RecognitionSession {
         // ASR teardown: send endAudio and drain event stream with hard deadlines.
         // Uses detached tasks + continuation so a stuck client can't block stopRecording.
         let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider).isStreaming
-        var clean = true
+        var eventStreamDrained = true
 
         guard let client,
               isCurrent(sessionID),
               ownsASRClient(client, sessionID: sessionID) else {
-            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: clean)
+            return ASRTeardownResult(
+                providerIsStreaming: providerIsStreaming,
+                endAudioSucceeded: true,
+                eventStreamDrained: true
+            )
         }
         let ownedEventTask: Task<Void, Never>?
         let ownedEventToken: UUID?
@@ -1235,34 +1323,50 @@ actor RecognitionSession {
         }
         guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
             DebugFileLogger.log("stop: ASR endAudio returned for stale session=\(sessionID.rawValue)")
-            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+            return ASRTeardownResult(
+                providerIsStreaming: providerIsStreaming,
+                endAudioSucceeded: false,
+                eventStreamDrained: false
+            )
         }
         if !endAudioOK {
             DebugFileLogger.log("endAudio timeout or failed")
-            clean = false
         }
 
         // Always try to drain events — even if endAudio failed, the server
         // may have already queued transcript events before the connection broke.
         if let evtTask = ownedEventTask {
-            let drainTimeout: Duration = providerIsStreaming ? .seconds(2) : .seconds(5)
+            let drainTimeout: Duration
+            if provider == .volcano {
+                drainTimeout = .milliseconds(1_200)
+            } else {
+                drainTimeout = providerIsStreaming ? .seconds(2) : .seconds(5)
+            }
             let drained = await AsyncTimeout.run(drainTimeout) {
                 await evtTask.value
             }
             guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
                 DebugFileLogger.log("stop: event drain returned for stale session=\(sessionID.rawValue)")
-                return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+                return ASRTeardownResult(
+                    providerIsStreaming: providerIsStreaming,
+                    endAudioSucceeded: false,
+                    eventStreamDrained: false
+                )
             }
             if !drained {
                 DebugFileLogger.log("event stream drain timeout")
-                clean = false
+                eventStreamDrained = false
             }
         }
 
         await client.disconnect()
         guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
             DebugFileLogger.log("stop: disconnect returned for stale session=\(sessionID.rawValue)")
-            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+            return ASRTeardownResult(
+                providerIsStreaming: providerIsStreaming,
+                endAudioSucceeded: false,
+                eventStreamDrained: false
+            )
         }
 
         ownedEventTask?.cancel()
@@ -1274,23 +1378,33 @@ actor RecognitionSession {
         }
         clearASRClientIfOwned(client, sessionID: sessionID)
         hasEmittedReadyForCurrentSession = false
-        DebugFileLogger.log("stop: ASR teardown complete (clean=\(clean)) +\(ContinuousClock.now - stopT0)")
-        return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: clean)
+        let result = ASRTeardownResult(
+            providerIsStreaming: providerIsStreaming,
+            endAudioSucceeded: endAudioOK,
+            eventStreamDrained: eventStreamDrained
+        )
+        DebugFileLogger.log(
+            "stop: ASR teardown complete (clean=\(result.clean) endAudio=\(result.endAudioSucceeded) drained=\(result.eventStreamDrained)) +\(ContinuousClock.now - stopT0)"
+        )
+        return result
     }
 
     private func recoverTranscriptAfterStreamingFailureIfNeeded(
         streamingFailed: Bool,
+        audio fullAudio: Data,
         sessionID: RecognitionSessionID
-    ) async {
-        guard streamingFailed, isCurrent(sessionID) else { return }
+    ) async -> TranscriptRecoveryResult {
+        guard streamingFailed, isCurrent(sessionID) else { return .notNeeded }
 
         let partialText = currentTranscript.composedText
         DebugFileLogger.log("stop: streaming failed (partial=\(partialText.count) chars), attempting batch fallback")
 
-        let fullAudio = audioEngine.getRecordedAudio()
         guard !fullAudio.isEmpty,
               currentConfigSessionID == sessionID,
-              let config = currentConfig else { return }
+              let config = currentConfig else {
+            DebugFileLogger.log("stop: batch fallback unavailable (audio/config missing)")
+            return .failed
+        }
         let provider = activeProvider
 
         onASREvent?(.processingResult(text: partialText.isEmpty ? "重新识别中..." : partialText))
@@ -1300,11 +1414,11 @@ actor RecognitionSession {
             provider: provider
         ) else {
             DebugFileLogger.log("stop: batch fallback failed, using partial text")
-            return
+            return .failed
         }
         guard isCurrent(sessionID) else {
             DebugFileLogger.log("stop: batch fallback result ignored for stale session")
-            return
+            return .failed
         }
 
         // REPAIR_PLAN K2：兜底不劣化——批量结果比流式已有文本更短时保留流式，
@@ -1314,7 +1428,7 @@ actor RecognitionSession {
             DebugFileLogger.log(
                 "stop: batch fallback shorter than streaming (\(batchText.count) < \(streamingText.count)), keeping streaming text"
             )
-            return
+            return .succeeded
         }
 
         currentTranscript = RecognitionTranscript(
@@ -1324,6 +1438,7 @@ actor RecognitionSession {
             isFinal: true
         )
         DebugFileLogger.log("stop: batch fallback succeeded, \(batchText.count) chars")
+        return .succeeded
     }
 
     // REPAIR_PLAN K2：注入取值守卫。HUD 字幕与 LLM 路径显示/消费 composedText
@@ -1344,9 +1459,20 @@ actor RecognitionSession {
         return auth
     }
 
-    // REPAIR_PLAN K2：长录音字数低到不合理（有字但不足每秒 0.5 字）视为疑似
-    // 流层丢失，强制批量复核。0 字不触发——那是「没说话」，走 empty 路径；
-    // 短录音不触发——短句+快松手是正常形态。
+    // REPAIR_PLAN K10：按真实有声时长而非墙钟录音时长判断，长停顿不再把正常
+    // 文本误报为丢字；活动摘要只计通过声音阈值的 20ms 帧。
+    static func isTranscriptImplausiblyShort(
+        textCount: Int,
+        audioSummary: PCMAudioActivitySummary
+    ) -> Bool {
+        isTranscriptImplausiblyShort(
+            textCount: textCount,
+            durationSeconds: audioSummary.voicedDurationSeconds
+        )
+    }
+
+    // REPAIR_PLAN K2：有声时长较长且不足每秒 0.5 字时视为疑似流层丢失。
+    // 0 字交由 K7 的 PCM 活动摘要另行判断；不足 10 秒的短句不触发。
     static func isTranscriptImplausiblyShort(
         textCount: Int,
         durationSeconds: Double
@@ -1392,15 +1518,13 @@ actor RecognitionSession {
             break
         }
 
-        // Notify UI layer for all non-ready events
-        onASREvent?(event)
-
         switch event {
         case .ready, .completed:
             break  // handled above
 
         case .transcript(let transcript):
             currentTranscript = transcript
+            onASREvent?(event)
             logger.info("Transcript updated chars=\(transcript.displayText.count, privacy: .public) segments=\(transcript.confirmedSegments.count, privacy: .public) final=\(transcript.isFinal, privacy: .public)")
             if state == .recording && !currentMode.prompt.isEmpty {
                 scheduleSpeculativeLLM(sessionID: sessionID)
@@ -1408,6 +1532,22 @@ actor RecognitionSession {
 
         case .error(let error):
             logger.error("ASR error: \(error, privacy: .private)")
+            let supportsFullPCMReplay = activeProvider == .aliyun
+                || activeProvider == .volcano
+            if supportsFullPCMReplay,
+               state == .recording || state == .finishing {
+                // 云端任务失败不再立即 forceReset 丢掉本地整段音频。录音中只给
+                // 非致命断流提示，停止阶段静默标记降级，随后统一做完整重放。
+                streamingDegraded = true
+                DebugFileLogger.log(
+                    "ASR terminal error preserved local audio state=\(state); batch fallback required"
+                )
+                if state == .recording {
+                    onASREvent?(.streamingInterrupted)
+                }
+                return
+            }
+            onASREvent?(event)
             if state == .recording || state == .starting {
                 Task { await self.failActiveSessionAfterASRError(sessionID: sessionID) }
             }
@@ -1416,9 +1556,11 @@ actor RecognitionSession {
             // REPAIR_PLAN B7b：客户端静默重连成功也会发此事件——重连期间的
             // 语音服务端没听到，标记降级让停止流程批量复核全文
             streamingDegraded = true
+            onASREvent?(event)
             logger.warning("streaming degraded (interrupted/reconnected); batch fallback will verify at stop")
 
         case .processingResult, .finalized:
+            onASREvent?(event)
             break
         }
     }
@@ -1617,40 +1759,79 @@ actor RecognitionSession {
         config: any ASRProviderConfig,
         provider: ASRProvider
     ) async -> String? {
+        let timeout = Self.batchFallbackTimeout(
+            provider: provider,
+            audioByteCount: audio.count
+        )
+        let clientFactory = asrClientFactory
+        let replaySleep = aliyunReplaySleep
         do {
             return try await AsyncTimeout.throwingValue(
-                .seconds(30),
+                timeout,
                 timeoutError: BatchFallbackTimeoutError()
             ) {
-                guard let client = ASRProviderRegistry.createClient(for: provider) else { return nil }
+                guard let client = clientFactory(provider) else { return nil }
                 do {
                     let options = ASRRequestOptions(enablePunc: true, contextHistoryLength: 0)
                     try await client.connect(config: config, options: options)
-                    // Send all audio at once, then signal end
-                    try await client.sendAudio(audio)
+                    if provider == .aliyun {
+                        try await AliyunAudioReplay.send(
+                            audio: audio,
+                            to: client,
+                            sleep: replaySleep
+                        )
+                    } else if provider == .volcano {
+                        try await VolcanoAudioReplay.send(
+                            audio: audio,
+                            to: client
+                        )
+                    } else {
+                        try await client.sendAudio(audio)
+                    }
                     try await client.endAudio()
 
                     // Wait for final transcript
                     let events = await client.events
+                    var latestNonEmptyText: String?
                     for await event in events {
                         switch event {
-                        case .transcript(let transcript) where transcript.isFinal:
-                            await client.disconnect()
-                            // REPAIR_PLAN K2：批量 final 同样可能 auth 短于 composed，取长
+                        case .transcript(let transcript):
+                            // REPAIR_PLAN K2：批量结果同样可能 auth 短于 composed，取长。
                             let text = RecognitionSession.effectiveTranscriptText(for: transcript)
-                            return text.isEmpty ? nil : text
-                        case .error:
+                            if !text.isEmpty {
+                                latestNonEmptyText = text
+                            }
+                            guard transcript.isFinal else { continue }
+                            let result = latestNonEmptyText
+                            await client.disconnect()
+                            return result
+                        case .error(let error):
+                            DebugFileLogger.log(
+                                "batch fallback provider=\(provider.rawValue) server error: \(error)"
+                            )
                             await client.disconnect()
                             return nil
                         case .completed:
+                            let result = latestNonEmptyText
+                            if let result {
+                                DebugFileLogger.log(
+                                    "batch fallback provider=\(provider.rawValue) completed without final; using latest \(result.count) chars"
+                                )
+                            }
                             await client.disconnect()
-                            return nil
+                            return result
                         default:
                             continue
                         }
                     }
+                    let result = latestNonEmptyText
+                    if let result {
+                        DebugFileLogger.log(
+                            "batch fallback provider=\(provider.rawValue) event stream ended without final; using latest \(result.count) chars"
+                        )
+                    }
                     await client.disconnect()
-                    return nil
+                    return result
                 } catch {
                     DebugFileLogger.log("batch fallback error: \(error)")
                     await client.disconnect()
@@ -1658,12 +1839,25 @@ actor RecognitionSession {
                 }
             }
         } catch is BatchFallbackTimeoutError {
-            DebugFileLogger.log("batch fallback timeout after 30s")
+            DebugFileLogger.log("batch fallback timeout after \(timeout)")
             return nil
         } catch {
             DebugFileLogger.log("batch fallback cancelled: \(error)")
             return nil
         }
+    }
+
+    /// 阿里云与火山重放都按实时节奏发送，超时必须覆盖音频本身时长；其他厂商
+    /// 保持原 30 秒上限。极长会话最多等待 5 分钟，避免停止流程无限占用。
+    static func batchFallbackTimeout(
+        provider: ASRProvider,
+        audioByteCount: Int
+    ) -> Duration {
+        guard provider == .aliyun || provider == .volcano else { return .seconds(30) }
+        let bytesPerSecond = Int(AudioCaptureEngine.sampleRate)
+            * MemoryLayout<Int16>.size
+        let audioSeconds = Double(max(0, audioByteCount)) / Double(bytesPerSecond)
+        return .seconds(min(300, max(30, audioSeconds.rounded(.up) + 15)))
     }
 
     // MARK: - Force Reset

@@ -579,6 +579,32 @@ final class VolcProtocolTests: XCTestCase {
         }
     }
 
+    func testDecodeOfficialServerErrorWireFormat() throws {
+        let messageText = "server busy"
+        let messageData = Data(messageText.utf8)
+        let header = VolcHeader(
+            messageType: .serverError,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+        var code = UInt32(55_000_031).bigEndian
+        var size = UInt32(messageData.count).bigEndian
+        var message = header.encode()
+        message.append(Data(bytes: &code, count: MemoryLayout<UInt32>.size))
+        message.append(Data(bytes: &size, count: MemoryLayout<UInt32>.size))
+        message.append(messageData)
+
+        XCTAssertThrowsError(try VolcProtocol.decodeServerResponse(message)) { error in
+            guard case VolcProtocolError.serverError(let code, let detail) = error else {
+                XCTFail("Expected serverError, got \(error)")
+                return
+            }
+            XCTAssertEqual(code, 55_000_031)
+            XCTAssertEqual(detail, messageText)
+        }
+    }
+
     func testDecodeServerMessage_gzipJSONServerError() throws {
         let compressed = Data([
             0xAB, 0x56, 0x4A, 0xCE, 0x4F, 0x49, 0x55, 0xB2, 0x32, 0x34, 0x30, 0x30, 0xD4,

@@ -138,6 +138,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     case .completed:
                         if appState.barPhase == .recording {
                             appState.stopRecording()
+                        } else if appState.barPhase == .preparing {
+                            // 用户在录音启动完成前就松键：会话已取消，HUD 也必须
+                            // 从 preparing 收起，不能留下一个没有结果的假等待状态。
+                            appState.cancel()
                         } else {
                             DebugFileLogger.log("completed ignored in barPhase=\(String(describing: appState.barPhase))")
                         }

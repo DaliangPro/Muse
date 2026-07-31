@@ -84,6 +84,133 @@ final class AliyunASRClientTests: XCTestCase {
         }
     }
 
+    func testReceiveInterruptionReconnectsOnceAndResendsOnNewTask() async throws {
+        let firstSocket = ScriptedAliyunWebSocketTask()
+        let secondSocket = ScriptedAliyunWebSocketTask()
+        let dialQueue = AliyunDialFactoryQueue(sockets: [firstSocket, secondSocket])
+        let client = AliyunASRClient { request, configuration in
+            dialQueue.make(request: request, configuration: configuration)
+        }
+        let config = try XCTUnwrap(AliyunASRConfig(credentials: ["apiKey": "sk-test"]))
+
+        try await client.connect(config: config)
+        var iterator = await client.events.makeAsyncIterator()
+        let firstAudio = Data([0x01, 0x02])
+        try await client.sendAudio(firstAudio)
+
+        firstSocket.failReceive(AliyunSocketTestError.connectionLost)
+        guard case .streamingInterrupted? = await iterator.next() else {
+            return XCTFail("接收中断后应立即标记流式降级")
+        }
+
+        let secondAudio = Data([0x03, 0x04])
+        try await client.sendAudio(secondAudio)
+
+        XCTAssertEqual(dialQueue.dialCount, 2)
+        XCTAssertEqual(firstSocket.sentBinaryMessages, [firstAudio])
+        XCTAssertEqual(secondSocket.sentBinaryMessages, [secondAudio])
+        XCTAssertGreaterThanOrEqual(firstSocket.cancelCount, 1)
+        await client.disconnect()
+    }
+
+    func testSendFailureReconnectsOnceAndRetriesFailedPacket() async throws {
+        let firstSocket = ScriptedAliyunWebSocketTask(binarySendFailures: 1)
+        let secondSocket = ScriptedAliyunWebSocketTask()
+        let dialQueue = AliyunDialFactoryQueue(sockets: [firstSocket, secondSocket])
+        let client = AliyunASRClient { request, configuration in
+            dialQueue.make(request: request, configuration: configuration)
+        }
+        let config = try XCTUnwrap(AliyunASRConfig(credentials: ["apiKey": "sk-test"]))
+        let audio = Data([0x11, 0x12, 0x13])
+
+        try await client.connect(config: config)
+        var iterator = await client.events.makeAsyncIterator()
+        try await client.sendAudio(audio)
+
+        guard case .streamingInterrupted? = await iterator.next() else {
+            return XCTFail("发送失败重连后也必须标记流式降级")
+        }
+        XCTAssertEqual(dialQueue.dialCount, 2)
+        XCTAssertEqual(firstSocket.sentBinaryMessages, [])
+        XCTAssertEqual(secondSocket.sentBinaryMessages, [audio])
+        await client.disconnect()
+    }
+
+    func testReconnectFailureEndsEventStreamAndRejectsFurtherAudio() async throws {
+        let firstSocket = ScriptedAliyunWebSocketTask()
+        let failedReconnectSocket = ScriptedAliyunWebSocketTask(
+            handshakeFailure: (code: "ServiceUnavailable", message: "try later")
+        )
+        let dialQueue = AliyunDialFactoryQueue(
+            sockets: [firstSocket, failedReconnectSocket]
+        )
+        let client = AliyunASRClient { request, configuration in
+            dialQueue.make(request: request, configuration: configuration)
+        }
+        let config = try XCTUnwrap(AliyunASRConfig(credentials: ["apiKey": "sk-test"]))
+
+        try await client.connect(config: config)
+        var iterator = await client.events.makeAsyncIterator()
+        try await client.sendAudio(Data([0x01]))
+        firstSocket.failReceive(AliyunSocketTestError.connectionLost)
+
+        guard case .streamingInterrupted? = await iterator.next() else {
+            return XCTFail("重连失败前应先标记流式降级")
+        }
+        do {
+            try await client.sendAudio(Data([0x02]))
+            XCTFail("唯一一次重连失败后不得继续向死连接发送")
+        } catch {
+            // 预期：会话层会在停止时使用完整本地录音重放。
+        }
+        let streamEnd = await iterator.next()
+        XCTAssertNil(streamEnd)
+        XCTAssertEqual(dialQueue.dialCount, 2)
+    }
+
+    func testEmptyTaskFinishedCompletesWithoutInventingTranscript() async throws {
+        let socket = ScriptedAliyunWebSocketTask()
+        let client = AliyunASRClient { _, _ in
+            AliyunDialResources(task: socket, invalidateSession: {})
+        }
+        let config = try XCTUnwrap(AliyunASRConfig(credentials: ["apiKey": "sk-test"]))
+
+        try await client.connect(config: config)
+        var iterator = await client.events.makeAsyncIterator()
+        try await client.sendAudio(Data(repeating: 0, count: 3_200))
+        try await client.endAudio()
+        let taskID = try XCTUnwrap(socket.taskID)
+        socket.yieldServerMessage(taskFinishedMessage(taskID: taskID))
+
+        guard case .completed? = await iterator.next() else {
+            return XCTFail("空 task-finished 也必须明确结束事件流")
+        }
+        let streamEnd = await iterator.next()
+        XCTAssertNil(streamEnd)
+    }
+
+    func testAliyunReplayUses100MillisecondChunksAndPacing() async throws {
+        let client = AliyunReplayRecognizerSpy()
+        let sleepRecorder = AliyunReplaySleepRecorder()
+        let audio = Data((0..<7_000).map { UInt8($0 % 251) })
+
+        try await AliyunAudioReplay.send(
+            audio: audio,
+            to: client,
+            sleep: { duration in
+                sleepRecorder.record(duration)
+            }
+        )
+
+        let packets = await client.sentPackets
+        XCTAssertEqual(packets.map(\.count), [3_200, 3_200, 600])
+        XCTAssertEqual(Data(packets.joined()), audio)
+        XCTAssertEqual(
+            sleepRecorder.durations,
+            [.milliseconds(100), .milliseconds(100)]
+        )
+    }
+
     private func resultMessage(taskID: String, text: String, isFinal: Bool) -> String {
         """
         {
@@ -126,6 +253,35 @@ private final class AliyunDialFactorySpy: @unchecked Sendable {
     }
 }
 
+private final class AliyunDialFactoryQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sockets: [ScriptedAliyunWebSocketTask]
+    private var storedDialCount = 0
+
+    init(sockets: [ScriptedAliyunWebSocketTask]) {
+        self.sockets = sockets
+    }
+
+    var dialCount: Int { lock.withLock { storedDialCount } }
+
+    func make(
+        request: URLRequest,
+        configuration: URLSessionConfiguration
+    ) -> AliyunDialResources {
+        _ = request
+        _ = configuration
+        return lock.withLock {
+            storedDialCount += 1
+            let socket = sockets.removeFirst()
+            return AliyunDialResources(task: socket, invalidateSession: {})
+        }
+    }
+}
+
+private enum AliyunSocketTestError: Error {
+    case connectionLost
+}
+
 private final class ScriptedAliyunWebSocketTask: AliyunWebSocketTasking, @unchecked Sendable {
     private typealias ReceiveContinuation = CheckedContinuation<
         URLSessionWebSocketTask.Message,
@@ -134,26 +290,43 @@ private final class ScriptedAliyunWebSocketTask: AliyunWebSocketTasking, @unchec
 
     private let lock = NSLock()
     private let handshakeFailure: (code: String, message: String)?
+    private var binarySendFailures: Int
     private var queuedMessages: [URLSessionWebSocketTask.Message] = []
     private var receiveContinuation: ReceiveContinuation?
     private var storedTaskID: String?
     private var storedSentActions: [String] = []
     private var storedBinaryMessages: [Data] = []
+    private var storedCancelCount = 0
 
-    init(handshakeFailure: (code: String, message: String)? = nil) {
+    init(
+        handshakeFailure: (code: String, message: String)? = nil,
+        binarySendFailures: Int = 0
+    ) {
         self.handshakeFailure = handshakeFailure
+        self.binarySendFailures = binarySendFailures
     }
 
     var taskID: String? { lock.withLock { storedTaskID } }
     var sentActions: [String] { lock.withLock { storedSentActions } }
     var sentBinaryMessages: [Data] { lock.withLock { storedBinaryMessages } }
+    var cancelCount: Int { lock.withLock { storedCancelCount } }
 
     func resume() {}
 
     func send(_ message: URLSessionWebSocketTask.Message) async throws {
         switch message {
         case .data(let data):
-            lock.withLock { storedBinaryMessages.append(data) }
+            let shouldFail = lock.withLock { () -> Bool in
+                guard binarySendFailures > 0 else {
+                    storedBinaryMessages.append(data)
+                    return false
+                }
+                binarySendFailures -= 1
+                return true
+            }
+            if shouldFail {
+                throw AliyunSocketTestError.connectionLost
+            }
         case .string(let text):
             guard let data = text.data(using: .utf8),
                   let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -211,10 +384,19 @@ private final class ScriptedAliyunWebSocketTask: AliyunWebSocketTasking, @unchec
         _ = closeCode
         _ = reason
         let continuation = lock.withLock { () -> ReceiveContinuation? in
+            storedCancelCount += 1
             defer { receiveContinuation = nil }
             return receiveContinuation
         }
         continuation?.resume(throwing: CancellationError())
+    }
+
+    func failReceive(_ error: Error) {
+        let continuation = lock.withLock { () -> ReceiveContinuation? in
+            defer { receiveContinuation = nil }
+            return receiveContinuation
+        }
+        continuation?.resume(throwing: error)
     }
 
     func yieldServerMessage(_ text: String) {
@@ -228,5 +410,36 @@ private final class ScriptedAliyunWebSocketTask: AliyunWebSocketTasking, @unchec
             return continuation
         }
         continuation?.resume(returning: message)
+    }
+}
+
+private actor AliyunReplayRecognizerSpy: SpeechRecognizer {
+    private(set) var sentPackets: [Data] = []
+
+    func connect(config: any ASRProviderConfig, options: ASRRequestOptions) async throws {
+        _ = config
+        _ = options
+    }
+
+    func sendAudio(_ data: Data) async throws {
+        sentPackets.append(data)
+    }
+
+    func endAudio() async throws {}
+    func disconnect() async {}
+
+    var events: AsyncStream<RecognitionEvent> {
+        AsyncStream { $0.finish() }
+    }
+}
+
+private final class AliyunReplaySleepRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Duration] = []
+
+    var durations: [Duration] { lock.withLock { storage } }
+
+    func record(_ duration: Duration) {
+        lock.withLock { storage.append(duration) }
     }
 }

@@ -141,6 +141,14 @@ struct AliyunTranscriptAccumulator: Sendable {
     private(set) var confirmedSegments: [String] = []
     private(set) var partialText = ""
 
+    /// 连接中断前把当前临时字幕冻结为已确认前缀。新连接只会返回重连后的音频，
+    /// 若直接覆盖 partialText，用户已经看到的半句会从字幕与最终兜底前文本中消失。
+    mutating func freezePartialAsConfirmed() {
+        guard !partialText.isEmpty else { return }
+        confirmedSegments.append(partialText)
+        partialText = ""
+    }
+
     mutating func apply(_ sentence: AliyunSentence) -> RecognitionTranscript? {
         guard !sentence.isHeartbeat else { return nil }
         let text = sentence.text.trimmingCharacters(in: .whitespacesAndNewlines)
