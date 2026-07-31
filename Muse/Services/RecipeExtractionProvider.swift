@@ -67,7 +67,12 @@ actor RemoteRecipeExtractionProvider: RecipeExtractionProvider {
             provider: provider
         )
         let raw = try await RemoteAssetExtractionProvider.withTimeout(seconds: 120) {
-            try await client.process(text: messages.user, prompt: messages.system ?? "", config: llmConfig)
+            try await client.process(
+                text: messages.user,
+                prompt: messages.system ?? "",
+                context: .structuredTask,
+                config: llmConfig
+            )
         }
         return try Self.parse(rawResponse: raw)
     }

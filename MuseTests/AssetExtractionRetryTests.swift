@@ -9,13 +9,20 @@ final class AssetExtractionRetryTests: XCTestCase {
         private var responses: [String]
         private(set) var callCount = 0
         private(set) var lastPrompt = ""
+        private(set) var lastContext: LLMRequestContext?
 
         init(responses: [String]) { self.responses = responses }
 
-        func process(text: String, prompt: String, config: LLMConfig) async throws -> String {
+        func process(
+            text: String,
+            prompt: String,
+            context: LLMRequestContext,
+            config: LLMConfig
+        ) async throws -> String {
             lock.withLock {
                 callCount += 1
                 lastPrompt = prompt
+                lastContext = context
                 return responses.isEmpty ? "" : responses.removeFirst()
             }
         }
@@ -31,6 +38,7 @@ final class AssetExtractionRetryTests: XCTestCase {
         _ = try await provider.requestAndParse(
             client: mock, input: "记录", prompt: "提示", config: dummyConfig)
         XCTAssertEqual(mock.callCount, 1)
+        XCTAssertEqual(mock.lastContext, .structuredTask)
     }
 
     func testBadJSONRetriesOnceWithCorrectionAndSucceeds() async throws {

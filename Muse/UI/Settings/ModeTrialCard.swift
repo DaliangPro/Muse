@@ -315,8 +315,9 @@ private extension ModeTrialCard {
 
         do {
             let result = try await client.process(
-                text: draftMode.llmInputMessage(for: input),
+                text: input,
                 prompt: expandedPrompt,
+                context: .processingMode,
                 config: llmConfig
             )
             let cleaned = draftMode.applyingLLMResultCleanup(to: result)

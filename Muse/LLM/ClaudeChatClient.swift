@@ -26,10 +26,16 @@ actor ClaudeChatClient: LLMClient {
     }
 
     /// Process text through Anthropic Messages API (streaming).
-    func process(text: String, prompt: String, config: LLMConfig) async throws -> String {
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
         let result = try await execute(
             text: text,
             prompt: prompt,
+            context: context,
             config: config,
             stream: true,
             maxTokens: 4_096,
@@ -47,6 +53,7 @@ actor ClaudeChatClient: LLMClient {
         let result = try await execute(
             text: LLMThinkingModeValidator.probeText,
             prompt: "{text}",
+            context: .connectivityProbe,
             config: config,
             stream: false,
             maxTokens: 2_048,
@@ -58,6 +65,7 @@ actor ClaudeChatClient: LLMClient {
     private func execute(
         text: String,
         prompt: String,
+        context: LLMRequestContext,
         config: LLMConfig,
         stream: Bool,
         maxTokens: Int,
@@ -67,7 +75,11 @@ actor ClaudeChatClient: LLMClient {
         guard !trimmedText.isEmpty else {
             return ClaudeExecutionResult(text: text, evidence: .unknown)
         }
-        let promptParts = prompt.separatedLLMMessages(with: trimmedText)
+        let promptParts = LLMRequestBuilder.messages(
+            prompt: prompt,
+            text: trimmedText,
+            context: context
+        )
 
         let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
             rawValue: config.baseURL,

@@ -2,7 +2,12 @@ import Foundation
 
 /// Common interface for LLM clients (OpenAI-compatible and Claude).
 protocol LLMClient: Sendable {
-    func process(text: String, prompt: String, config: LLMConfig) async throws -> String
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String
     func probeThinkingMode(config: LLMConfig) async throws -> LLMThinkingProbeEvidence
     func warmUp(baseURL: String) async
 }
@@ -14,6 +19,7 @@ extension LLMClient {
         _ = try await process(
             text: LLMThinkingModeValidator.probeText,
             prompt: "{text}",
+            context: .connectivityProbe,
             config: config
         )
         return .unknown

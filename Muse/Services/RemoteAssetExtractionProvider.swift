@@ -88,7 +88,12 @@ actor RemoteAssetExtractionProvider: AssetExtractionProvider {
         config: LLMConfig
     ) async throws -> AssetExtractionResult {
         let raw = try await Self.withTimeout(seconds: Self.requestTimeoutSeconds) {
-            try await client.process(text: input, prompt: prompt, config: config)
+            try await client.process(
+                text: input,
+                prompt: prompt,
+                context: .structuredTask,
+                config: config
+            )
         }
         do {
             return try parse(rawResponse: raw)
@@ -96,7 +101,12 @@ actor RemoteAssetExtractionProvider: AssetExtractionProvider {
             AppLogger.log("[AssetExtraction] 响应不是合法 JSON，带纠错指令重试一次")
             let correctedPrompt = prompt + "\n\n注意：你上一次的输出不是合法 JSON，解析失败。这次必须严格只输出符合上述结构的 JSON 本体，禁止 markdown 代码块、禁止任何解释文字。"
             let retryRaw = try await Self.withTimeout(seconds: Self.requestTimeoutSeconds) {
-                try await client.process(text: input, prompt: correctedPrompt, config: config)
+                try await client.process(
+                    text: input,
+                    prompt: correctedPrompt,
+                    context: .structuredTask,
+                    config: config
+                )
             }
             return try parse(rawResponse: retryRaw)
         }
