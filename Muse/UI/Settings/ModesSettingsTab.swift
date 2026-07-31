@@ -11,6 +11,7 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
     @State private var modePickerTriggerFrame = CGRect.zero
     @State private var modePickerPopoverFrame = CGRect.zero
     @State private var configuringModeId: UUID?
+    @State private var isVoicePolishSettingsPresented = false
 
     var body: some View {
         // 2026-07-08 大梁老师：工作区高度改按实际几何现场计算（隐藏标题栏窗口的
@@ -36,6 +37,11 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
         }
         .sheet(isPresented: isModeSettingsPresented) {
             modeSettingsSheet
+        }
+        .sheet(isPresented: $isVoicePolishSettingsPresented) {
+            VoicePolishSettingsSheet {
+                isVoicePolishSettingsPresented = false
+            }
         }
         .alert(
             L("删除模式", "Delete Mode"),
@@ -157,6 +163,18 @@ private extension ModesSettingsTab {
             if let mode = selectedMode {
                 ModeSettingsButton(modeName: mode.name) {
                     configuringModeId = mode.id
+                }
+
+                if mode.kind == .voicePolish {
+                    SettingsTextButton(
+                        L("润色设置", "Polish"),
+                        variant: .secondary,
+                        minWidth: 66,
+                        onCanvas: true
+                    ) {
+                        isVoicePolishSettingsPresented = true
+                    }
+                    .help(L("质量、上下文、词典与个性化", "Quality, context, lexicon, and personalization"))
                 }
 
                 if !mode.isBuiltin {

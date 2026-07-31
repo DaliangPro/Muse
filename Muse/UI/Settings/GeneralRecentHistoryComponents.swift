@@ -5,6 +5,7 @@ struct RecentHistoryRowView: View {
     let timeText: String
     let isCopied: Bool
     let copyAction: () -> Void
+    let learnAction: (() -> Void)?
     let deleteAction: () -> Void
 
     @State private var isHovering = false
@@ -35,6 +36,16 @@ struct RecentHistoryRowView: View {
                     isRowHovering: isHovering,
                     action: copyAction
                 )
+
+                if let learnAction {
+                    RecentHistoryActionIconButton(
+                        systemName: "pencil.and.scribble",
+                        accessibilityLabel: L("纠正并学习", "Correct and learn"),
+                        isDestructive: false,
+                        isRowHovering: isHovering,
+                        action: learnAction
+                    )
+                }
 
                 RecentHistoryActionIconButton(
                     systemName: "xmark",

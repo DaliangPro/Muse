@@ -77,6 +77,34 @@ final class PersonalLexiconTests: XCTestCase {
         })
     }
 
+    func testClearRemovesOnlyASRItemsOwnedByPersonalLexicon() throws {
+        let fixture = try StorageFixture()
+        defer { fixture.cleanup() }
+        try HotwordStorage.save(["Existing"], context: fixture.context)
+        try SnippetStorage.save(
+            [(trigger: "Existing Alias", value: "Existing")],
+            context: fixture.context
+        )
+        try PersonalLexiconStorage.save(
+            PersonalLexiconDocument(
+                schemaVersion: 1,
+                entries: [
+                    PersonalLexiconEntry(canonical: "Existing", aliases: ["Existing Alias"]),
+                    PersonalLexiconEntry(canonical: "Kubernetes", aliases: ["Kubernetez"]),
+                ]
+            ),
+            context: fixture.context
+        )
+
+        try PersonalLexiconStorage.clear(context: fixture.context)
+
+        XCTAssertEqual(HotwordStorage.load(context: fixture.context), ["Existing"])
+        let snippets = SnippetStorage.load(context: fixture.context)
+        XCTAssertTrue(snippets.contains { $0.trigger == "Existing Alias" && $0.value == "Existing" })
+        XCTAssertFalse(snippets.contains { $0.trigger == "Kubernetez" })
+        XCTAssertTrue(PersonalLexiconStorage.load(context: fixture.context).entries.isEmpty)
+    }
+
     func testResolverUsesPriorityThresholdAndConflictMargin() {
         let lexicon = PersonalLexiconDocument(
             schemaVersion: 1,

@@ -39,6 +39,14 @@ struct PersonalLexiconDocument: Codable, Sendable, Equatable {
 }
 
 enum PersonalLexiconStorage {
+    private struct ASRSyncManifest: Codable {
+        var hotwords: [String]
+        /// normalized alias -> canonical
+        var corrections: [String: String]
+
+        static let empty = ASRSyncManifest(hotwords: [], corrections: [:])
+    }
+
     static func fileURL(in context: VocabularyStorageContext = .production) -> URL {
         context.supportDirectory.appendingPathComponent("voice-polish-lexicon.json")
     }
@@ -75,6 +83,7 @@ enum PersonalLexiconStorage {
     }
 
     static func clear(context: VocabularyStorageContext = .production) throws {
+        try syncConfirmedEntriesToASR([], context: context)
         try save(.empty, syncToASR: false, context: context)
     }
 
@@ -158,21 +167,89 @@ enum PersonalLexiconStorage {
         context: VocabularyStorageContext
     ) throws {
         let enabled = entries.filter(\.isEnabled)
+        let previous = try loadSyncManifest(context: context)
+        let desiredHotwords = enabled.map(\.canonical)
+        let desiredHotwordKeys = Set(desiredHotwords.map(normalizedKey))
+        var desiredCorrections: [String: (alias: String, canonical: String)] = [:]
+        for entry in enabled {
+            for alias in entry.aliases {
+                desiredCorrections[normalizedKey(alias)] = (alias, entry.canonical)
+            }
+        }
+
         var hotwords = HotwordStorage.load(context: context)
-        let hotwordKeys = Set(hotwords.map(normalizedKey))
-        hotwords.append(contentsOf: enabled.map(\.canonical).filter {
-            !hotwordKeys.contains(normalizedKey($0))
-        })
+        let previousOwnedHotwordKeys = Set(previous.hotwords.map(normalizedKey))
+        hotwords.removeAll {
+            previousOwnedHotwordKeys.contains(normalizedKey($0))
+                && !desiredHotwordKeys.contains(normalizedKey($0))
+        }
+        var currentHotwordKeys = Set(hotwords.map(normalizedKey))
+        var ownedHotwords: [String] = []
+        for hotword in desiredHotwords {
+            let key = normalizedKey(hotword)
+            if previousOwnedHotwordKeys.contains(key) {
+                ownedHotwords.append(hotword)
+                if currentHotwordKeys.insert(key).inserted {
+                    hotwords.append(hotword)
+                }
+            } else if currentHotwordKeys.insert(key).inserted {
+                hotwords.append(hotword)
+                ownedHotwords.append(hotword)
+            }
+        }
         try HotwordStorage.save(hotwords, context: context)
 
         var snippets = SnippetStorage.load(context: context)
-        let snippetKeys = Set(snippets.map { normalizedKey($0.trigger) })
-        for entry in enabled {
-            snippets.append(contentsOf: entry.aliases.filter {
-                !snippetKeys.contains(normalizedKey($0))
-            }.map { (trigger: $0, value: entry.canonical) })
+        snippets.removeAll { snippet in
+            let key = normalizedKey(snippet.trigger)
+            guard let previousCanonical = previous.corrections[key] else { return false }
+            if let desired = desiredCorrections[key],
+               normalizedKey(desired.canonical) == normalizedKey(previousCanonical) {
+                return false
+            }
+            return normalizedKey(snippet.value) == normalizedKey(previousCanonical)
+        }
+        var currentSnippetKeys = Set(snippets.map { normalizedKey($0.trigger) })
+        var ownedCorrections: [String: String] = [:]
+        for (key, desired) in desiredCorrections {
+            if let previousCanonical = previous.corrections[key],
+               normalizedKey(previousCanonical) == normalizedKey(desired.canonical) {
+                ownedCorrections[key] = desired.canonical
+                if !currentSnippetKeys.contains(key) {
+                    snippets.append((trigger: desired.alias, value: desired.canonical))
+                    currentSnippetKeys.insert(key)
+                }
+            } else if currentSnippetKeys.insert(key).inserted {
+                snippets.append((trigger: desired.alias, value: desired.canonical))
+                ownedCorrections[key] = desired.canonical
+            }
         }
         try SnippetStorage.save(snippets, context: context)
+        try JSONFileStore.writeOrThrow(
+            ASRSyncManifest(hotwords: ownedHotwords, corrections: ownedCorrections),
+            to: syncManifestURL(in: context)
+        )
+    }
+
+    private static func syncManifestURL(in context: VocabularyStorageContext) -> URL {
+        context.supportDirectory.appendingPathComponent("voice-polish-asr-sync.json")
+    }
+
+    private static func loadSyncManifest(
+        context: VocabularyStorageContext
+    ) throws -> ASRSyncManifest {
+        switch JSONFileStore.read(
+            ASRSyncManifest.self,
+            from: syncManifestURL(in: context),
+            fileManager: context.fileManager
+        ) {
+        case .missing:
+            return .empty
+        case .value(let manifest):
+            return manifest
+        case .corrupt(let url, _):
+            throw JSONFileStoreError.recoveryRequired(url)
+        }
     }
 
     private static func normalizedKey(_ value: String) -> String {

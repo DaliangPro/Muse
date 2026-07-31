@@ -359,8 +359,17 @@ actor HistoryStore {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int(stmt, 1, Int32(limit))
-        if stepSingleWrite(stmt), sqlite3_changes(db) > 0 {
-            AppLogger.log("[HistoryStore] 已按上限 \(limit) 裁剪 \(sqlite3_changes(db)) 条旧记录")
+        guard stepSingleWrite(stmt) else { return }
+        let prunedCount = sqlite3_changes(db)
+        // 纠正样本依附于历史记录；裁剪历史后同步清理孤儿样本，避免画像读取到
+        // 已经无法追溯来源的私人数据。
+        sqlite3_exec(
+            db,
+            "DELETE FROM voice_polish_corrections WHERE history_id NOT IN (SELECT id FROM recognition_history);",
+            nil, nil, nil
+        )
+        if prunedCount > 0 {
+            AppLogger.log("[HistoryStore] 已按上限 \(limit) 裁剪 \(prunedCount) 条旧记录")
             postDidChangeNotification()
         }
     }

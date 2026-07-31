@@ -5,6 +5,7 @@ struct GeneralRecentHistorySection: View, SettingsCardHelpers {
     let copiedRecordId: String?
     @Binding var selectedDayKey: String
     let onCopy: (HistoryRecord) -> Void
+    let onLearn: (HistoryRecord) -> Void
     let onDelete: (HistoryRecord) -> Void
 
     var body: some View {
@@ -126,6 +127,7 @@ private extension GeneralRecentHistorySection {
             timeText: GeneralSettingsFormatters.recentTime(record.createdAt),
             isCopied: copiedRecordId == record.id,
             copyAction: { onCopy(record) },
+            learnAction: record.status.hasPrefix("voice_polish_") ? { onLearn(record) } : nil,
             deleteAction: { onDelete(record) }
         )
     }

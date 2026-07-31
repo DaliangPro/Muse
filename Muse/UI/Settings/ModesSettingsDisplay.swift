@@ -34,7 +34,7 @@ extension ModesSettingsTab {
     }
 
     func currentModelStatus(for mode: ProcessingMode) -> ModeModelStatus {
-        let usesLLM = !mode.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let usesLLM = mode.requiresLLM
         if usesLLM {
             return ModeModelStatus(
                 title: currentLLMShortName,

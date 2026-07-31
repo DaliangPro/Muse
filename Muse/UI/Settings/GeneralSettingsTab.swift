@@ -21,6 +21,7 @@ struct GeneralSettingsTab: View {
     @State private var historyDatabaseErrorMessage: String?
     @State private var assetDatabaseErrorMessage: String?
     @State private var copiedRecentRecordId: String?
+    @State private var learningRecord: HistoryRecord?
     @State private var selectedDayKey = GeneralRecentHistorySection.dayKey(for: Date())
 
     private static var cachedStatistics: HistoryStore.Statistics?
@@ -59,6 +60,7 @@ struct GeneralSettingsTab: View {
                 copiedRecordId: copiedRecentRecordId,
                 selectedDayKey: $selectedDayKey,
                 onCopy: copyRecentRecord,
+                onLearn: { learningRecord = $0 },
                 onDelete: deleteRecentRecord
             )
                 .padding(.top, GeneralSettingsStyle.overviewHistoryTopSpacing)
@@ -77,6 +79,22 @@ struct GeneralSettingsTab: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .languageAssetStoreDidChange)) { _ in
             Task { await reloadAssetCount() }
+        }
+        .sheet(item: $learningRecord) { record in
+            VoicePolishCorrectionSheet(
+                record: record,
+                onConfirm: { correctedText, scene in
+                    _ = try await historyStore.confirmVoicePolishCorrection(
+                        historyID: record.id,
+                        correctedText: correctedText,
+                        scene: scene,
+                        personalizationEnabled: VoicePolishSettings.personalizationEnabled(),
+                        retentionLimit: VoicePolishSettings.correctionLimit()
+                    )
+                    await reloadHistoryData()
+                },
+                onCancel: { learningRecord = nil }
+            )
         }
     }
 

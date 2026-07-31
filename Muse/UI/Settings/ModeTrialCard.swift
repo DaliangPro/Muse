@@ -325,16 +325,40 @@ private extension ModeTrialCard {
                 durationMs: 0,
                 provider: asrProvider
             )
+            let trialContext = WritingContext(
+                scene: .unknown,
+                level: .metadataOnly,
+                safety: .unknown
+            )
+            let resolvedEntities = EntityResolver.resolve(
+                segments: envelope.segments,
+                lexicon: PersonalLexiconStorage.load(),
+                snippets: SnippetStorage.load(),
+                hotwords: HotwordStorage.loadEffective(),
+                context: trialContext
+            )
+            let styleProfile: StyleProfile?
+            if VoicePolishSettings.personalizationEnabled() {
+                let store = HistoryStore()
+                let corrections = (try? await store.fetchVoicePolishCorrections(
+                    limit: VoicePolishSettings.correctionLimit()
+                )) ?? []
+                styleProfile = StyleProfileUpdater.mergedProfile(from: corrections, scene: .unknown)
+            } else {
+                styleProfile = nil
+            }
             let result = await VoicePolishPipeline(
                 client: client,
                 config: llmConfig
             ).process(VoicePolishRequest(
                 input: envelope,
-                context: .phaseOneUnknown,
+                context: trialContext,
                 preferences: UserPolishPreferences(
-                    additionalRequirements: draftMode.prompt
+                    additionalRequirements: draftMode.prompt,
+                    styleProfile: styleProfile
                 ),
-                qualityMode: .balanced
+                qualityMode: VoicePolishSettings.qualityMode(),
+                resolvedEntities: resolvedEntities
             ))
             trialOutput = result.text
             trialDiagnostics = voicePolishDiagnostics(result)

@@ -186,6 +186,35 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertTrue(empty.isEmpty)
     }
 
+    func testHistoryPruneAlsoRemovesOrphanedVoicePolishCorrections() async throws {
+        for index in 0..<2 {
+            let id = "prune-vp-\(index)"
+            await store.insert(HistoryRecord(
+                id: id,
+                createdAt: Date(timeIntervalSince1970: Double(2_000 + index)),
+                durationSeconds: 1,
+                rawText: "原文\(index)",
+                processingMode: "语音润色",
+                processedText: "结果\(index)",
+                finalText: "结果\(index)",
+                status: "voice_polish_success",
+                characterCount: 3
+            ))
+            _ = try await store.confirmVoicePolishCorrection(
+                historyID: id,
+                correctedText: "修改\(index)",
+                scene: .document,
+                personalizationEnabled: true,
+                retentionLimit: 200
+            )
+        }
+
+        await store.prune(keepingMostRecent: 1)
+
+        let corrections = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(corrections.map(\.historyID), ["prune-vp-1"])
+    }
+
     func testFetchRecentReturnsLimitedNewestRecords() async {
         await store.insert(HistoryRecord(
             id: "1", createdAt: Date(timeIntervalSinceNow: -100), durationSeconds: 1,
