@@ -1,5 +1,15 @@
 import Foundation
 
+enum ProcessingKind: String, Codable, CaseIterable, Sendable {
+    case direct
+    case smartDirect
+    case voicePolish
+    case translate
+    case promptOptimize
+    case command
+    case custom
+}
+
 // MARK: - Processing Mode
 // 2026-07-09 J14：从 AppState.swift 迁出——领域模型不属于 UI 层。
 // Prompt 模板见 ProcessingMode+Prompts.swift，LLM 结果清洗见 ProcessingMode+LLMCleanup.swift。
@@ -8,6 +18,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     let id: UUID
     var name: String
     var prompt: String
+    var kind: ProcessingKind
     var isBuiltin: Bool
     var processingLabel: String
     var hotkeyCode: Int?
@@ -37,6 +48,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         id: UUID,
         name: String,
         prompt: String,
+        kind: ProcessingKind? = nil,
         isBuiltin: Bool,
         processingLabel: String = L("处理中", "Processing"),
         hotkeyCode: Int? = nil,
@@ -46,6 +58,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         self.id = id
         self.name = name
         self.prompt = prompt
+        self.kind = Self.kind(forStableID: id) ?? kind ?? .custom
         self.isBuiltin = isBuiltin
         self.processingLabel = processingLabel
         self.hotkeyCode = hotkeyCode
@@ -63,7 +76,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, prompt, isBuiltin, processingLabel
+        case id, name, prompt, kind, isBuiltin, processingLabel
         case hotkeyCode, hotkeyModifiers, hotkeyStyle
     }
 
@@ -72,6 +85,9 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         id = try container.decode(UUID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
         prompt = try container.decode(String.self, forKey: .prompt)
+        // 业务类型只由稳定 ID 决定。旧数据没有 kind 时在内存兼容；未知 ID
+        // 一律保持 custom，避免用户改名或手改 JSON 获得内置模式语义。
+        kind = Self.kind(forStableID: id) ?? .custom
         isBuiltin = try container.decode(Bool.self, forKey: .isBuiltin)
         processingLabel = try container.decodeIfPresent(String.self, forKey: .processingLabel) ?? L("处理中", "Processing")
         hotkeyCode = try container.decodeIfPresent(Int.self, forKey: .hotkeyCode)
@@ -100,19 +116,24 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     }
 
     var isFormalWritingMode: Bool {
-        id == Self.formalWritingId
-            || name.localizedCaseInsensitiveContains("润色")
-            || name.localizedCaseInsensitiveContains("polish")
+        kind == .voicePolish
     }
     var isPromptOptimizeMode: Bool {
-        id == Self.promptOptimizeId
-            || name.localizedCaseInsensitiveContains("prompt")
+        kind == .promptOptimize
     }
     var isTranslateMode: Bool {
-        id == Self.translateId
-            || id == Self.defaultTranslateId
-            || name.localizedCaseInsensitiveContains("翻译")
-            || name.localizedCaseInsensitiveContains("translat")
+        kind == .translate
+    }
+
+    var requiresLLM: Bool {
+        switch kind {
+        case .direct:
+            return false
+        case .smartDirect, .voicePolish, .translate, .promptOptimize, .command:
+            return true
+        case .custom:
+            return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     // MARK: - Default Custom Mode IDs (stable, for fresh installs)
@@ -121,11 +142,32 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     private static let defaultTranslateId = UUID(uuidString: "87AF4048-83C3-4306-8AF8-1E52DB7CA2F5")!
     private static let commandModeId = UUID(uuidString: "A3B1D9E7-6F42-4C8A-B5E0-9D3F7A2C1E84")!
 
+    private static func kind(forStableID id: UUID) -> ProcessingKind? {
+        switch id {
+        case directId:
+            return .direct
+        case smartDirectId:
+            return .smartDirect
+        case formalWritingId:
+            return .voicePolish
+        case translateId, defaultTranslateId:
+            return .translate
+        case promptOptimizeId:
+            return .promptOptimize
+        case commandModeId:
+            return .command
+        default:
+            return nil
+        }
+    }
+
     static var formalWriting: ProcessingMode {
         ProcessingMode(
             id: formalWritingId,
             name: L("语音润色", "Voice Polish"),
-            prompt: formalWritingPromptTemplate,
+            // V2 起，默认规则由 VoicePolishPrompts 版本化维护；这里仅保存用户
+            // 的附加润色要求，因此新装默认为空。
+            prompt: "",
             isBuiltin: false,
             processingLabel: L("润色中", "Polishing"),
             hotkeyCode: 18, hotkeyModifiers: 524288, hotkeyStyle: .toggle

@@ -8,29 +8,9 @@ extension ProcessingMode {
             return expandedPrompt
         }
 
-        // contains 检查须覆盖中英双版本：用户存量 prompt 可能内嵌另一语言的守卫
+        // Voice Polish V2 的规则由独立、版本化管线维护。附加要求不能再触发
+        // 旧版隐藏列表、机械清理或任务边界拼接。
         var guardedPrompt = expandedPrompt
-        let hasListGuard = guardedPrompt.contains(Self.formalWritingListGuardZH)
-            || guardedPrompt.contains(Self.formalWritingListGuardEN)
-        if isFormalWritingMode && !hasListGuard {
-            guardedPrompt = """
-            \(guardedPrompt)
-
-            \(Self.formalWritingListGuard)
-
-            \(Self.formalWritingCleanupGuard)
-            """
-        }
-
-        let hasTaskBoundaryGuard = guardedPrompt.contains(Self.formalWritingTaskBoundaryGuardZH)
-            || guardedPrompt.contains(Self.formalWritingTaskBoundaryGuardEN)
-        if isFormalWritingMode && !hasTaskBoundaryGuard {
-            guardedPrompt = """
-            \(guardedPrompt)
-
-            \(Self.formalWritingTaskBoundaryGuard)
-            """
-        }
 
         let hasBoundaryGuard = guardedPrompt.contains(Self.llmOutputBoundaryGuardZH)
             || guardedPrompt.contains(Self.llmOutputBoundaryGuardEN)
@@ -46,38 +26,20 @@ extension ProcessingMode {
 
     func applyingLLMResultCleanup(to result: String) -> String {
         var cleaned = Self.stripCommonLLMResponsePrefix(result.strippingThinkTags())
+        if kind == .voicePolish {
+            return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         if !isPromptOptimizeMode {
             cleaned = Self.stripLikelyPromptLeakage(from: cleaned)
         }
-
-        guard isFormalWritingMode else {
-            return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let replacements: [(String, String)] = [
-            ("CodeX", "Codex"),
-            ("Cloud Code", "Claude Code"),
-            ("markdown", "Markdown"),
-            ("本质上就是", "本质上是"),
-            ("其实就是", "本质上是"),
-            ("其实它就是", "本质上是"),
-            ("也就是", "换句话说"),
-            ("就是说", "换句话说"),
-            ("就是一个", "是一个"),
-            ("就是一种", "是一种"),
-            ("就是要", "要"),
-            ("就是我", "我"),
-            ("，就是", "，"),
-            ("。就是", "。"),
-        ]
-        for (source, target) in replacements {
-            cleaned = cleaned.replacingOccurrences(of: source, with: target)
-        }
-        cleaned = cleaned.replacingOccurrences(of: "就是", with: "是")
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func applyingFinalInsertionCleanup(to result: String) -> String {
         var cleaned = result.strippingThinkTags()
+        if kind == .voicePolish {
+            return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         if !isPromptOptimizeMode {
             cleaned = Self.stripLikelyPromptLeakage(from: cleaned)
         }

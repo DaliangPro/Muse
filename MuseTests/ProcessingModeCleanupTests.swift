@@ -16,7 +16,7 @@ final class ProcessingModeCleanupTests: XCTestCase {
         action()
     }
 
-    func testFormalWritingCleanupStripsPromptLeakageTail() {
+    func testVoicePolishCleanupDoesNotTruncateMarkerLikeSourceContent() {
         let leaked = """
         今晚要做三件事：
         1. 锻炼健身
@@ -28,7 +28,7 @@ final class ProcessingModeCleanupTests: XCTestCase {
 
         let cleaned = ProcessingMode.formalWriting.applyingLLMResultCleanup(to: leaked)
 
-        XCTAssertEqual(cleaned, "今晚要做三件事：\n1. 锻炼健身\n2. 写一篇稿子")
+        XCTAssertEqual(cleaned, leaked)
     }
 
     func testCommandModeCleanupStripsInlinePromptLeakage() {
@@ -43,7 +43,7 @@ final class ProcessingModeCleanupTests: XCTestCase {
         XCTAssertEqual(cleaned, "整理好了。")
     }
 
-    func testFormalWritingCleanupStripsChangeRequestLeakageTail() {
+    func testVoicePolishCleanupDoesNotTruncateChangeRequestPhrase() {
         let leaked = """
         这个地方需要整体调一下。
 
@@ -52,15 +52,15 @@ final class ProcessingModeCleanupTests: XCTestCase {
 
         let cleaned = ProcessingMode.formalWriting.applyingLLMResultCleanup(to: leaked)
 
-        XCTAssertEqual(cleaned, "这个地方需要整体调一下。")
+        XCTAssertEqual(cleaned, leaked)
     }
 
-    func testFormalWritingCleanupStripsInlineChangeRequestLeakage() {
+    func testVoicePolishCleanupDoesNotTruncateInlineChangeRequestPhrase() {
         let leaked = "已经整理好了。要求后续变更：保留对齐规则"
 
         let cleaned = ProcessingMode.formalWriting.applyingLLMResultCleanup(to: leaked)
 
-        XCTAssertEqual(cleaned, "已经整理好了。")
+        XCTAssertEqual(cleaned, leaked)
     }
 
     // REPAIR_PLAN K1：applyingFinalInsertionCleanup 仅由 LLM 输出路径调用
@@ -119,7 +119,7 @@ final class ProcessingModeCleanupTests: XCTestCase {
         XCTAssertEqual(finalized, "今天先到这里。")
     }
 
-    func testLLMOutputStillStripsLeakageViaFinalize() {
+    func testVoicePolishFinalizationDoesNotUseGenericMarkerTruncation() {
         let leaked = "已经整理好了。现在剪切板里的内容如下"
 
         let finalized = RecognitionSession.finalizeInsertionText(
@@ -128,7 +128,7 @@ final class ProcessingModeCleanupTests: XCTestCase {
             isLLMOutput: true
         )
 
-        XCTAssertEqual(finalized, "已经整理好了。")
+        XCTAssertEqual(finalized, leaked)
     }
 
     func testPromptOptimizerKeepsGeneratedPromptHeadings() {

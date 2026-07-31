@@ -340,10 +340,12 @@ actor RecognitionSession {
         } else {
             let effectiveHotwords = HotwordStorage.loadEffectiveForASR()
             let biasSettings = ASRBiasSettingsStorage.load()
-            let needsLLM = !effectiveMode.prompt.isEmpty
+            let needsLLM = effectiveMode.requiresLLM
             requestSetup = (
                 ASRRequestOptions(
-                    enablePunc: !needsLLM,
+                    // Voice Polish V2 使用 Provider 可用的带标点终稿；其余模式
+                    // 沿用旧行为：直出开标点，通用 LLM 模式关闭 ASR 标点。
+                    enablePunc: effectiveMode.kind == .voicePolish || !needsLLM,
                     hotwords: effectiveHotwords.words,
                     userHotwordCount: effectiveHotwords.userCount,
                     correctionWords: SnippetStorage.userCorrectionWords(),
@@ -752,7 +754,7 @@ actor RecognitionSession {
 
     /// Pre-warm LLM connection for modes with post-processing
     private func prewarmLLMIfNeeded(sessionID: RecognitionSessionID) async {
-        guard !currentMode.prompt.isEmpty else { return }
+        guard currentMode.requiresLLM else { return }
         let llmConfig = await loadLLMConfigOffActor()
         guard isCurrent(sessionID), state == .recording else {
             DebugFileLogger.log("startRecording: cancelled during LLM prewarm config load, bailing")
@@ -847,7 +849,7 @@ actor RecognitionSession {
         // Keep speculative LLM task alive — we'll compare its input text
         // against the final ASR transcript after full teardown.
         cancelSpeculativeLLM(sessionID: sessionID)
-        let needsLLM = !currentMode.prompt.isEmpty
+        let needsLLM = currentMode.requiresLLM
         let provider = activeProvider
 
         let asrTeardown = await teardownASRClient(
@@ -995,7 +997,7 @@ actor RecognitionSession {
         sessionID: RecognitionSessionID,
         stopStartedAt stopT0: ContinuousClock.Instant
     ) async -> Task<String?, Never>? {
-        guard needsLLM && canEarlyLLM else { return nil }
+        guard needsLLM && canEarlyLLM && currentMode.kind != .voicePolish else { return nil }
 
         var finalASRText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1526,7 +1528,9 @@ actor RecognitionSession {
             currentTranscript = transcript
             onASREvent?(event)
             logger.info("Transcript updated chars=\(transcript.displayText.count, privacy: .public) segments=\(transcript.confirmedSegments.count, privacy: .public) final=\(transcript.isFinal, privacy: .public)")
-            if state == .recording && !currentMode.prompt.isEmpty {
+            if state == .recording,
+               currentMode.requiresLLM,
+               currentMode.kind != .voicePolish {
                 scheduleSpeculativeLLM(sessionID: sessionID)
             }
 

@@ -155,7 +155,7 @@ final class ProcessingModeLLMInputTests: XCTestCase {
         }
     }
 
-    func testFormalWritingAddsTaskBoundaryAfterCustomPromptOnlyOnce() throws {
+    func testVoicePolishDoesNotAppendLegacyTaskBoundary() throws {
         try withChineseAppLanguage {
             var mode = ProcessingMode.formalWriting
             mode.prompt = "请润色下面的内容：{text}"
@@ -163,17 +163,12 @@ final class ProcessingModeLLMInputTests: XCTestCase {
             let guardedOnce = mode.applyingLLMFormatGuard(to: mode.prompt)
             let guardedTwice = mode.applyingLLMFormatGuard(to: guardedOnce)
 
-            XCTAssertTrue(guardedOnce.contains("润色任务边界（最高优先级）"))
-            XCTAssertTrue(guardedOnce.contains("如果原文是问句"))
-            XCTAssertTrue(guardedOnce.contains("禁止回答问题或提供解决方案"))
+            XCTAssertFalse(guardedOnce.contains("润色任务边界（最高优先级）"))
+            XCTAssertFalse(guardedOnce.contains("自然分段与口语清理强制规则"))
             XCTAssertEqual(
-                guardedTwice.components(separatedBy: "润色任务边界（最高优先级）").count - 1,
+                guardedTwice.components(separatedBy: "只输出最终要写入输入框的正文").count - 1,
                 1
             )
-
-            let customPromptRange = try XCTUnwrap(guardedOnce.range(of: mode.prompt))
-            let taskBoundaryRange = try XCTUnwrap(guardedOnce.range(of: "润色任务边界（最高优先级）"))
-            XCTAssertLessThan(customPromptRange.upperBound, taskBoundaryRange.lowerBound)
         }
     }
 

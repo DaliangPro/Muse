@@ -54,7 +54,12 @@ struct ModeStorage {
             if mode.id == ProcessingMode.formalWriting.id {
                 return migrateSeededDefaultPrompt(
                     mode,
-                    legacyPrompts: [ProcessingMode.legacyFormalWritingPromptTemplate],
+                    legacyPrompts: [
+                        ProcessingMode.legacyFormalWritingPromptTemplate,
+                        ProcessingMode.legacyVoiceDraftEnginePromptTemplate,
+                        ProcessingMode.formalWritingPromptTemplateZH,
+                        ProcessingMode.formalWritingPromptTemplateEN,
+                    ],
                     fallbackPrompt: ProcessingMode.formalWriting.prompt
                 )
             }
@@ -112,7 +117,10 @@ struct ModeStorage {
         legacyPrompts: Set<String>,
         fallbackPrompt: String
     ) -> ProcessingMode {
-        guard legacyPrompts.contains(mode.prompt) else { return mode }
+        let normalizedPrompt = Self.normalizedPromptFingerprint(mode.prompt)
+        guard legacyPrompts.contains(where: {
+            Self.normalizedPromptFingerprint($0) == normalizedPrompt
+        }) else { return mode }
 
         var migrated = mode
         migrated.prompt = fallbackPrompt
@@ -186,9 +194,33 @@ struct ModeStorage {
         if let labels = Self.knownDefaultLabels[mode.id], labels.contains(mode.processingLabel) {
             migrated.processingLabel = current.processingLabel
         }
-        if let prompts = Self.knownDefaultPrompts[mode.id], prompts.contains(mode.prompt) {
+        if mode.kind == .voicePolish, Self.isOfficialVoicePolishPrompt(mode.prompt) {
+            // V2 中官方规则迁入 VoicePolishPrompts，存储字段仅表示附加要求。
+            migrated.prompt = ""
+        } else if let prompts = Self.knownDefaultPrompts[mode.id], prompts.contains(mode.prompt) {
             migrated.prompt = current.prompt
         }
         return migrated
+    }
+
+    private static func isOfficialVoicePolishPrompt(_ prompt: String) -> Bool {
+        let normalized = normalizedPromptFingerprint(prompt)
+        let official = [
+            ProcessingMode.legacyFormalWritingPromptTemplate,
+            ProcessingMode.legacyVoiceDraftEnginePromptTemplate,
+            ProcessingMode.formalWritingPromptTemplateZH,
+            ProcessingMode.formalWritingPromptTemplateEN,
+        ]
+        return official.contains {
+            normalizedPromptFingerprint($0) == normalized
+        }
+    }
+
+    /// 官方指纹只允许换行统一与 Unicode NFC；不 trim、不折叠空格、不忽略大小写。
+    private static func normalizedPromptFingerprint(_ prompt: String) -> String {
+        prompt
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .precomposedStringWithCanonicalMapping
     }
 }

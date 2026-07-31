@@ -168,20 +168,17 @@ final class ModeStorageTests: XCTestCase {
         XCTAssertEqual(mode.prompt, "")
     }
 
-    func testFormalWritingModeAppliesListFormatGuardToCustomPrompt() {
+    func testVoicePolishDoesNotAppendLegacyHiddenGuards() {
         withChineseAppLanguage {
             var mode = ProcessingMode.formalWriting
             mode.prompt = "请润色：{text}"
 
             let guardedPrompt = mode.applyingLLMFormatGuard(to: mode.prompt)
 
-            XCTAssertTrue(guardedPrompt.contains("枚举事项强制规则"))
-            XCTAssertTrue(guardedPrompt.contains("必须整理成编号列表"))
-            XCTAssertTrue(guardedPrompt.contains("自然分段与口语清理强制规则"))
-            XCTAssertTrue(guardedPrompt.contains("优先级高于前面的自定义 prompt"))
-            XCTAssertTrue(guardedPrompt.contains("必须清理无意义口语填充词"))
-            XCTAssertTrue(guardedPrompt.contains("最终输出中默认不要出现“就是”"))
-            XCTAssertTrue(guardedPrompt.contains("CodeX 写作 Codex"))
+            XCTAssertTrue(guardedPrompt.contains(mode.prompt))
+            XCTAssertFalse(guardedPrompt.contains("枚举事项强制规则"))
+            XCTAssertFalse(guardedPrompt.contains("自然分段与口语清理强制规则"))
+            XCTAssertFalse(guardedPrompt.contains("润色任务边界（最高优先级）"))
         }
     }
 
@@ -196,14 +193,11 @@ final class ModeStorageTests: XCTestCase {
         }
     }
 
-    func testFormalWritingModeCleansLLMResultFillerWords() {
+    func testVoicePolishDoesNotMechanicallyReplaceSemanticPhrases() {
         let result = "搭建系统其实它就是一个文件系统。问题就是用 CodeX 还是 Cloud Code。"
         let cleanedResult = ProcessingMode.formalWriting.applyingLLMResultCleanup(to: result)
 
-        XCTAssertFalse(cleanedResult.contains("就是"))
-        XCTAssertTrue(cleanedResult.contains("本质上是一个文件系统"))
-        XCTAssertTrue(cleanedResult.contains("Codex"))
-        XCTAssertTrue(cleanedResult.contains("Claude Code"))
+        XCTAssertEqual(cleanedResult, result)
     }
 
     func testDirectModeDoesNotCleanLLMResult() {
