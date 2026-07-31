@@ -95,6 +95,7 @@ actor RecognitionSession {
     private let asrConfigLoader: (@Sendable (ASRProvider) async -> (any ASRProviderConfig)?)?
     private let microphonePermission: (@Sendable () async -> Bool)?
     private let promptContextCapture: @Sendable () async -> PromptContext
+    private let writingContextCapture: @Sendable (WritingContextLevel) async -> WritingContext
     private let requestOptionsProvider: (@Sendable (ProcessingMode) -> (
         options: ASRRequestOptions,
         hotwordCount: Int
@@ -120,6 +121,9 @@ actor RecognitionSession {
         promptContextCapture: @escaping @Sendable () async -> PromptContext = {
             PromptContext.capture()
         },
+        writingContextCapture: @escaping @Sendable (WritingContextLevel) async -> WritingContext = {
+            await WritingContextCapture.capture(level: $0)
+        },
         requestOptionsProvider: (@Sendable (ProcessingMode) -> (
             options: ASRRequestOptions,
             hotwordCount: Int
@@ -140,6 +144,7 @@ actor RecognitionSession {
         self.asrConfigLoader = asrConfigLoader
         self.microphonePermission = microphonePermission
         self.promptContextCapture = promptContextCapture
+        self.writingContextCapture = writingContextCapture
         self.requestOptionsProvider = requestOptionsProvider
         self.llmClientFactory = llmClientFactory
         self.llmConfigLoader = llmConfigLoader
@@ -278,6 +283,11 @@ actor RecognitionSession {
 
     private var promptContext: PromptContext = PromptContext(selectedText: "", clipboardText: "")
 
+    // MARK: - Voice Polish writing context（录音启动时并行，400ms 超时）
+
+    private var writingContextTask: Task<WritingContext, Never>?
+    private var writingContextTaskSessionID: RecognitionSessionID?
+
     // MARK: - Speculative LLM (fire during recording pauses)
 
     private var speculativeLLMTask: Task<String?, Never>?
@@ -326,6 +336,20 @@ actor RecognitionSession {
         streamingDegraded = false
         state = .starting
 
+        if effectiveMode.kind == .voicePolish {
+            let level = VoicePolishSettings.contextLevel()
+            let capture = writingContextCapture
+            writingContextTask = Task { await capture(level) }
+            writingContextTaskSessionID = sessionID
+            DebugFileLogger.log(
+                "voice polish context capture scheduled level=\(level.rawValue) session=\(sessionID.rawValue)"
+            )
+        } else {
+            writingContextTask?.cancel()
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
+        }
+
         // Load credentials for selected provider
         guard let config = await resolveASRConfig(provider: provider, sessionID: sessionID) else {
             return
@@ -368,15 +392,20 @@ actor RecognitionSession {
             )
         }
 
-        // Capture prompt context while the user's selection is still active.
-        DebugFileLogger.log("prompt context capture start")
-        let capturedPromptContext = await promptContextCapture()
-        DebugFileLogger.log("prompt context capture done")
-        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
-            DebugFileLogger.log("startRecording: zombie detected after capture, bailing")
-            return
+        // Voice Polish 使用独立、受授权级别约束的 WritingContext，不读取旧的
+        // selected/clipboard PromptContext，也不让上下文采集阻塞麦克风启动。
+        if effectiveMode.kind == .voicePolish {
+            promptContext = PromptContext(selectedText: "", clipboardText: "")
+        } else {
+            DebugFileLogger.log("prompt context capture start")
+            let capturedPromptContext = await promptContextCapture()
+            DebugFileLogger.log("prompt context capture done")
+            guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+                DebugFileLogger.log("startRecording: zombie detected after capture, bailing")
+                return
+            }
+            promptContext = capturedPromptContext
         }
-        promptContext = capturedPromptContext
 
         // Reset text state and clean up previous pipeline
         currentTranscript = .empty
@@ -488,6 +517,11 @@ actor RecognitionSession {
         }
         if speculativeLLMSessionID == sessionID || speculativeDebounceSessionID == sessionID {
             resetSpeculativeLLM(sessionID: sessionID)
+        }
+        if writingContextTaskSessionID == sessionID {
+            writingContextTask?.cancel()
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
         }
 
         SoundFeedback.playError()
@@ -1000,6 +1034,11 @@ actor RecognitionSession {
             recordingStartTime = nil
             recordingStartSessionID = nil
         }
+        if writingContextTaskSessionID == sessionID {
+            writingContextTask?.cancel()
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
+        }
         resetSpeculativeLLM(sessionID: sessionID)
         logger.info("Session complete, injected \(effectiveText.count) chars")
     }
@@ -1118,13 +1157,32 @@ actor RecognitionSession {
                     return nil
                 }
                 let mode = currentMode
+                let writingContext: WritingContext
+                if writingContextTaskSessionID == sessionID,
+                   let contextTask = writingContextTask {
+                    writingContext = await contextTask.value
+                    guard isCurrent(sessionID) else {
+                        DebugFileLogger.log("stopRecording: stale voice polish context ignored")
+                        return nil
+                    }
+                    writingContextTask = nil
+                    writingContextTaskSessionID = nil
+                } else {
+                    writingContext = WritingContext(
+                        level: VoicePolishSettings.contextLevel(),
+                        safety: .unknown
+                    )
+                }
+                DebugFileLogger.log(
+                    "voice polish context scene=\(writingContext.scene.rawValue) level=\(writingContext.level.rawValue) safety=\(writingContext.safety.rawValue) selected=\(writingContext.selectedText?.count ?? 0) before=\(writingContext.textBeforeCursor?.count ?? 0) after=\(writingContext.textAfterCursor?.count ?? 0)"
+                )
                 let request = VoicePolishRequest(
                     input: envelope,
-                    context: .phaseOneUnknown,
+                    context: writingContext,
                     preferences: UserPolishPreferences(
                         additionalRequirements: mode.prompt
                     ),
-                    qualityMode: .balanced
+                    qualityMode: VoicePolishSettings.qualityMode()
                 )
                 let pipeline = VoicePolishPipeline(
                     client: currentLLMClient(),
@@ -1998,6 +2056,9 @@ actor RecognitionSession {
         speculativeLLMTask = nil
         speculativeLLMSessionID = nil
         speculativeLLMText = ""
+        writingContextTask?.cancel()
+        writingContextTask = nil
+        writingContextTaskSessionID = nil
         currentConfig = nil
         currentConfigSessionID = nil
         recordingStartTime = nil

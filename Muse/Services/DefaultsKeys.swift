@@ -23,6 +23,14 @@ enum DefaultsKeys {
     /// 历史记录保留上限（条），默认见 HistoryStore.defaultRetentionLimit（REPAIR_PLAN C1）
     static let historyRetentionLimit = "tf_historyRetentionLimit"
 
+    // MARK: - Voice Polish V2
+    static let voicePolishQualityMode = "tf_voicePolishQualityMode"
+    static let voicePolishContextLevel = "tf_voicePolishContextLevel"
+    static let voicePolishPersonalizationEnabled = "tf_voicePolishPersonalizationEnabled"
+    static let voicePolishCorrectionLimit = "tf_voicePolishCorrectionLimit"
+    static let voicePolishSceneOverrides = "tf_voicePolishSceneOverrides"
+    static let voicePolishSnippetMigrationCompleted = "tf_voicePolishSnippetMigrationCompleted"
+
     // MARK: - Provider 选择（此前在 ModesSettingsTab 与 KeychainService 各定义一遍，易漂移）
     static let selectedASRProvider = "tf_selectedASRProvider"
     static let selectedLLMProvider = "tf_selectedLLMProvider"

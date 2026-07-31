@@ -143,6 +143,124 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertNil(metadataOnly.selectedText)
     }
 
+    func testContextSafetyUsesStrictAllowlistAndExplicitSecureChecks() {
+        XCTAssertEqual(
+            WritingContextCapture.safetyForTesting(
+                role: "AXTextField",
+                subrole: "AXStandardTextField",
+                editable: true,
+                protectedContent: false
+            ),
+            .safe
+        )
+        XCTAssertEqual(
+            WritingContextCapture.safetyForTesting(
+                role: "AXTextField",
+                subrole: "AXSecureTextField",
+                editable: true,
+                protectedContent: true
+            ),
+            .secure
+        )
+        XCTAssertEqual(
+            WritingContextCapture.safetyForTesting(
+                role: "AXWebArea",
+                subrole: "AXStandardWindow",
+                editable: true,
+                protectedContent: false
+            ),
+            .unknown
+        )
+        XCTAssertEqual(
+            WritingContextCapture.safetyForTesting(
+                role: "AXTextArea",
+                subrole: nil,
+                editable: true,
+                protectedContent: false
+            ),
+            .unknown
+        )
+        XCTAssertEqual(
+            WritingContextCapture.safetyForTesting(
+                role: "AXTextArea",
+                subrole: "AXStandardTextArea",
+                editable: true,
+                protectedContent: nil
+            ),
+            .unknown
+        )
+    }
+
+    func testSceneClassifierHonorsOverridesAndDoesNotGuessBrowserPages() {
+        XCTAssertEqual(
+            AppSceneClassifier.classify(
+                bundleID: "com.google.Chrome",
+                focusedRole: "AXTextField"
+            ),
+            .unknown
+        )
+        XCTAssertEqual(
+            AppSceneClassifier.classify(
+                bundleID: "com.google.Chrome",
+                focusedRole: "AXTextField",
+                userOverrides: ["com.google.Chrome": .aiPrompt]
+            ),
+            .aiPrompt
+        )
+        XCTAssertEqual(
+            AppSceneClassifier.classify(
+                bundleID: "com.apple.mail",
+                focusedRole: "AXTextArea"
+            ),
+            .email
+        )
+    }
+
+    func testPromptPayloadCannotCarryUnauthorizedContextBody() throws {
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: "请回复确认。",
+                segments: [segment("请回复确认。")],
+                durationMs: 1_000,
+                provider: .volcano
+            ),
+            context: WritingContext(
+                applicationBundleID: "com.apple.mail",
+                scene: .email,
+                level: .nearbyText,
+                safety: .unknown,
+                selectedText: "未授权秘密",
+                textBeforeCursor: "未授权前文",
+                textAfterCursor: "未授权后文"
+            ),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .balanced
+        )
+
+        let payload = try VoicePolishPrompts.payload(
+            for: request,
+            sourceFacts: [],
+            deepDeferred: false
+        )
+
+        XCTAssertFalse(payload.contains("未授权秘密"))
+        XCTAssertFalse(payload.contains("未授权前文"))
+        XCTAssertFalse(payload.contains("未授权后文"))
+        XCTAssertTrue(payload.contains(#""level":"nearbyText""#))
+        XCTAssertTrue(payload.contains(#""safety":"unknown""#))
+    }
+
+    func testVoicePolishSettingsDefaultsArePrivacyPreserving() {
+        let suite = "VoicePolishSettingsTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertEqual(VoicePolishSettings.qualityMode(defaults: defaults), .balanced)
+        XCTAssertEqual(VoicePolishSettings.contextLevel(defaults: defaults), .metadataOnly)
+        XCTAssertFalse(VoicePolishSettings.personalizationEnabled(defaults: defaults))
+        XCTAssertEqual(VoicePolishSettings.correctionLimit(defaults: defaults), 200)
+    }
+
     func testInputEnvelopeAlwaysCoversAuthoritativeFinalTranscript() {
         let transcript = RecognitionTranscript(
             confirmedSegments: ["已确认的前半句，"],
