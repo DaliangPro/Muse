@@ -1,6 +1,6 @@
 # Muse 语音润色 V2 分期实施规格
 
-文档状态：第一期已实施；第二、三期待实施
+文档状态：三期工程实施完成；真实观察、Live Provider 与人工盲测待执行
 
 适用仓库：`DaliangPro/Muse`
 
@@ -1165,6 +1165,16 @@ Prompt 泄漏作为 Validator Hard Fail 处理，不通过匹配“输入消息�
 - 用户清空后，纠正记录、派生 StyleProfile 和自动词典候选同步清除或重算。
 - 关闭个性化后请求不携带 StyleProfile。
 - 数据导出不包含未授权的附近正文。
+
+### 8.4 第二、三期综合实施记录
+
+- 代码提交：`885a61d`、`936039c`、`8107a38`、`06bfe9e`、`6ab8ce6`、`1f79cd8`。
+- 第二期：Deep Analyze → Render → 可选 Repair 已接入正式管线并受三次预算约束；上下文按元数据、选中文本、附近正文三档授权，未知或安全输入框不读取正文；PersonalLexicon、确定性 EntityResolver、ASR 同步、导出、清空和显式 snippet 复制均已完成。
+- 第三期：历史记录内“纠正并学习”、最多 200 条的关联纠正表、可解释 StyleProfile、候选词典确认、质量档位、个性化开关、导出/重置及完整试跑 UI 已完成。关闭个性化时不采集或读取画像。
+- 评测：94 条合成固定夹具、显式启用的 Live Provider Benchmark、30 条以上随机左右盲测与 85% 门槛评分脚本已完成；默认测试不会调用真实 Provider。
+- 验证：`swift build`、`swift build -c release`、`swift test` 与 `bash scripts/health-check.sh` 全部通过；全量 720 个 Swift 测试中 6 个按环境条件跳过，0 失败；13 个 Python 服务测试通过，健康检查结果为 PASS。
+- 部署：复用既有 `Muse Local` 签名覆盖安装并重启 `/Applications/Muse.app`；Bundle ID、严格签名、运行进程、安装包哈希与第二、三期二进制标识均已核验。
+- 验收边界：大梁老师在当前任务明确要求连续完成第二、三期工程，因此未等待第一期 50 次/3 日观察门槛再开工。真实观察、Live Provider 报告和人工盲测尚未执行，不能据此声称 V2 已完成真实模型产品效果或发布就绪验收。
 
 ---
 
