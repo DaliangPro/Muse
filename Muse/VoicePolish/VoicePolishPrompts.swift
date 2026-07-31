@@ -90,6 +90,7 @@ enum VoicePolishPrompts {
             punctuatedText: request.input.punctuatedText,
             context: request.context,
             userPreferences: request.preferences.additionalRequirements,
+            styleProfile: request.preferences.styleProfile,
             sourceFacts: sourceFacts,
             resolvedEntities: request.resolvedEntities,
             deepDeferred: deepDeferred
@@ -154,6 +155,7 @@ private struct VoicePolishPayload: Encodable {
     let punctuatedText: String?
     let context: WritingContext
     let userPreferences: String
+    let styleProfile: StyleProfile?
     let sourceFacts: [SourceFactCandidate]
     let resolvedEntities: [ResolvedEntity]
     let deepDeferred: Bool

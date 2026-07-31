@@ -93,6 +93,99 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertTrue(all.isEmpty)
     }
 
+    func testVoicePolishCorrectionRequiresExplicitEligibleChangedConfirmation() async throws {
+        await store.insert(HistoryRecord(
+            id: "vp-1", createdAt: Date(), durationSeconds: 1,
+            rawText: "原始口述", processingMode: "语音润色", processedText: "模型结果",
+            finalText: "模型结果", status: "voice_polish_success", characterCount: 4
+        ))
+
+        do {
+            _ = try await store.confirmVoicePolishCorrection(
+                historyID: "vp-1",
+                correctedText: "用户修改",
+                scene: .workChat,
+                personalizationEnabled: false,
+                retentionLimit: 200
+            )
+            XCTFail("关闭个性化时不得采集")
+        } catch {
+            XCTAssertEqual(error as? HistoryStoreError, .personalizationDisabled)
+        }
+
+        do {
+            _ = try await store.confirmVoicePolishCorrection(
+                historyID: "vp-1",
+                correctedText: "模型结果",
+                scene: .workChat,
+                personalizationEnabled: true,
+                retentionLimit: 200
+            )
+            XCTFail("未修改结果不得形成样本")
+        } catch {
+            XCTAssertEqual(error as? HistoryStoreError, .correctionUnchanged)
+        }
+
+        let confirmed = try await store.confirmVoicePolishCorrection(
+            historyID: "vp-1",
+            correctedText: "用户修改",
+            scene: .workChat,
+            personalizationEnabled: true,
+            retentionLimit: 200
+        )
+        XCTAssertEqual(confirmed.sourceText, "原始口述")
+        XCTAssertEqual(confirmed.generatedText, "模型结果")
+        XCTAssertEqual(confirmed.correctedText, "用户修改")
+        let stored = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(stored.count, 1)
+        XCTAssertEqual(stored[0].id, confirmed.id)
+        XCTAssertEqual(stored[0].correctedText, confirmed.correctedText)
+    }
+
+    func testVoicePolishCorrectionRetentionExportClearAndHistoryDelete() async throws {
+        for index in 0..<3 {
+            let id = "vp-\(index)"
+            await store.insert(HistoryRecord(
+                id: id,
+                createdAt: Date(timeIntervalSince1970: Double(1_000 + index)),
+                durationSeconds: 1,
+                rawText: "原文\(index)",
+                processingMode: "语音润色",
+                processedText: "结果\(index)",
+                finalText: "结果\(index)",
+                status: "voice_polish_success",
+                characterCount: 3
+            ))
+            _ = try await store.confirmVoicePolishCorrection(
+                historyID: id,
+                correctedText: "修改\(index)",
+                scene: .document,
+                personalizationEnabled: true,
+                retentionLimit: 2
+            )
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+
+        var corrections = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(corrections.count, 2)
+        let exported = try await store.exportVoicePolishCorrections()
+        XCTAssertEqual(
+            try JSONDecoder.voicePolishDecoder.decode(
+                [VoicePolishCorrectionRecord].self,
+                from: exported
+            ).count,
+            2
+        )
+
+        await store.delete(id: corrections[0].historyID)
+        corrections = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(corrections.count, 1)
+
+        try await store.deleteAllVoicePolishCorrections()
+        let empty = try await store.fetchVoicePolishCorrections()
+        XCTAssertTrue(empty.isEmpty)
+    }
+
     func testFetchRecentReturnsLimitedNewestRecords() async {
         await store.insert(HistoryRecord(
             id: "1", createdAt: Date(timeIntervalSinceNow: -100), durationSeconds: 1,
@@ -381,5 +474,13 @@ final class HistoryStoreTests: XCTestCase {
 
         let all = await store.fetchAll()
         XCTAssertEqual(all.map(\.id), ["busy-wait"], "撞锁 <3s 时记录必须最终落库（busy_timeout 生效）")
+    }
+}
+
+private extension JSONDecoder {
+    static var voicePolishDecoder: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
     }
 }

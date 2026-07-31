@@ -85,10 +85,15 @@ enum VoicePolishRoute: String, Codable, Sendable, Equatable {
 
 struct UserPolishPreferences: Sendable, Equatable {
     let additionalRequirements: String
+    let styleProfile: StyleProfile?
 
-    init(additionalRequirements: String) {
+    init(
+        additionalRequirements: String,
+        styleProfile: StyleProfile? = nil
+    ) {
         self.additionalRequirements = additionalRequirements
             .removingPromptTextPlaceholder()
+        self.styleProfile = styleProfile
     }
 }
 

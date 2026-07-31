@@ -1183,11 +1183,25 @@ actor RecognitionSession {
                     hotwords: HotwordStorage.loadEffective(),
                     context: writingContext
                 )
+                let styleProfile: StyleProfile?
+                if VoicePolishSettings.personalizationEnabled() {
+                    let corrections = (try? await historyStore.fetchVoicePolishCorrections(
+                        limit: VoicePolishSettings.correctionLimit()
+                    )) ?? []
+                    styleProfile = StyleProfileUpdater.mergedProfile(
+                        from: corrections,
+                        scene: writingContext.scene
+                    )
+                } else {
+                    // 关闭后既不读取纠正记录，也不向 payload 携带派生画像。
+                    styleProfile = nil
+                }
                 let request = VoicePolishRequest(
                     input: envelope,
                     context: writingContext,
                     preferences: UserPolishPreferences(
-                        additionalRequirements: mode.prompt
+                        additionalRequirements: mode.prompt,
+                        styleProfile: styleProfile
                     ),
                     qualityMode: VoicePolishSettings.qualityMode(),
                     resolvedEntities: resolvedEntities
