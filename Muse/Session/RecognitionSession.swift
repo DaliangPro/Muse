@@ -55,6 +55,7 @@ private struct LLMPostProcessingResult: Sendable {
     var finalText: String
     var processedText: String?
     var llmFailed: Bool
+    var voicePolishHistoryStatus: String?
 }
 
 actor RecognitionSession {
@@ -98,6 +99,8 @@ actor RecognitionSession {
         options: ASRRequestOptions,
         hotwordCount: Int
     ))?
+    private let llmClientFactory: @Sendable () -> any LLMClient
+    private let llmConfigLoader: (@Sendable () async -> LLMConfig?)?
     private let aliyunReplaySleep: @Sendable (Duration) async throws -> Void
     private var asrClient: (any SpeechRecognizer)?
     private var asrClientSessionID: RecognitionSessionID?
@@ -121,6 +124,10 @@ actor RecognitionSession {
             options: ASRRequestOptions,
             hotwordCount: Int
         ))? = nil,
+        llmClientFactory: @escaping @Sendable () -> any LLMClient = {
+            LLMProviderRegistry.makeClient(for: KeychainService.selectedLLMProvider)
+        },
+        llmConfigLoader: (@Sendable () async -> LLMConfig?)? = nil,
         aliyunReplaySleep: @escaping @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
         }
@@ -134,6 +141,8 @@ actor RecognitionSession {
         self.microphonePermission = microphonePermission
         self.promptContextCapture = promptContextCapture
         self.requestOptionsProvider = requestOptionsProvider
+        self.llmClientFactory = llmClientFactory
+        self.llmConfigLoader = llmConfigLoader
         self.aliyunReplaySleep = aliyunReplaySleep
     }
 
@@ -153,7 +162,7 @@ actor RecognitionSession {
 
     /// Return the appropriate LLM client for the currently selected provider.
     private func currentLLMClient() -> any LLMClient {
-        LLMProviderRegistry.makeClient(for: KeychainService.selectedLLMProvider)
+        llmClientFactory()
     }
 
     private func loadASRConfigOffActor(for provider: ASRProvider) async -> (any ASRProviderConfig)? {
@@ -170,6 +179,9 @@ actor RecognitionSession {
     }
 
     private func loadLLMConfigOffActor() async -> LLMConfig? {
+        if let llmConfigLoader {
+            return await llmConfigLoader()
+        }
         let provider = KeychainService.selectedLLMProvider
         DebugFileLogger.log("LLM config load start provider=\(provider.rawValue)")
         let result: TimedValue<LLMConfig> = await AsyncTimeout.value(.milliseconds(900)) {
@@ -932,6 +944,9 @@ actor RecognitionSession {
                 rawText: rawText,
                 needsLLM: needsLLM,
                 earlyLLMTask: earlyLLMTask,
+                transcript: currentTranscript,
+                provider: provider,
+                durationMs: Int((recordedDuration * 1_000).rounded()),
                 sessionID: sessionID,
                 stopStartedAt: stopT0
             ) else { return }
@@ -1063,17 +1078,78 @@ actor RecognitionSession {
         rawText: String,
         needsLLM: Bool,
         earlyLLMTask: Task<String?, Never>?,
+        transcript: RecognitionTranscript,
+        provider: ASRProvider,
+        durationMs: Int,
         sessionID: RecognitionSessionID,
         stopStartedAt stopT0: ContinuousClock.Instant
     ) async -> LLMPostProcessingResult? {
         var finalText = SnippetStorage.applyEffective(to: rawText)
         var processedText: String?
         var llmFailed = false
+        var voicePolishHistoryStatus: String?
 
         // LLM post-processing: prefer early result (fired at stop time),
         // fall back to synchronous call for very short recordings where
         // no streaming text was available yet.
-        if let earlyTask = earlyLLMTask {
+        if currentMode.kind == .voicePolish {
+            state = .postProcessing
+            finalText = rawText
+            guard let envelope = VoiceInputEnvelope.fromFinalTranscript(
+                transcript,
+                finalText: rawText,
+                durationMs: durationMs,
+                provider: provider
+            ) else {
+                llmFailed = true
+                voicePolishHistoryStatus = "voice_polish_fallback"
+                onASREvent?(.processingResult(text: rawText))
+                return LLMPostProcessingResult(
+                    finalText: rawText,
+                    processedText: nil,
+                    llmFailed: true,
+                    voicePolishHistoryStatus: voicePolishHistoryStatus
+                )
+            }
+
+            if let llmConfig = await loadLLMConfigOffActor() {
+                guard isCurrent(sessionID) else {
+                    DebugFileLogger.log("stopRecording: superseded during voice polish config, bailing")
+                    return nil
+                }
+                let mode = currentMode
+                let request = VoicePolishRequest(
+                    input: envelope,
+                    context: .phaseOneUnknown,
+                    preferences: UserPolishPreferences(
+                        additionalRequirements: mode.prompt
+                    ),
+                    qualityMode: .balanced
+                )
+                let pipeline = VoicePolishPipeline(
+                    client: currentLLMClient(),
+                    config: llmConfig
+                )
+                let result = await pipeline.process(request, startedAt: stopT0)
+                guard isCurrent(sessionID) else {
+                    DebugFileLogger.log("stopRecording: superseded during voice polish, bailing")
+                    return nil
+                }
+                finalText = result.text
+                if !result.usedFallback {
+                    processedText = result.text
+                }
+                llmFailed = result.usedFallback
+                voicePolishHistoryStatus = Self.voicePolishHistoryStatus(for: result)
+                onASREvent?(.processingResult(text: result.text))
+            } else {
+                DebugFileLogger.log("stop: no LLM credentials for voice polish, falling back")
+                llmFailed = true
+                voicePolishHistoryStatus = "voice_polish_fallback"
+                onASREvent?(.processingResult(text: envelope.fallbackText))
+                finalText = envelope.fallbackText
+            }
+        } else if let earlyTask = earlyLLMTask {
             state = .postProcessing
             DebugFileLogger.log("stop: awaiting early LLM result +\(ContinuousClock.now - stopT0)")
             // REPAIR_PLAN J12：stop 链路上 LLM 是唯一无会话级硬超时的阻塞点——底层
@@ -1185,8 +1261,21 @@ actor RecognitionSession {
         return LLMPostProcessingResult(
             finalText: finalText,
             processedText: processedText,
-            llmFailed: llmFailed
+            llmFailed: llmFailed,
+            voicePolishHistoryStatus: voicePolishHistoryStatus
         )
+    }
+
+    private static func voicePolishHistoryStatus(for result: VoicePolishResult) -> String {
+        guard result.usedFallback else { return "voice_polish_success" }
+        switch result.failureReason {
+        case .timeout:
+            return "voice_polish_timeout"
+        case .validationFailed:
+            return "voice_polish_validation_failed"
+        case .requestFailed, .setupFailed, .none:
+            return "voice_polish_fallback"
+        }
     }
 
     // REPAIR_PLAN K1：防泄漏清洗只作用于真 LLM 输出。直出与 LLM 失败回退的文本是
@@ -1227,9 +1316,19 @@ actor RecognitionSession {
     ) async {
         // J15：状态口径反映注入结局——仅复制到剪贴板 / 没找到输入位置时不再记 completed
         let status: String
-        if llmResult.llmFailed { status = "llm_error" }
-        else if streamingFailed { status = "stream_recovered" }
-        else {
+        if llmResult.llmFailed {
+            if let voicePolishStatus = llmResult.voicePolishHistoryStatus,
+               case .inserted = injection {
+                status = voicePolishStatus
+            } else {
+                status = "llm_error"
+            }
+        } else if streamingFailed {
+            status = "stream_recovered"
+        } else if let voicePolishStatus = llmResult.voicePolishHistoryStatus,
+                  case .inserted = injection {
+            status = voicePolishStatus
+        } else {
             switch injection {
             case .inserted:
                 status = "completed"
@@ -1970,6 +2069,45 @@ extension RecognitionSession {
 
     var hasEmittedReadyForTesting: Bool {
         hasEmittedReadyForCurrentSession
+    }
+
+    func postProcessVoicePolishForTesting(
+        rawText: String,
+        transcript: RecognitionTranscript,
+        provider: ASRProvider = .volcano,
+        durationMs: Int = 1_000
+    ) async -> (
+        finalText: String,
+        processedText: String?,
+        llmFailed: Bool,
+        historyStatus: String?
+    )? {
+        let sessionID: RecognitionSessionID
+        if let currentSessionID {
+            sessionID = currentSessionID
+        } else {
+            sessionID = makeSessionID()
+            currentSessionID = sessionID
+        }
+        currentMode = .formalWriting
+        let result = await postProcessRecognizedText(
+            rawText: rawText,
+            needsLLM: true,
+            earlyLLMTask: nil,
+            transcript: transcript,
+            provider: provider,
+            durationMs: durationMs,
+            sessionID: sessionID,
+            stopStartedAt: .now
+        )
+        return result.map {
+            (
+                finalText: $0.finalText,
+                processedText: $0.processedText,
+                llmFailed: $0.llmFailed,
+                historyStatus: $0.voicePolishHistoryStatus
+            )
+        }
     }
 }
 #endif

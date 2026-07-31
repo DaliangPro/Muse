@@ -15,6 +15,7 @@ struct ModeTrialCard: View {
     @State private var trialInput = ""
     @State private var trialOutput = ""
     @State private var trialError = ""
+    @State private var trialDiagnostics = ""
     @State private var isRunningTrial = false
     @State private var didSaveSampleFlash = false
 
@@ -182,7 +183,7 @@ private extension ModeTrialCard {
 
                 Spacer(minLength: 8)
 
-                if isRunningTrial || !trialError.isEmpty {
+                if isRunningTrial || !trialError.isEmpty || !trialDiagnostics.isEmpty {
                     trialStatusLine
                 }
             }
@@ -231,7 +232,7 @@ private extension ModeTrialCard {
                 ) {
                     clearResult()
                 }
-                .disabled(trialOutput.isEmpty && trialError.isEmpty)
+                .disabled(trialOutput.isEmpty && trialError.isEmpty && trialDiagnostics.isEmpty)
                 .help(L("清空输出", "Clear the output"))
 
                 Spacer(minLength: 0)
@@ -251,7 +252,7 @@ private extension ModeTrialCard {
                     .controlSize(.small)
                     .scaleEffect(0.7)
             }
-            Text(trialError.isEmpty ? L("调用中...", "Calling...") : trialError)
+            Text(trialStatusText)
                 .font(TF.settingsFontMetadata)
                 .foregroundStyle(trialError.isEmpty ? TF.settingsTextTertiary : TF.settingsAccentAmber)
                 .lineLimit(1)
@@ -261,6 +262,12 @@ private extension ModeTrialCard {
 
     var canRunTrial: Bool {
         !trialInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var trialStatusText: String {
+        if isRunningTrial { return L("调用中...", "Calling...") }
+        if !trialError.isEmpty { return trialError }
+        return trialDiagnostics
     }
 
     var fieldFill: Color {
@@ -295,6 +302,45 @@ private extension ModeTrialCard {
         draftMode.prompt = prompt
         draftMode.hotkeyStyle = hotkeyStyle
 
+        guard let llmConfig = KeychainService.loadLLMConfig() else {
+            trialError = L("当前 LLM 没有可用配置", "Current LLM is not configured")
+            return
+        }
+
+        let provider = KeychainService.selectedLLMProvider
+        let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
+
+        if draftMode.kind == .voicePolish {
+            let asrProvider = KeychainService.selectedASRProvider
+            let envelope = VoiceInputEnvelope(
+                providerFinalText: input,
+                segments: [RecognitionSegment(
+                    id: "s1",
+                    text: input,
+                    startTimeMs: nil,
+                    endTimeMs: nil,
+                    confidence: nil,
+                    isFinal: true
+                )],
+                durationMs: 0,
+                provider: asrProvider
+            )
+            let result = await VoicePolishPipeline(
+                client: client,
+                config: llmConfig
+            ).process(VoicePolishRequest(
+                input: envelope,
+                context: .phaseOneUnknown,
+                preferences: UserPolishPreferences(
+                    additionalRequirements: draftMode.prompt
+                ),
+                qualityMode: .balanced
+            ))
+            trialOutput = result.text
+            trialDiagnostics = voicePolishDiagnostics(result)
+            return
+        }
+
         guard !draftMode.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             trialOutput = input
             return
@@ -304,14 +350,6 @@ private extension ModeTrialCard {
         let expandedPrompt = draftMode.applyingLLMFormatGuard(
             to: context.expandContextVariables(draftMode.prompt)
         )
-
-        guard let llmConfig = KeychainService.loadLLMConfig() else {
-            trialError = L("当前 LLM 没有可用配置", "Current LLM is not configured")
-            return
-        }
-
-        let provider = KeychainService.selectedLLMProvider
-        let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
 
         do {
             let result = try await client.process(
@@ -330,5 +368,16 @@ private extension ModeTrialCard {
     func clearResult() {
         trialOutput = ""
         trialError = ""
+        trialDiagnostics = ""
+    }
+
+    func voicePolishDiagnostics(_ result: VoicePolishResult) -> String {
+        let routes = "\(result.detectedRoute.rawValue.capitalized) → \(result.executedRoute.rawValue.capitalized)"
+        let calls = L("\(result.llmAttemptCount) 次", "\(result.llmAttemptCount) call(s)")
+        let validation = result.validationCodes.isEmpty
+            ? L("校验通过", "Validated")
+            : result.validationCodes.map(\.rawValue).joined(separator: ",")
+        let fallback = result.usedFallback ? L(" · 原文回退", " · Fallback") : ""
+        return "\(routes) · \(calls) · \(validation)\(fallback)"
     }
 }

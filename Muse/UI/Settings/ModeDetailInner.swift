@@ -134,10 +134,12 @@ private extension ModeDetailInner {
         }
     }
 
-    /// 标题行：Prompt + 恢复默认（靠右）。保存按钮已撤——输入即自动保存（2026-07-08 大梁老师）
+    /// 标题行：处理要求 + 恢复默认（靠右）。保存按钮已撤——输入即自动保存（2026-07-08 大梁老师）
     var modePromptHeader: some View {
         HStack(spacing: ModeSettingsLayout.modePromptActionSpacing) {
-            Text("Prompt")
+            Text(mode.kind == .voicePolish
+                ? L("附加润色要求", "Additional polishing requirements")
+                : "Prompt")
                 .font(TF.settingsFontBodyLarge)
                 .foregroundStyle(TF.settingsTextTertiary)
                 .lineLimit(1)
@@ -152,7 +154,9 @@ private extension ModeDetailInner {
             ) {
                 restoreDefaults()
             }
-            .help(L("恢复默认 Prompt", "Restore the default prompt"))
+            .help(mode.kind == .voicePolish
+                ? L("恢复默认附加要求", "Restore default requirements")
+                : L("恢复默认 Prompt", "Restore the default prompt"))
         }
         .padding(.horizontal, ModeSettingsLayout.modeGutter)
         .padding(.vertical, 8)
@@ -178,7 +182,9 @@ private extension ModeDetailInner {
             )
 
             if shouldShowPromptPlaceholder {
-                Text(L("在这里编辑当前模式的 Prompt...", "Edit the current mode prompt here..."))
+                Text(mode.kind == .voicePolish
+                    ? L("可选：填写语气、简洁度或格式偏好...", "Optional: add tone, brevity, or format preferences...")
+                    : L("在这里编辑当前模式的 Prompt...", "Edit the current mode prompt here..."))
                     .font(TF.settingsFontReading)
                     .foregroundStyle(TF.settingsTextTertiary.opacity(0.58))
                     .lineLimit(1)

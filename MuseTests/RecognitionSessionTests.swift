@@ -176,6 +176,54 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(state, .recording)
     }
 
+    func testVoicePolishWaitsForFinalTranscriptAndCallsLLMWithEmptyRequirements() async throws {
+        let source = "明天下午三点开会。"
+        let client = RecognitionSessionVoicePolishLLM(response: source)
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmClientFactory: { client },
+            llmConfigLoader: {
+                LLMConfig(
+                    apiKey: "test",
+                    model: "mock-model",
+                    baseURL: "https://example.com/v1"
+                )
+            }
+        )
+        await session.switchMode(to: .formalWriting)
+        await session.setState(.recording)
+        await session.handleASREventForTesting(.transcript(RecognitionTranscript(
+            confirmedSegments: [],
+            partialText: "明天下午",
+            authoritativeText: "",
+            isFinal: false
+        )))
+        try await Task.sleep(for: .milliseconds(900))
+        let speculativeCount = await client.requestCount()
+        XCTAssertEqual(speculativeCount, 0)
+
+        let finalTranscript = RecognitionTranscript(
+            confirmedSegments: [source],
+            partialText: "",
+            authoritativeText: source,
+            isFinal: true
+        )
+        let result = await session.postProcessVoicePolishForTesting(
+            rawText: source,
+            transcript: finalTranscript
+        )
+
+        XCTAssertEqual(result?.finalText, source)
+        XCTAssertEqual(result?.processedText, source)
+        XCTAssertEqual(result?.llmFailed, false)
+        XCTAssertEqual(result?.historyStatus, "voice_polish_success")
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].task, .voicePolishFast)
+        XCTAssertTrue(requests[0].user.contains(#""user_preferences":"""#))
+        XCTAssertTrue(requests[0].user.contains(source))
+    }
+
     // MARK: - REPAIR_PLAN K2：注入取值守卫与时长合理性
 
     func testEffectiveTextPrefersAuthoritativeWhenComparable() {
@@ -354,4 +402,33 @@ private final class RecognitionEventRecorder: @unchecked Sendable {
             return "streamingInterrupted"
         }
     }
+}
+
+private actor RecognitionSessionVoicePolishLLM: LLMClient {
+    private let response: String
+    private var requests: [LLMRequest] = []
+
+    init(response: String) {
+        self.response = response
+    }
+
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        requests.append(request)
+        return LLMResponse(text: response, model: config.model)
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
+        XCTFail("Voice Polish 不应回到兼容 process 接口")
+        return response
+    }
+
+    func warmUp(baseURL: String) async {}
+
+    func requestCount() -> Int { requests.count }
+    func recordedRequests() -> [LLMRequest] { requests }
 }
