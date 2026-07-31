@@ -10,6 +10,14 @@ enum LLMRequestContext: Equatable, Sendable {
 
 enum LLMRequestBuilder {
 
+    static func messages(for request: LLMRequest) -> (system: String?, user: String) {
+        messages(
+            prompt: request.system ?? "",
+            text: request.user,
+            context: request.context
+        )
+    }
+
     static func messages(
         prompt: String,
         text: String,

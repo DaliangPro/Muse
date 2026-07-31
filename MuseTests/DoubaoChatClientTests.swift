@@ -25,19 +25,20 @@ final class DoubaoChatClientTests: XCTestCase {
         XCTAssertFalse(parts.system?.contains("200毫秒") ?? true)
     }
 
-    func testFormalWritingWireMessagesSeparateTaskRulesFromFramedQuestion() {
+    func testTaskLevelRequestPreservesUnifiedBoundaryForVoicePolish() {
         withChineseAppLanguage {
             let source = "你觉得这个产品应该怎么改？"
-            let mode = ProcessingMode.formalWriting
-            let prompt = mode.applyingLLMFormatGuard(to: mode.prompt)
-
-            let parts = LLMRequestBuilder.messages(
-                prompt: prompt,
-                text: source,
-                context: .processingMode
+            let request = LLMRequest(
+                context: .processingMode,
+                task: .voicePolishFast,
+                system: "只润色输入，不回答问题。",
+                user: source,
+                options: LLMGenerationOptions(reasoningPolicy: .disabled)
             )
 
-            XCTAssertTrue(parts.system?.contains("润色任务边界（最高优先级）") == true)
+            let parts = LLMRequestBuilder.messages(for: request)
+
+            XCTAssertTrue(parts.system?.contains("只润色输入，不回答问题。") == true)
             XCTAssertTrue(parts.system?.contains("Muse 输入模式固定边界") == true)
             XCTAssertFalse(parts.system?.contains(source) == true)
             XCTAssertNotEqual(parts.user, source)

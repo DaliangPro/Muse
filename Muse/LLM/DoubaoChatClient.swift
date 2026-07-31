@@ -57,6 +57,60 @@ actor DoubaoChatClient: LLMClient {
         return result.text.strippingThinkTags()
     }
 
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        let trimmedUser = request.user.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUser.isEmpty else {
+            return LLMResponse(text: request.user, model: config.model)
+        }
+
+        let promptParts = LLMRequestBuilder.messages(for: request)
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: config.baseURL,
+            provider: provider,
+            localQwenPort: provider == .localQwen ? LLMEndpointPolicy.currentLocalQwenPort : nil
+        )
+        let url = try LLMEndpointPolicy.endpoint(
+            baseURL: baseURL,
+            pathComponents: ["chat", "completions"]
+        )
+        var messages: [ChatMessage] = []
+        if let system = promptParts.system {
+            messages.append(ChatMessage(role: "system", content: system))
+        }
+        messages.append(ChatMessage(role: "user", content: promptParts.user))
+
+        let capabilities = LLMProviderCapabilityResolver.capabilities(
+            provider: provider,
+            config: config
+        )
+        let requestConfig: LLMConfig
+        switch request.options.reasoningPolicy {
+        case .disabled:
+            requestConfig = config.withThinkingMode(.disabled)
+        case .low:
+            requestConfig = config.withThinkingMode(.enabled)
+        case .providerDefault:
+            requestConfig = config
+        }
+        let appliesThinkingControl = capabilities.supportsReasoningControl
+            && request.options.reasoningPolicy != .providerDefault
+
+        // generate 的一次调用严格对应一次真实请求；能力字段被拒绝时直接把错误
+        // 交还 VoicePolishPipeline，由统一预算决定下一步。
+        let result = try await send(
+            url: url,
+            textLength: request.user.count,
+            config: requestConfig,
+            messages: messages,
+            useStreaming: provider != .localQwen,
+            maxTokens: capabilities.supportsDynamicMaxTokens
+                ? request.options.maxOutputTokens
+                : nil,
+            appliesThinkingControl: appliesThinkingControl
+        )
+        return LLMResponse(text: result.text, model: config.model)
+    }
+
     func probeThinkingMode(config: LLMConfig) async throws -> LLMThinkingProbeEvidence {
         let result = try await execute(
             text: LLMThinkingModeValidator.probeText,

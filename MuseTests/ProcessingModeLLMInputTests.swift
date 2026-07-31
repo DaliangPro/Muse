@@ -155,8 +155,8 @@ final class ProcessingModeLLMInputTests: XCTestCase {
         }
     }
 
-    func testVoicePolishDoesNotAppendLegacyTaskBoundary() throws {
-        try withChineseAppLanguage {
+    func testVoicePolishDoesNotAppendLegacyTaskBoundary() {
+        withChineseAppLanguage {
             var mode = ProcessingMode.formalWriting
             mode.prompt = "请润色下面的内容：{text}"
 

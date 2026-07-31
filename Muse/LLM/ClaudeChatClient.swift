@@ -49,6 +49,50 @@ actor ClaudeChatClient: LLMClient {
         return result.text.strippingThinkTags()
     }
 
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        let trimmedUser = request.user.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUser.isEmpty else {
+            return LLMResponse(text: request.user, model: config.model)
+        }
+
+        let promptParts = LLMRequestBuilder.messages(for: request)
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: config.baseURL,
+            provider: .claude
+        )
+        let url = try LLMEndpointPolicy.endpoint(
+            baseURL: baseURL,
+            pathComponents: ["messages"]
+        )
+        let requestConfig: LLMConfig
+        let thinkingStyle: ClaudeThinkingRequestStyle
+        switch request.options.reasoningPolicy {
+        case .disabled:
+            requestConfig = config.withThinkingMode(.disabled)
+            thinkingStyle = .adaptive
+        case .low:
+            requestConfig = config.withThinkingMode(.enabled)
+            thinkingStyle = .adaptive
+        case .providerDefault:
+            requestConfig = config
+            thinkingStyle = .omitted
+        }
+
+        // 与 OpenAI-compatible 客户端一致：不做 adaptive/manual/baseline 隐式
+        // 重试，一次 generate 只发出一次请求。
+        let result = try await send(
+            url: url,
+            textLength: request.user.count,
+            config: requestConfig,
+            maxTokens: 4_096,
+            system: promptParts.system,
+            user: promptParts.user,
+            stream: true,
+            thinkingStyle: thinkingStyle
+        )
+        return LLMResponse(text: result.text, model: config.model)
+    }
+
     func probeThinkingMode(config: LLMConfig) async throws -> LLMThinkingProbeEvidence {
         let result = try await execute(
             text: LLMThinkingModeValidator.probeText,
