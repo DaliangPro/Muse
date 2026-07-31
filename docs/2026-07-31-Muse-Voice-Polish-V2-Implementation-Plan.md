@@ -1,6 +1,6 @@
 # Muse 语音润色 V2 分期实施规格
 
-文档状态：待实施
+文档状态：第一期已实施；第二、三期待实施
 
 适用仓库：`DaliangPro/Muse`
 
@@ -32,7 +32,7 @@ Voice Polish V2 继续采用独立管线，但不一次性同时上线核心重�
 
 每一期都必须独立可编译、可测试、可回滚。后一期不得作为前一期“完成”的隐含条件。
 
-### 0.1 当前禁止直接开工
+### 0.1 第一期前置条件（已满足）
 
 截至 2026-07-31，当前 `main` 工作区包含多项未提交修复，并与本计划将修改的 `RecognitionSession`、`LLMClient`、`DoubaoChatClient`、`ClaudeChatClient` 等文件重叠。
 
@@ -41,7 +41,7 @@ Voice Polish V2 继续采用独立管线，但不一次性同时上线核心重�
 - 当前修复按 `REPAIR_PLAN.md` 完成验证并拆成原子提交，使工作区干净；或
 - 经用户明确批准，创建基于已提交 `main` 的独立干净 worktree。
 
-Agent 不得自行 `stash`、重置、覆盖或搬运当前在途修改。
+第一期于 2026-07-31 在分支 `feature/voice-polish-v2-phase-1` 实施。开工前已把重叠修复拆成原子提交并完成基线验证，过程中未 `stash`、重置、覆盖或搬运用户修改。
 
 ### 0.2 仓库治理
 
@@ -61,9 +61,9 @@ Agent 不得自行 `stash`、重置、覆盖或搬运当前在途修改。
 
 ---
 
-## 1. 已确认的现状
+## 1. 第一期实施前确认的现状
 
-以下问题已经在当前仓库中确认，第一期需要处理：
+以下问题在第一期开工前已经确认，并已由第一期处理：
 
 1. `ProcessingMode` 通过名称包含“润色”“polish”“prompt”“翻译”等文字推断业务类型。
 2. Voice Polish 会在用户 Prompt 后追加隐藏列表、清理和任务边界规则。
@@ -1076,6 +1076,13 @@ Prompt 泄漏作为 Validator Hard Fail 处理，不通过匹配“输入消息�
 - “就是”等词不再被本地机械替换。
 - Direct、Smart Direct、Translate、Prompt Optimize、Command 和普通 Custom 不回归。
 - 日志不包含 Voice Polish 输入正文、输出正文、上下文正文或 Prompt payload。
+
+#### 第一期实施记录
+
+- 代码提交：`5d01517`、`ea00c04`、`508ec85`、`4f69d83`、`3e9d7c8`。
+- 验证：`swift build`、`swift build -c release`、`swift test` 与 `bash scripts/health-check.sh` 均通过；全量 696 个测试中 5 个按环境条件跳过，0 失败。
+- 部署：复用既有 `Muse Local` 签名覆盖安装并重启 `/Applications/Muse.app`；Bundle ID、严格签名、运行进程和 Voice Polish V2 二进制标识均已核验。
+- 边界：本期按范围不以 Live Provider 或人工盲测为完成硬门槛；尚未执行真实模型观察期，因此这里只确认第一期实现与确定性验收通过，不声称真实模型产品效果已经验收。
 
 ### 8.2 第二期：Deep、安全上下文与个人词典
 
