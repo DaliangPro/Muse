@@ -104,6 +104,33 @@ enum VoicePolishComplexityRouter {
         )
     }
 
+    /// 将基础复杂度与用户选择的质量档位合并。基础判断始终保留在
+    /// `detectedRoute`，这里仅决定实际执行路径，便于历史与试跑审计。
+    static func executedRoute(
+        for decision: VoicePolishRouteDecision,
+        request: VoicePolishRequest
+    ) -> VoicePolishRoute {
+        switch request.qualityMode {
+        case .fast:
+            return decision.route == .fast ? .fast : .structured
+        case .balanced:
+            return decision.route
+        case .quality:
+            guard decision.route == .structured else { return decision.route }
+            let elevatedSignals: Set<String> = [
+                "immediate_correction",
+                "side_note",
+                "enumeration",
+            ]
+            if !decision.matchedSignalCategories.isDisjoint(with: elevatedSignals)
+                || decision.factCandidateCount >= 9
+                || exceedsQualityLengthThreshold(request.input.segments.map(\.text).joined(separator: "\n")) {
+                return .deep
+            }
+            return .structured
+        }
+    }
+
     static func containsExplicitExclusionSignal(_ text: String) -> Bool {
         containsAny(
             in: text.precomposedStringWithCompatibilityMapping.lowercased(),
@@ -116,6 +143,15 @@ enum VoicePolishComplexityRouter {
         text.split { character in
             character.isWhitespace || character.isPunctuation
         }.count
+    }
+
+    private static func exceedsQualityLengthThreshold(_ text: String) -> Bool {
+        let normalized = text.precomposedStringWithCompatibilityMapping.lowercased()
+        let hasChinese = normalized.unicodeScalars.contains { scalar in
+            (0x3400...0x4DBF).contains(scalar.value)
+                || (0x4E00...0x9FFF).contains(scalar.value)
+        }
+        return hasChinese ? normalized.count > 250 : englishWordCount(normalized) > 150
     }
 
     private static func containsAny(

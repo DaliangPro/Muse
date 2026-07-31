@@ -24,6 +24,19 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(route(Array(repeating: "word", count: 301).joined(separator: " ")), .deep)
     }
 
+    func testQualityModesApplyDeterministicExecutionPolicy() {
+        let simple = makeRequest("今天下午把方案发出去。")
+        let structured = makeRequest("第一，写方案。第二，补测试。")
+        let deep = makeRequest("先用红色，不对，我改一下，应该是蓝色。")
+
+        XCTAssertEqual(executedRoute(simple, quality: .fast), .fast)
+        XCTAssertEqual(executedRoute(structured, quality: .fast), .structured)
+        XCTAssertEqual(executedRoute(deep, quality: .fast), .structured)
+        XCTAssertEqual(executedRoute(structured, quality: .balanced), .structured)
+        XCTAssertEqual(executedRoute(structured, quality: .quality), .deep)
+        XCTAssertEqual(executedRoute(deep, quality: .quality), .deep)
+    }
+
     func testChineseNumberCanonicalizationCoversColloquialTailUnits() {
         XCTAssertEqual(ProtectedFactExtractor.canonicalChineseNumber("一万六千八"), "16800")
         XCTAssertEqual(ProtectedFactExtractor.canonicalChineseNumber("一万六"), "16000")
@@ -171,6 +184,24 @@ final class VoicePolishCoreTests: XCTestCase {
             preferences: UserPolishPreferences(additionalRequirements: ""),
             qualityMode: .balanced
         )
+    }
+
+    private func executedRoute(
+        _ baseRequest: VoicePolishRequest,
+        quality: VoicePolishQualityMode
+    ) -> VoicePolishRoute {
+        let request = VoicePolishRequest(
+            input: baseRequest.input,
+            context: baseRequest.context,
+            preferences: baseRequest.preferences,
+            qualityMode: quality
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let decision = VoicePolishComplexityRouter.decide(
+            request: request,
+            factCandidates: facts
+        )
+        return VoicePolishComplexityRouter.executedRoute(for: decision, request: request)
     }
 
     private func segment(_ text: String) -> RecognitionSegment {

@@ -10,6 +10,25 @@ struct VoicePolishValidationResult: Sendable, Equatable {
 
 enum VoicePolishValidator {
 
+    static func validatePlan(
+        _ plan: VoicePolishPlan,
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> VoicePolishValidationResult {
+        // 复用完整 Plan 完整性检查，但只返回分析阶段可以在本地证明的结构错误。
+        // Analyzer 尚未产生成稿，因此不能在此判断事实是否已进入最终正文。
+        let provisional = StructuredVoicePolishResponse(
+            plan: plan,
+            finalText: request.input.fallbackText
+        )
+        let codes = validateStructured(
+            response: provisional,
+            request: request,
+            sourceFacts: sourceFacts
+        ).codes.filter { $0 == .planIntegrityFailure }
+        return VoicePolishValidationResult(codes: codes)
+    }
+
     static func validateFast(
         output: String,
         request: VoicePolishRequest,

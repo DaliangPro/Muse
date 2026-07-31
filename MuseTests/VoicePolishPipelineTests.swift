@@ -104,10 +104,9 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(requestCount, 2)
     }
 
-    func testDeepSignalIsRecordedButExecutedByStructuredInPhaseOne() async throws {
+    func testDeepUsesAnalyzeThenRenderWithinTwoAttempts() async throws {
         let source = "先用红色，不对，我改一下，应该是蓝色。"
-        let response = StructuredVoicePolishResponse(
-            plan: VoicePolishPlan(
+        let plan = VoicePolishPlan(
                 version: 1,
                 language: "zh",
                 scene: .unknown,
@@ -130,17 +129,64 @@ final class VoicePolishPipelineTests: XCTestCase {
                 uncertainEntities: [],
                 outputFormat: VoiceOutputFormat(kind: .sentence, expectedListCount: nil),
                 confidence: 0.9
-            ),
-            finalText: "最终使用蓝色。"
         )
-        let client = ScriptedVoicePolishLLM(steps: [.response(try encoded(response))])
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(try encoded(plan)),
+            .response("最终使用蓝色。"),
+        ])
 
         let result = await pipeline(client).process(makeRequest(source))
 
         XCTAssertEqual(result.detectedRoute, .deep)
-        XCTAssertEqual(result.executedRoute, .structured)
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.executedRoute, .deep)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertFalse(result.usedFallback)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishAnalyze, .voicePolishRender])
+        XCTAssertEqual(requests[0].options.reasoningPolicy, .low)
+    }
+
+    func testDeepAnalyzerFormatRepairConsumesThirdAttemptBeforeRender() async throws {
+        let source = "先用红色，不对，我改一下，应该是蓝色。"
+        let plan = simpleCorrectionPlan()
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response("不是 JSON"),
+            .response(try encoded(plan)),
+            .response("最终使用红色。"),
+            .response("不应调用第四次"),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.executedRoute, .deep)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        XCTAssertTrue(result.usedFallback)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(
+            requests.map(\.task),
+            [.voicePolishAnalyze, .voicePolishRepair, .voicePolishRender]
+        )
+    }
+
+    func testDeepRenderHardFailureUsesSingleFinalRepair() async throws {
+        let source = "先用红色，不对，我改一下，应该是蓝色。"
+        let plan = simpleCorrectionPlan()
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(try encoded(plan)),
+            .response("最终使用红色。"),
+            .response("最终使用蓝色。"),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "最终使用蓝色。")
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(
+            requests.map(\.task),
+            [.voicePolishAnalyze, .voicePolishRender, .voicePolishRepair]
+        )
     }
 
     func testStructuredRejectsModelSuppliedCanonicalValueMismatch() async throws {
@@ -324,6 +370,33 @@ final class VoicePolishPipelineTests: XCTestCase {
                 confidence: 0.95
             ),
             finalText: finalText
+        )
+    }
+
+    private func simpleCorrectionPlan() -> VoicePolishPlan {
+        VoicePolishPlan(
+            version: 1,
+            language: "zh",
+            scene: .unknown,
+            finalIntent: "最终使用蓝色",
+            orderedBlocks: [VoicePolishBlock(
+                id: "b1",
+                text: "最终使用蓝色。",
+                sourceSegmentIDs: ["s1"],
+                kind: .content
+            )],
+            discardedFragments: [],
+            corrections: [VoiceCorrection(
+                previousText: "红色",
+                finalText: "蓝色",
+                sourceSegmentIDs: ["s1"],
+                isFinal: true
+            )],
+            sideNotes: [],
+            facts: [],
+            uncertainEntities: [],
+            outputFormat: VoiceOutputFormat(kind: .sentence, expectedListCount: nil),
+            confidence: 0.9
         )
     }
 

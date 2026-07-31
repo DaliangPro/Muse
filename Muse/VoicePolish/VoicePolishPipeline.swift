@@ -7,6 +7,8 @@ struct VoicePolishPipeline: Sendable {
     private let config: LLMConfig
     private let totalTimeout: Duration
     private let firstRequestTimeout: Duration
+    private let analyzeTimeout: Duration
+    private let renderTimeout: Duration
     private let repairTimeout: Duration
 
     init(
@@ -14,12 +16,16 @@ struct VoicePolishPipeline: Sendable {
         config: LLMConfig,
         totalTimeout: Duration = .seconds(45),
         firstRequestTimeout: Duration = .seconds(30),
+        analyzeTimeout: Duration = .seconds(15),
+        renderTimeout: Duration = .seconds(20),
         repairTimeout: Duration = .seconds(10)
     ) {
         self.client = client
         self.config = config
         self.totalTimeout = totalTimeout
         self.firstRequestTimeout = firstRequestTimeout
+        self.analyzeTimeout = analyzeTimeout
+        self.renderTimeout = renderTimeout
         self.repairTimeout = repairTimeout
     }
 
@@ -33,10 +39,19 @@ struct VoicePolishPipeline: Sendable {
             request: request,
             factCandidates: sourceFacts
         )
-        let executedRoute: VoicePolishRoute = decision.route == .fast ? .fast : .structured
-        let maximumAttempts = request.qualityMode == .fast
-            ? 1
-            : (executedRoute == .fast ? 1 : 2)
+        let executedRoute = VoicePolishComplexityRouter.executedRoute(
+            for: decision,
+            request: request
+        )
+        let maximumAttempts: Int
+        switch executedRoute {
+        case .fast:
+            maximumAttempts = 1
+        case .structured:
+            maximumAttempts = request.qualityMode == .fast ? 1 : 2
+        case .deep:
+            maximumAttempts = 3
+        }
 
         DebugFileLogger.log(
             "voice polish start route=\(decision.route.rawValue) executed=\(executedRoute.rawValue) quality=\(request.qualityMode.rawValue) input=\(request.input.fallbackText.count)chars facts=\(sourceFacts.count)"
@@ -46,10 +61,19 @@ struct VoicePolishPipeline: Sendable {
             let payload = try VoicePolishPrompts.payload(
                 for: request,
                 sourceFacts: sourceFacts,
-                deepDeferred: decision.route == .deep
+                deepDeferred: false
             )
             if executedRoute == .fast {
                 return await runFast(
+                    request: request,
+                    payload: payload,
+                    sourceFacts: sourceFacts,
+                    detectedRoute: decision.route,
+                    startedAt: startedAt
+                )
+            }
+            if executedRoute == .deep {
+                return await runDeep(
                     request: request,
                     payload: payload,
                     sourceFacts: sourceFacts,
@@ -73,6 +97,235 @@ struct VoicePolishPipeline: Sendable {
                 attempts: 0,
                 codes: [.emptyOutput],
                 reason: .setupFailed
+            )
+        }
+    }
+
+    private func runDeep(
+        request: VoicePolishRequest,
+        payload: String,
+        sourceFacts: [SourceFactCandidate],
+        detectedRoute: VoicePolishRoute,
+        startedAt: ContinuousClock.Instant
+    ) async -> VoicePolishResult {
+        var attempts = 0
+        let analyzerRaw: String
+        do {
+            let timeout = try availableTimeout(stageLimit: analyzeTimeout, startedAt: startedAt)
+            attempts += 1
+            analyzerRaw = try await generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishAnalyze,
+                    system: VoicePolishPrompts.analyzer,
+                    user: payload,
+                    options: LLMGenerationOptions(
+                        reasoningPolicy: .low,
+                        responseFormat: .jsonObject
+                    )
+                ),
+                timeout: timeout
+            ).text
+        } catch {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: [.invalidStructuredResponse],
+                reason: failureReason(for: error)
+            )
+        }
+
+        var plan: VoicePolishPlan
+        do {
+            plan = try StructuredLLMDecoder.decode(VoicePolishPlan.self, from: analyzerRaw)
+        } catch {
+            let decodeCode = validationCode(for: error)
+            guard analyzerRaw.utf8.count <= VoicePolishOutputNormalizer.maximumResponseBytes else {
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .deep,
+                    attempts: attempts,
+                    codes: [decodeCode]
+                )
+            }
+            do {
+                let timeout = try availableTimeout(stageLimit: repairTimeout, startedAt: startedAt)
+                attempts += 1
+                let repairPayload = try VoicePolishPrompts.repairPayload(
+                    originalPayload: payload,
+                    rawResponse: analyzerRaw,
+                    validationCodes: [decodeCode]
+                )
+                let repairedRaw = try await generate(
+                    LLMRequest(
+                        context: .processingMode,
+                        task: .voicePolishRepair,
+                        system: VoicePolishPrompts.planFormatRepair,
+                        user: repairPayload,
+                        options: LLMGenerationOptions(
+                            reasoningPolicy: .disabled,
+                            responseFormat: .jsonObject
+                        )
+                    ),
+                    timeout: timeout
+                ).text
+                plan = try StructuredLLMDecoder.decode(VoicePolishPlan.self, from: repairedRaw)
+            } catch {
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .deep,
+                    attempts: attempts,
+                    codes: [validationCode(for: error)],
+                    reason: failureReason(for: error)
+                )
+            }
+        }
+
+        let planValidation = VoicePolishValidator.validatePlan(
+            plan,
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        guard !planValidation.hasHardFailure else {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: planValidation.codes
+            )
+        }
+
+        let renderRaw: String
+        do {
+            let timeout = try availableTimeout(stageLimit: renderTimeout, startedAt: startedAt)
+            attempts += 1
+            let renderPayload = try VoicePolishPrompts.renderPayload(
+                originalPayload: payload,
+                plan: plan
+            )
+            renderRaw = try await generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishRender,
+                    system: VoicePolishPrompts.renderer,
+                    user: renderPayload,
+                    options: LLMGenerationOptions(
+                        reasoningPolicy: .disabled,
+                        responseFormat: .text
+                    )
+                ),
+                timeout: timeout
+            ).text
+        } catch {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: [.emptyOutput],
+                reason: failureReason(for: error)
+            )
+        }
+
+        guard let rendered = VoicePolishOutputNormalizer.plainText(
+            renderRaw,
+            sourceText: request.input.fallbackText
+        ) else {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: [.abnormalLength]
+            )
+        }
+        let validation = VoicePolishValidator.validateStructured(
+            response: StructuredVoicePolishResponse(plan: plan, finalText: rendered),
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        guard validation.hasHardFailure else {
+            return success(
+                text: rendered,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: validation.codes
+            )
+        }
+
+        // Analyzer 曾使用格式修复时已消耗三次预算，Renderer 失败直接回退。
+        guard attempts < 3 else {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: validation.codes
+            )
+        }
+        do {
+            let timeout = try availableTimeout(stageLimit: repairTimeout, startedAt: startedAt)
+            attempts += 1
+            let repairPayload = try VoicePolishPrompts.renderRepairPayload(
+                originalPayload: payload,
+                plan: plan,
+                rawResponse: renderRaw,
+                validationCodes: validation.codes.filter(\.isHardFailure)
+            )
+            let repairedRaw = try await generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishRepair,
+                    system: VoicePolishPrompts.renderRepair,
+                    user: repairPayload,
+                    options: LLMGenerationOptions(
+                        reasoningPolicy: .disabled,
+                        responseFormat: .text
+                    )
+                ),
+                timeout: timeout
+            ).text
+            guard let repaired = VoicePolishOutputNormalizer.plainText(
+                repairedRaw,
+                sourceText: request.input.fallbackText
+            ) else {
+                throw StructuredLLMDecoderError.invalidJSON
+            }
+            let repairedValidation = VoicePolishValidator.validateStructured(
+                response: StructuredVoicePolishResponse(plan: plan, finalText: repaired),
+                request: request,
+                sourceFacts: sourceFacts
+            )
+            guard !repairedValidation.hasHardFailure else {
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .deep,
+                    attempts: attempts,
+                    codes: repairedValidation.codes
+                )
+            }
+            return success(
+                text: repaired,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: repairedValidation.codes
+            )
+        } catch {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .deep,
+                attempts: attempts,
+                codes: [validationCode(for: error)],
+                reason: failureReason(for: error)
             )
         }
     }
