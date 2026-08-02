@@ -12,6 +12,58 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(state, .idle)
     }
 
+    func testStopDuringBlockedTargetApplicationCaptureCannotStartZombieSession() async throws {
+        let gate = RecognitionSessionApplicationCaptureGate()
+        let recorder = RecognitionEventRecorder()
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            frontmostApplicationBundleIdentifier: { await gate.capture() }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        let startTask = Task { await session.startRecording(mode: .direct) }
+        for _ in 0..<100 {
+            if await gate.hasStarted { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let didStartCapture = await gate.hasStarted
+        XCTAssertTrue(didStartCapture)
+
+        await session.stopRecording()
+        await gate.resolve("com.example.target")
+        await startTask.value
+
+        let finalState = await session.state
+        XCTAssertEqual(finalState, .idle)
+        XCTAssertTrue(recorder.values.contains("completed"))
+    }
+
+    func testAbortDuringBlockedTargetApplicationCaptureCannotStartZombieSession() async throws {
+        let gate = RecognitionSessionApplicationCaptureGate()
+        let recorder = RecognitionEventRecorder()
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            frontmostApplicationBundleIdentifier: { await gate.capture() }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        let startTask = Task { await session.startRecording(mode: .direct) }
+        for _ in 0..<100 {
+            if await gate.hasStarted { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let didStartCapture = await gate.hasStarted
+        XCTAssertTrue(didStartCapture)
+
+        await session.abortCurrentSession()
+        await gate.resolve("com.example.target")
+        await startTask.value
+
+        let finalState = await session.state
+        XCTAssertEqual(finalState, .idle)
+        XCTAssertTrue(recorder.values.contains("completed"))
+    }
+
     func testSetState() async {
         let session = makeSession()
         await session.setState(.recording)
@@ -282,6 +334,314 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertFalse(request.user.contains("内置整句"))
         let models = await client.recordedModels()
         XCTAssertEqual(models, ["voice-polish-fast-model"])
+    }
+
+    func testDirectAndVoicePolishShareGlobalCanonicalAndFixedSnippetBehavior() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "Type less")],
+                origin: .manual,
+                scope: .global
+            )]),
+            context: fixture.context
+        )
+        try SnippetStorage.save([
+            (trigger: "旧的整句模板。", value: "固定替换成功。"),
+        ], context: fixture.context)
+        let raw = "我正在使用 Type less。旧的整句模板。"
+        let expected = "我正在使用 Typeless。固定替换成功。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let directSession = RecognitionSession(historyStore: HistoryStore(path: ":memory:"))
+        let directResult = await directSession.postProcessForTesting(
+            rawText: raw,
+            transcript: transcript,
+            mode: .direct,
+            vocabularyContext: fixture.context
+        )
+        let voicePolishSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let voicePolishResult = await voicePolishSession.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(directResult?.finalText, expected)
+        XCTAssertEqual(voicePolishResult?.finalText, expected)
+    }
+
+    func testAllASRProvidersShareLocalCanonicalFinalization() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "type list")],
+                origin: .manual,
+                scope: .global
+            )]),
+            context: fixture.context
+        )
+        let raw = "我正在使用 type list。"
+        let expected = "我正在使用 Typeless。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        for provider in ASRProvider.allCases {
+            let session = RecognitionSession(historyStore: HistoryStore(path: ":memory:"))
+            let result = await session.postProcessForTesting(
+                rawText: raw,
+                transcript: transcript,
+                mode: .direct,
+                provider: provider,
+                vocabularyContext: fixture.context
+            )
+            XCTAssertEqual(result?.finalText, expected, provider.rawValue)
+        }
+    }
+
+    func testDirectAndVoicePolishApplyApplicationTerminologyForSameTarget() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        let targetApplication = "com.example.app-a"
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "Type less")],
+                origin: .manual,
+                scope: .application(targetApplication)
+            )]),
+            context: fixture.context
+        )
+        let raw = "我正在使用 Type less。"
+        let expected = "我正在使用 Typeless。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let directSession = RecognitionSession(historyStore: HistoryStore(path: ":memory:"))
+        let directResult = await directSession.postProcessForTesting(
+            rawText: raw,
+            transcript: transcript,
+            mode: .direct,
+            applicationBundleIdentifier: targetApplication,
+            vocabularyContext: fixture.context
+        )
+        let voicePolishSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let voicePolishResult = await voicePolishSession.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            writingContext: WritingContext(applicationBundleID: targetApplication),
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(directResult?.finalText, expected)
+        XCTAssertEqual(voicePolishResult?.finalText, expected)
+    }
+
+    func testApplicationTerminologyDoesNotLeakToOtherTargetInEitherMode() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "Type less")],
+                origin: .manual,
+                scope: .application("com.example.app-a")
+            )]),
+            context: fixture.context
+        )
+        let otherApplication = "com.example.app-b"
+        let raw = "我正在使用 Type less。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let directSession = RecognitionSession(historyStore: HistoryStore(path: ":memory:"))
+        let directResult = await directSession.postProcessForTesting(
+            rawText: raw,
+            transcript: transcript,
+            mode: .direct,
+            applicationBundleIdentifier: otherApplication,
+            vocabularyContext: fixture.context
+        )
+        let voicePolishSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let voicePolishResult = await voicePolishSession.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            writingContext: WritingContext(applicationBundleID: otherApplication),
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(directResult?.finalText, raw)
+        XCTAssertEqual(voicePolishResult?.finalText, raw)
+    }
+
+    func testCapturedNilTargetDoesNotFallBackToLaterVoicePolishFocus() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        let laterFocusedApplication = "com.example.later-focused"
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "Type less")],
+                origin: .manual,
+                scope: .application(laterFocusedApplication)
+            )]),
+            context: fixture.context
+        )
+        let raw = "我正在使用 Type less。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+
+        let result = await session.postProcessForTesting(
+            rawText: raw,
+            transcript: transcript,
+            mode: .formalWriting,
+            writingContext: WritingContext(
+                applicationBundleID: laterFocusedApplication
+            ),
+            applicationBundleIdentifier: nil,
+            applicationBundleIdentifierWasCaptured: true,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(result?.finalText, raw)
+    }
+
+    func testLegacyLLMAndVoicePolishFallbackBothUseCanonicalText() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "Type less")],
+                origin: .manual,
+                scope: .global
+            )]),
+            context: fixture.context
+        )
+        let raw = "我正在使用 Type less。"
+        let expected = "我正在使用 Typeless。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let legacyLLMSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let legacyResult = await legacyLLMSession.postProcessForTesting(
+            rawText: raw,
+            transcript: transcript,
+            mode: .smartDirect,
+            vocabularyContext: fixture.context
+        )
+        let voicePolishSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let voicePolishResult = await voicePolishSession.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(legacyResult?.finalText, expected)
+        XCTAssertTrue(legacyResult?.llmFailed ?? false)
+        XCTAssertEqual(voicePolishResult?.finalText, expected)
+        XCTAssertTrue(voicePolishResult?.llmFailed ?? false)
+    }
+
+    func testConfirmedHistoryCorrectionIsCanonicalInNextRecognitionSession() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try TerminologyRepository.save(.empty, context: fixture.context)
+        let historyID = "history-confirmed-for-next-session"
+        let historyStore = HistoryStore(
+            path: fixture.directory.appendingPathComponent("history.db").path
+        )
+        await historyStore.insert(HistoryRecord(
+            id: historyID,
+            createdAt: Date(),
+            durationSeconds: 1,
+            rawText: "我正在使用 Type less。",
+            processingMode: ProcessingMode.formalWriting.name,
+            processedText: "我正在使用 Type less。",
+            finalText: "我正在使用 Type less。",
+            status: "voice_polish_success",
+            characterCount: 18
+        ))
+        let coordinator = TerminologyHistoryTransactionCoordinator(context: fixture.context)
+        _ = try await coordinator.confirmCorrection(
+            historyStore: historyStore,
+            historyID: historyID,
+            candidates: [TerminologyCorrectionCandidate(
+                alias: "Type less",
+                canonical: "Typeless"
+            )],
+            correctedText: "我正在使用 Typeless。",
+            scene: .document,
+            personalizationEnabled: true,
+            retentionLimit: 200,
+            learnStyle: false,
+            learnTerminology: true
+        )
+
+        let raw = "下一次继续使用 Type less。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+        let nextSession = RecognitionSession(historyStore: HistoryStore(path: ":memory:"))
+        let nextResult = await nextSession.postProcessForTesting(
+            rawText: raw,
+            transcript: transcript,
+            mode: .direct,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(nextResult?.finalText, "下一次继续使用 Typeless。")
     }
 
     func testVoicePolishScopesTerminologyByApplicationBeforeCanonicalization() async throws {
@@ -744,6 +1104,21 @@ private final class RecognitionEventRecorder: @unchecked Sendable {
         case .streamingInterrupted:
             return "streamingInterrupted"
         }
+    }
+}
+
+private actor RecognitionSessionApplicationCaptureGate {
+    private var continuation: CheckedContinuation<String?, Never>?
+    private(set) var hasStarted = false
+
+    func capture() async -> String? {
+        hasStarted = true
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resolve(_ bundleIdentifier: String?) {
+        continuation?.resume(returning: bundleIdentifier)
+        continuation = nil
     }
 }
 

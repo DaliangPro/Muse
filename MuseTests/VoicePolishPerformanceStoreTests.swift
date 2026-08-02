@@ -29,8 +29,10 @@ final class VoicePolishPerformanceStoreTests: XCTestCase {
             VoicePolishPerformanceStore.summary(minimumSampleCount: 1, defaults: defaults)
         )
         XCTAssertEqual(summary.sampleCount, 6)
-        XCTAssertEqual(summary.singleCallRate, 4.0 / 6.0, accuracy: 0.0001)
-        XCTAssertEqual(summary.repairRate, 1.0 / 6.0, accuracy: 0.0001)
+        XCTAssertEqual(summary.llmRequestSampleCount, 6)
+        XCTAssertEqual(summary.automaticSampleCount, 6)
+        XCTAssertEqual(try XCTUnwrap(summary.singleCallRate), 4.0 / 6.0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(summary.repairRate), 1.0 / 6.0, accuracy: 0.0001)
         XCTAssertEqual(summary.fallbackRate, 0)
         let fast = try XCTUnwrap(summary.routes.first { $0.route == .fast })
         XCTAssertEqual(fast.p50Milliseconds, 200)
@@ -61,7 +63,7 @@ final class VoicePolishPerformanceStoreTests: XCTestCase {
         XCTAssertEqual(samples.last?.latencyMilliseconds, VoicePolishPerformanceStore.maximumSampleCount + 19)
     }
 
-    func testSummaryRecordsEveryOutcomeAndDoesNotCountFallbackAsSingleCall() throws {
+    func testSummaryUsesOutcomeSpecificDenominators() throws {
         let suiteName = "VoicePolishPerformanceOutcomeTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -100,8 +102,66 @@ final class VoicePolishPerformanceStoreTests: XCTestCase {
             VoicePolishPerformanceStore.summary(minimumSampleCount: 1, defaults: defaults)
         )
         XCTAssertEqual(summary.sampleCount, 3)
-        XCTAssertEqual(summary.singleCallRate, 0)
-        XCTAssertEqual(summary.fallbackRate, 2.0 / 3.0, accuracy: 0.0001)
+        XCTAssertEqual(summary.llmRequestSampleCount, 1)
+        XCTAssertEqual(summary.automaticSampleCount, 2)
+        XCTAssertEqual(try XCTUnwrap(summary.singleCallRate), 1)
+        XCTAssertEqual(summary.fallbackRate, 1)
+        XCTAssertTrue(summary.routes.allSatisfy { $0.route != .structured })
+    }
+
+    func testSummaryDoesNotInventRatesWhenEverySessionUsesCanonicalExit() throws {
+        let suiteName = "VoicePolishPerformanceCanonicalOnlyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        for _ in 0..<VoicePolishPerformanceStore.minimumVisibleSampleCount {
+            VoicePolishPerformanceStore.record(
+                measurement: VoicePolishPerformanceMeasurement(
+                    outcome: .canonicalExit,
+                    route: .structured,
+                    llmAttemptCount: 1
+                ),
+                latencyMilliseconds: 200,
+                defaults: defaults
+            )
+        }
+
+        XCTAssertEqual(
+            VoicePolishPerformanceStore.samples(defaults: defaults).count,
+            VoicePolishPerformanceStore.minimumVisibleSampleCount
+        )
+        XCTAssertEqual(VoicePolishPerformanceStore.automaticSampleCount(defaults: defaults), 0)
+        XCTAssertNil(VoicePolishPerformanceStore.summary(defaults: defaults))
+
+        VoicePolishPerformanceStore.record(
+            result: result(route: .fast, attempts: 1),
+            latencyMilliseconds: 100,
+            defaults: defaults
+        )
+        XCTAssertEqual(VoicePolishPerformanceStore.automaticSampleCount(defaults: defaults), 1)
+        XCTAssertNil(VoicePolishPerformanceStore.summary(defaults: defaults))
+    }
+
+    func testSummaryShowsUnavailableLLMRatesWhenAutomaticSessionsNeverReachModel() throws {
+        let suiteName = "VoicePolishPerformanceNoLLMTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        for _ in 0..<VoicePolishPerformanceStore.minimumVisibleSampleCount {
+            VoicePolishPerformanceStore.record(
+                measurement: VoicePolishPerformanceMeasurement(outcome: .setupFailure),
+                latencyMilliseconds: 20,
+                defaults: defaults
+            )
+        }
+
+        let summary = try XCTUnwrap(VoicePolishPerformanceStore.summary(defaults: defaults))
+        XCTAssertEqual(summary.automaticSampleCount, VoicePolishPerformanceStore.minimumVisibleSampleCount)
+        XCTAssertEqual(summary.llmRequestSampleCount, 0)
+        XCTAssertNil(summary.singleCallRate)
+        XCTAssertNil(summary.repairRate)
+        XCTAssertEqual(summary.fallbackRate, 1)
+        XCTAssertTrue(summary.routes.isEmpty)
     }
 
     private func result(

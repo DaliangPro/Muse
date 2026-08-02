@@ -174,30 +174,39 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.voicePolishStage, .analyzing)
         XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
 
-        let accepted = await appState.useVoicePolishCanonicalTextIfAvailable(
+        let result = await appState.useVoicePolishCanonicalTextIfAvailable(
             restoreOnFailure: true
         )
-        let duplicateAccepted = await appState.useVoicePolishCanonicalTextIfAvailable(
+        let duplicateResult = await appState.useVoicePolishCanonicalTextIfAvailable(
             restoreOnFailure: true
         )
 
-        XCTAssertTrue(accepted)
-        XCTAssertFalse(duplicateAccepted)
+        XCTAssertEqual(result, .accepted)
+        XCTAssertEqual(duplicateResult, .stale)
+        XCTAssertFalse(duplicateResult.shouldAbortSessionAfterEscape)
         XCTAssertEqual(invocationCount, 1)
         XCTAssertFalse(appState.canUseVoicePolishCanonicalText)
         XCTAssertFalse(appState.isRequestingVoicePolishCanonicalText)
         XCTAssertNotNil(appState.voicePolishCanonicalExitMessage)
+
+        appState.showProcessingResult("已选择的纠正原文")
+        let afterCommitResult = await appState.useVoicePolishCanonicalTextIfAvailable(
+            restoreOnFailure: false
+        )
+        XCTAssertEqual(afterCommitResult, .stale)
+        XCTAssertFalse(afterCommitResult.shouldAbortSessionAfterEscape)
     }
 
     func testCanonicalExitRejectionRestoresMouseActionAndShowsRetryState() async {
         let appState = makeCanonicalReadyAppState()
         appState.onUseVoicePolishCanonicalText = { false }
 
-        let accepted = await appState.useVoicePolishCanonicalTextIfAvailable(
+        let result = await appState.useVoicePolishCanonicalTextIfAvailable(
             restoreOnFailure: true
         )
 
-        XCTAssertFalse(accepted)
+        XCTAssertEqual(result, .rejected)
+        XCTAssertTrue(result.shouldAbortSessionAfterEscape)
         XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
         XCTAssertFalse(appState.isRequestingVoicePolishCanonicalText)
         XCTAssertNotNil(appState.voicePolishCanonicalExitMessage)
@@ -223,9 +232,10 @@ final class AppStateTests: XCTestCase {
         // 模拟 pipeline 已提交 polished 结果，但迟到的 session ack 随后才返回 false。
         appState.showProcessingResult("已经提交的润色结果")
         await gate.resolve(false)
-        let accepted = await requestTask.value
+        let result = await requestTask.value
 
-        XCTAssertFalse(accepted)
+        XCTAssertEqual(result, .stale)
+        XCTAssertFalse(result.shouldAbortSessionAfterEscape)
         XCTAssertNil(appState.voicePolishStage)
         XCTAssertFalse(appState.canUseVoicePolishCanonicalText)
         XCTAssertFalse(appState.isRequestingVoicePolishCanonicalText)

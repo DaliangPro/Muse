@@ -98,6 +98,7 @@ actor RecognitionSession {
     private let microphonePermission: (@Sendable () async -> Bool)?
     private let promptContextCapture: @Sendable () async -> PromptContext
     private let writingContextCapture: @Sendable (WritingContextLevel) async -> WritingContext
+    private let frontmostApplicationBundleIdentifier: @Sendable () async -> String?
     private let requestOptionsProvider: (@Sendable (ProcessingMode) -> (
         options: ASRRequestOptions,
         hotwordCount: Int
@@ -127,6 +128,11 @@ actor RecognitionSession {
         writingContextCapture: @escaping @Sendable (WritingContextLevel) async -> WritingContext = {
             await WritingContextCapture.capture(level: $0)
         },
+        frontmostApplicationBundleIdentifier: @escaping @Sendable () async -> String? = {
+            await MainActor.run {
+                NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            }
+        },
         requestOptionsProvider: (@Sendable (ProcessingMode) -> (
             options: ASRRequestOptions,
             hotwordCount: Int
@@ -149,6 +155,7 @@ actor RecognitionSession {
         self.microphonePermission = microphonePermission
         self.promptContextCapture = promptContextCapture
         self.writingContextCapture = writingContextCapture
+        self.frontmostApplicationBundleIdentifier = frontmostApplicationBundleIdentifier
         self.requestOptionsProvider = requestOptionsProvider
         self.llmClientFactory = llmClientFactory
         self.llmConfigLoader = llmConfigLoader
@@ -292,6 +299,9 @@ actor RecognitionSession {
 
     private var writingContextTask: Task<WritingContext, Never>?
     private var writingContextTaskSessionID: RecognitionSessionID?
+    /// 录音开始时冻结目标应用，避免停止或 HUD 切换焦点后把应用级术语套到错误应用。
+    private var targetApplicationBundleIdentifier: String?
+    private var targetApplicationBundleIdentifierSessionID: RecognitionSessionID?
 
     // MARK: - Active Voice Polish task
 
@@ -353,18 +363,24 @@ actor RecognitionSession {
 
         let provider = selectedASRProvider()
         let sessionID = makeSessionID()
+        let effectiveMode = ASRProviderRegistry.resolvedMode(for: mode, provider: provider)
         currentSessionID = sessionID
         activeProvider = provider
-        let effectiveMode = ASRProviderRegistry.resolvedMode(for: mode, provider: provider)
-        DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
-
-        self.currentMode = effectiveMode
-        self.recordingStartTime = nil
+        currentMode = effectiveMode
+        recordingStartTime = nil
         recordingStartSessionID = nil
         hasEmittedReadyForCurrentSession = false
         pendingLLMError = nil
         streamingDegraded = false
+        // 第一次 await 前必须进入 starting。否则快速松键/ESC 会把仍在捕获前台
+        // App 的会话误认为 idle，待 await 返回后形成僵尸录音。
         state = .starting
+
+        let capturedApplicationBundleIdentifier = await frontmostApplicationBundleIdentifier()
+        guard isCurrent(sessionID), state == .starting else { return }
+        targetApplicationBundleIdentifier = capturedApplicationBundleIdentifier
+        targetApplicationBundleIdentifierSessionID = sessionID
+        DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
 
         if effectiveMode.kind == .voicePolish {
             let level = VoicePolishSettings.contextLevel()
@@ -552,6 +568,10 @@ actor RecognitionSession {
             writingContextTask?.cancel()
             writingContextTask = nil
             writingContextTaskSessionID = nil
+        }
+        if targetApplicationBundleIdentifierSessionID == sessionID {
+            targetApplicationBundleIdentifier = nil
+            targetApplicationBundleIdentifierSessionID = nil
         }
 
         SoundFeedback.playError()
@@ -1081,6 +1101,10 @@ actor RecognitionSession {
             writingContextTask = nil
             writingContextTaskSessionID = nil
         }
+        if targetApplicationBundleIdentifierSessionID == sessionID {
+            targetApplicationBundleIdentifier = nil
+            targetApplicationBundleIdentifierSessionID = nil
+        }
         if voicePolishTaskSessionID == sessionID {
             voicePolishTask?.cancel()
             voicePolishTask = nil
@@ -1106,9 +1130,12 @@ actor RecognitionSession {
     ) async -> Task<String?, Never>? {
         guard needsLLM && canEarlyLLM && currentMode.kind != .voicePolish else { return nil }
 
-        var finalASRText = currentTranscript.composedText
+        let rawASRText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        finalASRText = SnippetStorage.applyEffective(to: finalASRText)
+        let finalASRText = canonicalText(
+            for: rawASRText,
+            sessionID: sessionID
+        )
         DebugFileLogger.log("stop: needsLLM=true mode=\(currentMode.name) text=\(finalASRText.count)chars specMatch=\(finalASRText == speculativeLLMText)")
         guard !finalASRText.isEmpty else { return nil }
 
@@ -1177,11 +1204,13 @@ actor RecognitionSession {
         stopStartedAt stopT0: ContinuousClock.Instant,
         vocabularyContext: VocabularyStorageContext = .production
     ) async -> LLMPostProcessingResult? {
-        // rawText 必须原样留给历史审计。非 Voice Polish 保持旧 snippet 行为；
-        // Voice Polish 必须先取得应用上下文，再按 scope 生成独立 canonical 副本。
-        var finalText = currentMode.kind == .voicePolish
-            ? rawText
-            : SnippetStorage.applyEffective(to: rawText, context: vocabularyContext)
+        // rawText 必须原样留给历史审计。所有模式共用统一术语仓库生成 canonical；
+        // 固定/整句 Snippet 仍由运行时先执行，应用级规则只读取录音开始时冻结的目标应用。
+        var finalText = canonicalText(
+            for: rawText,
+            sessionID: sessionID,
+            vocabularyContext: vocabularyContext
+        )
         var processedText: String?
         var llmFailed = false
         var voicePolishHistoryStatus: String?
@@ -1232,7 +1261,12 @@ actor RecognitionSession {
 
             let terminologyInput = VoicePolishTerminologyRuntime.prepare(
                 rawText: rawText,
-                applicationBundleIdentifier: writingContext.applicationBundleID,
+                // “已捕获但为 nil”也表示录音开始时没有可靠目标，必须保持全局作用域；
+                // 只有旧测试入口完全没有捕获记录时才允许 WritingContext 兜底。
+                applicationBundleIdentifier: terminologyApplicationBundleIdentifier(
+                    for: sessionID,
+                    fallbackBundleIdentifier: writingContext.applicationBundleID
+                ),
                 context: vocabularyContext
             )
             finalText = terminologyInput.canonicalText
@@ -1424,10 +1458,10 @@ actor RecognitionSession {
                 onASREvent?(.processingResult(text: result))
             } else {
                 let err = pendingLLMError ?? LLMError.emptyResponse(nil)
-                DebugFileLogger.log("stop: early LLM failed, falling back to raw text: \(err)")
+                DebugFileLogger.log("stop: early LLM failed, falling back to canonical text: \(err)")
                 pendingLLMError = nil
                 llmFailed = true
-                onASREvent?(.processingResult(text: rawText))
+                onASREvent?(.processingResult(text: finalText))
             }
         } else if needsLLM {
             state = .postProcessing
@@ -1469,9 +1503,9 @@ actor RecognitionSession {
                         return nil
                     }
                     if cleanedResult.isEmpty {
-                        DebugFileLogger.log("stop: sync LLM empty result, falling back to raw text")
+                        DebugFileLogger.log("stop: sync LLM empty result, falling back to canonical text")
                         llmFailed = true
-                        onASREvent?(.processingResult(text: rawText))
+                        onASREvent?(.processingResult(text: finalText))
                     } else {
                         processedText = cleanedResult
                         finalText = cleanedResult
@@ -1483,14 +1517,14 @@ actor RecognitionSession {
                         return nil
                     }
                     logger.error("LLM failed: \(error)")
-                    DebugFileLogger.log("stop: sync LLM FAILED, falling back to raw text: \(error)")
+                    DebugFileLogger.log("stop: sync LLM FAILED, falling back to canonical text: \(error)")
                     llmFailed = true
-                    onASREvent?(.processingResult(text: rawText))
+                    onASREvent?(.processingResult(text: finalText))
                 }
             } else {
-                DebugFileLogger.log("stop: no LLM credentials, falling back to raw text")
+                DebugFileLogger.log("stop: no LLM credentials, falling back to canonical text")
                 llmFailed = true
-                onASREvent?(.processingResult(text: rawText))
+                onASREvent?(.processingResult(text: finalText))
             }
         }
 
@@ -1533,6 +1567,33 @@ actor RecognitionSession {
               state == .postProcessing,
               voicePolishCanonicalOptionSessionID == sessionID else { return }
         onASREvent?(.voicePolishStage(stage))
+    }
+
+    private func applicationBundleIdentifier(for sessionID: RecognitionSessionID) -> String? {
+        guard targetApplicationBundleIdentifierSessionID == sessionID else { return nil }
+        return targetApplicationBundleIdentifier
+    }
+
+    private func terminologyApplicationBundleIdentifier(
+        for sessionID: RecognitionSessionID,
+        fallbackBundleIdentifier: String?
+    ) -> String? {
+        if targetApplicationBundleIdentifierSessionID == sessionID {
+            return targetApplicationBundleIdentifier
+        }
+        return fallbackBundleIdentifier
+    }
+
+    private func canonicalText(
+        for rawText: String,
+        sessionID: RecognitionSessionID,
+        vocabularyContext: VocabularyStorageContext = .production
+    ) -> String {
+        VoicePolishTerminologyRuntime.prepare(
+            rawText: rawText,
+            applicationBundleIdentifier: applicationBundleIdentifier(for: sessionID),
+            context: vocabularyContext
+        ).canonicalText
     }
 
     private func consumeCanonicalVoicePolishRequest(
@@ -2088,9 +2149,9 @@ actor RecognitionSession {
 
     private func fireSpeculativeLLM(sessionID: RecognitionSessionID) async {
         guard isCurrent(sessionID), state == .recording else { return }
-        var text = currentTranscript.composedText
+        let rawText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        text = SnippetStorage.applyEffective(to: text)
+        let text = canonicalText(for: rawText, sessionID: sessionID)
         guard !text.isEmpty, text != speculativeLLMText else { return }
         guard let llmConfig = await loadLLMConfigOffActor() else { return }
         guard isCurrent(sessionID), state == .recording else { return }
@@ -2306,6 +2367,8 @@ actor RecognitionSession {
         writingContextTask?.cancel()
         writingContextTask = nil
         writingContextTaskSessionID = nil
+        targetApplicationBundleIdentifier = nil
+        targetApplicationBundleIdentifierSessionID = nil
         voicePolishTask = nil
         voicePolishTaskSessionID = nil
         voicePolishCanonicalOptionSessionID = nil
@@ -2397,6 +2460,34 @@ extension RecognitionSession {
         llmFailed: Bool,
         historyStatus: String?
     )? {
+        await postProcessForTesting(
+            rawText: rawText,
+            transcript: transcript,
+            mode: .formalWriting,
+            provider: provider,
+            durationMs: durationMs,
+            writingContext: writingContext,
+            vocabularyContext: vocabularyContext
+        )
+    }
+
+    func postProcessForTesting(
+        rawText: String,
+        transcript: RecognitionTranscript,
+        mode: ProcessingMode,
+        needsLLM: Bool? = nil,
+        provider: ASRProvider = .volcano,
+        durationMs: Int = 1_000,
+        writingContext: WritingContext? = nil,
+        applicationBundleIdentifier: String? = nil,
+        applicationBundleIdentifierWasCaptured: Bool = false,
+        vocabularyContext: VocabularyStorageContext = .production
+    ) async -> (
+        finalText: String,
+        processedText: String?,
+        llmFailed: Bool,
+        historyStatus: String?
+    )? {
         let sessionID: RecognitionSessionID
         if let currentSessionID {
             sessionID = currentSessionID
@@ -2404,14 +2495,21 @@ extension RecognitionSession {
             sessionID = makeSessionID()
             currentSessionID = sessionID
         }
-        currentMode = .formalWriting
+        currentMode = mode
+        if applicationBundleIdentifierWasCaptured || applicationBundleIdentifier != nil {
+            targetApplicationBundleIdentifier = applicationBundleIdentifier
+            targetApplicationBundleIdentifierSessionID = sessionID
+        } else {
+            targetApplicationBundleIdentifier = nil
+            targetApplicationBundleIdentifierSessionID = nil
+        }
         if let writingContext {
             writingContextTask = Task { writingContext }
             writingContextTaskSessionID = sessionID
         }
         let result = await postProcessRecognizedText(
             rawText: rawText,
-            needsLLM: true,
+            needsLLM: needsLLM ?? mode.requiresLLM,
             earlyLLMTask: nil,
             transcript: transcript,
             provider: provider,

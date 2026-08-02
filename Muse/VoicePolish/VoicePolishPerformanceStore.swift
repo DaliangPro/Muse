@@ -58,9 +58,16 @@ struct VoicePolishRoutePerformanceSummary: Sendable, Equatable {
 }
 
 struct VoicePolishPerformanceSummary: Sendable, Equatable {
+    /// 最近保存的全部正式语音润色会话，包含主动使用 canonical 和初始化失败。
     let sampleCount: Int
-    let singleCallRate: Double
-    let repairRate: Double
+    /// 真正完成过至少一次 LLM 调用且未由用户主动提前结束的会话。
+    let llmRequestSampleCount: Int
+    /// 系统自动处理的会话；主动使用 canonical 不参与回退率分母。
+    let automaticSampleCount: Int
+    /// 尚无实际模型请求时为 nil，避免把 0/0 错写成 0%。
+    let singleCallRate: Double?
+    /// 尚无实际模型请求时为 nil，避免把 0/0 错写成 0%。
+    let repairRate: Double?
     let fallbackRate: Double
     let routes: [VoicePolishRoutePerformanceSummary]
 }
@@ -134,15 +141,22 @@ enum VoicePolishPerformanceStore {
         return lock.withLock { _ in loadUnlocked(defaults: storage.value) }
     }
 
+    static func automaticSampleCount(defaults: UserDefaults = .standard) -> Int {
+        samples(defaults: defaults).filter { $0.resolvedOutcome != .canonicalExit }.count
+    }
+
     static func summary(
         minimumSampleCount: Int = minimumVisibleSampleCount,
         defaults: UserDefaults = .standard
     ) -> VoicePolishPerformanceSummary? {
         let values = samples(defaults: defaults)
-        guard values.count >= max(1, minimumSampleCount) else { return nil }
-        let count = Double(values.count)
+        let automaticValues = values.filter { $0.resolvedOutcome != .canonicalExit }
+        guard automaticValues.count >= max(1, minimumSampleCount) else { return nil }
+        let llmRequestValues = automaticValues.filter { $0.llmAttemptCount > 0 }
         let routeSummaries = VoicePolishRoute.allCasesForMetrics.compactMap { route -> VoicePolishRoutePerformanceSummary? in
-            let latencies = values.filter { $0.route == route }.map(\.latencyMilliseconds).sorted()
+            let latencies = automaticValues.filter { $0.route == route }
+                .map(\.latencyMilliseconds)
+                .sorted()
             guard !latencies.isEmpty else { return nil }
             return VoicePolishRoutePerformanceSummary(
                 route: route,
@@ -153,13 +167,22 @@ enum VoicePolishPerformanceStore {
         }
         return VoicePolishPerformanceSummary(
             sampleCount: values.count,
-            singleCallRate: Double(values.filter {
-                $0.resolvedOutcome == .success && $0.llmAttemptCount == 1
-            }.count) / count,
-            repairRate: Double(values.filter(\.usedRepair).count) / count,
-            fallbackRate: Double(values.filter {
+            llmRequestSampleCount: llmRequestValues.count,
+            automaticSampleCount: automaticValues.count,
+            singleCallRate: rate(
+                numerator: llmRequestValues.filter { $0.llmAttemptCount == 1 }.count,
+                denominator: llmRequestValues.count
+            ),
+            repairRate: rate(
+                numerator: llmRequestValues.filter(\.usedRepair).count,
+                denominator: llmRequestValues.count
+            ),
+            fallbackRate: rate(
+                numerator: automaticValues.filter {
                 $0.resolvedOutcome == .fallback || $0.resolvedOutcome == .setupFailure
-            }.count) / count,
+                }.count,
+                denominator: automaticValues.count
+            ) ?? 0,
             routes: routeSummaries
         )
     }
@@ -180,6 +203,11 @@ enum VoicePolishPerformanceStore {
         guard !values.isEmpty else { return 0 }
         let rank = max(1, Int(ceil(percentile * Double(values.count))))
         return values[min(values.count - 1, rank - 1)]
+    }
+
+    private static func rate(numerator: Int, denominator: Int) -> Double? {
+        guard denominator > 0 else { return nil }
+        return Double(numerator) / Double(denominator)
     }
 }
 

@@ -32,7 +32,7 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     @State private var recentInputContextEnabled = VoicePolishSettings.recentInputContextEnabled()
     @State private var contextDiagnostic = VoicePolishContextDiagnostics.latest()
     @State private var performanceSummary = VoicePolishPerformanceStore.summary()
-    @State private var performanceSampleCount = VoicePolishPerformanceStore.samples().count
+    @State private var performanceSampleCount = VoicePolishPerformanceStore.automaticSampleCount()
     @State private var saveTask: Task<Void, Never>?
     @State private var saveStatus = ""
     @State private var errorMessage = ""
@@ -568,16 +568,16 @@ private extension VoicePolishSettingsTab {
                 }
 
                 Text(L(
-                    "基于最近 \(performanceSummary.sampleCount) 次真实语音润色请求，不包含文字试跑；这里只展示实测值，不代表目标承诺。",
-                    "Based on the latest \(performanceSummary.sampleCount) real Voice Polish requests, excluding text trials. These are measured values, not target claims."
+                    "最近 \(performanceSummary.sampleCount) 次正式语音润色中，单次/修复率按 \(performanceSummary.llmRequestSampleCount) 次实际模型请求计算，回退率按 \(performanceSummary.automaticSampleCount) 次系统自动处理计算（不含主动使用纠正原文）；不包含文字试跑，也不代表目标承诺。",
+                    "Across the latest \(performanceSummary.sampleCount) Voice Polish sessions, single-call/repair rates use \(performanceSummary.llmRequestSampleCount) actual model requests, while fallback uses \(performanceSummary.automaticSampleCount) automatic runs (excluding manual corrected-transcript exits). Text trials are excluded; these are measurements, not promises."
                 ))
                 .font(TF.settingsFontMetadata)
                 .foregroundStyle(TF.settingsTextTertiary)
                 .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text(L(
-                    "已积累 \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) 次真实请求；样本足够后再显示 P50、P95、修复率和回退率。",
-                    "Collected \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) real requests. P50, P95, repair rate, and fallback rate appear only after enough samples."
+                    "已积累 \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) 次系统自动处理；主动使用纠正原文不计入门槛，样本足够后再显示实测指标。",
+                    "Collected \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) automatic runs. Manual corrected-transcript exits do not count; measured metrics appear only after enough samples."
                 ))
                 .font(TF.settingsFontCaption)
                 .foregroundStyle(TF.settingsTextTertiary)
@@ -761,8 +761,9 @@ private extension VoicePolishSettingsTab {
         return String(format: "%.1fs", Double(milliseconds) / 1_000)
     }
 
-    func percent(_ value: Double) -> String {
-        String(format: "%.0f%%", value * 100)
+    func percent(_ value: Double?) -> String {
+        guard let value else { return L("暂无", "N/A") }
+        return String(format: "%.0f%%", value * 100)
     }
 
     func sceneTitle(_ scene: WritingScene) -> String {
@@ -883,7 +884,7 @@ private extension VoicePolishSettingsTab {
 
     @MainActor
     func reloadPerformanceSummary() {
-        performanceSampleCount = VoicePolishPerformanceStore.samples().count
+        performanceSampleCount = VoicePolishPerformanceStore.automaticSampleCount()
         performanceSummary = VoicePolishPerformanceStore.summary()
     }
 

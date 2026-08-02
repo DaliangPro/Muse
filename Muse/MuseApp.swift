@@ -318,11 +318,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             Task { @MainActor in
                 let phase = self.appState.barPhase
-                if await self.appState.useVoicePolishCanonicalTextIfAvailable(
+                let canonicalResult = await self.appState.useVoicePolishCanonicalTextIfAvailable(
                     restoreOnFailure: false
-                ) {
+                )
+                if canonicalResult == .accepted {
                     AppLogger.log("[Muse] >>> HOTKEY: ESC use Voice Polish canonical text")
                     DebugFileLogger.log("hotkey ESC use voice polish canonical text")
+                    return
+                }
+                guard canonicalResult.shouldAbortSessionAfterEscape else {
+                    DebugFileLogger.log("hotkey ESC ignored stale voice polish canonical ack")
                     return
                 }
                 DebugFileLogger.log("hotkey ESC canonical unavailable or rejected; continuing with abort")

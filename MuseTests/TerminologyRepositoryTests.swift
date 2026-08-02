@@ -3,11 +3,12 @@ import XCTest
 @testable import Muse
 
 final class TerminologyRepositoryTests: XCTestCase {
-    func testProjectionPreservesSpaceAliasAndOmitsAmbiguousAlias() {
+    func testProjectionCorrectsTypelessAliasVariantsAndOmitsAmbiguousAlias() {
         let typeless = TerminologyEntry(
             canonicalText: "Typeless",
             aliases: [
                 TerminologyAlias(text: "Type less", source: .manual),
+                TerminologyAlias(text: "type list", source: .manual),
                 TerminologyAlias(text: "Type-less", source: .legacySnippet),
                 TerminologyAlias(text: "typeless", source: .confirmedCorrection),
             ]
@@ -26,10 +27,21 @@ final class TerminologyRepositoryTests: XCTestCase {
         ))
         let projection = TerminologyProjections.make(from: document)
 
-        XCTAssertEqual(document.entries.first?.aliases.map(\.text), ["Type less", "Type-less", "typeless"])
+        XCTAssertEqual(
+            document.entries.first?.aliases.map(\.text),
+            ["Type less", "type list", "Type-less", "typeless"]
+        )
         XCTAssertEqual(projection.corrections["Type less"], "Typeless")
+        XCTAssertEqual(projection.corrections["type list"], "Typeless")
         XCTAssertEqual(projection.corrections["Type-less"], "Typeless")
         XCTAssertEqual(projection.corrections["typeless"], "Typeless")
+        XCTAssertEqual(
+            EntityResolver.applyingKnownCorrections(
+                projection.corrections,
+                to: "Type less、type list、TypeLess"
+            ),
+            "Typeless、Typeless、Typeless"
+        )
         XCTAssertNil(projection.corrections["shared"])
         XCTAssertNil(projection.corrections["Shared"])
         XCTAssertEqual(document.conflicts.count, 1)

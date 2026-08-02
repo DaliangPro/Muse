@@ -13,6 +13,19 @@ enum FloatingBarPhase: Equatable {
     case error
 }
 
+/// canonical 出口请求的最终归属。`stale` 表示请求发出后 HUD 已换代，
+/// 调用方必须忽略迟到 ACK，不能据此取消当前或下一条会话。
+enum VoicePolishCanonicalExitResult: Equatable {
+    case accepted
+    case rejected
+    case stale
+
+    /// ESC 只有在当前 HUD 确认未接管 canonical 出口时，才继续原有取消语义。
+    var shouldAbortSessionAfterEscape: Bool {
+        self == .rejected
+    }
+}
+
 // MARK: - Transcription Segment
 
 struct TranscriptionSegment: Identifiable, Equatable {
@@ -73,6 +86,8 @@ final class AppState {
     @ObservationIgnored var onUseVoicePolishCanonicalText: (() async -> Bool)?
     @ObservationIgnored private let voicePolishCanonicalExitDelay: Duration
     @ObservationIgnored private var voicePolishCanonicalExitGeneration = 0
+    /// canonical 已接受或 pipeline 已提交结果后，在 finalized/completed 之前屏蔽重复 ESC。
+    @ObservationIgnored private var hasCommittedVoicePolishTerminalResult = false
 
     // MARK: Update Check
 
@@ -192,9 +207,12 @@ final class AppState {
         }
         copyFallbackWasCopied = false
         segments = [TranscriptionSegment(text: result, isConfirmed: true)]
+        if barPhase == .processing, currentMode.kind == .voicePolish {
+            hasCommittedVoicePolishTerminalResult = true
+        }
         // processingResult 表示 Session 已提交最终输出，canonical 出口不再可用。
         // 必须在 finalized 之前关闭，避免注入阶段仍显示一个后台必然拒绝的按钮。
-        resetVoicePolishProcessingState()
+        resetVoicePolishProcessingState(preserveTerminalResult: true)
     }
 
     func showVoicePolishStage(_ stage: VoicePolishStage) {
@@ -229,16 +247,20 @@ final class AppState {
         }
     }
 
-    /// 鼠标、VoiceOver 与 ESC 最终都等待 RecognitionSession 的 Bool 确认。
+    /// 鼠标、VoiceOver 与 ESC 最终都等待 RecognitionSession 的明确确认。
     /// AppState 的可用态只负责防重复点击，不能自行宣告 canonical 已被接受。
     @discardableResult
     func useVoicePolishCanonicalTextIfAvailable(
         restoreOnFailure: Bool
-    ) async -> Bool {
+    ) async -> VoicePolishCanonicalExitResult {
+        if isRequestingVoicePolishCanonicalText || hasCommittedVoicePolishTerminalResult {
+            // 请求在途或已收到成功 ACK 时，后续 ESC 都属于重复事件；不得把
+            // `canUse=false` 误解成当前会话明确拒绝并继续 abort。
+            return .stale
+        }
         guard barPhase == .processing,
               currentMode.kind == .voicePolish,
-              canUseVoicePolishCanonicalText,
-              !isRequestingVoicePolishCanonicalText else { return false }
+              canUseVoicePolishCanonicalText else { return .rejected }
         voicePolishCanonicalExitGeneration &+= 1
         let generation = voicePolishCanonicalExitGeneration
         canUseVoicePolishCanonicalText = false
@@ -249,18 +271,19 @@ final class AppState {
         guard voicePolishCanonicalExitGeneration == generation,
               barPhase == .processing,
               currentMode.kind == .voicePolish else {
-            // Session 结果已经提交或 HUD 已进入其他阶段时，不得让迟到的 false
-            // 把过期按钮重新显示出来。
-            return accepted
+            // Session 结果已经提交或 HUD 已进入其他阶段时，ACK 已失去归属。
+            // 无论后台返回 true/false，都不能复活按钮或触发 ESC abort。
+            return .stale
         }
 
         isRequestingVoicePolishCanonicalText = false
         if accepted {
+            hasCommittedVoicePolishTerminalResult = true
             voicePolishCanonicalExitMessage = L(
                 "正在使用纠正文本…",
                 "Using corrected transcript…"
             )
-            return true
+            return .accepted
         }
 
         if restoreOnFailure, voicePolishStage != nil {
@@ -272,7 +295,7 @@ final class AppState {
         } else {
             voicePolishCanonicalExitMessage = nil
         }
-        return false
+        return .rejected
     }
 
     func finalize(text: String, outcome: InjectionOutcome) {
@@ -354,11 +377,14 @@ final class AppState {
 
     private var hideGeneration = 0
 
-    private func resetVoicePolishProcessingState() {
+    private func resetVoicePolishProcessingState(preserveTerminalResult: Bool = false) {
         voicePolishCanonicalExitGeneration &+= 1
         voicePolishStage = nil
         canUseVoicePolishCanonicalText = false
         isRequestingVoicePolishCanonicalText = false
+        if !preserveTerminalResult {
+            hasCommittedVoicePolishTerminalResult = false
+        }
         voicePolishCanonicalExitMessage = nil
     }
 
