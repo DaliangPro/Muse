@@ -57,6 +57,10 @@ final class AppState {
     var processingFinishTime: Date?
     var copyFallbackWasCopied = false
     var preserveProcessingWidthForCopyFallback = false
+    var voicePolishStage: VoicePolishStage?
+    var canUseVoicePolishCanonicalText = false
+    var isRequestingVoicePolishCanonicalText = false
+    var voicePolishCanonicalExitMessage: String?
     var isQwen3OnlyMode: Bool {
         SenseVoiceServerManager.currentPort == nil && SenseVoiceServerManager.currentQwen3Port != nil
     }
@@ -66,6 +70,9 @@ final class AppState {
     @ObservationIgnored var onShowPanel: (() -> Void)?
     @ObservationIgnored var onHidePanel: (() -> Void)?
     @ObservationIgnored var onCopyFallbackVisibilityChange: ((Bool) -> Void)?
+    @ObservationIgnored var onUseVoicePolishCanonicalText: (() async -> Bool)?
+    @ObservationIgnored private let voicePolishCanonicalExitDelay: Duration
+    @ObservationIgnored private var voicePolishCanonicalExitGeneration = 0
 
     // MARK: Update Check
 
@@ -79,13 +86,17 @@ final class AppState {
         set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.hasCompletedSetup) }
     }
 
-    init(initialModes: [ProcessingMode]? = nil) {
+    init(
+        initialModes: [ProcessingMode]? = nil,
+        voicePolishCanonicalExitDelay: Duration = .milliseconds(1_200)
+    ) {
         // 测试必须注入内存模式，避免读取或隔离真实用户的 modes.json。
         let modes = initialModes ?? ModeStorage().load()
         availableModes = modes
         currentMode = modes.first(where: { $0.id == ProcessingMode.smartDirectId })
             ?? modes.first
             ?? .direct
+        self.voicePolishCanonicalExitDelay = voicePolishCanonicalExitDelay
     }
 
     // MARK: Actions
@@ -97,6 +108,7 @@ final class AppState {
         feedbackMessage = L("已完成", "Done")
         copyFallbackWasCopied = false
         preserveProcessingWidthForCopyFallback = false
+        resetVoicePolishProcessingState()
         onCopyFallbackVisibilityChange?(false)
         barPhase = .preparing
         preparingStartDate = Date()
@@ -124,6 +136,7 @@ final class AppState {
             cancel()
         case .recording:
             processingFinishTime = nil
+            resetVoicePolishProcessingState()
             // 2026-07 修回归：AX 焦点查询对微信等无响应进程可阻塞主线程数百 ms（AX 超时上限秒级），
             // 曾导致停止录音瞬间 HUD 冻结（文字不显示/卡顿）。改后台计算，先按 false 走流程
             preserveProcessingWidthForCopyFallback = false
@@ -179,6 +192,87 @@ final class AppState {
         }
         copyFallbackWasCopied = false
         segments = [TranscriptionSegment(text: result, isConfirmed: true)]
+        // processingResult 表示 Session 已提交最终输出，canonical 出口不再可用。
+        // 必须在 finalized 之前关闭，避免注入阶段仍显示一个后台必然拒绝的按钮。
+        resetVoicePolishProcessingState()
+    }
+
+    func showVoicePolishStage(_ stage: VoicePolishStage) {
+        guard barPhase == .processing, currentMode.kind == .voicePolish else { return }
+        let shouldScheduleCanonicalExit = voicePolishStage == nil
+            && !canUseVoicePolishCanonicalText
+        voicePolishStage = stage
+        guard shouldScheduleCanonicalExit else { return }
+
+        voicePolishCanonicalExitGeneration &+= 1
+        let generation = voicePolishCanonicalExitGeneration
+        if voicePolishCanonicalExitDelay <= .zero {
+            canUseVoicePolishCanonicalText = true
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: self.voicePolishCanonicalExitDelay)
+            guard self.voicePolishCanonicalExitGeneration == generation,
+                  self.barPhase == .processing,
+                  self.currentMode.kind == .voicePolish,
+                  self.voicePolishStage != nil else { return }
+            self.canUseVoicePolishCanonicalText = true
+        }
+    }
+
+    func useVoicePolishCanonicalText() {
+        Task { @MainActor [weak self] in
+            _ = await self?.useVoicePolishCanonicalTextIfAvailable(
+                restoreOnFailure: true
+            )
+        }
+    }
+
+    /// 鼠标、VoiceOver 与 ESC 最终都等待 RecognitionSession 的 Bool 确认。
+    /// AppState 的可用态只负责防重复点击，不能自行宣告 canonical 已被接受。
+    @discardableResult
+    func useVoicePolishCanonicalTextIfAvailable(
+        restoreOnFailure: Bool
+    ) async -> Bool {
+        guard barPhase == .processing,
+              currentMode.kind == .voicePolish,
+              canUseVoicePolishCanonicalText,
+              !isRequestingVoicePolishCanonicalText else { return false }
+        voicePolishCanonicalExitGeneration &+= 1
+        let generation = voicePolishCanonicalExitGeneration
+        canUseVoicePolishCanonicalText = false
+        isRequestingVoicePolishCanonicalText = true
+        voicePolishCanonicalExitMessage = L("正在切换…", "Switching…")
+
+        let accepted = await onUseVoicePolishCanonicalText?() ?? false
+        guard voicePolishCanonicalExitGeneration == generation,
+              barPhase == .processing,
+              currentMode.kind == .voicePolish else {
+            // Session 结果已经提交或 HUD 已进入其他阶段时，不得让迟到的 false
+            // 把过期按钮重新显示出来。
+            return accepted
+        }
+
+        isRequestingVoicePolishCanonicalText = false
+        if accepted {
+            voicePolishCanonicalExitMessage = L(
+                "正在使用纠正文本…",
+                "Using corrected transcript…"
+            )
+            return true
+        }
+
+        if restoreOnFailure, voicePolishStage != nil {
+            canUseVoicePolishCanonicalText = true
+            voicePolishCanonicalExitMessage = L(
+                "切换失败，点击重试",
+                "Switch failed — retry"
+            )
+        } else {
+            voicePolishCanonicalExitMessage = nil
+        }
+        return false
     }
 
     func finalize(text: String, outcome: InjectionOutcome) {
@@ -187,6 +281,7 @@ final class AppState {
             return
         }
         segments = [TranscriptionSegment(text: text, isConfirmed: true)]
+        resetVoicePolishProcessingState()
         if case .noFocusedInput(let copiedToClipboard) = outcome {
             showCopyFallback(message: outcome.completionMessage, copiedToClipboard: copiedToClipboard)
             return
@@ -196,6 +291,7 @@ final class AppState {
 
     func showError(_ message: String) {
         feedbackMessage = message
+        resetVoicePolishProcessingState()
         audioLevel.current = 0
         recordingStartDate = nil
         onCopyFallbackVisibilityChange?(false)
@@ -210,12 +306,14 @@ final class AppState {
         audioLevel.current = 0
         copyFallbackWasCopied = false
         preserveProcessingWidthForCopyFallback = false
+        resetVoicePolishProcessingState()
         onCopyFallbackVisibilityChange?(false)
         onHidePanel?()
     }
 
     func showCancelled() {
         feedbackMessage = L("已取消", "Cancelled")
+        resetVoicePolishProcessingState()
         audioLevel.current = 0
         recordingStartDate = nil
         onCopyFallbackVisibilityChange?(false)
@@ -256,8 +354,17 @@ final class AppState {
 
     private var hideGeneration = 0
 
+    private func resetVoicePolishProcessingState() {
+        voicePolishCanonicalExitGeneration &+= 1
+        voicePolishStage = nil
+        canUseVoicePolishCanonicalText = false
+        isRequestingVoicePolishCanonicalText = false
+        voicePolishCanonicalExitMessage = nil
+    }
+
     private func showDone(message: String = L("已完成", "Done")) {
         feedbackMessage = message
+        resetVoicePolishProcessingState()
         copyFallbackWasCopied = false
         preserveProcessingWidthForCopyFallback = false
         onCopyFallbackVisibilityChange?(false)

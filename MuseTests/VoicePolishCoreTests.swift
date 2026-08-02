@@ -15,13 +15,38 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(route("Scratch that. I mean, ship it Friday."), .deep)
     }
 
-    func testRouterUsesCharacterAndWordThresholds() {
+    func testRouterUsesLengthOnlyForStructuredAndNeverForDeep() {
         XCTAssertEqual(route(String(repeating: "中", count: 120)), .fast)
         XCTAssertEqual(route(String(repeating: "中", count: 121)), .structured)
-        XCTAssertEqual(route(String(repeating: "中", count: 501)), .deep)
+        XCTAssertEqual(route(String(repeating: "中", count: 501)), .structured)
         XCTAssertEqual(route(Array(repeating: "word", count: 80).joined(separator: " ")), .fast)
         XCTAssertEqual(route(Array(repeating: "word", count: 81).joined(separator: " ")), .structured)
-        XCTAssertEqual(route(Array(repeating: "word", count: 301).joined(separator: " ")), .deep)
+        XCTAssertEqual(route(Array(repeating: "word", count: 301).joined(separator: " ")), .structured)
+    }
+
+    func testRouterDoesNotUseSegmentCountAloneForDeep() {
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: "今天整理方案。明天发给团队。",
+                segments: [segment("今天整理方案。"), RecognitionSegment(
+                    id: "s2",
+                    text: "明天发给团队。",
+                    startTimeMs: nil,
+                    endTimeMs: nil,
+                    confidence: nil,
+                    isFinal: true
+                )],
+                durationMs: 1_000,
+                provider: .volcano
+            ),
+            context: .phaseOneUnknown,
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .balanced
+        )
+
+        let decision = VoicePolishComplexityRouter.decide(request: request, factCandidates: [])
+
+        XCTAssertEqual(decision.route, .structured)
     }
 
     func testQualityModesApplyDeterministicExecutionPolicy() {
@@ -258,7 +283,21 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(VoicePolishSettings.qualityMode(defaults: defaults), .balanced)
         XCTAssertEqual(VoicePolishSettings.contextLevel(defaults: defaults), .metadataOnly)
         XCTAssertFalse(VoicePolishSettings.personalizationEnabled(defaults: defaults))
+        XCTAssertTrue(VoicePolishSettings.terminologyLearningEnabled(defaults: defaults))
         XCTAssertEqual(VoicePolishSettings.correctionLimit(defaults: defaults), 200)
+        XCTAssertNil(VoicePolishSettings.modelOverride(defaults: defaults))
+    }
+
+    func testVoicePolishDedicatedModelOverrideIsTrimmedAndOptional() {
+        let suite = "VoicePolishModelOverrideTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        VoicePolishSettings.setModelOverride("  fast-model  ", defaults: defaults)
+        XCTAssertEqual(VoicePolishSettings.modelOverride(defaults: defaults), "fast-model")
+
+        VoicePolishSettings.setModelOverride("   ", defaults: defaults)
+        XCTAssertNil(VoicePolishSettings.modelOverride(defaults: defaults))
     }
 
     func testInputEnvelopeAlwaysCoversAuthoritativeFinalTranscript() {
@@ -271,7 +310,8 @@ final class VoicePolishCoreTests: XCTestCase {
 
         let envelope = VoiceInputEnvelope.fromFinalTranscript(
             transcript,
-            finalText: "已确认的前半句，最终完整后半句。",
+            rawFinalText: "已确认的前半句，最终完整后半句。",
+            canonicalText: "已确认的前半句，最终完整后半句。",
             durationMs: 2_000,
             provider: .volcano
         )
@@ -279,6 +319,63 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(envelope?.providerFinalText, "已确认的前半句，最终完整后半句。")
         XCTAssertEqual(envelope?.segments.map(\.text), ["已确认的前半句，最终完整后半句。"])
         XCTAssertEqual(envelope?.segments.map(\.id), ["s1"])
+    }
+
+    func testInputEnvelopeKeepsRawEvidenceAndUsesCanonicalFallback() {
+        let raw = "我正在使用 Type less。"
+        let canonical = "我正在使用 Typeless。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let envelope = VoiceInputEnvelope.fromFinalTranscript(
+            transcript,
+            rawFinalText: raw,
+            canonicalText: canonical,
+            durationMs: 1_000,
+            provider: .volcano
+        )
+
+        XCTAssertEqual(envelope?.providerFinalText, raw)
+        XCTAssertEqual(envelope?.rawSegments.map(\.text), [raw])
+        XCTAssertEqual(envelope?.canonicalText, canonical)
+        XCTAssertEqual(envelope?.segments.map(\.text), [canonical])
+        XCTAssertEqual(envelope?.fallbackText, canonical)
+    }
+
+    func testCanonicalizationKeepsSegmentIdentityAndRecordsActualTerminologyEdit() throws {
+        let rawSegments = ["我正在使用 Type less。", "它很好用。"]
+        let raw = rawSegments.joined()
+        let canonicalSegments = ["我正在使用 Typeless。", "它很好用。"]
+        let canonical = canonicalSegments.joined()
+        let transcript = RecognitionTranscript(
+            confirmedSegments: rawSegments,
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let envelope = try XCTUnwrap(VoiceInputEnvelope.fromFinalTranscript(
+            transcript,
+            rawFinalText: raw,
+            canonicalText: canonical,
+            preferredCanonicalSegmentTexts: canonicalSegments,
+            deterministicCorrections: ["Type less": "Typeless"],
+            durationMs: 1_000,
+            provider: .volcano
+        ))
+
+        XCTAssertEqual(envelope.rawSegments.map(\.id), ["s1", "s2"])
+        XCTAssertEqual(envelope.segments.map(\.id), ["s1", "s2"])
+        XCTAssertEqual(envelope.segments.map(\.text), canonicalSegments)
+        XCTAssertEqual(envelope.requiredEntityEdits, [VoiceTerminologyEdit(
+            alias: "Type less",
+            canonical: "Typeless",
+            sourceSegmentIDs: ["s1"]
+        )])
     }
 
     private func route(_ text: String, scene: WritingScene = .unknown) -> VoicePolishRoute {

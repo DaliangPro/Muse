@@ -45,6 +45,7 @@ enum VoicePolishValidator {
         }) {
             append(.planIntegrityFailure, to: &codes)
         }
+        appendTerminologyEditCodes(output: output, request: request, to: &codes)
         return VoicePolishValidationResult(codes: codes)
     }
 
@@ -193,7 +194,56 @@ enum VoicePolishValidator {
             append(.ambiguousStructuredResponse, to: &codes)
         }
 
+        appendTerminologyEditCodes(output: output, request: request, to: &codes)
+
         return VoicePolishValidationResult(codes: codes)
+    }
+
+    /// canonical 化阶段已经实际命中的术语必须保持标准写法，且旧 alias 不能被
+    /// 模型重新带回。两项分开校验，避免「Typeless（Type less）」因为包含标准词
+    /// 而被误判为通过。
+    private static func appendTerminologyEditCodes(
+        output: String,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        for edit in terminologyEdits(for: request) {
+            let canonical = normalizedNaturalText(edit.canonical)
+            if canonical.isEmpty || !normalizedNaturalText(output).contains(canonical) {
+                append(.missingProtectedFact, to: &codes)
+            }
+            if EntityResolver.applyingKnownCorrections(
+                [edit.alias: edit.canonical],
+                to: output
+            ) != output {
+                append(.supersededFactRetained, to: &codes)
+            }
+        }
+    }
+
+    private static func terminologyEdits(
+        for request: VoicePolishRequest
+    ) -> [VoiceTerminologyEdit] {
+        var edits = request.input.requiredEntityEdits
+        let fallback = request.input.fallbackText
+        edits.append(contentsOf: request.resolvedEntities.compactMap { entity in
+            guard entity.surfaceText != entity.canonical,
+                  EntityResolver.applying([entity], to: fallback) != fallback else {
+                return nil
+            }
+            return VoiceTerminologyEdit(
+                alias: entity.surfaceText,
+                canonical: entity.canonical,
+                sourceSegmentIDs: entity.sourceSegmentIDs
+            )
+        })
+
+        var seen = Set<String>()
+        return edits.filter { edit in
+            seen.insert(
+                "\(normalizedNaturalText(edit.alias))|\(normalizedNaturalText(edit.canonical))"
+            ).inserted
+        }
     }
 
     private static func commonCodes(

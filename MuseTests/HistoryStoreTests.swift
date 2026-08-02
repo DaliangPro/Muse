@@ -186,6 +186,191 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertTrue(empty.isEmpty)
     }
 
+    func testVoicePolishCorrectionUpsertRollsBackWhenRetentionPruneFails() async throws {
+        await store.insert(HistoryRecord(
+            id: "vp-transaction-old",
+            createdAt: Date(timeIntervalSince1970: 1_000),
+            durationSeconds: 1,
+            rawText: "旧原文",
+            processingMode: "语音润色",
+            processedText: "旧结果",
+            finalText: "旧结果",
+            status: "voice_polish_success",
+            characterCount: 3
+        ))
+        _ = try await store.confirmVoicePolishCorrection(
+            historyID: "vp-transaction-old",
+            correctedText: "旧修改",
+            scene: .document,
+            personalizationEnabled: true,
+            retentionLimit: 2
+        )
+        await store.insert(HistoryRecord(
+            id: "vp-transaction-new",
+            createdAt: Date(timeIntervalSince1970: 2_000),
+            durationSeconds: 1,
+            rawText: "新原文",
+            processingMode: "语音润色",
+            processedText: "新结果",
+            finalText: "新结果",
+            status: "voice_polish_success",
+            characterCount: 3
+        ))
+
+        var triggerDB: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(testPath, &triggerDB), SQLITE_OK)
+        defer { sqlite3_close(triggerDB) }
+        let triggerSQL = """
+        CREATE TRIGGER fail_voice_polish_prune
+        BEFORE DELETE ON voice_polish_corrections
+        BEGIN
+            SELECT RAISE(ABORT, 'planned prune failure');
+        END;
+        """
+        XCTAssertEqual(sqlite3_exec(triggerDB, triggerSQL, nil, nil, nil), SQLITE_OK)
+
+        do {
+            _ = try await store.confirmVoicePolishCorrection(
+                historyID: "vp-transaction-new",
+                correctedText: "新修改",
+                scene: .document,
+                personalizationEnabled: true,
+                retentionLimit: 1
+            )
+            XCTFail("清理失败时整笔纠正事务必须失败")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("planned prune failure"))
+        }
+
+        let stored = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(stored.map(\.historyID), ["vp-transaction-old"])
+        XCTAssertEqual(stored.first?.correctedText, "旧修改")
+    }
+
+    func testVoicePolishCorrectionCanBeUndoneWithoutDeletingHistory() async throws {
+        await store.insert(HistoryRecord(
+            id: "vp-undo", createdAt: Date(), durationSeconds: 1,
+            rawText: "Type less", processingMode: "语音润色", processedText: "Type less",
+            finalText: "Type less", status: "voice_polish_success", characterCount: 9
+        ))
+        _ = try await store.confirmVoicePolishCorrection(
+            historyID: "vp-undo",
+            correctedText: "Typeless",
+            scene: .workChat,
+            personalizationEnabled: true,
+            retentionLimit: 200
+        )
+
+        try await store.deleteVoicePolishCorrection(historyID: "vp-undo")
+
+        let corrections = try await store.fetchVoicePolishCorrections()
+        let histories = await store.fetch(ids: ["vp-undo"])
+        XCTAssertTrue(corrections.isEmpty)
+        XCTAssertEqual(histories.first?.finalText, "Type less")
+    }
+
+    func testDeleteOrThrowAtomicallyRemovesHistoryAndCorrection() async throws {
+        await store.insert(HistoryRecord(
+            id: "vp-delete-throwing", createdAt: Date(), durationSeconds: 1,
+            rawText: "Type less", processingMode: "语音润色", processedText: "Type less",
+            finalText: "Type less", status: "voice_polish_success", characterCount: 9
+        ))
+        _ = try await store.confirmVoicePolishCorrection(
+            historyID: "vp-delete-throwing",
+            correctedText: "Typeless",
+            scene: .chat,
+            personalizationEnabled: true,
+            retentionLimit: 200
+        )
+
+        try await store.deleteOrThrow(id: "vp-delete-throwing")
+
+        let histories = await store.fetch(ids: ["vp-delete-throwing"])
+        let corrections = try await store.fetchVoicePolishCorrections()
+        XCTAssertTrue(histories.isEmpty)
+        XCTAssertTrue(corrections.isEmpty)
+    }
+
+    func testVoicePolishTerminologyOnlyCorrectionWorksWithStyleLearningOff() async throws {
+        await store.insert(HistoryRecord(
+            id: "vp-term-only", createdAt: Date(), durationSeconds: 1,
+            rawText: "Type less", processingMode: "语音润色", processedText: "Type less",
+            finalText: "Type less", status: "voice_polish_success", characterCount: 9
+        ))
+
+        let record = try await store.confirmVoicePolishCorrection(
+            historyID: "vp-term-only",
+            correctedText: "Typeless",
+            scene: .workChat,
+            personalizationEnabled: false,
+            retentionLimit: 200,
+            learnStyle: false,
+            learnTerminology: true
+        )
+
+        XCTAssertFalse(record.learnStyle)
+        XCTAssertTrue(record.learnTerminology)
+        let stored = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(stored.map(\.learnStyle), [false])
+        XCTAssertEqual(stored.map(\.learnTerminology), [true])
+    }
+
+    func testResetVoicePolishStyleLearningPreservesTerminologyEvidence() async throws {
+        let fixtures: [(id: String, learnedText: String)] = [
+            ("vp-mixed", "Typeless 正确"),
+            ("vp-style-only", "更简洁的表达"),
+            ("vp-term-only-reset", "Claude Code 正确"),
+        ]
+        for (index, fixture) in fixtures.enumerated() {
+            await store.insert(HistoryRecord(
+                id: fixture.id,
+                createdAt: Date(timeIntervalSince1970: Double(index + 1)),
+                durationSeconds: 1,
+                rawText: "原始文字 \(index)",
+                processingMode: "语音润色",
+                processedText: "生成文字 \(index)",
+                finalText: "生成文字 \(index)",
+                status: "voice_polish_success",
+                characterCount: 6
+            ))
+        }
+
+        _ = try await store.confirmVoicePolishCorrection(
+            historyID: fixtures[0].id,
+            correctedText: fixtures[0].learnedText,
+            scene: .chat,
+            personalizationEnabled: true,
+            retentionLimit: 200,
+            learnStyle: true,
+            learnTerminology: true
+        )
+        _ = try await store.confirmVoicePolishCorrection(
+            historyID: fixtures[1].id,
+            correctedText: fixtures[1].learnedText,
+            scene: .chat,
+            personalizationEnabled: true,
+            retentionLimit: 200,
+            learnStyle: true,
+            learnTerminology: false
+        )
+        _ = try await store.confirmVoicePolishCorrection(
+            historyID: fixtures[2].id,
+            correctedText: fixtures[2].learnedText,
+            scene: .code,
+            personalizationEnabled: false,
+            retentionLimit: 200,
+            learnStyle: false,
+            learnTerminology: true
+        )
+
+        try await store.resetVoicePolishStyleLearning()
+
+        let records = try await store.fetchVoicePolishCorrections()
+        XCTAssertEqual(Set(records.map(\.historyID)), [fixtures[0].id, fixtures[2].id])
+        XCTAssertTrue(records.allSatisfy { !$0.learnStyle })
+        XCTAssertTrue(records.allSatisfy(\.learnTerminology))
+    }
+
     func testHistoryPruneAlsoRemovesOrphanedVoicePolishCorrections() async throws {
         for index in 0..<2 {
             let id = "prune-vp-\(index)"

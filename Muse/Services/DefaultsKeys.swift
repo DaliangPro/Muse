@@ -27,9 +27,12 @@ enum DefaultsKeys {
     static let voicePolishQualityMode = "tf_voicePolishQualityMode"
     static let voicePolishContextLevel = "tf_voicePolishContextLevel"
     static let voicePolishPersonalizationEnabled = "tf_voicePolishPersonalizationEnabled"
+    static let voicePolishTerminologyLearningEnabled = "tf_voicePolishTerminologyLearningEnabled"
     static let voicePolishCorrectionLimit = "tf_voicePolishCorrectionLimit"
     static let voicePolishSceneOverrides = "tf_voicePolishSceneOverrides"
     static let voicePolishSnippetMigrationCompleted = "tf_voicePolishSnippetMigrationCompleted"
+    static let voicePolishModelOverride = "tf_voicePolishModelOverride"
+    static let voicePolishRecentInputContextEnabled = "tf_voicePolishRecentInputContextEnabled"
 
     // MARK: - Provider 选择（此前在 ModesSettingsTab 与 KeychainService 各定义一遍，易漂移）
     static let selectedASRProvider = "tf_selectedASRProvider"

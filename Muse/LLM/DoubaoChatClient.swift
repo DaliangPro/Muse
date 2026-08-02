@@ -106,7 +106,14 @@ actor DoubaoChatClient: LLMClient {
             maxTokens: capabilities.supportsDynamicMaxTokens
                 ? request.options.maxOutputTokens
                 : nil,
-            appliesThinkingControl: appliesThinkingControl
+            appliesThinkingControl: appliesThinkingControl,
+            temperature: capabilities.supportsTemperature
+                ? request.options.temperature
+                : nil,
+            responseFormat: capabilities.supportsJSONMode
+                ? request.options.responseFormat
+                : .text,
+            reasoningPolicy: request.options.reasoningPolicy
         )
         return LLMResponse(text: result.text, model: config.model)
     }
@@ -227,7 +234,10 @@ actor DoubaoChatClient: LLMClient {
         messages: [ChatMessage],
         useStreaming: Bool,
         maxTokens: Int?,
-        appliesThinkingControl: Bool
+        appliesThinkingControl: Bool,
+        temperature: Double? = nil,
+        responseFormat: LLMResponseFormat = .text,
+        reasoningPolicy: ReasoningPolicy = .providerDefault
     ) async throws -> LLMExecutionResult {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -240,7 +250,10 @@ actor DoubaoChatClient: LLMClient {
             messages: messages,
             stream: useStreaming,
             maxTokens: maxTokens,
-            appliesThinkingControl: appliesThinkingControl
+            appliesThinkingControl: appliesThinkingControl,
+            temperature: temperature,
+            responseFormat: responseFormat,
+            reasoningPolicy: reasoningPolicy
         ))
         Self.authorizeLocalServiceRequest(&request, provider: provider)
 
@@ -248,9 +261,18 @@ actor DoubaoChatClient: LLMClient {
             "LLM request: \(textLength) chars, endpoint=\(config.model), stream=\(useStreaming), thinking=\(config.thinkingMode.rawValue), controlled=\(appliesThinkingControl)"
         )
 
+        let requestStartedAt = ContinuousClock.now
         let result = useStreaming
-            ? try await processStreaming(request: request, model: config.model)
-            : try await processNonStreaming(request: request, model: config.model)
+            ? try await processStreaming(
+                request: request,
+                model: config.model,
+                requestStartedAt: requestStartedAt
+            )
+            : try await processNonStreaming(
+                request: request,
+                model: config.model,
+                requestStartedAt: requestStartedAt
+            )
         let controlAccepted = appliesThinkingControl
             && provider.thinkingRequestField(for: config.model).isExplicitlyControllable
         logger.info("LLM result: \(result.text.count) chars")
@@ -266,15 +288,30 @@ actor DoubaoChatClient: LLMClient {
         messages: [ChatMessage],
         stream: Bool,
         maxTokens: Int?,
-        appliesThinkingControl: Bool = true
+        appliesThinkingControl: Bool = true,
+        temperature: Double? = nil,
+        responseFormat: LLMResponseFormat = .text,
+        reasoningPolicy: ReasoningPolicy = .providerDefault
     ) -> ChatRequest {
         let thinkingField = provider.thinkingRequestField(for: config.model)
         let thinkingEnabled = config.thinkingMode.isEnabled
+        let reasoningEffort: String
+        if !thinkingEnabled {
+            reasoningEffort = "none"
+        } else if reasoningPolicy == .low {
+            reasoningEffort = "low"
+        } else {
+            reasoningEffort = "medium"
+        }
         return ChatRequest(
             model: config.model,
             messages: messages,
             stream: stream,
             max_tokens: maxTokens,
+            temperature: temperature,
+            response_format: responseFormat == .jsonObject
+                ? ChatResponseFormat(type: "json_object")
+                : nil,
             thinking: appliesThinkingControl && thinkingField == .thinking
                 ? ThinkingConfig(type: thinkingEnabled ? "enabled" : "disabled")
                 : nil,
@@ -282,10 +319,10 @@ actor DoubaoChatClient: LLMClient {
                 ? thinkingEnabled
                 : nil,
             reasoning_effort: appliesThinkingControl && thinkingField == .reasoningEffort
-                ? (thinkingEnabled ? "medium" : "none")
+                ? reasoningEffort
                 : nil,
             reasoning: appliesThinkingControl && thinkingField == .reasoningObject
-                ? ReasoningConfig(effort: thinkingEnabled ? "medium" : "none")
+                ? ReasoningConfig(effort: reasoningEffort)
                 : nil,
             think: appliesThinkingControl && thinkingField == .think ? thinkingEnabled : nil,
             reasoning_split: provider.needsReasoningSplit ? true : nil
@@ -302,7 +339,11 @@ actor DoubaoChatClient: LLMClient {
 
     // MARK: - Streaming (SSE)
 
-    private func processStreaming(request: URLRequest, model: String) async throws -> LLMExecutionResult {
+    private func processStreaming(
+        request: URLRequest,
+        model: String,
+        requestStartedAt: ContinuousClock.Instant
+    ) async throws -> LLMExecutionResult {
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw LLMError.requestFailed(0)
@@ -318,10 +359,17 @@ actor DoubaoChatClient: LLMClient {
         }
 
         var lineCount = 0
+        var didRecordFirstByte = false
         var parser = LLMStreamingParser()
         var decoder = SSEByteStreamDecoder()
         do {
             for try await byte in bytes {
+                if !didRecordFirstByte {
+                    didRecordFirstByte = true
+                    DebugFileLogger.log(
+                        "LLM[\(model)]: ttft_ms=\(Self.milliseconds(ContinuousClock.now - requestStartedAt)) transport=stream"
+                    )
+                }
                 if let line = try decoder.consume(byte: byte) {
                     lineCount += 1
                     try parser.consume(line: line)
@@ -368,7 +416,11 @@ actor DoubaoChatClient: LLMClient {
 
     // MARK: - Non-streaming (single JSON response)
 
-    private func processNonStreaming(request: URLRequest, model: String) async throws -> LLMExecutionResult {
+    private func processNonStreaming(
+        request: URLRequest,
+        model: String,
+        requestStartedAt: ContinuousClock.Instant
+    ) async throws -> LLMExecutionResult {
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw LLMError.requestFailed(0)
@@ -382,6 +434,9 @@ actor DoubaoChatClient: LLMClient {
             )
             throw LLMError.requestRejected(http.statusCode, errorBody)
         }
+        DebugFileLogger.log(
+            "LLM[\(model)]: ttft_ms=\(Self.milliseconds(ContinuousClock.now - requestStartedAt)) transport=nonstream"
+        )
 
         let data = try await LLMNetworkSession.readCapped(
             bytes,
@@ -395,6 +450,11 @@ actor DoubaoChatClient: LLMClient {
             throw LLMError.emptyResponse(nil)
         }
         return LLMExecutionResult(text: content, evidence: json.thinkingEvidence)
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Int64 {
+        duration.components.seconds * 1_000
+            + Int64(duration.components.attoseconds / 1_000_000_000_000_000)
     }
 }
 
@@ -413,11 +473,17 @@ struct ReasoningConfig: Encodable, Sendable {
     let effort: String
 }
 
+struct ChatResponseFormat: Encodable, Sendable {
+    let type: String
+}
+
 struct ChatRequest: Encodable, Sendable {
     let model: String
     let messages: [ChatMessage]
     let stream: Bool
     let max_tokens: Int?
+    let temperature: Double?
+    let response_format: ChatResponseFormat?
     let thinking: ThinkingConfig?
     let enable_thinking: Bool?
     let reasoning_effort: String?

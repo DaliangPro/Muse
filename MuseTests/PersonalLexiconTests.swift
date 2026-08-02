@@ -147,6 +147,149 @@ final class PersonalLexiconTests: XCTestCase {
         XCTAssertTrue(ambiguous.isEmpty)
     }
 
+    func testResolverMatchesKnownAliasAcrossCaseSpacesAndHyphensWithoutSubstringDamage() {
+        let lexicon = PersonalLexiconDocument(
+            schemaVersion: 1,
+            entries: [PersonalLexiconEntry(
+                canonical: "Typeless",
+                aliases: ["Type less"]
+            )]
+        )
+        let source = "Type less、type-less、typeless 都是术语，prototype-less 保持原样。"
+
+        let resolutions = EntityResolver.resolve(
+            segments: [segment(source)],
+            lexicon: lexicon,
+            snippets: [],
+            hotwords: [],
+            context: WritingContext()
+        )
+
+        XCTAssertTrue(resolutions.contains { $0.surfaceText == "Type less" })
+        XCTAssertTrue(resolutions.contains { $0.surfaceText == "type-less" })
+        XCTAssertTrue(resolutions.contains { $0.surfaceText == "typeless" })
+        XCTAssertEqual(
+            EntityResolver.applying(resolutions, to: source),
+            "Typeless、Typeless、Typeless 都是术语，prototype-less 保持原样。"
+        )
+    }
+
+    func testResolverOnlyAppliesKnownAliasAtEntityBoundaries() {
+        let lexicon = PersonalLexiconDocument(
+            schemaVersion: 1,
+            entries: [PersonalLexiconEntry(
+                canonical: "CAT",
+                aliases: ["Cat"]
+            )]
+        )
+        let source = "Cat catalog concatenate"
+        let resolutions = EntityResolver.resolve(
+            segments: [segment(source)],
+            lexicon: lexicon,
+            snippets: [],
+            hotwords: [],
+            context: WritingContext()
+        )
+
+        XCTAssertEqual(
+            EntityResolver.applying(resolutions, to: source),
+            "CAT catalog concatenate"
+        )
+    }
+
+    func testResolverUsesEnglishPhoneticChannelOnlyForWhitelistedTerminology() {
+        let lexicon = PersonalLexiconDocument(
+            schemaVersion: 1,
+            entries: [PersonalLexiconEntry(canonical: "Night Shift", aliases: [])]
+        )
+        let source = "Please enable Nite Shift today."
+
+        XCTAssertLessThan(
+            EntityResolver.editSimilarity("Nite Shift", "Night Shift"),
+            EntityResolver.similarityThreshold
+        )
+        let resolutions = EntityResolver.resolve(
+            segments: [segment(source)],
+            lexicon: lexicon,
+            snippets: [],
+            hotwords: [],
+            context: WritingContext()
+        )
+
+        XCTAssertTrue(resolutions.contains {
+            $0.surfaceText == "Nite Shift" && $0.canonical == "Night Shift"
+        })
+        XCTAssertEqual(
+            EntityResolver.applying(resolutions, to: source),
+            "Please enable Night Shift today."
+        )
+    }
+
+    func testResolverFindsChinesePinyinCandidateInsideContinuousSentence() {
+        let lexicon = PersonalLexiconDocument(
+            schemaVersion: 1,
+            entries: [PersonalLexiconEntry(canonical: "飞书", aliases: [])]
+        )
+        let source = "我们用菲书沟通"
+
+        let resolutions = EntityResolver.resolve(
+            segments: [segment(source)],
+            lexicon: lexicon,
+            snippets: [],
+            hotwords: [],
+            context: WritingContext()
+        )
+
+        XCTAssertTrue(resolutions.contains {
+            $0.surfaceText == "菲书" && $0.canonical == "飞书"
+        })
+        XCTAssertEqual(
+            EntityResolver.applying(resolutions, to: source),
+            "我们用飞书沟通"
+        )
+    }
+
+    func testResolverPreservesAmbiguousChinesePinyinSurface() {
+        let lexicon = PersonalLexiconDocument(
+            schemaVersion: 1,
+            entries: [
+                PersonalLexiconEntry(canonical: "飞书", aliases: []),
+                PersonalLexiconEntry(canonical: "非书", aliases: []),
+            ]
+        )
+        let source = "我们用菲书沟通"
+
+        let resolutions = EntityResolver.resolve(
+            segments: [segment(source)],
+            lexicon: lexicon,
+            snippets: [],
+            hotwords: [],
+            context: WritingContext()
+        )
+
+        XCTAssertFalse(resolutions.contains { $0.surfaceText == "菲书" })
+        XCTAssertEqual(EntityResolver.applying(resolutions, to: source), source)
+    }
+
+    func testResolverDoesNotIgnoreChineseTonesForLowConfidenceCandidate() {
+        let lexicon = PersonalLexiconDocument(
+            schemaVersion: 1,
+            entries: [PersonalLexiconEntry(canonical: "飞书", aliases: [])]
+        )
+        let source = "这不是非数值类型"
+
+        let resolutions = EntityResolver.resolve(
+            segments: [segment(source)],
+            lexicon: lexicon,
+            snippets: [],
+            hotwords: [],
+            context: WritingContext()
+        )
+
+        XCTAssertFalse(resolutions.contains { $0.surfaceText == "非数" })
+        XCTAssertEqual(EntityResolver.applying(resolutions, to: source), source)
+    }
+
     private func segment(_ text: String) -> RecognitionSegment {
         RecognitionSegment(
             id: "s1",

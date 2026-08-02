@@ -74,6 +74,8 @@ enum RecognitionEvent: Sendable {
     case error(Error)
     case completed
     case processingResult(text: String)
+    /// Voice Polish 正在执行的可见阶段；不携带任何用户正文。
+    case voicePolishStage(VoicePolishStage)
     case finalized(text: String, injection: InjectionOutcome)
     /// 流式上传中断（REPAIR_PLAN B7a）：录音仍在继续，最终文本由停止后的
     /// 批量兜底重识别保证；UI 据此提示用户不必因字幕停更而中断说话
@@ -104,6 +106,17 @@ struct LLMConfig: Sendable {
             model: model,
             baseURL: baseURL,
             thinkingMode: mode
+        )
+    }
+
+    func withModel(_ model: String) -> LLMConfig {
+        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return self }
+        return LLMConfig(
+            apiKey: apiKey,
+            model: normalized,
+            baseURL: baseURL,
+            thinkingMode: thinkingMode
         )
     }
 }

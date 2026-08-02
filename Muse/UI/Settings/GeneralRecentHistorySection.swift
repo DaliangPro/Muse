@@ -3,9 +3,11 @@ import SwiftUI
 struct GeneralRecentHistorySection: View, SettingsCardHelpers {
     let records: [HistoryRecord]
     let copiedRecordId: String?
+    let correctedRecordIds: Set<String>
     @Binding var selectedDayKey: String
     let onCopy: (HistoryRecord) -> Void
     let onLearn: (HistoryRecord) -> Void
+    let onUndoCorrection: (HistoryRecord) -> Void
     let onDelete: (HistoryRecord) -> Void
 
     var body: some View {
@@ -87,6 +89,7 @@ private extension GeneralRecentHistorySection {
                 width: 86,
                 height: 22
             )
+            .accessibilityLabel(L("识别记录日期", "Recognition history date"))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -126,8 +129,12 @@ private extension GeneralRecentHistorySection {
             record: record,
             timeText: GeneralSettingsFormatters.recentTime(record.createdAt),
             isCopied: copiedRecordId == record.id,
+            isCorrected: correctedRecordIds.contains(record.id),
             copyAction: { onCopy(record) },
             learnAction: record.status.hasPrefix("voice_polish_") ? { onLearn(record) } : nil,
+            undoCorrectionAction: correctedRecordIds.contains(record.id)
+                ? { onUndoCorrection(record) }
+                : nil,
             deleteAction: { onDelete(record) }
         )
     }

@@ -407,6 +407,8 @@ private actor SenseVoiceEventRecorder {
             return "completed"
         case .processingResult(let text):
             return "processing:\(text)"
+        case .voicePolishStage(let stage):
+            return "voicePolishStage:\(stage.rawValue)"
         case .finalized(let text, _):
             return "finalized:\(text)"
         case .streamingInterrupted:

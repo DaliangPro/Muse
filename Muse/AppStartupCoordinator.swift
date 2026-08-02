@@ -12,6 +12,16 @@ enum AppStartupCoordinator {
         KeychainService.migrateIfNeeded()
         HotwordStorage.migrateIfNeeded()
         SnippetStorage.migrateIfNeeded()
+        do {
+            let outcome = try TerminologyRepository.migrateIfNeeded()
+            DebugFileLogger.log(
+                "terminology migration migrated=\(outcome.didMigrate) entries=\(outcome.importedEntryCount) aliases=\(outcome.importedAliasCount) conflicts=\(outcome.conflictCount)"
+            )
+        } catch {
+            // 旧词汇文件继续可用；统一 Repository 的迁移版本不会在失败时推进，
+            // 下次启动可安全重试。日志只记录错误类型，不记录任何词条正文。
+            AppLogger.log("[App] 统一术语迁移失败，将继续使用兼容词汇数据: \(error.localizedDescription)")
+        }
         AliyunVocabularySyncCoordinator.schedule(after: .seconds(1))
         removeOrphanHistoryFileIfNeeded()
     }

@@ -1,0 +1,1208 @@
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+
+private enum TerminologySettingsPanel: String, CaseIterable {
+    case myTerms
+    case discoveries
+    case fixedReplacements
+    case builtIn
+
+    var title: String {
+        switch self {
+        case .myTerms: return L("我的术语", "My Terms")
+        case .discoveries: return L("待确认发现", "Discoveries")
+        case .fixedReplacements: return L("固定替换", "Fixed Replacements")
+        case .builtIn: return L("内置术语", "Built-in Terms")
+        }
+    }
+}
+
+/// 术语编辑器中的 Bundle ID 只接受可预测的反向域名格式，避免保存一个永远匹配不到的作用域。
+enum TerminologyBundleIdentifierValidator {
+    static func isValid(_ rawValue: String) -> Bool {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.utf8.count <= 255 else { return false }
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count >= 2 else { return false }
+
+        return components.allSatisfy { component in
+            guard !component.isEmpty, component.utf8.count <= 63,
+                  let first = component.unicodeScalars.first,
+                  let last = component.unicodeScalars.last,
+                  isASCIIAlphaNumeric(first),
+                  isASCIIAlphaNumeric(last) else {
+                return false
+            }
+            return component.unicodeScalars.allSatisfy {
+                isASCIIAlphaNumeric($0) || $0.value == 45 // "-"
+            }
+        }
+    }
+
+    private static func isASCIIAlphaNumeric(_ scalar: UnicodeScalar) -> Bool {
+        (48...57).contains(scalar.value)
+            || (65...90).contains(scalar.value)
+            || (97...122).contains(scalar.value)
+    }
+}
+
+/// 待确认候选与“已忽略”使用同一个稳定键，删除已确认术语后才能可靠阻止它立即回流。
+enum TerminologyDiscoveryIdentity {
+    static func id(alias: String, canonical: String) -> String {
+        "\(TerminologyText.normalizedKey(alias))→\(TerminologyText.normalizedKey(canonical))"
+    }
+
+    static func ids(for entry: TerminologyEntry) -> Set<String> {
+        Set(entry.aliases.map { id(alias: $0.text, canonical: entry.canonicalText) })
+    }
+}
+
+private struct TerminologyEditorDraft: Identifiable {
+    let id = UUID()
+    let entry: TerminologyEntry?
+    let discoverySourceRecordIDs: [String]
+
+    init(entry: TerminologyEntry?, discoverySourceRecordIDs: [String] = []) {
+        self.entry = entry
+        self.discoverySourceRecordIDs = discoverySourceRecordIDs
+    }
+}
+
+private struct PendingTerminologyDiscovery: Identifiable {
+    let alias: String
+    let canonical: String
+    let sourceRecordIDs: [String]
+    let lastSeenAt: Date
+
+    var id: String {
+        TerminologyDiscoveryIdentity.id(alias: alias, canonical: canonical)
+    }
+}
+
+/// 统一术语入口：同一份数据同时投影给 ASR、确定性纠错和 Voice Polish。
+struct TerminologySettingsTab: View, SettingsCardHelpers {
+    private static let ignoredDiscoveriesKey = "tf_ignoredTerminologyDiscoveryIDs"
+
+    @AppStorage(DefaultsKeys.selectedASRProvider)
+    private var selectedASRProviderRaw = ASRProvider.volcano.rawValue
+
+    @State private var selectedPanel = TerminologySettingsPanel.myTerms
+    @State private var document: TerminologyDocument?
+    @State private var corrections: [VoicePolishCorrectionRecord] = []
+    @State private var editorDraft: TerminologyEditorDraft?
+    @State private var loadErrorMessage = ""
+    @State private var corruptFileURL: URL?
+    @State private var statusMessage = ""
+    @State private var searchText = ""
+    @State private var isMigrating = false
+    @State private var discoveryLoadErrorMessage = ""
+    @State private var ignoredDiscoveryIDs = Set(
+        UserDefaults.standard.stringArray(forKey: TerminologySettingsTab.ignoredDiscoveriesKey) ?? []
+    )
+    @State private var pendingDeletion: TerminologyEntry?
+    @State private var aliyunVocabularySyncNotice: AliyunVocabularySyncNotice?
+
+    private let historyStore = HistoryStore()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            introduction
+            panelSwitch
+
+            if !loadErrorMessage.isEmpty {
+                failureCard
+            } else {
+                migrationCard
+                conflictCard
+                providerStatusCard
+                aliyunSyncStatusCard
+                panelContent
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .task { await reload() }
+        .sheet(item: $editorDraft) { draft in
+            TerminologyEntryEditorSheet(
+                entry: draft.entry,
+                requiresAlias: !draft.discoverySourceRecordIDs.isEmpty,
+                onCancel: { editorDraft = nil },
+                onSave: { entry in
+                    saveEntry(entry, discoverySourceRecordIDs: draft.discoverySourceRecordIDs)
+                }
+            )
+        }
+        .alert(
+            L("删除术语", "Delete Term"),
+            isPresented: Binding(
+                get: { pendingDeletion != nil },
+                set: { if !$0 { pendingDeletion = nil } }
+            )
+        ) {
+            Button(L("取消", "Cancel"), role: .cancel) { pendingDeletion = nil }
+            Button(L("删除", "Delete"), role: .destructive) {
+                if let entry = pendingDeletion {
+                    removeEntry(entry)
+                }
+                pendingDeletion = nil
+            }
+        } message: {
+            if let entry = pendingDeletion {
+                Text(L(
+                    "确定删除“\(entry.canonicalText)”吗？识别增强、自动纠错和润色保护都会停止使用它。",
+                    "Delete “\(entry.canonicalText)”? ASR boosting, auto-correction, and Voice Polish protection will stop using it."
+                ))
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .aliyunVocabularySyncStatusDidChange)) { note in
+            guard selectedASRProvider == .aliyun,
+                  let notice = note.object as? AliyunVocabularySyncNotice else { return }
+            aliyunVocabularySyncNotice = notice
+        }
+    }
+}
+
+private extension TerminologySettingsTab {
+    var introduction: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "character.book.closed")
+                .font(TF.settingsFontSectionTitle)
+                .foregroundStyle(TF.settingsAccentGreen)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(L("一个词库，三处生效", "One terminology library, three uses"))
+                    .font(TF.settingsFontSectionTitle)
+                    .foregroundStyle(TF.settingsText)
+                Text(L(
+                    "标准写法和常见错法统一管理：尽量提高语音识别命中率，识别后做确定性纠正，并在语音润色时保护专有名词。固定整句替换仍单独管理。",
+                    "Manage canonical terms and common mishearings together: improve ASR recognition where supported, apply deterministic correction, and protect names during Voice Polish. Fixed phrase replacements remain separate."
+                ))
+                .font(TF.settingsFontBody)
+                .foregroundStyle(TF.settingsTextTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    var panelSwitch: some View {
+        HStack(spacing: 10) {
+            SettingsSwitchGroup(width: nil) {
+                ForEach(TerminologySettingsPanel.allCases, id: \.rawValue) { panel in
+                    SettingsSwitchOption(
+                        title: panel.title,
+                        isSelected: selectedPanel == panel
+                    ) {
+                        selectedPanel = panel
+                    }
+                    .accessibilityAddTraits(selectedPanel == panel ? .isSelected : [])
+                    .accessibilityValue(selectedPanel == panel
+                        ? L("已选择", "Selected")
+                        : L("未选择", "Not selected"))
+                }
+            }
+            Spacer(minLength: 8)
+            if !statusMessage.isEmpty {
+                SettingsChip(
+                    statusMessage,
+                    controlSize: .compact,
+                    font: TF.settingsFontMetadata,
+                    foreground: TF.settingsAccentGreen,
+                    fill: TF.settingsSuccessFill
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    var panelContent: some View {
+        switch selectedPanel {
+        case .myTerms:
+            myTermsCard
+        case .discoveries:
+            discoveriesCard
+        case .fixedReplacements:
+            fixedReplacementsCard
+        case .builtIn:
+            builtInTermsCard
+        }
+    }
+
+    var failureCard: some View {
+        settingsGroupCard(
+            L("术语库暂时无法读取", "Terminology library unavailable"),
+            icon: "exclamationmark.triangle",
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(loadErrorMessage)
+                    .font(TF.settingsFontBody)
+                    .foregroundStyle(TF.settingsAccentRed)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(L(
+                    "Muse 没有把错误文件当成空词库，也不会覆盖它。请先保留或恢复备份，再重试。",
+                    "Muse did not treat the damaged file as an empty library and will not overwrite it. Preserve or restore the backup, then retry."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                HStack(spacing: 8) {
+                    SettingsTextButton(L("重试", "Retry"), variant: .primary, controlSize: .compact) {
+                        Task { await reload() }
+                    }
+                    if let corruptFileURL {
+                        SettingsTextButton(L("在 Finder 中显示", "Show in Finder"), controlSize: .compact) {
+                            NSWorkspace.shared.activateFileViewerSelecting([corruptFileURL])
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    var migrationCard: some View {
+        if let document,
+           document.migrationVersion < TerminologyDocument.currentMigrationVersion {
+            settingsGroupCard(
+                L("整合现有词汇", "Consolidate existing vocabulary"),
+                icon: "arrow.triangle.merge",
+                trailing: AnyView(
+                    SettingsTextButton(
+                        isMigrating ? L("整合中", "Consolidating") : L("重试整合", "Retry Consolidation"),
+                        variant: .primary,
+                        controlSize: .compact
+                    ) {
+                        migrateLegacyVocabulary()
+                    }
+                    .disabled(isMigrating)
+                ),
+                expandVertically: false
+            ) {
+                Text(L(
+                    "升级时会自动整合热词、个人词典和可安全转换的错词；如果此前未完成，可在这里重试。原文件始终保留作为兼容恢复源。",
+                    "Muse consolidates hotwords, personal terms, and safely convertible corrections during upgrade. Retry here if it did not finish. Original files remain as compatibility recovery sources."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    var conflictCard: some View {
+        if let document, !document.conflicts.isEmpty {
+            settingsGroupCard(
+                L("发现 \(document.conflicts.count) 个术语冲突", "\(document.conflicts.count) terminology conflict(s)"),
+                icon: "exclamationmark.triangle",
+                expandVertically: false,
+                fillColor: TF.settingsWarningFill
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(L(
+                        "同一个错误写法指向多个标准词。冲突解决前，Muse 不会自动替换这个写法，以免改错。",
+                        "The same alias points to multiple canonical terms. Muse pauses automatic replacement for that alias until you resolve it."
+                    ))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextSecondary)
+
+                    ForEach(document.conflicts) { conflict in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(conflict.aliases.joined(separator: " / "))
+                                .font(TF.settingsFontBodyStrong)
+                                .foregroundStyle(TF.settingsText)
+                            Image(systemName: "arrow.right")
+                                .font(TF.settingsFontIconMicro)
+                                .foregroundStyle(TF.settingsTextTertiary)
+                            Text(conflict.candidates.map(\.canonicalText).joined(separator: "、"))
+                                .font(TF.settingsFontBody)
+                                .foregroundStyle(TF.settingsTextSecondary)
+                            Spacer(minLength: 8)
+                            if let editable = conflict.candidates.compactMap({ candidate in
+                                document.entries.first(where: {
+                                    $0.id == candidate.entryID && !$0.isReadOnly
+                                })
+                            }).first {
+                                SettingsTextButton(L("编辑解决", "Resolve"), controlSize: .compact) {
+                                    editorDraft = TerminologyEditorDraft(entry: editable)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var providerStatusCard: some View {
+        let capabilities = ASRTerminologyCapabilities.forProvider(selectedASRProvider)
+        let enabledEntries = (document?.entries ?? []).filter(\.isEnabled)
+        let globalProjections = document.map { TerminologyProjections.make(from: $0) }
+            ?? TerminologyProjections.make(from: .empty)
+        let hasGlobalTerms = enabledEntries.contains { $0.scope.kind == .global }
+        let applicationEntries = enabledEntries.filter { $0.scope.kind == .application }
+        return settingsGroupCard(
+            L("生效状态", "Effect Status"),
+            icon: "checkmark.shield",
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(L("全部应用范围", "All-app scope"))
+                    .font(TF.settingsFontBodyStrong)
+                    .foregroundStyle(TF.settingsTextSecondary)
+                HStack(spacing: 6) {
+                    terminologyStatusChip(
+                        L("识别增强", "ASR boost"),
+                        active: hasGlobalTerms && capabilities.hotwordDelivery != .unsupported
+                    )
+                    terminologyStatusChip(
+                        L("自动纠错", "Auto-correction"),
+                        active: !globalProjections.corrections.isEmpty
+                    )
+                    terminologyStatusChip(
+                        L("语音润色保护", "Voice Polish protection"),
+                        active: !globalProjections.voicePolishEntries.isEmpty
+                    )
+                }
+
+                if !applicationEntries.isEmpty {
+                    Rectangle()
+                        .fill(TF.settingsStroke.opacity(0.55))
+                        .frame(height: 1)
+                    Text(L(
+                        "指定应用范围 · \(applicationEntries.count) 个术语",
+                        "Specific-app scope · \(applicationEntries.count) term(s)"
+                    ))
+                    .font(TF.settingsFontBodyStrong)
+                    .foregroundStyle(TF.settingsTextSecondary)
+                    HStack(spacing: 6) {
+                        terminologyStatusChip(L("识别增强", "ASR boost"), active: false)
+                            .help(L(
+                                "指定应用术语不会全局下发给识别引擎。",
+                                "App-scoped terms are never sent globally to the recognition engine."
+                            ))
+                        terminologyStatusChip(
+                            L("自动纠错", "Auto-correction"),
+                            active: applicationEntries.contains(where: hasUnconflictedAlias)
+                        )
+                        terminologyStatusChip(
+                            L("语音润色保护", "Voice Polish protection"),
+                            active: true
+                        )
+                    }
+                    Text(L(
+                        "只在 Bundle ID 精确匹配的应用中进行本地纠错和润色保护，不会污染其他应用的识别请求。",
+                        "Local correction and polishing protection apply only when the Bundle ID matches exactly, without affecting recognition requests in other apps."
+                    ))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                DisclosureGroup(L(
+                    "查看当前识别引擎的具体生效方式",
+                    "Show how the current ASR applies terms"
+                )) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(selectedASRProvider.displayName)
+                            .font(TF.settingsFontBodyStrong)
+                            .foregroundStyle(TF.settingsTextSecondary)
+                        Text(providerDeliveryDescription(capabilities))
+                            .font(TF.settingsFontCaption)
+                            .foregroundStyle(TF.settingsTextTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.top, 7)
+                }
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextSecondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    var aliyunSyncStatusCard: some View {
+        if selectedASRProvider == .aliyun, let notice = aliyunVocabularySyncNotice {
+            HStack(spacing: 8) {
+                Image(systemName: notice.state == .failed ? "exclamationmark.triangle" : "arrow.triangle.2.circlepath")
+                    .foregroundStyle(notice.state == .failed ? TF.settingsAccentRed : TF.settingsTextTertiary)
+                    .accessibilityHidden(true)
+                Text(notice.message)
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(notice.state == .failed ? TF.settingsAccentRed : TF.settingsTextSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                if notice.state == .failed {
+                    SettingsTextButton(L("重试同步", "Retry Sync"), controlSize: .compact) {
+                        AliyunVocabularySyncCoordinator.schedule(after: .milliseconds(50))
+                    }
+                }
+            }
+            .padding(10)
+            .background(
+                notice.state == .failed ? TF.settingsDangerFill : TF.settingsCard,
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 9).stroke(TF.settingsStroke, lineWidth: 1)
+            }
+        }
+    }
+
+    var myTermsCard: some View {
+        settingsGroupCard(
+            L("我的术语", "My Terms"),
+            icon: "person.crop.rectangle.stack",
+            trailing: AnyView(
+                HStack(spacing: 8) {
+                    SettingsTextButton(L("导出", "Export"), controlSize: .compact) {
+                        exportTerminology()
+                    }
+                    .disabled(myTerms.isEmpty)
+                    SettingsTextButton(L("新增术语", "Add Term"), variant: .primary, controlSize: .compact) {
+                        editorDraft = TerminologyEditorDraft(entry: nil)
+                    }
+                }
+            ),
+            expandVertically: false
+        ) {
+            terminologyList(
+                entries: myTerms,
+                emptyTitle: L("还没有个人术语", "No personal terms yet"),
+                emptyDescription: L(
+                    "先添加 Typeless、产品名、人名等标准写法；如有常见识别错误，再补充“错误写法”。",
+                    "Add canonical product names, people, or terms such as Typeless, then add common mishearings as aliases."
+                ),
+                allowsEditing: true
+            )
+        }
+    }
+
+    var discoveriesCard: some View {
+        settingsGroupCard(
+            L("待确认发现", "Discoveries awaiting confirmation"),
+            icon: "sparkles.rectangle.stack",
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(L(
+                    "仅展示在至少两次明确纠正中重复出现、但尚未进入术语库的对应关系。不会自动入库。",
+                    "Shows mappings repeated in at least two explicit corrections but not yet in the terminology library. Nothing is added automatically."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+
+                if !discoveryLoadErrorMessage.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundStyle(TF.settingsAccentRed)
+                        Text(discoveryLoadErrorMessage)
+                            .font(TF.settingsFontCaption)
+                            .foregroundStyle(TF.settingsAccentRed)
+                        Spacer(minLength: 8)
+                        SettingsTextButton(L("重试", "Retry"), controlSize: .compact) {
+                            Task { await reload() }
+                        }
+                    }
+                }
+
+                if pendingDiscoveries.isEmpty {
+                    terminologyEmptyState(
+                        title: L("没有待确认发现", "No discoveries to review"),
+                        description: L("你在识别记录中点击“纠正”后，明确的术语修改可直接确认；重复候选也会汇总到这里。", "Use Correct on a Voice Polish record to confirm a clear term edit; repeated candidates also collect here.")
+                    )
+                } else {
+                    ForEach(Array(pendingDiscoveries.enumerated()), id: \.element.id) { index, discovery in
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 6) {
+                                    Text(discovery.alias)
+                                        .foregroundStyle(TF.settingsTextTertiary)
+                                    Image(systemName: "arrow.right")
+                                        .font(TF.settingsFontIconMicro)
+                                        .foregroundStyle(TF.settingsTextTertiary)
+                                    Text(discovery.canonical)
+                                        .foregroundStyle(TF.settingsText)
+                                }
+                                .font(TF.settingsFontBodyStrong)
+                                Text(L("来自 \(discovery.sourceRecordIDs.count) 次明确纠正", "Seen in \(discovery.sourceRecordIDs.count) explicit corrections"))
+                                    .font(TF.settingsFontCaption)
+                                    .foregroundStyle(TF.settingsTextTertiary)
+                                Text(L(
+                                    "最近出现：\(Self.discoveryDateFormatter.string(from: discovery.lastSeenAt))",
+                                    "Last seen: \(Self.discoveryDateFormatter.string(from: discovery.lastSeenAt))"
+                                ))
+                                .font(TF.settingsFontMetadata)
+                                .foregroundStyle(TF.settingsTextTertiary)
+                            }
+                            Spacer(minLength: 8)
+                            SettingsTextButton(L("忽略", "Ignore"), controlSize: .compact) {
+                                ignoreDiscovery(discovery)
+                            }
+                            SettingsTextButton(L("编辑后确认", "Edit & Confirm"), controlSize: .compact) {
+                                editDiscovery(discovery)
+                            }
+                            SettingsTextButton(L("确认加入", "Confirm"), variant: .primary, controlSize: .compact) {
+                                confirmDiscovery(discovery)
+                            }
+                        }
+                        if index < pendingDiscoveries.count - 1 {
+                            Rectangle().fill(TF.settingsStroke.opacity(0.5)).frame(height: 1)
+                        }
+                    }
+                }
+
+                if !ignoredDiscoveryIDs.isEmpty {
+                    SettingsTextButton(L("恢复已忽略候选", "Restore Ignored"), controlSize: .compact) {
+                        ignoredDiscoveryIDs = []
+                        persistIgnoredDiscoveries()
+                        statusMessage = L("已恢复待确认候选", "Ignored discoveries restored")
+                    }
+                }
+            }
+        }
+    }
+
+    var fixedReplacementsCard: some View {
+        settingsGroupCard(
+            L("固定替换", "Fixed Replacements"),
+            icon: "arrow.left.arrow.right.square",
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(L(
+                    "用于整句、固定短语和格式模板的“命中必改”。单个专有名词及其错法请放在“我的术语”。",
+                    "Use for deterministic full phrases, fixed wording, and format templates. Put individual proper terms and mishearings under My Terms."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                VocabularyTab(fixedReplacementOnly: true)
+                    .frame(height: 540)
+            }
+        }
+    }
+
+    var builtInTermsCard: some View {
+        settingsGroupCard(
+            L("内置术语", "Built-in Terms"),
+            icon: "shippingbox",
+            trailing: AnyView(
+                TextField(L("搜索", "Search"), text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 180)
+                    .accessibilityLabel(L("搜索内置术语", "Search built-in terms"))
+            ),
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(L(
+                    "内置词不可改名或删除，但可以逐项停用。你的个人术语优先级更高。",
+                    "Built-in terms cannot be renamed or deleted, but each can be disabled. Your personal terms take priority."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                terminologyList(
+                    entries: filteredBuiltInTerms,
+                    emptyTitle: searchText.isEmpty ? L("暂无内置术语", "No built-in terms") : L("没有匹配项", "No matches"),
+                    emptyDescription: searchText.isEmpty ? L("当前内置词表为空。", "The built-in terminology list is empty.") : L("换一个关键词试试。", "Try another search.")
+                )
+            }
+        }
+    }
+
+    var myTerms: [TerminologyEntry] {
+        (document?.entries ?? [])
+            .filter { $0.origin != .builtIn && $0.origin != .contextCandidate }
+            .sorted(by: termSort)
+    }
+
+    var builtInTerms: [TerminologyEntry] {
+        (document?.entries ?? [])
+            .filter { $0.origin == .builtIn }
+            .sorted(by: termSort)
+    }
+
+    var filteredBuiltInTerms: [TerminologyEntry] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return builtInTerms }
+        return builtInTerms.filter { entry in
+            entry.canonicalText.localizedCaseInsensitiveContains(query)
+                || entry.aliases.contains { $0.text.localizedCaseInsensitiveContains(query) }
+        }
+    }
+
+    var pendingDiscoveries: [PendingTerminologyDiscovery] {
+        struct Bucket {
+            let alias: String
+            let canonical: String
+            var sourceRecordIDs: [String]
+            var lastSeenAt: Date
+        }
+        var buckets: [String: Bucket] = [:]
+        for correction in corrections where correction.learnTerminology {
+            for candidate in TerminologyCorrectionExtractor.candidates(
+                generatedText: correction.generatedText,
+                correctedText: correction.correctedText
+            ) {
+                let key = TerminologyDiscoveryIdentity.id(
+                    alias: candidate.alias,
+                    canonical: candidate.canonical
+                )
+                var bucket = buckets[key] ?? Bucket(
+                    alias: candidate.alias,
+                    canonical: candidate.canonical,
+                    sourceRecordIDs: [],
+                    lastSeenAt: correction.createdAt
+                )
+                if !bucket.sourceRecordIDs.contains(correction.historyID) {
+                    bucket.sourceRecordIDs.append(correction.historyID)
+                }
+                bucket.lastSeenAt = max(bucket.lastSeenAt, correction.createdAt)
+                buckets[key] = bucket
+            }
+        }
+
+        let known = Set((document?.entries ?? []).flatMap { entry in
+            entry.aliases.map {
+                TerminologyDiscoveryIdentity.id(alias: $0.text, canonical: entry.canonicalText)
+            }
+        })
+        return buckets.compactMap { key, bucket -> PendingTerminologyDiscovery? in
+            guard bucket.sourceRecordIDs.count >= 2,
+                  !known.contains(key),
+                  !ignoredDiscoveryIDs.contains(key) else { return nil }
+            return PendingTerminologyDiscovery(
+                alias: bucket.alias,
+                canonical: bucket.canonical,
+                sourceRecordIDs: bucket.sourceRecordIDs,
+                lastSeenAt: bucket.lastSeenAt
+            )
+        }.sorted {
+            if $0.sourceRecordIDs.count != $1.sourceRecordIDs.count {
+                return $0.sourceRecordIDs.count > $1.sourceRecordIDs.count
+            }
+            return $0.canonical.localizedCaseInsensitiveCompare($1.canonical) == .orderedAscending
+        }
+    }
+
+    var selectedASRProvider: ASRProvider {
+        ASRProvider(rawValue: selectedASRProviderRaw) ?? .volcano
+    }
+
+    @ViewBuilder
+    func terminologyList(
+        entries: [TerminologyEntry],
+        emptyTitle: String,
+        emptyDescription: String,
+        allowsEditing: Bool = false
+    ) -> some View {
+        if entries.isEmpty {
+            terminologyEmptyState(title: emptyTitle, description: emptyDescription)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                    terminologyRow(entry, allowsEditing: allowsEditing)
+                    if index < entries.count - 1 {
+                        Rectangle().fill(TF.settingsStroke.opacity(0.5)).frame(height: 1)
+                    }
+                }
+            }
+        }
+    }
+
+    func terminologyRow(_ entry: TerminologyEntry, allowsEditing: Bool) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text(entry.canonicalText)
+                        .font(TF.settingsFontBodyStrong)
+                        .foregroundStyle(entry.isEnabled ? TF.settingsText : TF.settingsTextTertiary)
+                    Text(originTitle(entry.origin))
+                        .font(TF.settingsFontMetadata)
+                        .foregroundStyle(TF.settingsTextTertiary)
+                    if entry.scope.kind == .application,
+                       let bundleID = entry.scope.applicationBundleIdentifier {
+                        Text(bundleID)
+                            .font(TF.settingsFontMetadata)
+                            .foregroundStyle(TF.settingsAccentBlue)
+                            .lineLimit(1)
+                    }
+                }
+
+                Text(entry.aliases.isEmpty
+                    ? L("暂无错误写法", "No known mishearings")
+                    : L("常见错法：\(entry.aliases.map(\.text).joined(separator: "、"))", "Misheard as: \(entry.aliases.map(\.text).joined(separator: ", "))"))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .lineLimit(2)
+
+                HStack(spacing: 5) {
+                    terminologyStatusChip(
+                        L("识别增强", "ASR"),
+                        active: entry.isEnabled
+                            && entry.scope.kind == .global
+                            && ASRTerminologyCapabilities.forProvider(selectedASRProvider).hotwordDelivery != .unsupported
+                    )
+                    .help(asrStatusHelp(for: entry))
+                    terminologyStatusChip(
+                        L("自动纠错", "Correction"),
+                        active: entry.isEnabled && hasUnconflictedAlias(entry)
+                    )
+                    terminologyStatusChip(L("润色保护", "Polish"), active: entry.isEnabled)
+                }
+            }
+            Spacer(minLength: 12)
+
+            Toggle("", isOn: Binding(
+                get: { entry.isEnabled },
+                set: { setEntryEnabled(entry, enabled: $0) }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .accessibilityLabel(entry.isEnabled ? L("停用术语", "Disable term") : L("启用术语", "Enable term"))
+
+            if allowsEditing && !entry.isReadOnly {
+                SettingsTextButton(L("编辑", "Edit"), controlSize: .compact) {
+                    editorDraft = TerminologyEditorDraft(entry: entry)
+                }
+                SettingsDeleteIconButton(
+                    systemName: "trash",
+                    accessibilityLabel: L("删除术语", "Delete term")
+                ) {
+                    pendingDeletion = entry
+                }
+            }
+        }
+        .padding(.vertical, 10)
+        .opacity(entry.isEnabled ? 1 : 0.68)
+    }
+
+    func terminologyEmptyState(title: String, description: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(TF.settingsFontBodyStrong)
+                .foregroundStyle(TF.settingsText)
+            Text(description)
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 8)
+    }
+
+    func terminologyStatusChip(_ title: String, active: Bool) -> some View {
+        SettingsChip(
+            title,
+            controlSize: .compact,
+            font: TF.settingsFontMetadata,
+            foreground: active ? TF.settingsAccentGreen : TF.settingsTextTertiary,
+            fill: active ? TF.settingsSuccessFill : TF.settingsCardAlt
+        )
+    }
+
+    func providerDeliveryDescription(_ capabilities: ASRTerminologyCapabilities) -> String {
+        switch capabilities.hotwordDelivery {
+        case .request:
+            return capabilities.aliasDelivery == .requestCorrections
+                ? L("标准术语和错词映射会随每次识别请求下发；Muse 仍保留本地纠错兜底。", "Canonical terms and correction mappings are sent with each request; Muse keeps local correction as a fallback.")
+                : L("标准术语会随每次识别请求下发；错词映射由 Muse 在本地确定性纠正。", "Canonical terms are sent with each request; aliases are corrected deterministically by Muse locally.")
+        case .remoteVocabulary:
+            return L("此引擎通过远端词表增强识别。界面保存只代表 Muse 本地词库与兼容配置已更新；远端不可用时仍由本地纠错兜底。", "This engine boosts recognition through a remote vocabulary. Saved here means Muse's local library and compatibility config were updated; local correction remains the fallback if remote sync is unavailable.")
+        case .localServiceVocabulary:
+            return L("标准术语提供给本地识别服务，错词映射由 Muse 本地确定性纠正。", "Canonical terms are provided to the local recognition service; aliases are corrected deterministically by Muse.")
+        case .unsupported:
+            return L("此引擎不支持术语下发，因此没有识别前增强；识别后的本地纠错和语音润色保护仍然生效。", "This engine does not support terminology delivery, so there is no pre-ASR boost; local correction and Voice Polish protection still apply.")
+        }
+    }
+
+    func originTitle(_ origin: TerminologyOrigin) -> String {
+        switch origin {
+        case .confirmedCorrection: return L("纠正确认", "Confirmed")
+        case .manual: return L("手动添加", "Manual")
+        case .legacyPersonalLexicon: return L("个人词典", "Personal lexicon")
+        case .legacySnippet: return L("旧错词", "Legacy correction")
+        case .legacyHotword: return L("旧热词", "Legacy hotword")
+        case .builtIn: return L("内置", "Built-in")
+        case .contextCandidate: return L("候选", "Candidate")
+        }
+    }
+
+    func asrStatusHelp(for entry: TerminologyEntry) -> String {
+        if entry.scope.kind == .application {
+            return L(
+                "指定应用词不会全局下发给识别引擎；本地纠错和语音润色保护仍在该应用生效。",
+                "App-scoped terms are not sent globally to ASR; local correction and Voice Polish protection still apply in that app."
+            )
+        }
+        if ASRTerminologyCapabilities.forProvider(selectedASRProvider).hotwordDelivery == .unsupported {
+            return L(
+                "当前识别引擎不支持术语下发，Muse 会使用本地纠错兜底。",
+                "The current ASR does not support term delivery; Muse uses local correction as the fallback."
+            )
+        }
+        return L("该标准术语会用于识别增强。", "This canonical term is used for ASR boosting.")
+    }
+
+    func hasUnconflictedAlias(_ entry: TerminologyEntry) -> Bool {
+        entry.aliases.contains { alias in
+            let aliasKey = TerminologyText.normalizedKey(alias.text)
+            return !(document?.conflicts.contains { conflict in
+                conflict.normalizedAlias == aliasKey
+                    && conflict.candidates.contains { $0.entryID == entry.id }
+            } ?? false)
+        }
+    }
+
+    func termSort(_ lhs: TerminologyEntry, _ rhs: TerminologyEntry) -> Bool {
+        if lhs.isEnabled != rhs.isEnabled { return lhs.isEnabled && !rhs.isEnabled }
+        if lhs.origin.priority != rhs.origin.priority { return lhs.origin.priority > rhs.origin.priority }
+        return lhs.canonicalText.localizedCaseInsensitiveCompare(rhs.canonicalText) == .orderedAscending
+    }
+
+    @MainActor
+    func reload() async {
+        switch TerminologyRepository.loadResult() {
+        case .corrupt(let url, let error):
+            document = nil
+            corruptFileURL = url
+            loadErrorMessage = error.localizedDescription
+            return
+        case .missing, .value:
+            document = TerminologyRepository.load()
+            corruptFileURL = nil
+            loadErrorMessage = ""
+        }
+
+        do {
+            corrections = try await historyStore.fetchVoicePolishCorrections()
+            discoveryLoadErrorMessage = ""
+        } catch {
+            // 词库本身仍可管理；候选历史不可用时明确显示状态，不伪装成已加载。
+            corrections = []
+            discoveryLoadErrorMessage = error.localizedDescription
+        }
+    }
+
+    func migrateLegacyVocabulary() {
+        guard !isMigrating else { return }
+        isMigrating = true
+        do {
+            let outcome = try TerminologyRepository.migrateIfNeeded()
+            statusMessage = outcome.didMigrate
+                ? L("已整合 \(outcome.importedEntryCount) 个术语", "Consolidated \(outcome.importedEntryCount) terms")
+                : L("已是最新结构", "Already up to date")
+            Task { await reload() }
+        } catch {
+            loadErrorMessage = error.localizedDescription
+        }
+        isMigrating = false
+    }
+
+    func saveEntry(
+        _ entry: TerminologyEntry,
+        discoverySourceRecordIDs: [String] = []
+    ) {
+        do {
+            var savedEntry = entry
+            if !discoverySourceRecordIDs.isEmpty {
+                savedEntry.origin = .confirmedCorrection
+                savedEntry.aliases = savedEntry.aliases.map { alias in
+                    TerminologyAlias(
+                        id: alias.id,
+                        text: alias.text,
+                        source: .confirmedCorrection,
+                        evidenceCount: discoverySourceRecordIDs.count,
+                        lastSeenAt: Date(),
+                        sourceRecordIDs: discoverySourceRecordIDs
+                    )
+                }
+            }
+            try TerminologyRepository.upsert(savedEntry)
+            editorDraft = nil
+            document = TerminologyRepository.load()
+            statusMessage = document?.conflicts.isEmpty == false
+                ? L("已保存；冲突写法已暂停自动替换", "Saved; conflicting aliases are paused")
+                : L("术语已保存", "Term saved")
+        } catch {
+            loadErrorMessage = error.localizedDescription
+        }
+    }
+
+    func setEntryEnabled(_ entry: TerminologyEntry, enabled: Bool) {
+        do {
+            try TerminologyRepository.setEnabled(enabled, id: entry.id)
+            document = TerminologyRepository.load()
+            statusMessage = enabled ? L("术语已启用", "Term enabled") : L("术语已停用", "Term disabled")
+        } catch {
+            loadErrorMessage = error.localizedDescription
+        }
+    }
+
+    func removeEntry(_ entry: TerminologyEntry) {
+        do {
+            try TerminologyRepository.remove(id: entry.id)
+            if entry.origin == .confirmedCorrection {
+                // 数据库中的原始纠正仍存在。同步写入忽略键，避免删除后的同一候选立即回到“待确认发现”。
+                ignoredDiscoveryIDs.formUnion(TerminologyDiscoveryIdentity.ids(for: entry))
+                persistIgnoredDiscoveries()
+            }
+            document = TerminologyRepository.load()
+            statusMessage = L("术语已删除", "Term deleted")
+        } catch {
+            loadErrorMessage = error.localizedDescription
+        }
+    }
+
+    func confirmDiscovery(_ discovery: PendingTerminologyDiscovery) {
+        do {
+            _ = try TerminologyRepository.addConfirmedEvidence(
+                alias: discovery.alias,
+                canonical: discovery.canonical,
+                sourceRecordIDs: discovery.sourceRecordIDs
+            )
+            document = TerminologyRepository.load()
+            statusMessage = L("发现已加入术语库", "Discovery added to terminology")
+        } catch {
+            loadErrorMessage = error.localizedDescription
+        }
+    }
+
+    func editDiscovery(_ discovery: PendingTerminologyDiscovery) {
+        let entry = TerminologyEntry(
+            canonicalText: discovery.canonical,
+            aliases: [TerminologyAlias(
+                text: discovery.alias,
+                source: .confirmedCorrection,
+                evidenceCount: discovery.sourceRecordIDs.count,
+                lastSeenAt: discovery.lastSeenAt,
+                sourceRecordIDs: discovery.sourceRecordIDs
+            )],
+            origin: .confirmedCorrection
+        )
+        editorDraft = TerminologyEditorDraft(
+            entry: entry,
+            discoverySourceRecordIDs: discovery.sourceRecordIDs
+        )
+    }
+
+    func ignoreDiscovery(_ discovery: PendingTerminologyDiscovery) {
+        ignoredDiscoveryIDs.insert(discovery.id)
+        persistIgnoredDiscoveries()
+        statusMessage = L("候选已忽略", "Discovery ignored")
+    }
+
+    func persistIgnoredDiscoveries() {
+        UserDefaults.standard.set(
+            ignoredDiscoveryIDs.sorted(),
+            forKey: Self.ignoredDiscoveriesKey
+        )
+    }
+
+    func exportTerminology() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "Muse-Terminology-\(Self.exportDateString()).json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(TerminologyRepository.load()).write(to: url, options: .atomic)
+            statusMessage = L("术语已导出", "Terminology exported")
+        } catch {
+            loadErrorMessage = error.localizedDescription
+        }
+    }
+
+    static func exportDateString() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
+    }
+
+    static let discoveryDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: Locale.preferredLanguages.first ?? "zh-Hans")
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+}
+
+private struct TerminologyEntryEditorSheet: View {
+    let entry: TerminologyEntry?
+    let requiresAlias: Bool
+    let onCancel: () -> Void
+    let onSave: (TerminologyEntry) -> Void
+
+    @State private var canonicalText: String
+    @State private var aliasesText: String
+    @State private var scopeKind: TerminologyScope.Kind
+    @State private var applicationBundleID: String
+
+    init(
+        entry: TerminologyEntry?,
+        requiresAlias: Bool = false,
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (TerminologyEntry) -> Void
+    ) {
+        self.entry = entry
+        self.requiresAlias = requiresAlias
+        self.onCancel = onCancel
+        self.onSave = onSave
+        _canonicalText = State(initialValue: entry?.canonicalText ?? "")
+        _aliasesText = State(initialValue: entry?.aliases.map(\.text).joined(separator: "、") ?? "")
+        _scopeKind = State(initialValue: entry?.scope.kind ?? .global)
+        _applicationBundleID = State(initialValue: entry?.scope.applicationBundleIdentifier ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(entry == nil ? L("新增术语", "Add Term") : L("编辑术语", "Edit Term"))
+                .font(TF.settingsFontSectionTitle)
+                .foregroundStyle(TF.settingsText)
+
+            terminologyField(
+                title: L("标准写法", "Canonical term"),
+                hint: L("例如 Typeless", "For example, Typeless"),
+                text: $canonicalText
+            )
+
+            terminologyField(
+                title: L("常见错误写法", "Common mishearings"),
+                hint: L("多个写法用逗号或换行分隔，例如 Type less、泰普莱斯", "Separate with commas or new lines, e.g. Type less"),
+                text: $aliasesText
+            )
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L("生效范围", "Scope"))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                Picker("", selection: $scopeKind) {
+                    Text(L("全部应用", "All apps")).tag(TerminologyScope.Kind.global)
+                    Text(L("指定应用", "Specific app")).tag(TerminologyScope.Kind.application)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .accessibilityLabel(L("生效范围", "Scope"))
+                .accessibilityValue(scopeKind == .global
+                    ? L("全部应用", "All apps")
+                    : L("指定应用", "Specific app"))
+                if scopeKind == .application {
+                    TextField(L("应用 Bundle ID，例如 com.openai.chat", "App bundle ID, e.g. com.openai.chat"), text: $applicationBundleID)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel(L("应用 Bundle ID", "App bundle ID"))
+                        .accessibilityHint(L(
+                            "请输入反向域名格式，例如 com.openai.chat",
+                            "Enter a reverse-domain identifier such as com.openai.chat"
+                        ))
+                    if !applicationBundleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       !TerminologyBundleIdentifierValidator.isValid(applicationBundleID) {
+                        Text(L(
+                            "Bundle ID 格式无效。请使用 com.company.app 这类反向域名格式，只包含英文字母、数字、连字符和点。",
+                            "Invalid Bundle ID. Use reverse-domain format such as com.company.app with letters, numbers, hyphens, and dots only."
+                        ))
+                        .font(TF.settingsFontCaption)
+                        .foregroundStyle(TF.settingsAccentRed)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            Text(scopeDescription)
+            .font(TF.settingsFontCaption)
+            .foregroundStyle(TF.settingsTextTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Spacer()
+                SettingsTextButton(L("取消", "Cancel"), variant: .secondary, onCanvas: true, action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                SettingsTextButton(L("保存", "Save"), variant: .primary) {
+                    onSave(makeEntry())
+                }
+                .disabled(!canSave)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(18)
+        .frame(width: 480)
+        .background(TF.settingsCanvas)
+    }
+
+    private var canSave: Bool {
+        !canonicalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (!requiresAlias || !splitAliases(aliasesText).isEmpty)
+            && (scopeKind == .global
+                || TerminologyBundleIdentifierValidator.isValid(applicationBundleID))
+    }
+
+    private var scopeDescription: String {
+        if scopeKind == .application {
+            return L(
+                "只在 Bundle ID 精确匹配的应用中进行本地纠错和润色保护；不会把该术语全局下发给识别引擎。保存后如产生冲突，Muse 会暂停该错词的自动替换。",
+                "Local correction and polishing protection apply only in the app whose Bundle ID matches exactly. The term is not sent globally to the recognition engine. Muse pauses an alias if saving creates a conflict."
+            )
+        }
+        return L(
+            "标准写法会尽可能用于识别增强和润色保护；错误写法用于识别后的确定性纠正。保存后如产生冲突，Muse 会暂停该错词的自动替换。",
+            "The canonical term is used for recognition boosting where supported and protected during polishing; aliases drive deterministic post-ASR correction. Muse pauses an alias if saving creates a conflict."
+        )
+    }
+
+    private func terminologyField(
+        title: String,
+        hint: String,
+        text: Binding<String>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+            TextField(hint, text: text, axis: .vertical)
+                .lineLimit(1...4)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel(title)
+        }
+    }
+
+    private func makeEntry() -> TerminologyEntry {
+        let canonical = canonicalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let aliasStrings = splitAliases(aliasesText).filter {
+            TerminologyText.displayKey($0) != TerminologyText.displayKey(canonical)
+        }
+        var existingAliases: [String: TerminologyAlias] = [:]
+        for alias in entry?.aliases ?? [] {
+            existingAliases[TerminologyText.aliasStorageKey(alias.text)] = alias
+        }
+        let aliases = aliasStrings.map { aliasText in
+            existingAliases[TerminologyText.aliasStorageKey(aliasText)]
+                ?? TerminologyAlias(text: aliasText, source: .manual)
+        }
+        let scope = scopeKind == .global
+            ? TerminologyScope.global
+            : TerminologyScope.application(applicationBundleID)
+        return TerminologyEntry(
+            id: entry?.id ?? UUID(),
+            canonicalText: canonical,
+            aliases: aliases,
+            isEnabled: entry?.isEnabled ?? true,
+            origin: entry?.origin ?? .manual,
+            scope: scope,
+            createdAt: entry?.createdAt ?? Date(),
+            updatedAt: Date()
+        )
+    }
+
+    private func splitAliases(_ text: String) -> [String] {
+        let separators = CharacterSet(charactersIn: ",，、;；\n")
+        var seen = Set<String>()
+        return text.components(separatedBy: separators).compactMap { raw in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = TerminologyText.aliasStorageKey(value)
+            guard !value.isEmpty, !key.isEmpty, seen.insert(key).inserted else { return nil }
+            return value
+        }
+    }
+}

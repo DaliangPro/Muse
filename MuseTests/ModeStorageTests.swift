@@ -80,9 +80,29 @@ final class ModeStorageTests: XCTestCase {
 
         // direct is kept
         XCTAssertTrue(loaded.contains { $0.id == ProcessingMode.direct.id })
+        // Voice Polish 拥有独立设置与学习数据，稳定 ID 始终恢复。
+        XCTAssertTrue(loaded.contains { $0.id == ProcessingMode.formalWriting.id })
         // smartDirect and translate were removed and not re-injected
         XCTAssertFalse(loaded.contains { $0.id == ProcessingMode.smartDirect.id })
         XCTAssertFalse(loaded.contains { $0.id == ProcessingMode.translate.id })
+    }
+
+    func testVoicePolishIsRestoredAsProtectedSystemModeWithoutOverwritingPrompt() throws {
+        let storage = ModeStorage(fileURL: testURL)
+        var voicePolish = ProcessingMode.formalWriting
+        voicePolish.isBuiltin = false
+        voicePolish.prompt = "保留我的口语感，不要过度正式。"
+        voicePolish.hotkeyCode = 27
+
+        try storage.save([ProcessingMode.direct, voicePolish])
+        let loaded = storage.load()
+
+        let restored = try XCTUnwrap(loaded.first { $0.id == ProcessingMode.formalWriting.id })
+        XCTAssertTrue(restored.isBuiltin)
+        XCTAssertTrue(restored.isProtectedSystemMode)
+        XCTAssertFalse(restored.isUserDeletable)
+        XCTAssertEqual(restored.prompt, voicePolish.prompt)
+        XCTAssertEqual(restored.hotkeyCode, 27)
     }
 
     func testCustomSmartModePromptIsPreserved() throws {

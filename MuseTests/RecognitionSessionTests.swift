@@ -224,6 +224,347 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertTrue(requests[0].user.contains(source))
     }
 
+    func testVoicePolishUsesCanonicalTextAndCompleteEffectiveSnippetRules() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try SnippetStorage.saveBuiltin([
+            (trigger: "Type less", value: "Typeless"),
+            (trigger: "Cloud Code", value: "Claude Code"),
+            (trigger: "把这整句替换掉。", value: "内置整句。"),
+        ], context: fixture.context)
+        try SnippetStorage.save([
+            (trigger: "Code X", value: "Codex"),
+            (trigger: "把这整句替换掉。", value: "用户整句。"),
+        ], context: fixture.context)
+        VoicePolishSettings.setModelOverride(
+            "voice-polish-fast-model",
+            defaults: fixture.context.userDefaults
+        )
+        let raw = "我在用 Type less、Cloud Code 和 Code X。把这整句替换掉。"
+        let canonical = "我在用 Typeless、Claude Code 和 Codex。用户整句。"
+        let client = RecognitionSessionVoicePolishLLM(response: canonical)
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmClientFactory: { client },
+            llmConfigLoader: {
+                LLMConfig(
+                    apiKey: "test",
+                    model: "mock-model",
+                    baseURL: "https://example.com/v1"
+                )
+            }
+        )
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let result = await session.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(result?.finalText, canonical)
+        XCTAssertEqual(result?.processedText, canonical)
+        XCTAssertFalse(result?.llmFailed ?? true)
+        let requests = await client.recordedRequests()
+        let request = try XCTUnwrap(requests.first)
+        let payload = try Self.voicePolishPayload(from: request)
+        XCTAssertEqual(payload["provider_final_text"] as? String, raw)
+        XCTAssertEqual(payload["canonical_text"] as? String, canonical)
+        let rawSegments = try XCTUnwrap(payload["raw_source_segments"] as? [[String: Any]])
+        XCTAssertEqual(rawSegments.compactMap { $0["text"] as? String }, [raw])
+        let canonicalSegments = try XCTUnwrap(payload["source_segments"] as? [[String: Any]])
+        XCTAssertEqual(canonicalSegments.compactMap { $0["text"] as? String }, [canonical])
+        XCTAssertFalse(request.user.contains("内置整句"))
+        let models = await client.recordedModels()
+        XCTAssertEqual(models, ["voice-polish-fast-model"])
+    }
+
+    func testVoicePolishScopesTerminologyByApplicationBeforeCanonicalization() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try TerminologyRepository.save(
+            TerminologyDocument(entries: [TerminologyEntry(
+                canonicalText: "Typeless",
+                aliases: [TerminologyAlias(text: "Type less")],
+                origin: .manual,
+                scope: .application("com.example.app-a")
+            )]),
+            context: fixture.context
+        )
+        let raw = "我正在使用 Type less。"
+        let canonical = "我正在使用 Typeless。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let otherApplicationSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let otherResult = await otherApplicationSession.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            writingContext: WritingContext(applicationBundleID: "com.example.app-b"),
+            vocabularyContext: fixture.context
+        )
+        XCTAssertEqual(otherResult?.finalText, raw)
+
+        let client = RecognitionSessionVoicePolishLLM(response: canonical)
+        let targetApplicationSession = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmClientFactory: { client },
+            llmConfigLoader: {
+                LLMConfig(
+                    apiKey: "test",
+                    model: "mock-model",
+                    baseURL: "https://example.com/v1"
+                )
+            }
+        )
+        let targetResult = await targetApplicationSession.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            writingContext: WritingContext(applicationBundleID: "com.example.app-a"),
+            vocabularyContext: fixture.context
+        )
+        XCTAssertEqual(targetResult?.finalText, canonical)
+        let targetRequests = await client.recordedRequests()
+        let request = try XCTUnwrap(targetRequests.first)
+        let payload = try Self.voicePolishPayload(from: request)
+        XCTAssertEqual(payload["provider_final_text"] as? String, raw)
+        XCTAssertEqual(payload["canonical_text"] as? String, canonical)
+    }
+
+    func testVoicePolishDoesNotBypassRepositorySuppressionThroughLegacySnippets() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try SnippetStorage.save([
+            (trigger: "Cloud Code", value: "Claude Code"),
+            (trigger: "旧的整句模板。", value: "固定替换成功。"),
+        ], context: fixture.context)
+        // 空的统一词库会把仍留在兼容文件中的旧术语规则标记为 suppressed。
+        // Voice Polish 不能再通过 SnippetStorage.applyEffective 绕过这个决定。
+        try TerminologyRepository.save(.empty, context: fixture.context)
+        XCTAssertTrue(SnippetStorage.load(context: fixture.context).contains {
+            $0.trigger == "Cloud Code" && $0.value == "Claude Code"
+        })
+        let raw = "请打开 Cloud Code。旧的整句模板。"
+        let expected = "请打开 Cloud Code。固定替换成功。"
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let result = await session.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(result?.finalText, expected)
+    }
+
+    func testVoicePolishUsesAndRemembersRecentMuseInputsOnlyWhenEnabled() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        VoicePolishSettings.setRecentInputContextEnabled(
+            true,
+            defaults: fixture.context.userDefaults
+        )
+        let applicationID = "com.example.chat"
+        let recentStore = VoicePolishRecentInputContextStore()
+        await recentStore.remember(
+            "上一条 Muse 输入",
+            applicationBundleID: applicationID
+        )
+        let raw = "这是本次口述。"
+        let polished = "这是本次成稿。"
+        let client = RecognitionSessionVoicePolishLLM(response: polished)
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmClientFactory: { client },
+            llmConfigLoader: {
+                LLMConfig(
+                    apiKey: "test",
+                    model: "mock-model",
+                    baseURL: "https://example.com/v1"
+                )
+            },
+            voicePolishRecentInputStore: recentStore
+        )
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let result = await session.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            writingContext: WritingContext(
+                applicationBundleID: applicationID,
+                scene: .chat
+            ),
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(result?.finalText, polished)
+        let requests = await client.recordedRequests()
+        let request = try XCTUnwrap(requests.first)
+        let payload = try Self.voicePolishPayload(from: request)
+        let context = try XCTUnwrap(payload["context"] as? [String: Any])
+        XCTAssertEqual(context["recent_muse_inputs"] as? [String], ["上一条 Muse 输入"])
+        let rememberedInputs = await recentStore.recentInputs(
+            applicationBundleID: applicationID
+        )
+        XCTAssertEqual(rememberedInputs, ["上一条 Muse 输入", polished])
+    }
+
+    func testVoicePolishEmitsStageAndCanImmediatelyUseCanonicalText() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try SnippetStorage.saveBuiltin([
+            (trigger: "Type less", value: "Typeless"),
+        ], context: fixture.context)
+        let raw = "我正在使用 Type less。"
+        let canonical = "我正在使用 Typeless。"
+        let client = RecognitionSessionBlockingVoicePolishLLM()
+        let recorder = RecognitionEventRecorder()
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmClientFactory: { client },
+            llmConfigLoader: {
+                LLMConfig(
+                    apiKey: "test",
+                    model: "mock-model",
+                    baseURL: "https://example.com/v1"
+                )
+            }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+        let vocabularyContext = fixture.context
+        async let processingResult = session.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: vocabularyContext
+        )
+
+        for _ in 0..<100 {
+            if await client.requestCount() > 0,
+               recorder.values.contains("voicePolishStage:polishing") {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 1)
+        let accepted = await session.useCanonicalVoicePolishResult()
+        XCTAssertTrue(accepted)
+        let result = await processingResult
+
+        XCTAssertEqual(result?.finalText, canonical)
+        XCTAssertNil(result?.processedText)
+        XCTAssertFalse(result?.llmFailed ?? true)
+        XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
+        XCTAssertTrue(recorder.values.contains("voicePolishStage:polishing"))
+        XCTAssertTrue(recorder.values.contains("processing:\(canonical)"))
+    }
+
+    func testVoicePolishCanonicalRequestIsRejectedAfterPipelineResultCommitted() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        let polished = "这是已经提交的润色结果。"
+        let client = RecognitionSessionVoicePolishLLM(response: polished)
+        let recorder = RecognitionEventRecorder()
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmClientFactory: { client },
+            llmConfigLoader: {
+                LLMConfig(
+                    apiKey: "test",
+                    model: "mock-model",
+                    baseURL: "https://example.com/v1"
+                )
+            }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+        let raw = "这是需要润色的原始口述。"
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let result = await session.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: fixture.context
+        )
+        let acceptedAfterCommit = await session.useCanonicalVoicePolishResult()
+
+        XCTAssertEqual(result?.finalText, polished)
+        XCTAssertTrue(recorder.values.contains("processing:\(polished)"))
+        XCTAssertFalse(acceptedAfterCommit)
+    }
+
+    func testVoicePolishFallbackUsesCanonicalTextInsteadOfRawTranscript() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try SnippetStorage.saveBuiltin([
+            (trigger: "Type less", value: "Typeless"),
+        ], context: fixture.context)
+        let raw = "我正在使用 Type less。"
+        let canonical = "我正在使用 Typeless。"
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"),
+            llmConfigLoader: { nil }
+        )
+        let transcript = RecognitionTranscript(
+            confirmedSegments: [raw],
+            partialText: "",
+            authoritativeText: raw,
+            isFinal: true
+        )
+
+        let result = await session.postProcessVoicePolishForTesting(
+            rawText: raw,
+            transcript: transcript,
+            vocabularyContext: fixture.context
+        )
+
+        XCTAssertEqual(result?.finalText, canonical)
+        XCTAssertNil(result?.processedText)
+        XCTAssertTrue(result?.llmFailed ?? false)
+        XCTAssertEqual(result?.historyStatus, "voice_polish_fallback")
+    }
+
+    private static func voicePolishPayload(from request: LLMRequest) throws -> [String: Any] {
+        let object = try JSONSerialization.jsonObject(with: Data(request.user.utf8))
+        return try XCTUnwrap(object as? [String: Any])
+    }
+
     // MARK: - REPAIR_PLAN K2：注入取值守卫与时长合理性
 
     func testEffectiveTextPrefersAuthoritativeWhenComparable() {
@@ -396,6 +737,8 @@ private final class RecognitionEventRecorder: @unchecked Sendable {
             return "completed"
         case .processingResult(let text):
             return "processing:\(text)"
+        case .voicePolishStage(let stage):
+            return "voicePolishStage:\(stage.rawValue)"
         case .finalized(let text, let injection):
             return "finalized:\(text):\(injection)"
         case .streamingInterrupted:
@@ -404,9 +747,34 @@ private final class RecognitionEventRecorder: @unchecked Sendable {
     }
 }
 
+private actor RecognitionSessionBlockingVoicePolishLLM: LLMClient {
+    private var requests: [LLMRequest] = []
+
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        requests.append(request)
+        try await Task.sleep(for: .seconds(30))
+        return LLMResponse(text: "不应等待到这里", model: config.model)
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
+        XCTFail("Voice Polish 不应回到兼容 process 接口")
+        return text
+    }
+
+    func warmUp(baseURL: String) async {}
+
+    func requestCount() -> Int { requests.count }
+}
+
 private actor RecognitionSessionVoicePolishLLM: LLMClient {
     private let response: String
     private var requests: [LLMRequest] = []
+    private var models: [String] = []
 
     init(response: String) {
         self.response = response
@@ -414,6 +782,7 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
 
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
         requests.append(request)
+        models.append(config.model)
         return LLMResponse(text: response, model: config.model)
     }
 
@@ -431,4 +800,31 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
 
     func requestCount() -> Int { requests.count }
     func recordedRequests() -> [LLMRequest] { requests }
+    func recordedModels() -> [String] { models }
+}
+
+private final class RecognitionSessionVocabularyFixture {
+    let directory: URL
+    let suiteName: String
+    let context: VocabularyStorageContext
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseRecognitionSessionVocabularyTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        suiteName = "MuseRecognitionSessionVocabularyTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        context = VocabularyStorageContext(
+            supportDirectory: directory,
+            userDefaults: defaults,
+            fileManager: .default,
+            hotwordsDidChange: {},
+            revealFile: { _ in }
+        )
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: directory)
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+    }
 }

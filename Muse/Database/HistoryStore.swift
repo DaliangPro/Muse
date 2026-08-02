@@ -74,6 +74,18 @@ actor HistoryStore {
             // Migration: add character_count column if it doesn't exist (for existing databases)
             sqlite3_exec(db, "ALTER TABLE recognition_history ADD COLUMN character_count INTEGER;", nil, nil, nil)
             sqlite3_exec(db, "ALTER TABLE recognition_history ADD COLUMN token_count INTEGER;", nil, nil, nil)
+            // 旧纠正记录历史上同时用于风格和术语，迁移默认 true；新记录按用户
+            // 本次确认的两个独立开关写入，关闭风格学习不再影响术语记忆。
+            sqlite3_exec(
+                db,
+                "ALTER TABLE voice_polish_corrections ADD COLUMN learn_style INTEGER NOT NULL DEFAULT 1;",
+                nil, nil, nil
+            )
+            sqlite3_exec(
+                db,
+                "ALTER TABLE voice_polish_corrections ADD COLUMN learn_terminology INTEGER NOT NULL DEFAULT 1;",
+                nil, nil, nil
+            )
 
             // REPAIR_PLAN B5：WAL 降低写阻塞；created_at 建索引，
             // 列表按时间倒序查询不再随数据量增长全表排序。
@@ -320,27 +332,38 @@ actor HistoryStore {
     }
 
     func delete(id: String) {
-        var correctionStmt: OpaquePointer?
-        if sqlite3_prepare_v2(
-            db,
-            "DELETE FROM voice_polish_corrections WHERE history_id = ?;",
-            -1,
-            &correctionStmt,
-            nil
-        ) == SQLITE_OK {
-            SQL.bind(correctionStmt, 1, id)
-            _ = sqlite3_step(correctionStmt)
+        do {
+            try deleteOrThrow(id: id)
+        } catch {
+            AppLogger.log("[HistoryStore] 删除历史失败: \(error.localizedDescription)")
         }
-        sqlite3_finalize(correctionStmt)
+    }
 
-        let sql = "DELETE FROM recognition_history WHERE id = ?;"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
-        defer { sqlite3_finalize(stmt) }
-        SQL.bind(stmt, 1, id)
-        if stepSingleWrite(stmt) {
-            postDidChangeNotification()
+    /// 原子删除历史及其纠正记录，并把失败显式返回给需要跨存储回滚的上层。
+    func deleteOrThrow(id: String) throws {
+        let db = try requireDB()
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
         }
+        do {
+            try executeDelete(
+                "DELETE FROM voice_polish_corrections WHERE history_id = ?;",
+                id: id,
+                in: db
+            )
+            try executeDelete(
+                "DELETE FROM recognition_history WHERE id = ?;",
+                id: id,
+                in: db
+            )
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+            }
+        } catch {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+        postDidChangeNotification()
     }
 
     /// 历史保留上限的默认值（REPAIR_PLAN C1），可经 defaults 写
@@ -396,9 +419,15 @@ actor HistoryStore {
         correctedText: String,
         scene: WritingScene,
         personalizationEnabled: Bool,
-        retentionLimit: Int
+        retentionLimit: Int,
+        learnStyle requestedLearnStyle: Bool? = nil,
+        learnTerminology requestedLearnTerminology: Bool? = nil
     ) throws -> VoicePolishCorrectionRecord {
-        guard personalizationEnabled else { throw HistoryStoreError.personalizationDisabled }
+        let learnStyle = (requestedLearnStyle ?? personalizationEnabled) && personalizationEnabled
+        let learnTerminology = requestedLearnTerminology ?? personalizationEnabled
+        guard learnStyle || learnTerminology else {
+            throw HistoryStoreError.personalizationDisabled
+        }
         guard let history = try fetchOrThrow(ids: [historyID]).first,
               history.status.hasPrefix("voice_polish_") else {
             throw HistoryStoreError.correctionNotEligible
@@ -411,27 +440,28 @@ actor HistoryStore {
         let db = try requireDB()
         let id = UUID().uuidString
         let createdAt = Date()
-        let sql = """
-        INSERT INTO voice_polish_corrections (id, history_id, created_at, scene, corrected_text)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(history_id) DO UPDATE SET
-            id = excluded.id,
-            created_at = excluded.created_at,
-            scene = excluded.scene,
-            corrected_text = excluded.corrected_text;
-        """
-        var stmt: OpaquePointer?
-        try prepare(sql, in: db, statement: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        SQL.bind(stmt, 1, id)
-        SQL.bind(stmt, 2, historyID)
-        SQL.bind(stmt, 3, ISO8601DateFormatter().string(from: createdAt))
-        SQL.bind(stmt, 4, scene.rawValue)
-        SQL.bind(stmt, 5, corrected)
-        guard stepSingleWrite(stmt) else {
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
             throw HistoryStoreError.sqlite(sqliteMessage(in: db))
         }
-        try pruneVoicePolishCorrections(keepingMostRecent: retentionLimit, in: db)
+        do {
+            try upsertVoicePolishCorrection(
+                id: id,
+                historyID: historyID,
+                createdAt: createdAt,
+                scene: scene,
+                correctedText: corrected,
+                learnStyle: learnStyle,
+                learnTerminology: learnTerminology,
+                in: db
+            )
+            try pruneVoicePolishCorrections(keepingMostRecent: retentionLimit, in: db)
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+            }
+        } catch {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
         postDidChangeNotification()
         return VoicePolishCorrectionRecord(
             id: id,
@@ -440,15 +470,56 @@ actor HistoryStore {
             scene: scene,
             sourceText: history.rawText,
             generatedText: history.finalText,
-            correctedText: corrected
+            correctedText: corrected,
+            learnStyle: learnStyle,
+            learnTerminology: learnTerminology
         )
+    }
+
+    private func upsertVoicePolishCorrection(
+        id: String,
+        historyID: String,
+        createdAt: Date,
+        scene: WritingScene,
+        correctedText: String,
+        learnStyle: Bool,
+        learnTerminology: Bool,
+        in db: OpaquePointer
+    ) throws {
+        let sql = """
+        INSERT INTO voice_polish_corrections (
+            id, history_id, created_at, scene, corrected_text, learn_style, learn_terminology
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(history_id) DO UPDATE SET
+            id = excluded.id,
+            created_at = excluded.created_at,
+            scene = excluded.scene,
+            corrected_text = excluded.corrected_text,
+            learn_style = excluded.learn_style,
+            learn_terminology = excluded.learn_terminology;
+        """
+        var stmt: OpaquePointer?
+        try prepare(sql, in: db, statement: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        SQL.bind(stmt, 1, id)
+        SQL.bind(stmt, 2, historyID)
+        SQL.bind(stmt, 3, ISO8601DateFormatter().string(from: createdAt))
+        SQL.bind(stmt, 4, scene.rawValue)
+        SQL.bind(stmt, 5, correctedText)
+        sqlite3_bind_int(stmt, 6, learnStyle ? 1 : 0)
+        sqlite3_bind_int(stmt, 7, learnTerminology ? 1 : 0)
+        guard stepSingleWrite(stmt) else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
     }
 
     func fetchVoicePolishCorrections(limit: Int? = nil) throws -> [VoicePolishCorrectionRecord] {
         let db = try requireDB()
         var sql = """
         SELECT c.id, c.history_id, c.created_at, c.scene,
-               h.raw_text, h.final_text, c.corrected_text
+               h.raw_text, h.final_text, c.corrected_text,
+               c.learn_style, c.learn_terminology
         FROM voice_polish_corrections c
         INNER JOIN recognition_history h ON h.id = c.history_id
         ORDER BY c.created_at DESC
@@ -472,7 +543,9 @@ actor HistoryStore {
                     scene: WritingScene(rawValue: SQL.column(stmt, 3)) ?? .unknown,
                     sourceText: SQL.column(stmt, 4),
                     generatedText: SQL.column(stmt, 5),
-                    correctedText: SQL.column(stmt, 6)
+                    correctedText: SQL.column(stmt, 6),
+                    learnStyle: sqlite3_column_int(stmt, 7) != 0,
+                    learnTerminology: sqlite3_column_int(stmt, 8) != 0
                 ))
             case SQLITE_DONE:
                 return records
@@ -489,9 +562,50 @@ actor HistoryStore {
         return try encoder.encode(fetchVoicePolishCorrections())
     }
 
+    /// 撤销某条历史记录对应的显式纠正。历史正文保持不变，只移除学习样本；
+    /// 术语 Repository 的投影撤销由上层使用同一 historyID 协调处理。
+    func deleteVoicePolishCorrection(historyID: String) throws {
+        let db = try requireDB()
+        var stmt: OpaquePointer?
+        try prepare(
+            "DELETE FROM voice_polish_corrections WHERE history_id = ?;",
+            in: db,
+            statement: &stmt
+        )
+        defer { sqlite3_finalize(stmt) }
+        SQL.bind(stmt, 1, historyID)
+        guard stepSingleWrite(stmt) else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
+        postDidChangeNotification()
+    }
+
     func deleteAllVoicePolishCorrections() throws {
         let db = try requireDB()
         guard sqlite3_exec(db, "DELETE FROM voice_polish_corrections;", nil, nil, nil) == SQLITE_OK else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
+        postDidChangeNotification()
+    }
+
+    /// 只重置表达风格学习，不破坏独立保存的术语纠正证据。
+    ///
+    /// - 仅学习风格的记录可以直接删除；
+    /// - 同时学习术语的记录保留，并把 `learn_style` 关闭；
+    /// - 仅学习术语的记录保持原样。
+    func resetVoicePolishStyleLearning() throws {
+        let db = try requireDB()
+        let sql = """
+        BEGIN IMMEDIATE;
+        DELETE FROM voice_polish_corrections
+        WHERE learn_style = 1 AND learn_terminology = 0;
+        UPDATE voice_polish_corrections
+        SET learn_style = 0
+        WHERE learn_style = 1 AND learn_terminology = 1;
+        COMMIT;
+        """
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
             throw HistoryStoreError.sqlite(sqliteMessage(in: db))
         }
         postDidChangeNotification()
@@ -710,6 +824,20 @@ actor HistoryStore {
         statement: inout OpaquePointer?
     ) throws {
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
+        }
+    }
+
+    private func executeDelete(
+        _ sql: String,
+        id: String,
+        in db: OpaquePointer
+    ) throws {
+        var statement: OpaquePointer?
+        try prepare(sql, in: db, statement: &statement)
+        defer { sqlite3_finalize(statement) }
+        SQL.bind(statement, 1, id)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
             throw HistoryStoreError.sqlite(sqliteMessage(in: db))
         }
     }

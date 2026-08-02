@@ -30,7 +30,9 @@ struct ModeDetailInner: View, SettingsCardHelpers {
 
     var body: some View {
         VStack(alignment: .leading, spacing: ModeSettingsLayout.modeWorkbenchGap) {
-            if isDirectMode {
+            if mode.kind == .voicePolish {
+                voicePolishModeNotice
+            } else if isDirectMode {
                 // 直出模式不走文本处理，Prompt 与试跑无意义（2026-06-12 用户拍板）
                 directModeNotice
             } else {
@@ -77,6 +79,62 @@ struct ModeDetailInner: View, SettingsCardHelpers {
                 .foregroundStyle(TF.settingsTextSecondary)
                 .lineSpacing(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(ModeSettingsLayout.modeGutter)
+        .frame(width: ModeSettingsLayout.modeWorkspaceWidth, alignment: .topLeading)
+        .background {
+            RoundedRectangle(
+                cornerRadius: ModeSettingsLayout.modeFieldCornerRadius,
+                style: .continuous
+            )
+            .fill(modeFieldFill)
+        }
+        .overlay {
+            RoundedRectangle(
+                cornerRadius: ModeSettingsLayout.modeFieldCornerRadius,
+                style: .continuous
+            )
+            .stroke(modeFieldStroke, lineWidth: 1)
+        }
+    }
+
+    private var voicePolishModeNotice: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "wand.and.stars")
+                    .font(TF.settingsFontBodyLarge)
+                    .foregroundStyle(TF.settingsAccentAmber)
+                    .accessibilityHidden(true)
+                Text(L("语音润色是 Muse 的系统模式", "Voice Polish is a Muse system mode"))
+                    .font(TF.settingsFontSectionTitle)
+                    .foregroundStyle(TF.settingsText)
+            }
+
+            Text(L(
+                "这里继续管理快捷键和触发方式。附加润色要求、响应速度、上下文与表达学习已集中到一级“语音润色”页面，避免出现两个互相冲突的编辑入口。",
+                "Keep managing the shortcut and trigger behavior here. Additional requirements, response speed, context, and style learning now live on the top-level Voice Polish page so there is only one editing source."
+            ))
+            .font(TF.settingsFontBody)
+            .foregroundStyle(TF.settingsTextSecondary)
+            .lineSpacing(3)
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                SettingsChip(
+                    prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? L("使用默认成稿策略", "Default writing strategy")
+                        : L("已设置附加要求", "Additional requirements set"),
+                    controlSize: .compact,
+                    foreground: TF.settingsTextSecondary,
+                    fill: TF.settingsSelectionFill
+                )
+
+                SettingsTextButton(L("前往语音润色设置", "Open Voice Polish Settings"), variant: .primary) {
+                    flushPendingSave()
+                    NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.voicePolish)
+                }
+                .accessibilityHint(L("打开附加润色要求、响应方式和上下文设置", "Opens requirements, response, and context settings"))
+            }
         }
         .padding(ModeSettingsLayout.modeGutter)
         .frame(width: ModeSettingsLayout.modeWorkspaceWidth, alignment: .topLeading)

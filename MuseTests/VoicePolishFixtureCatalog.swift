@@ -18,11 +18,13 @@ enum VoicePolishFixtureCategory: String, CaseIterable {
 
     var expectedCount: Int {
         switch self {
-        case .shortChat, .workChat, .immediateCorrection, .delayedCorrection,
+        case .shortChat:
+            return 9
+        case .workChat, .immediateCorrection, .delayedCorrection,
              .properNoun, .numericFact, .mixedTechnical, .aiPrompt:
             return 8
         case .email, .sideNote, .unorderedThinking, .listCountChange, .socialMonologue:
-            return 6
+            return 7
         }
     }
 }
@@ -45,6 +47,7 @@ enum VoicePolishFixtureCatalog {
     private static let variants = [
         "请保留原意", "语气自然", "不要扩写", "直接成稿",
         "表达清楚", "保持力度", "结构清晰", "只做整理",
+        "可以直接发送",
     ]
 
     private static func makeFixtures(

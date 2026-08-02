@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPORT_PATH="${MUSE_VOICE_POLISH_LIVE_REPORT:-$PROJECT_DIR/build/voice-polish-live-report.json}"
-LIMIT="${MUSE_VOICE_POLISH_LIVE_LIMIT:-30}"
+LIMIT="${MUSE_VOICE_POLISH_LIVE_LIMIT:-100}"
 
 mkdir -p "$(dirname "$REPORT_PATH")"
 cd "$PROJECT_DIR"

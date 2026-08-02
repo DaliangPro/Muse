@@ -35,6 +35,9 @@ struct WritingContext: Sendable, Equatable, Codable {
     let selectedText: String?
     let textBeforeCursor: String?
     let textAfterCursor: String?
+    /// 仅包含 Muse 自己在同一应用内近期完成的输入；由可选的内存 Store 注入，
+    /// 不读取第三方页面，也不跨应用、不持久化。
+    let recentMuseInputs: [String]
     let localeIdentifier: String?
 
     init(
@@ -47,6 +50,7 @@ struct WritingContext: Sendable, Equatable, Codable {
         selectedText: String? = nil,
         textBeforeCursor: String? = nil,
         textAfterCursor: String? = nil,
+        recentMuseInputs: [String] = [],
         localeIdentifier: String? = nil
     ) {
         self.applicationBundleID = applicationBundleID
@@ -56,6 +60,9 @@ struct WritingContext: Sendable, Equatable, Codable {
         self.level = level
         self.safety = safety
         self.localeIdentifier = localeIdentifier
+        self.recentMuseInputs = recentMuseInputs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
 
         if safety == .safe, level != .metadataOnly {
             self.selectedText = selectedText
@@ -69,6 +76,44 @@ struct WritingContext: Sendable, Equatable, Codable {
     }
 
     static let phaseOneUnknown = WritingContext()
+
+    private enum CodingKeys: String, CodingKey {
+        case applicationBundleID, applicationName, focusedRole, scene, level, safety
+        case selectedText, textBeforeCursor, textAfterCursor, recentMuseInputs, localeIdentifier
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            applicationBundleID: try container.decodeIfPresent(String.self, forKey: .applicationBundleID),
+            applicationName: try container.decodeIfPresent(String.self, forKey: .applicationName),
+            focusedRole: try container.decodeIfPresent(String.self, forKey: .focusedRole),
+            scene: try container.decodeIfPresent(WritingScene.self, forKey: .scene) ?? .unknown,
+            level: try container.decodeIfPresent(WritingContextLevel.self, forKey: .level) ?? .metadataOnly,
+            safety: try container.decodeIfPresent(ContextSafety.self, forKey: .safety) ?? .unknown,
+            selectedText: try container.decodeIfPresent(String.self, forKey: .selectedText),
+            textBeforeCursor: try container.decodeIfPresent(String.self, forKey: .textBeforeCursor),
+            textAfterCursor: try container.decodeIfPresent(String.self, forKey: .textAfterCursor),
+            recentMuseInputs: try container.decodeIfPresent([String].self, forKey: .recentMuseInputs) ?? [],
+            localeIdentifier: try container.decodeIfPresent(String.self, forKey: .localeIdentifier)
+        )
+    }
+
+    func includingRecentMuseInputs(_ inputs: [String]) -> WritingContext {
+        WritingContext(
+            applicationBundleID: applicationBundleID,
+            applicationName: applicationName,
+            focusedRole: focusedRole,
+            scene: scene,
+            level: level,
+            safety: safety,
+            selectedText: selectedText,
+            textBeforeCursor: textBeforeCursor,
+            textAfterCursor: textAfterCursor,
+            recentMuseInputs: inputs,
+            localeIdentifier: localeIdentifier
+        )
+    }
 }
 
 enum VoicePolishQualityMode: String, Codable, CaseIterable, Sendable, Equatable {
@@ -81,6 +126,14 @@ enum VoicePolishRoute: String, Codable, Sendable, Equatable {
     case fast
     case structured
     case deep
+}
+
+/// Voice Polish 当前正在执行的可见阶段。只描述处理步骤，不携带用户正文。
+enum VoicePolishStage: String, Sendable, Equatable {
+    case polishing
+    case analyzing
+    case rendering
+    case repairing
 }
 
 struct UserPolishPreferences: Sendable, Equatable {

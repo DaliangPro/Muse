@@ -13,8 +13,8 @@ final class VoicePolishLiveBenchmarkTests: XCTestCase {
         }
         let provider = KeychainService.selectedLLMProvider
         let client = LLMProviderRegistry.makeClient(for: provider)
-        let requestedLimit = Int(environment["MUSE_VOICE_POLISH_LIVE_LIMIT"] ?? "30") ?? 30
-        let fixtures = Array(VoicePolishFixtureCatalog.all.prefix(min(max(1, requestedLimit), 94)))
+        let requestedLimit = Int(environment["MUSE_VOICE_POLISH_LIVE_LIMIT"] ?? "100") ?? 100
+        let fixtures = Array(VoicePolishFixtureCatalog.all.prefix(min(max(1, requestedLimit), 100)))
         var cases: [LiveCaseReport] = []
 
         for fixture in fixtures {

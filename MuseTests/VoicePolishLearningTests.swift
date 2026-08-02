@@ -41,7 +41,7 @@ final class VoicePolishLearningTests: XCTestCase {
         XCTAssertLessThanOrEqual(abs(profile.brevity), 0.1)
     }
 
-    func testAutomaticLexiconCandidatesNeedRepeatedExplicitCorrections() {
+    func testExplicitCorrectionProducesCandidateImmediatelyAndSupportsEvidenceThreshold() {
         let once = [correction(
             id: "1",
             date: Date(),
@@ -49,7 +49,15 @@ final class VoicePolishLearningTests: XCTestCase {
             generated: "使用 Kubernetez 部署",
             corrected: "使用 Kubernetes 部署"
         )]
-        XCTAssertTrue(StyleProfileUpdater.lexiconCandidates(from: once).isEmpty)
+        let immediate = StyleProfileUpdater.lexiconCandidates(from: once)
+        XCTAssertEqual(immediate.count, 1)
+        XCTAssertEqual(immediate[0].alias, "Kubernetez")
+        XCTAssertEqual(immediate[0].canonical, "Kubernetes")
+        XCTAssertEqual(immediate[0].occurrenceCount, 1)
+        XCTAssertTrue(StyleProfileUpdater.lexiconCandidates(
+            from: once,
+            minimumOccurrences: 2
+        ).isEmpty)
 
         let candidates = StyleProfileUpdater.lexiconCandidates(from: once + [correction(
             id: "2",
@@ -57,11 +65,66 @@ final class VoicePolishLearningTests: XCTestCase {
             scene: .code,
             generated: "检查 Kubernetez 集群",
             corrected: "检查 Kubernetes 集群"
-        )])
+        )], minimumOccurrences: 2)
         XCTAssertEqual(candidates.count, 1)
         XCTAssertEqual(candidates[0].alias, "Kubernetez")
         XCTAssertEqual(candidates[0].canonical, "Kubernetes")
         XCTAssertEqual(candidates[0].occurrenceCount, 2)
+    }
+
+    func testAutomaticLexiconCandidateSupportsManyTokensToOneCanonicalTerm() {
+        XCTAssertEqual(
+            TerminologyCorrectionExtractor.candidates(
+                generatedText: "我正在用 Type less 写这段话",
+                correctedText: "我正在用 Typeless 写这段话"
+            ),
+            [TerminologyCorrectionCandidate(alias: "Type less", canonical: "Typeless")]
+        )
+        let record = correction(
+            id: "typeless",
+            date: Date(),
+            scene: .chat,
+            generated: "我正在用 Type less 写这段话",
+            corrected: "我正在用 Typeless 写这段话"
+        )
+
+        let candidates = StyleProfileUpdater.lexiconCandidates(from: [record])
+
+        XCTAssertEqual(candidates, [AutomaticLexiconCandidate(
+            alias: "Type less",
+            canonical: "Typeless",
+            occurrenceCount: 1
+        )])
+    }
+
+    func testTerminologyAndStyleLearningAuthorizationsAreIndependent() {
+        let terminologyOnly = (0..<5).map { index in
+            correction(
+                id: "term-\(index)",
+                date: Date(timeIntervalSince1970: Double(index)),
+                scene: .chat,
+                generated: "使用 Type less",
+                corrected: "使用 Typeless",
+                learnStyle: false,
+                learnTerminology: true
+            )
+        }
+        XCTAssertNil(StyleProfileUpdater.mergedProfile(from: terminologyOnly, scene: .chat))
+        XCTAssertEqual(
+            StyleProfileUpdater.lexiconCandidates(from: terminologyOnly).first?.canonical,
+            "Typeless"
+        )
+
+        let styleOnly = correction(
+            id: "style-only",
+            date: Date(),
+            scene: .chat,
+            generated: "使用 Type less",
+            corrected: "使用 Typeless",
+            learnStyle: true,
+            learnTerminology: false
+        )
+        XCTAssertTrue(StyleProfileUpdater.lexiconCandidates(from: [styleOnly]).isEmpty)
     }
 
     func testDisabledPersonalizationOmitsStyleProfileFromPayload() throws {
@@ -111,7 +174,9 @@ final class VoicePolishLearningTests: XCTestCase {
         date: Date,
         scene: WritingScene,
         generated: String,
-        corrected: String
+        corrected: String,
+        learnStyle: Bool = true,
+        learnTerminology: Bool = true
     ) -> VoicePolishCorrectionRecord {
         VoicePolishCorrectionRecord(
             id: id,
@@ -120,7 +185,9 @@ final class VoicePolishLearningTests: XCTestCase {
             scene: scene,
             sourceText: "原始口述",
             generatedText: generated,
-            correctedText: corrected
+            correctedText: corrected,
+            learnStyle: learnStyle,
+            learnTerminology: learnTerminology
         )
     }
 

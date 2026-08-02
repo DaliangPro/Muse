@@ -89,6 +89,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.onCopyFallbackVisibilityChange = { [weak self] isVisible in
             self?.hotkeyManager.isCopyFallbackVisible = isVisible
         }
+        appState.onUseVoicePolishCanonicalText = { [weak self] in
+            guard let self else { return false }
+            return await self.session.useCanonicalVoicePolishResult()
+        }
         AppStartupCoordinator.scheduleDebugWindowsIfNeeded(
             hudDebugPresenter: hudDebugPresenter,
             appState: appState,
@@ -149,6 +153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.safeResetHotkeyState()
                     case .processingResult(let text):
                         appState.showProcessingResult(text)
+                        self.hotkeyManager.isProcessing = true
+                    case .voicePolishStage(let stage):
+                        appState.showVoicePolishStage(stage)
                         self.hotkeyManager.isProcessing = true
                     case .finalized(let text, let injection):
                         appState.finalize(text: text, outcome: injection)
@@ -311,13 +318,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             Task { @MainActor in
                 let phase = self.appState.barPhase
+                if await self.appState.useVoicePolishCanonicalTextIfAvailable(
+                    restoreOnFailure: false
+                ) {
+                    AppLogger.log("[Muse] >>> HOTKEY: ESC use Voice Polish canonical text")
+                    DebugFileLogger.log("hotkey ESC use voice polish canonical text")
+                    return
+                }
+                DebugFileLogger.log("hotkey ESC canonical unavailable or rejected; continuing with abort")
                 AppLogger.log("[Muse] >>> HOTKEY: ESC abort session (phase=\(String(describing: phase)))")
                 DebugFileLogger.log("hotkey ESC abort session phase=\(phase)")
                 self.hotkeyManager.isSessionActive = false
                 self.appState.showCancelled()
-            }
-            Task {
-                await self.session.abortCurrentSession()
+                Task {
+                    await self.session.abortCurrentSession()
+                }
             }
         }
 

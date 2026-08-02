@@ -8,7 +8,7 @@ struct VoicePolishRouteDecision: Sendable, Equatable {
 }
 enum VoicePolishComplexityRouter {
 
-    static let signalConfigurationVersion = 1
+    static let signalConfigurationVersion = 2
 
     private static let immediateCorrectionsZH = ["不对", "我改一下", "应该是", "我的意思是", "说错了"]
     private static let immediateCorrectionsEN = ["actually", "i mean", "let me correct that", "scratch that"]
@@ -76,8 +76,6 @@ enum VoicePolishComplexityRouter {
             || countChange
             || topicSwitch
             || ambiguousEntity
-            || factCandidates.count >= 16
-            || (hasChinese ? length > 500 : length > 300)
             || (request.context.scene == .aiPrompt && aiConstraintCount >= 2)
 
         let isStructured = correctionCount == 1
@@ -123,8 +121,7 @@ enum VoicePolishComplexityRouter {
                 "enumeration",
             ]
             if !decision.matchedSignalCategories.isDisjoint(with: elevatedSignals)
-                || decision.factCandidateCount >= 9
-                || exceedsQualityLengthThreshold(request.input.segments.map(\.text).joined(separator: "\n")) {
+                || decision.factCandidateCount >= 9 {
                 return .deep
             }
             return .structured
@@ -143,15 +140,6 @@ enum VoicePolishComplexityRouter {
         text.split { character in
             character.isWhitespace || character.isPunctuation
         }.count
-    }
-
-    private static func exceedsQualityLengthThreshold(_ text: String) -> Bool {
-        let normalized = text.precomposedStringWithCompatibilityMapping.lowercased()
-        let hasChinese = normalized.unicodeScalars.contains { scalar in
-            (0x3400...0x4DBF).contains(scalar.value)
-                || (0x4E00...0x9FFF).contains(scalar.value)
-        }
-        return hasChinese ? normalized.count > 250 : englishWordCount(normalized) > 150
     }
 
     private static func containsAny(

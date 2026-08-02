@@ -52,7 +52,7 @@ struct ModeStorage {
                 return migrateDefaultMode(mode, fallback: .translate)
             }
             if mode.id == ProcessingMode.formalWriting.id {
-                return migrateSeededDefaultPrompt(
+                var migrated = migrateSeededDefaultPrompt(
                     mode,
                     legacyPrompts: [
                         ProcessingMode.legacyFormalWritingPromptTemplate,
@@ -62,6 +62,11 @@ struct ModeStorage {
                     ],
                     fallbackPrompt: ProcessingMode.formalWriting.prompt
                 )
+                // Voice Polish 是拥有独立设置、术语和学习数据的稳定系统模式。
+                // 旧版本曾把它标成可删除；升级后只修正保护标记，不改用户 Prompt、
+                // 快捷键、名称或处理文案。
+                migrated.isBuiltin = true
+                return migrated
             }
             if mode.id == ProcessingMode.translate.id {
                 return migrateSeededDefaultPrompt(

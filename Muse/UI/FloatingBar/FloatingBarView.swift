@@ -15,9 +15,19 @@ protocol FloatingBarState: AnyObject, Observable {
     var recordingStartDate: Date? { get }
     var copyFallbackWasCopied: Bool { get }
     var preserveProcessingWidthForCopyFallback: Bool { get }
+    var voicePolishStage: VoicePolishStage? { get }
+    var canUseVoicePolishCanonicalText: Bool { get }
+    var isRequestingVoicePolishCanonicalText: Bool { get }
+    var voicePolishCanonicalExitMessage: String? { get }
     /// True when recording without SenseVoice streaming (Qwen3-only).
     var isQwen3OnlyMode: Bool { get }
     func copyFallbackToClipboard()
+    func useVoicePolishCanonicalText()
+}
+
+extension FloatingBarState {
+    var isRequestingVoicePolishCanonicalText: Bool { false }
+    var voicePolishCanonicalExitMessage: String? { nil }
 }
 
 /// Dark-themed floating transcription bar with smooth morphing between states.
@@ -390,10 +400,66 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var processingContent: some View {
-        ZStack {
-            Text(state.currentMode.processingLabel)
-                .font(TF.hudFontTitle)
-                .floatingBarReadableText(color: barTextColor)
+        TimelineView(.periodic(from: .now, by: 0.5)) { timeline in
+            let elapsed = max(
+                0,
+                timeline.date.timeIntervalSince(processingStartDate ?? timeline.date)
+            )
+            HStack(spacing: 5) {
+                HStack(spacing: 5) {
+                    Text(processingLabel)
+                    Text("· \(String(format: "%.1fs", elapsed))")
+                        .monospacedDigit()
+                        .opacity(0.72)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(
+                    L(
+                        "\(processingLabel)，已等待 \(String(format: "%.1f", elapsed)) 秒",
+                        "\(processingLabel), \(String(format: "%.1f", elapsed)) seconds"
+                    )
+                )
+
+                if state.isRequestingVoicePolishCanonicalText {
+                    Text(state.voicePolishCanonicalExitMessage ?? L("正在切换…", "Switching…"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .opacity(0.82)
+                        .accessibilityLabel(L(
+                            "正在切换到已纠正识别文本",
+                            "Switching to the corrected transcript"
+                        ))
+                } else if state.canUseVoicePolishCanonicalText {
+                    Button {
+                        state.useVoicePolishCanonicalText()
+                    } label: {
+                        Text(canonicalExitButtonTitle)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.96))
+                            .padding(.horizontal, 8)
+                            .frame(height: 24)
+                            .background {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.14))
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .help(L(
+                        "按 Esc 或点击此处，跳过继续润色并立即使用术语纠正后的识别文本",
+                        "Press Esc or click to skip polishing and use the corrected transcript"
+                    ))
+                    .accessibilityLabel(canonicalExitAccessibilityLabel)
+                    .accessibilityHint(L(
+                        "跳过继续润色并立即使用术语纠正后的识别文本，也可以按 Esc",
+                        "Skip further polishing and use the terminology-corrected transcript now. You can also press Escape."
+                    ))
+                } else if let message = state.voicePolishCanonicalExitMessage {
+                    Text(message)
+                        .font(.system(size: 11, weight: .semibold))
+                        .opacity(0.82)
+                }
+            }
+            .font(TF.hudFontTitle)
+            .floatingBarReadableText(color: barTextColor)
         }
         .frame(maxWidth: .infinity)
     }
@@ -675,10 +741,49 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private func processingWidth() -> CGFloat {
-        let labelWidth = measureText(state.currentMode.processingLabel) + 84.0
+        // 给持续更新的“· 0.0s”留固定宽度，避免 HUD 每半秒抖动。
+        let showsCanonicalExitStatus = state.canUseVoicePolishCanonicalText
+            || state.isRequestingVoicePolishCanonicalText
+            || state.voicePolishCanonicalExitMessage != nil
+        let actionReserve: CGFloat = showsCanonicalExitStatus ? 172 : 0
+        let labelWidth = measureText(processingLabel) + 126.0 + actionReserve
         guard state.preserveProcessingWidthForCopyFallback else { return labelWidth }
         let preservedInputWidth = max(TF.barFallbackMinWidth, min(TF.barFallbackWidth, recordingPeakWidth))
         return max(labelWidth, preservedInputWidth)
+    }
+
+    private var processingLabel: String {
+        guard state.currentMode.kind == .voicePolish,
+              let stage = state.voicePolishStage else {
+            return state.currentMode.processingLabel
+        }
+        switch stage {
+        case .polishing:
+            return L("整理成稿", "Polishing")
+        case .analyzing:
+            return L("分析意图", "Analyzing")
+        case .rendering:
+            return L("生成成稿", "Rendering")
+        case .repairing:
+            return L("校验修复", "Repairing")
+        }
+    }
+
+    private var canonicalExitButtonTitle: String {
+        if state.voicePolishCanonicalExitMessage != nil {
+            return L("切换失败 · 重试", "Switch failed · Retry")
+        }
+        return L("Esc 用纠正文本", "Esc: corrected transcript")
+    }
+
+    private var canonicalExitAccessibilityLabel: String {
+        if state.voicePolishCanonicalExitMessage != nil {
+            return L(
+                "切换失败，重试使用已纠正识别文本",
+                "Switch failed. Retry using the corrected transcript"
+            )
+        }
+        return L("使用已纠正识别文本", "Use corrected transcript")
     }
 
     private func copyFallbackWidth() -> CGFloat {

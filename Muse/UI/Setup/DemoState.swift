@@ -18,12 +18,15 @@ final class DemoState {
     var recordingStartDate: Date?
     var copyFallbackWasCopied = false
     var preserveProcessingWidthForCopyFallback = false
+    var voicePolishStage: VoicePolishStage?
+    var canUseVoicePolishCanonicalText = false
 
     var transcriptionText: String {
         segments.map(\.text).joined()
     }
 
     func copyFallbackToClipboard() {}
+    func useVoicePolishCanonicalText() {}
 
     func dismissCopyFallback() {
         stop()

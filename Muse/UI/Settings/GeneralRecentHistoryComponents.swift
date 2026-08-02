@@ -4,21 +4,33 @@ struct RecentHistoryRowView: View {
     let record: HistoryRecord
     let timeText: String
     let isCopied: Bool
+    let isCorrected: Bool
     let copyAction: () -> Void
     let learnAction: (() -> Void)?
+    let undoCorrectionAction: (() -> Void)?
     let deleteAction: () -> Void
 
     @State private var isHovering = false
 
     var body: some View {
         HStack(alignment: .top, spacing: GeneralSettingsStyle.recordColumnSpacing) {
-            Text(timeText)
-                .font(TF.settingsFontMono)
-                .monospacedDigit()
-                .foregroundStyle(TF.settingsTextTertiary.opacity(isHovering ? 1.0 : 0.7))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(width: GeneralSettingsStyle.recordInfoColumnWidth, alignment: .leading)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(timeText)
+                    .font(TF.settingsFontMono)
+                    .monospacedDigit()
+                    .foregroundStyle(TF.settingsTextTertiary.opacity(isHovering ? 1.0 : 0.7))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if isVoicePolishRecord {
+                    Text(L("语音润色", "Voice Polish"))
+                        .font(TF.settingsFontMetadata)
+                        .foregroundStyle(TF.settingsAccentAmber)
+                        .lineLimit(1)
+                        .accessibilityLabel(L("语音润色记录", "Voice Polish record"))
+                }
+            }
+            .frame(width: GeneralSettingsStyle.recordInfoColumnWidth, alignment: .leading)
 
             // 默认淡一档（与 Prompt 输入区同色），悬停整行提亮（2026-06-12 用户拍板）
             Text(record.finalText)
@@ -38,12 +50,28 @@ struct RecentHistoryRowView: View {
                 )
 
                 if let learnAction {
+                    SettingsTextButton(
+                        isCorrected ? L("查看/编辑", "View/Edit") : L("纠正", "Correct"),
+                        variant: isCorrected ? .success : .secondary,
+                        controlSize: .compact,
+                        minWidth: isCorrected ? 66 : 52,
+                        action: learnAction
+                    )
+                    .help(isCorrected
+                        ? L("查看或修改上次保存的纠正和学习授权", "View or edit the saved correction and learning permissions")
+                        : L("纠正结果，并分别选择是否记住术语或学习表达习惯", "Correct the result and separately choose term memory or style learning"))
+                    .accessibilityLabel(isCorrected
+                        ? L("查看或编辑这条纠正", "View or edit this correction")
+                        : L("纠正这条语音润色结果", "Correct this Voice Polish result"))
+                }
+
+                if let undoCorrectionAction {
                     RecentHistoryActionIconButton(
-                        systemName: "pencil.and.scribble",
-                        accessibilityLabel: L("纠正并学习", "Correct and learn"),
+                        systemName: "arrow.uturn.backward",
+                        accessibilityLabel: L("撤销这条学习记录", "Undo this learned correction"),
                         isDestructive: false,
                         isRowHovering: isHovering,
-                        action: learnAction
+                        action: undoCorrectionAction
                     )
                 }
 
@@ -63,6 +91,10 @@ struct RecentHistoryRowView: View {
         .onHover { hovering in
             isHovering = hovering
         }
+    }
+
+    private var isVoicePolishRecord: Bool {
+        record.status.hasPrefix("voice_polish_")
     }
 }
 

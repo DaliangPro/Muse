@@ -1,7 +1,7 @@
 import XCTest
 
 final class VoicePolishBlindTestScriptTests: XCTestCase {
-    func testPrepareRandomizesThirtySamplesAndScoreAppliesEightyFivePercentGate() throws {
+    func testPrepareRandomizesOneHundredSamplesAndAppliesFullProductGate() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("MuseVoicePolishBlindTest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -10,12 +10,28 @@ final class VoicePolishBlindTestScriptTests: XCTestCase {
         let evaluation = root.appendingPathComponent("evaluation.json")
         let key = root.appendingPathComponent("key.json")
         let report = root.appendingPathComponent("report.json")
-        let samples: [[String: String]] = (0..<30).map {
-            [
+        let samples: [[String: Any]] = (0..<100).map {
+            let route = $0 % 10 == 0 ? "deep" : ($0 % 3 == 0 ? "structured" : "fast")
+            return [
                 "id": "sample-\($0)",
-                "input": "input-\($0)",
-                "legacy_output": "legacy-\($0)",
-                "new_output": "new-\($0)",
+                "audio_ref": "audio/sample-\($0).wav",
+                "category": "terminology",
+                "reference_transcript": "input-\($0)",
+                "typeless_output": "typeless-\($0)",
+                "muse_output": "muse-\($0)",
+                "typeless_latency_ms": 1_000,
+                "muse_metrics": [
+                    "latency_ms": route == "deep" ? 4_000 : 1_000,
+                    "route": route,
+                    "call_count": 1,
+                    "repair_used": false,
+                    "fallback_used": false,
+                    "confirmed_alias_total": 1,
+                    "confirmed_alias_correct": 1,
+                    "critical_fact_total": 1,
+                    "critical_fact_preserved": 1,
+                    "whitelist_hallucination_count": 0,
+                ],
             ]
         }
         try JSONSerialization.data(withJSONObject: ["samples": samples])
@@ -28,12 +44,19 @@ final class VoicePolishBlindTestScriptTests: XCTestCase {
             "--output", evaluation.path,
             "--key", key.path,
             "--seed", "7",
+            "--baseline-commit", "test-baseline",
         ]), 0)
 
         var publicDocument = try json(at: evaluation)
         var publicSamples = publicDocument["samples"] as! [[String: Any]]
         for index in publicSamples.indices {
-            publicSamples[index]["rating"] = index < 26 ? "tie" : "both_unusable"
+            publicSamples[index]["ratings"] = [
+                "overall": "tie",
+                "writing_quality": "tie",
+                "terminology": "tie",
+                "fact_preservation": "tie",
+                "sendability": "tie",
+            ]
         }
         publicDocument["samples"] = publicSamples
         try JSONSerialization.data(withJSONObject: publicDocument, options: [.prettyPrinted, .sortedKeys])
@@ -46,10 +69,12 @@ final class VoicePolishBlindTestScriptTests: XCTestCase {
             "--output", report.path,
         ]), 0)
         let scored = try json(at: report)
-        XCTAssertEqual(scored["baseline_commit"] as? String, "b81bce5")
-        XCTAssertEqual(scored["sample_count"] as? Int, 30)
+        XCTAssertEqual(scored["baseline_commit"] as? String, "test-baseline")
+        XCTAssertEqual(scored["sample_count"] as? Int, 100)
         XCTAssertEqual(scored["product_ready"] as? Bool, true)
-        XCTAssertEqual(scored["new_win_or_tie_rate"] as? Double ?? 0, 26.0 / 30.0, accuracy: 0.0001)
+        let dimensions = scored["dimensions"] as! [String: Any]
+        let overall = dimensions["overall"] as! [String: Any]
+        XCTAssertEqual(overall["muse_win_or_tie_rate"] as? Double, 1)
     }
 
     private var projectRoot: URL {

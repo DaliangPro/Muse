@@ -41,7 +41,17 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            fieldsSection
+            if mode.kind == .voicePolish {
+                Text(L(
+                    "此处只设置语音润色的快捷键和按键方式；润色要求请到一级“语音润色”页面编辑。",
+                    "Set only the Voice Polish shortcut and key behavior here. Edit polishing requirements on the top-level Voice Polish page."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            } else {
+                fieldsSection
+            }
             shortcutSection
             triggerSection
 
@@ -168,8 +178,10 @@ private extension ModeSettingsSheet {
             SettingsTextButton(L("保存", "Save"), variant: .primary, width: 64) {
                 stopListening()
                 var updated = mode
-                updated.name = sanitizedModeName
-                updated.processingLabel = sanitizedProcessingLabel
+                if mode.kind != .voicePolish {
+                    updated.name = sanitizedModeName
+                    updated.processingLabel = sanitizedProcessingLabel
+                }
                 updated.hotkeyCode = hotkeyCode
                 updated.hotkeyModifiers = hotkeyModifiers
                 updated.hotkeyStyle = hotkeyStyle

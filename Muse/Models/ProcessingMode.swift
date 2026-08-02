@@ -125,6 +125,16 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         kind == .translate
     }
 
+    /// 稳定系统模式不能被设置页删除。它与 `isBuiltin` 分开表达：
+    /// 旧版本可能已把 Voice Polish 持久化为非 builtin，但稳定 ID 仍必须受保护。
+    var isProtectedSystemMode: Bool {
+        id == Self.directId || kind == .voicePolish
+    }
+
+    var isUserDeletable: Bool {
+        !isProtectedSystemMode
+    }
+
     var requiresLLM: Bool {
         switch kind {
         case .direct:
@@ -168,7 +178,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             // V2 起，默认规则由 VoicePolishPrompts 版本化维护；这里仅保存用户
             // 的附加润色要求，因此新装默认为空。
             prompt: "",
-            isBuiltin: false,
+            isBuiltin: true,
             processingLabel: L("润色中", "Polishing"),
             hotkeyCode: 18, hotkeyModifiers: 524288, hotkeyStyle: .toggle
         )
@@ -207,6 +217,6 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
-    static var builtins: [ProcessingMode] { [.direct] }
+    static var builtins: [ProcessingMode] { [.direct, .formalWriting] }
     static var defaults: [ProcessingMode] { [.direct, .formalWriting, .promptOptimize, .translate, .commandMode] }
 }

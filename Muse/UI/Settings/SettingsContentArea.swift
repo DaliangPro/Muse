@@ -52,7 +52,9 @@ private extension SettingsContentArea {
         case .models:
             ModelSettingsTab()
         case .vocabulary:
-            VocabularyTab()
+            TerminologySettingsTab()
+        case .voicePolish:
+            VoicePolishSettingsTab()
         case .modes:
             ModesSettingsTab()
         case .about:
@@ -66,7 +68,7 @@ private extension SettingsTab {
         switch self {
         case .general, .assetLibrary:
             .fixed
-        case .models, .vocabulary, .modes, .about:
+        case .models, .vocabulary, .voicePolish, .modes, .about:
             .scroll(showsIndicators: false)
         }
     }

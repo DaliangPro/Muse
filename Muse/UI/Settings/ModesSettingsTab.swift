@@ -11,7 +11,6 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
     @State private var modePickerTriggerFrame = CGRect.zero
     @State private var modePickerPopoverFrame = CGRect.zero
     @State private var configuringModeId: UUID?
-    @State private var isVoicePolishSettingsPresented = false
 
     var body: some View {
         // 2026-07-08 大梁老师：工作区高度改按实际几何现场计算（隐藏标题栏窗口的
@@ -37,11 +36,6 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
         }
         .sheet(isPresented: isModeSettingsPresented) {
             modeSettingsSheet
-        }
-        .sheet(isPresented: $isVoicePolishSettingsPresented) {
-            VoicePolishSettingsSheet {
-                isVoicePolishSettingsPresented = false
-            }
         }
         .alert(
             L("删除模式", "Delete Mode"),
@@ -167,17 +161,17 @@ private extension ModesSettingsTab {
 
                 if mode.kind == .voicePolish {
                     SettingsTextButton(
-                        L("润色设置", "Polish"),
+                        L("前往语音润色", "Open Voice Polish"),
                         variant: .secondary,
-                        minWidth: 66,
+                        minWidth: 94,
                         onCanvas: true
                     ) {
-                        isVoicePolishSettingsPresented = true
+                        NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.voicePolish)
                     }
-                    .help(L("质量、上下文、词典与个性化", "Quality, context, lexicon, and personalization"))
+                    .help(L("打开一级语音润色设置", "Open the top-level Voice Polish settings"))
                 }
 
-                if !mode.isBuiltin {
+                if mode.isUserDeletable {
                     ModeDeleteButton(modeName: mode.name) {
                         deletingModeId = mode.id
                     }
@@ -257,7 +251,7 @@ private extension ModesSettingsTab {
     }
 
     func deleteMode(_ id: UUID) {
-        guard let mode = modes.first(where: { $0.id == id }), !mode.isBuiltin else { return }
+        guard let mode = modes.first(where: { $0.id == id }), mode.isUserDeletable else { return }
         modes.removeAll { $0.id == id }
         if selectedModeId == id {
             selectedModeId = modes.first(where: { $0.id == ProcessingMode.directId })?.id

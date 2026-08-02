@@ -120,6 +120,7 @@ private extension ModeTrialCard {
                     isEditable: true
                 )
                 .id(mode.id)
+                .accessibilityLabel(L("试跑输入", "Trial input"))
 
                 if trialInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     Text(L("输入一段测试文本...", "Enter sample text..."))
@@ -196,6 +197,7 @@ private extension ModeTrialCard {
                     text: .constant(trialOutput),
                     isEditable: false
                 )
+                .accessibilityLabel(L("试跑输出", "Trial output"))
 
                 if trialOutput.isEmpty {
                     Text(L("测试输出会显示在这里...", "Output will appear here..."))
@@ -223,6 +225,7 @@ private extension ModeTrialCard {
                 }
                 .disabled(!canRunTrial || isRunningTrial)
                 .opacity((canRunTrial && !isRunningTrial) ? 1 : 0.62)
+                .accessibilityHint(trialButtonAccessibilityHint)
 
                 SettingsIconButton(
                     systemName: "xmark",
@@ -258,6 +261,8 @@ private extension ModeTrialCard {
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(trialStatusText)
     }
 
     var canRunTrial: Bool {
@@ -268,6 +273,16 @@ private extension ModeTrialCard {
         if isRunningTrial { return L("调用中...", "Calling...") }
         if !trialError.isEmpty { return trialError }
         return trialDiagnostics
+    }
+
+    var trialButtonAccessibilityHint: String {
+        if mode.kind == .voicePolish {
+            return L(
+                "只测试文字润色链路，不包含麦克风和语音识别。真实语音请使用语音润色快捷键。",
+                "Tests the text-polishing path only, without microphone or speech recognition. Use the Voice Polish shortcut for a real voice test."
+            )
+        }
+        return L("使用当前设置处理左侧文字。", "Process the input with the current settings.")
     }
 
     var fieldFill: Color {
@@ -311,17 +326,38 @@ private extension ModeTrialCard {
         let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
 
         if draftMode.kind == .voicePolish {
+            let voicePolishConfig: LLMConfig
+            if let modelOverride = VoicePolishSettings.modelOverride() {
+                voicePolishConfig = llmConfig.withModel(modelOverride)
+            } else {
+                voicePolishConfig = llmConfig
+            }
             let asrProvider = KeychainService.selectedASRProvider
+            let prepared = VoicePolishTerminologyRuntime.prepare(
+                rawText: input,
+                applicationBundleIdentifier: nil
+            )
+            let rawSegment = RecognitionSegment(
+                id: "s1",
+                text: input,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+            let canonicalSegment = RecognitionSegment(
+                id: "s1",
+                text: prepared.canonicalText,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
             let envelope = VoiceInputEnvelope(
                 providerFinalText: input,
-                segments: [RecognitionSegment(
-                    id: "s1",
-                    text: input,
-                    startTimeMs: nil,
-                    endTimeMs: nil,
-                    confidence: nil,
-                    isFinal: true
-                )],
+                rawSegments: [rawSegment],
+                canonicalText: prepared.canonicalText,
+                segments: [canonicalSegment],
                 durationMs: 0,
                 provider: asrProvider
             )
@@ -332,9 +368,9 @@ private extension ModeTrialCard {
             )
             let resolvedEntities = EntityResolver.resolve(
                 segments: envelope.segments,
-                lexicon: PersonalLexiconStorage.load(),
-                snippets: SnippetStorage.load(),
-                hotwords: HotwordStorage.loadEffective(),
+                lexicon: prepared.projection.personalLexicon,
+                snippets: prepared.fixedSnippets,
+                hotwords: [],
                 context: trialContext
             )
             let styleProfile: StyleProfile?
@@ -349,7 +385,7 @@ private extension ModeTrialCard {
             }
             let result = await VoicePolishPipeline(
                 client: client,
-                config: llmConfig
+                config: voicePolishConfig
             ).process(VoicePolishRequest(
                 input: envelope,
                 context: trialContext,

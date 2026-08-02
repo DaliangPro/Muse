@@ -38,6 +38,17 @@ enum VoicePolishSettings {
         defaults.set(enabled, forKey: DefaultsKeys.voicePolishPersonalizationEnabled)
     }
 
+    static func terminologyLearningEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: DefaultsKeys.voicePolishTerminologyLearningEnabled) as? Bool ?? true
+    }
+
+    static func setTerminologyLearningEnabled(
+        _ enabled: Bool,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.set(enabled, forKey: DefaultsKeys.voicePolishTerminologyLearningEnabled)
+    }
+
     static func correctionLimit(defaults: UserDefaults = .standard) -> Int {
         guard defaults.object(forKey: DefaultsKeys.voicePolishCorrectionLimit) != nil else {
             return defaultCorrectionLimit
@@ -62,5 +73,33 @@ enum VoicePolishSettings {
     ) {
         guard let data = try? JSONEncoder().encode(overrides) else { return }
         defaults.set(data, forKey: DefaultsKeys.voicePolishSceneOverrides)
+    }
+
+    /// 可选的同 Provider 专用快速模型；空值表示沿用“文本处理”模型。
+    /// API Key 与 endpoint 始终复用已配置 Provider，避免复制凭证或引入第二套模型配置。
+    static func modelOverride(defaults: UserDefaults = .standard) -> String? {
+        let value = defaults.string(forKey: DefaultsKeys.voicePolishModelOverride)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    static func setModelOverride(_ value: String?, defaults: UserDefaults = .standard) {
+        let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if normalized.isEmpty {
+            defaults.removeObject(forKey: DefaultsKeys.voicePolishModelOverride)
+        } else {
+            defaults.set(normalized, forKey: DefaultsKeys.voicePolishModelOverride)
+        }
+    }
+
+    static func recentInputContextEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: DefaultsKeys.voicePolishRecentInputContextEnabled) as? Bool ?? false
+    }
+
+    static func setRecentInputContextEnabled(
+        _ enabled: Bool,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.set(enabled, forKey: DefaultsKeys.voicePolishRecentInputContextEnabled)
     }
 }

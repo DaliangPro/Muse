@@ -66,6 +66,53 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
     }
 
+    func testFastRejectsOutputThatRestoresOldAliasBesideCanonicalTerm() async {
+        let raw = "我正在使用 Type less。"
+        let canonical = "我正在使用 Typeless。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response("我正在使用 Typeless（Type less）。"),
+        ])
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: raw,
+                rawSegments: [RecognitionSegment(
+                    id: "s1",
+                    text: raw,
+                    startTimeMs: nil,
+                    endTimeMs: nil,
+                    confidence: nil,
+                    isFinal: true
+                )],
+                canonicalText: canonical,
+                segments: [RecognitionSegment(
+                    id: "s1",
+                    text: canonical,
+                    startTimeMs: nil,
+                    endTimeMs: nil,
+                    confidence: nil,
+                    isFinal: true
+                )],
+                requiredEntityEdits: [VoiceTerminologyEdit(
+                    alias: "Type less",
+                    canonical: "Typeless",
+                    sourceSegmentIDs: ["s1"]
+                )],
+                durationMs: 1_000,
+                provider: .volcano
+            ),
+            context: .phaseOneUnknown,
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .balanced
+        )
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.text, canonical)
+        XCTAssertTrue(result.validationCodes.contains(.supersededFactRetained))
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
     func testStructuredCorrectionSucceedsWithProtectedFinalFacts() async throws {
         let source = "第一期一万六千八，不对，最终每期一万六，总价四万八。"
         let response = structuredResponse(
@@ -169,6 +216,9 @@ final class VoicePolishPipelineTests: XCTestCase {
         let requests = await client.recordedRequests()
         XCTAssertEqual(requests.map(\.task), [.voicePolishAnalyze, .voicePolishRender])
         XCTAssertEqual(requests[0].options.reasoningPolicy, .low)
+        XCTAssertFalse(requests[1].user.contains("original_payload"))
+        XCTAssertFalse(requests[1].user.contains("provider_final_text"))
+        XCTAssertTrue(requests[1].user.contains("source_segments"))
     }
 
     func testDeepAnalyzerFormatRepairConsumesThirdAttemptBeforeRender() async throws {
