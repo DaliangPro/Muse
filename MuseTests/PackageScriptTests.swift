@@ -12,10 +12,26 @@ final class PackageScriptTests: XCTestCase {
             "scripts/sign-app-bundle.sh",
             "scripts/test_app_bundle.sh",
             "scripts/health-check.sh",
+            "scripts/build_and_run.sh",
         ] {
             let result = try run("/bin/bash", arguments: ["-n", repositoryRoot.appendingPathComponent(relativePath).path])
             XCTAssertEqual(result.status, 0, "\(relativePath): \(result.output)")
         }
+    }
+
+    func testBuildAndRunStopsStaleInstancesAndVerifiesExactlyOneProcess() throws {
+        let source = try source(at: "scripts/build_and_run.sh")
+        let terminateCall = try XCTUnwrap(source.range(of: "  terminate_running_instances\n"))
+        let packageCall = try XCTUnwrap(source.range(of: #"  "$ROOT_DIR/scripts/package-app.sh""#))
+
+        XCTAssertLessThan(terminateCall.lowerBound, packageCall.lowerBound)
+        XCTAssertTrue(source.contains("running_app_pids()"))
+        XCTAssertTrue(source.contains(#"/bin/ps -axo pid=,command="#))
+        XCTAssertTrue(source.contains(#"/bin/kill "$pid""#))
+        XCTAssertFalse(source.contains(#"/bin/kill -9"#))
+        XCTAssertTrue(source.contains("verify_single_running_instance"))
+        XCTAssertTrue(source.contains(#"if [ "$count" -ne 1 ]"#))
+        XCTAssertFalse(source.contains(#"pgrep -af "$APP_PATH/Contents/MacOS/Muse""#))
     }
 
     func testPackagingScriptRequiresStrictFinalSealPolicy() throws {
