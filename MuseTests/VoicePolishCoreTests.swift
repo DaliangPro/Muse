@@ -305,9 +305,10 @@ final class VoicePolishCoreTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
 
         XCTAssertEqual(VoicePolishSettings.qualityMode(defaults: defaults), .balanced)
-        XCTAssertEqual(VoicePolishSettings.contextLevel(defaults: defaults), .metadataOnly)
-        XCTAssertFalse(VoicePolishSettings.personalizationEnabled(defaults: defaults))
+        XCTAssertEqual(VoicePolishSettings.contextLevel(defaults: defaults), .nearbyText)
+        XCTAssertTrue(VoicePolishSettings.personalizationEnabled(defaults: defaults))
         XCTAssertTrue(VoicePolishSettings.terminologyLearningEnabled(defaults: defaults))
+        XCTAssertTrue(VoicePolishSettings.recentInputContextEnabled(defaults: defaults))
         XCTAssertEqual(VoicePolishSettings.correctionLimit(defaults: defaults), 200)
         XCTAssertNil(VoicePolishSettings.modelOverride(defaults: defaults))
     }

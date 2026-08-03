@@ -214,6 +214,13 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
             )
         }
 
+        // ASR 标点缺失时不能要求“多句/多主题”证据后才分段，否则最需要整理的
+        // 长口述反而会整块通过。代码场景与用户明确单段要求已在前面排除；其余
+        // 达到长文阈值的内容至少给出两段契约，具体语义断点由模型与安全 formatter 决定。
+        if signals.isLong, signals.allowsAutomaticParagraphs {
+            return paragraphs(minimumCount: 2, preferences: preferences)
+        }
+
         // 禁止列表时，原本可列点的长内容仍可自然分段；短内容保持普通句子。
         if preferences.forbidsAllLists,
            signals.isLong,
@@ -765,6 +772,7 @@ private extension VoicePolishLayoutExpectation {
         let topicSwitchCount: Int
         let aiSectionCount: Int
         let isLong: Bool
+        let allowsAutomaticParagraphs: Bool
         let isLongEnoughForRequestedParagraphs: Bool
         let isLongMultiTopic: Bool
         let hasStrongParallelIntroduction: Bool
@@ -849,6 +857,7 @@ private extension VoicePolishLayoutExpectation {
             // 与 Voice Polish 默认成稿标准保持一致：中文约 80 字、英文约
             // 60 词且存在多主题证据时，就应进入自然分段契约。
             isLong = hasCJK ? cjkLength >= 80 : wordLength >= 60
+            allowsAutomaticParagraphs = scene != .code
             isLongEnoughForRequestedParagraphs = hasCJK ? cjkLength >= 80 : wordLength >= 60
             let isVeryLong = hasCJK ? cjkLength >= 180 : wordLength >= 110
             let isMediumLength = hasCJK ? cjkLength >= 45 : wordLength >= 35

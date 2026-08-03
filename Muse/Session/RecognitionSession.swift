@@ -1038,6 +1038,7 @@ actor RecognitionSession {
             ) else { return }
             guard ensureCurrent("pre-injection") else { return }
 
+            let historyID = UUID().uuidString
             let injectionOutcome = injectFinalText(
                 llmResult.finalText,
                 stopStartedAt: stopT0
@@ -1054,6 +1055,18 @@ actor RecognitionSession {
             }
             guard ensureCurrent("post-injection") else { return }
             onASREvent?(.finalized(text: llmResult.finalText, injection: injectionOutcome))
+            let editLearningTarget: PostInjectionEditLearningTarget?
+            if currentMode.kind == .voicePolish,
+               case .inserted = injectionOutcome,
+               VoicePolishSettings.personalizationEnabled()
+                    || VoicePolishSettings.terminologyLearningEnabled() {
+                editLearningTarget = PostInjectionEditLearningMonitor.capture(
+                    injectedText: llmResult.finalText,
+                    historyID: historyID
+                )
+            } else {
+                editLearningTarget = nil
+            }
             if recoveryResult == .failed {
                 onASREvent?(.error(ASRRecoveryError.partialTextPreserved(
                     provider: provider.displayName
@@ -1061,6 +1074,7 @@ actor RecognitionSession {
             }
 
             await saveSuccessfulHistory(
+                historyID: historyID,
                 rawText: rawText,
                 llmResult: llmResult,
                 streamingFailed: streamingFailed,
@@ -1068,6 +1082,12 @@ actor RecognitionSession {
                 durationSeconds: recordedDuration,
                 sessionID: sessionID
             )
+            if let editLearningTarget {
+                await PostInjectionEditLearningMonitor.shared.start(
+                    editLearningTarget,
+                    historyStore: historyStore
+                )
+            }
             guard ensureCurrent("history save") else { return }
 
         } else {
@@ -1667,6 +1687,7 @@ actor RecognitionSession {
     }
 
     private func saveSuccessfulHistory(
+        historyID: String,
         rawText: String,
         llmResult: LLMPostProcessingResult,
         streamingFailed: Bool,
@@ -1706,7 +1727,7 @@ actor RecognitionSession {
 
         let finalText = llmResult.finalText
         await historyStore.insert(HistoryRecord(
-            id: UUID().uuidString,
+            id: historyID,
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: rawText,

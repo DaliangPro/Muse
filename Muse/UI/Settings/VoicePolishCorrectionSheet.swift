@@ -168,8 +168,8 @@ private extension VoicePolishCorrectionSheet {
                 .font(TF.settingsFontSectionTitle)
                 .foregroundStyle(TF.settingsText)
             Text(L(
-                "只有你在这里明确确认的修改才会被学习；Muse 不会监控目标 App 中的后续编辑。",
-                "Only edits you explicitly confirm here are learned. Muse does not monitor later edits in the target app."
+                "这里用于补充或调整历史纠正。标准输入框中的本次成稿修改也可在短时间内自动学习；密码框、网页/自绘输入区与后续无关内容不会被观察。",
+                "Use this page to add or revise a past correction. Edits to the latest dictation in a standard text field can also be learned briefly; password fields, web or custom inputs, and unrelated later content are never observed."
             ))
             .font(TF.settingsFontBody)
             .foregroundStyle(TF.settingsTextTertiary)

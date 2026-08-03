@@ -4,8 +4,8 @@ import UniformTypeIdentifiers
 
 /// Voice Polish 的唯一产品级设置入口。
 ///
-/// 输入模式页只负责快捷键与触发方式；这里负责附加 Prompt、响应方式、
-/// 上下文和表达学习，避免两个编辑器相互覆盖。
+/// 输入模式页只负责快捷键与触发方式；普通用户只需要表达偏好与个人词汇，
+/// 其余产品策略采用成熟默认，并通过高级设置保留透明度与退出能力。
 struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     var showsIntroduction = true
 
@@ -13,9 +13,9 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     @AppStorage(DefaultsKeys.voicePolishQualityMode)
     private var qualityRaw = VoicePolishQualityMode.balanced.rawValue
     @AppStorage(DefaultsKeys.voicePolishContextLevel)
-    private var contextRaw = WritingContextLevel.metadataOnly.rawValue
+    private var contextRaw = WritingContextLevel.nearbyText.rawValue
     @AppStorage(DefaultsKeys.voicePolishPersonalizationEnabled)
-    private var styleLearningEnabled = false
+    private var styleLearningEnabled = true
     @AppStorage(DefaultsKeys.voicePolishCorrectionLimit)
     private var correctionLimit = VoicePolishSettings.defaultCorrectionLimit
     @AppStorage(DefaultsKeys.selectedLLMProvider)
@@ -37,6 +37,7 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     @State private var saveStatus = ""
     @State private var errorMessage = ""
     @State private var isResetConfirmationPresented = false
+    @State private var isAdvancedSettingsExpanded = false
 
     private let historyStore = HistoryStore()
 
@@ -46,11 +47,10 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
                 introduction
             }
             promptCard
-            responseCard
-            contextCard
-            learningCard
-            modelCard
-            trialCard
+            automaticCapabilitiesCard
+            personalVocabularyCard
+            privacySummaryCard
+            advancedSettings
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .task { await reload() }
@@ -118,14 +118,139 @@ private extension VoicePolishSettingsTab {
             }
 
             Text(L(
-                "Muse 负责事实安全、术语保护和失败回退；你仍可自由定义语气、简洁度与格式。",
-                "Muse protects facts, terminology, and safe fallback. You stay in control of tone, brevity, and formatting."
+                "Muse 会自动纠错、清理口误、重建标点并按内容排版；你只需要决定自己想怎么表达。",
+                "Muse automatically corrects terms, removes false starts, rebuilds punctuation, and formats by meaning. You only decide how you want to sound."
             ))
             .font(TF.settingsFontBody)
             .foregroundStyle(TF.settingsTextSecondary)
             .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    var automaticCapabilitiesCard: some View {
+        settingsGroupCard(
+            L("自动成稿", "Automatic writing"),
+            icon: "sparkles",
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                capabilityRow(
+                    icon: "text.badge.checkmark",
+                    title: L("结合上下文纠正专名", "Correct names using context"),
+                    detail: L("先查个人术语与内置常用词，再让模型结合当前内容判断。", "Checks personal terminology and built-in common terms before using the current context.")
+                )
+                capabilityRow(
+                    icon: "arrow.uturn.backward",
+                    title: L("清理口误和重复", "Remove false starts and repetition"),
+                    detail: L("一句话说错后重说，只保留最终有效表达。", "When you restart a sentence, only the final intended version remains.")
+                )
+                capabilityRow(
+                    icon: "list.number",
+                    title: L("重建标点并自动排版", "Rebuild punctuation and format automatically"),
+                    detail: L("长内容自然分段，步骤和并列事项自动整理成列表。", "Long content becomes semantic paragraphs; steps and parallel items become lists.")
+                )
+            }
+        }
+    }
+
+    var personalVocabularyCard: some View {
+        settingsGroupCard(
+            L("个人词汇", "Personal vocabulary"),
+            icon: "character.book.closed",
+            expandVertically: false
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(L(
+                    "Muse 已内置常用品牌、应用与 AI 词汇。语音输入后，如果你在标准输入框里直接改正专名，Muse 会在短时间内识别这次修改并记住；记录可随时查看、编辑或撤销。",
+                    "Muse includes common brands, apps, and AI terms. If you directly correct a name shortly after dictation in a standard text field, Muse recognizes the edit and remembers it. You can review, edit, or undo it anytime."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                SettingsTextButton(L("管理个人词汇", "Manage Personal Vocabulary"), controlSize: .compact) {
+                    NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.vocabulary)
+                }
+            }
+        }
+    }
+
+    var privacySummaryCard: some View {
+        settingsGroupCard(
+            L("隐私保护", "Privacy protection"),
+            icon: "lock.shield",
+            expandVertically: false
+        ) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "checkmark.shield")
+                    .font(TF.settingsFontIconSmall)
+                    .foregroundStyle(TF.settingsAccentGreen)
+                    .accessibilityHidden(true)
+                Text(L(
+                    "Muse 只在安全的标准输入框中参考光标附近最多前后各 400 字，并只在内存中参考同一应用最近 3 次 Muse 输入。密码框、网页/自绘输入区、未知控件和读取失败时，不读取正文，也不会观察修改。",
+                    "Muse only references up to 400 nearby characters on each side of the cursor in safe standard text fields, plus the last 3 Muse inputs from the same app in memory. It never reads body text or observes edits in password fields, web or custom inputs, unknown controls, or when reading fails."
+                ))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    var advancedSettings: some View {
+        DisclosureGroup(isExpanded: $isAdvancedSettingsExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                responseCard
+                contextCard
+                learningCard
+                modelCard
+                trialCard
+            }
+            .padding(.top, 10)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape.2")
+                    .foregroundStyle(TF.settingsTextSecondary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L("高级设置与诊断", "Advanced settings & diagnostics"))
+                        .font(TF.settingsFontBodyStrong)
+                        .foregroundStyle(TF.settingsText)
+                    Text(L(
+                        "默认无需调整；可在这里退出上下文或学习，并查看真实链路。",
+                        "No adjustment is normally needed. You can opt out of context or learning and inspect the real pipeline here."
+                    ))
+                    .font(TF.settingsFontMetadata)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                }
+            }
+        }
+        .padding(12)
+        .background(TF.settingsCard, in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(TF.settingsStroke, lineWidth: 1)
+        }
+    }
+
+    func capabilityRow(icon: String, title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(TF.settingsFontIconSmall)
+                .foregroundStyle(TF.settingsAccentAmber)
+                .frame(width: 18)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(TF.settingsFontBodyStrong)
+                    .foregroundStyle(TF.settingsText)
+                Text(detail)
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     var promptCard: some View {
@@ -305,12 +430,12 @@ private extension VoicePolishSettingsTab {
             VStack(alignment: .leading, spacing: 12) {
                 Toggle(isOn: $terminologyLearningEnabled) {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(L("记住我明确确认的术语修改", "Remember term edits I explicitly confirm"))
+                        Text(L("自动记住我改正的术语", "Automatically remember corrected terms"))
                             .font(TF.settingsFontBody)
                             .foregroundStyle(TF.settingsText)
                         Text(L(
-                            "例如把“Type less”纠正为“Typeless”。这与表达风格学习相互独立，并可在每次纠正时取消。",
-                            "For example, correcting “Type less” to “Typeless.” This is independent from style learning and can be deselected for each correction."
+                            "例如把“Type less”改成“Typeless”。只观察本次成稿后的短时实质修改，纯追加文字不会被当作纠正。",
+                            "For example, changing “Type less” to “Typeless.” Only meaningful edits shortly after this dictation are observed; appended text is not treated as a correction."
                         ))
                         .font(TF.settingsFontCaption)
                         .foregroundStyle(TF.settingsTextTertiary)
@@ -320,7 +445,7 @@ private extension VoicePolishSettingsTab {
 
                 Toggle(isOn: $styleLearningEnabled) {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(L("从我明确确认的修改中学习表达习惯", "Learn writing style from edits I explicitly confirm"))
+                        Text(L("自动学习我的表达习惯", "Automatically learn my writing style"))
                             .font(TF.settingsFontBody)
                             .foregroundStyle(TF.settingsText)
                         Text(L(
@@ -362,7 +487,7 @@ private extension VoicePolishSettingsTab {
                     }
                 } else {
                     Text(L(
-                        "关闭后不会读取这些纠正样本，也不会把风格画像发送给模型；已经确认的术语仍然生效。",
+                        "关闭后不会从新修改中学习表达习惯，也不会把风格画像发送给模型；已经记住的术语仍然生效。",
                         "When off, correction samples are not read and no style profile is sent to the model. Confirmed terminology still works."
                     ))
                     .font(TF.settingsFontCaption)

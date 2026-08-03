@@ -323,6 +323,20 @@ final class AppState {
         scheduleAutoHide(for: .error, delay: .seconds(1.8))
     }
 
+    /// 自动学习发生在文字已经插入、用户完成修改之后。只在 HUD 空闲时给出
+    /// 一次轻提示，避免打断下一次正在进行的录音或润色。
+    func showVoicePolishAutomaticLearningNotice() {
+        guard barPhase == .hidden || barPhase == .done else { return }
+        feedbackMessage = L(
+            "已记住这次修改，可在个人词汇中管理",
+            "Edit remembered — manage it in Personal Vocabulary"
+        )
+        resetVoicePolishProcessingState()
+        barPhase = .done
+        onShowPanel?()
+        scheduleAutoHide(for: .done, delay: .seconds(2.4))
+    }
+
     func cancel() {
         barPhase = .hidden
         segments = []

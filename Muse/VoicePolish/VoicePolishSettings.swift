@@ -19,7 +19,7 @@ enum VoicePolishSettings {
 
     static func contextLevel(defaults: UserDefaults = .standard) -> WritingContextLevel {
         guard let raw = defaults.string(forKey: DefaultsKeys.voicePolishContextLevel),
-              let value = WritingContextLevel(rawValue: raw) else { return .metadataOnly }
+              let value = WritingContextLevel(rawValue: raw) else { return .nearbyText }
         return value
     }
 
@@ -31,7 +31,7 @@ enum VoicePolishSettings {
     }
 
     static func personalizationEnabled(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: DefaultsKeys.voicePolishPersonalizationEnabled) as? Bool ?? false
+        defaults.object(forKey: DefaultsKeys.voicePolishPersonalizationEnabled) as? Bool ?? true
     }
 
     static func setPersonalizationEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
@@ -93,7 +93,7 @@ enum VoicePolishSettings {
     }
 
     static func recentInputContextEnabled(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: DefaultsKeys.voicePolishRecentInputContextEnabled) as? Bool ?? false
+        defaults.object(forKey: DefaultsKeys.voicePolishRecentInputContextEnabled) as? Bool ?? true
     }
 
     static func setRecentInputContextEnabled(

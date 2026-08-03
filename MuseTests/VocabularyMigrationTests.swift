@@ -14,8 +14,8 @@ final class VocabularyMigrationTests: XCTestCase {
             SnippetStorage.loadBuiltin(context: context).map(pairKey),
             SnippetStorage.defaultSnippets.map(pairKey)
         )
-        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 1)
-        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 1)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 2)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 2)
     }
 
     func testModifiedBuiltinFilesAreNeverOverwrittenByLaterMigration() throws {
@@ -120,8 +120,8 @@ final class VocabularyMigrationTests: XCTestCase {
 
         XCTAssertTrue(HotwordStorage.load(context: context).isEmpty)
         XCTAssertTrue(SnippetStorage.load(context: context).isEmpty)
-        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 1)
-        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 1)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 2)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 2)
     }
 
     func testLegacyCompletedFlagsBridgeToSchemaWithoutResurrectingDeletedData() throws {
@@ -139,8 +139,35 @@ final class VocabularyMigrationTests: XCTestCase {
 
         XCTAssertTrue(HotwordStorage.load(context: context).isEmpty)
         XCTAssertTrue(SnippetStorage.load(context: context).isEmpty)
-        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 1)
-        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 1)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 2)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 2)
+    }
+
+    func testSchemaTwoAppendsOnlyNewCommonVocabularyAndPreservesCustomBuiltins() throws {
+        let context = try makeContext()
+        try HotwordStorage.saveBuiltin(["自定义内置热词"], context: context)
+        try SnippetStorage.saveBuiltin(
+            [(trigger: "自定义错词", value: "自定义正词")],
+            context: context
+        )
+        context.userDefaults.set(1, forKey: "tf_hotwords_schema_version")
+        context.userDefaults.set(1, forKey: "tf_snippets_schema_version")
+
+        HotwordStorage.migrateIfNeeded(context: context)
+        SnippetStorage.migrateIfNeeded(context: context)
+
+        let hotwords = HotwordStorage.loadBuiltin(context: context)
+        XCTAssertEqual(hotwords.first, "自定义内置热词")
+        XCTAssertTrue(hotwords.contains("Typeless"))
+        XCTAssertTrue(hotwords.contains("食其家"))
+        XCTAssertEqual(hotwords.filter { $0 == "Typeless" }.count, 1)
+
+        let snippets = SnippetStorage.loadBuiltin(context: context).map(pairKey)
+        XCTAssertEqual(snippets.first, "自定义错词\t自定义正词")
+        XCTAssertTrue(snippets.contains("Type less\tTypeless"))
+        XCTAssertTrue(snippets.contains("食奇家\t食其家"))
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_hotwords_schema_version"), 2)
+        XCTAssertEqual(context.userDefaults.integer(forKey: "tf_snippets_schema_version"), 2)
     }
 
     func testLegacySnippetKeepsUserReplacementCapitalizationOverride() throws {

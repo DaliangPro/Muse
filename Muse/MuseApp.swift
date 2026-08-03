@@ -191,6 +191,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NotificationCenter.default.addObserver(
+            forName: .voicePolishAutomaticLearningDidFinish,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.appState.showVoicePolishAutomaticLearningNotice()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
             forName: .asrProviderDidChange,
             object: nil,
             queue: .main

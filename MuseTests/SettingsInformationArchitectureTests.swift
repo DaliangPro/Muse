@@ -44,12 +44,12 @@ final class SettingsInformationArchitectureTests: XCTestCase {
         XCTAssertFalse(VoicePolishSettings.personalizationEnabled(defaults: defaults))
     }
 
-    func testRecentInputContextIsExplicitOptIn() {
+    func testRecentInputContextDefaultsOnAndCanBeChanged() {
         let suite = "SettingsRecentContextTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        XCTAssertFalse(VoicePolishSettings.recentInputContextEnabled(defaults: defaults))
+        XCTAssertTrue(VoicePolishSettings.recentInputContextEnabled(defaults: defaults))
         VoicePolishSettings.setRecentInputContextEnabled(true, defaults: defaults)
         XCTAssertTrue(VoicePolishSettings.recentInputContextEnabled(defaults: defaults))
     }

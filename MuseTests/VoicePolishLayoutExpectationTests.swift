@@ -584,7 +584,7 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(expectation.minimumParagraphCount, 2)
     }
 
-    func testLongUnpunctuatedContentWithoutParagraphPreferenceDoesNotUseRequestedLengthRule() {
+    func testLongUnpunctuatedContentUsesAutomaticParagraphContract() {
         let source = String(
             repeating: "这是一段连续说明并且没有可验证的主题切换或句子边界",
             count: 4
@@ -592,7 +592,8 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
         let expectation = infer(source, scene: .workChat)
 
         XCTAssertGreaterThanOrEqual(source.filter { !$0.isWhitespace }.count, 80)
-        XCTAssertEqual(expectation.kind, .sentence)
+        XCTAssertEqual(expectation.kind, .paragraphs)
+        XCTAssertGreaterThanOrEqual(expectation.minimumParagraphCount, 2)
     }
 
     func testRequestedNaturalParagraphsHandleLongUnpunctuatedSingleSegment() {
