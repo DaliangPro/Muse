@@ -8,7 +8,7 @@ struct VoicePolishRouteDecision: Sendable, Equatable {
 }
 enum VoicePolishComplexityRouter {
 
-    static let signalConfigurationVersion = 3
+    static let signalConfigurationVersion = 5
 
     private static let immediateCorrectionsZH = ["不对", "我改一下", "应该是", "我的意思是", "说错了"]
     private static let immediateCorrectionsEN = ["actually", "i mean", "let me correct that", "scratch that"]
@@ -22,8 +22,6 @@ enum VoicePolishComplexityRouter {
     private static let countChangesEN = ["one more thing", "remove one item", "not three but four"]
     private static let enumerationsZH = ["第一", "第二", "第三", "首先", "其次", "最后"]
     private static let enumerationsEN = ["first", "second", "third", "firstly", "secondly"]
-    private static let topicSwitchesZH = ["回到刚才", "换个话题", "另外一个问题", "先说另一件事"]
-    private static let topicSwitchesEN = ["back to the earlier point", "different topic", "another issue"]
     private static let ambiguousEntitiesZH = ["那个谁", "叫什么来着", "具体名字忘了", "好像叫"]
     private static let ambiguousEntitiesEN = ["what was the name", "what is it called", "i forgot the name", "something like"]
     private static let aiConstraintsZH = ["要求", "必须", "不要", "输入", "输出格式", "限制", "条件"]
@@ -46,7 +44,9 @@ enum VoicePolishComplexityRouter {
         let sideNote = containsAny(in: normalized, chinese: sideNotesZH, english: sideNotesEN)
         let countChange = containsAny(in: normalized, chinese: countChangesZH, english: countChangesEN)
         let enumeration = containsAny(in: normalized, chinese: enumerationsZH, english: enumerationsEN)
-        let topicSwitch = containsAny(in: normalized, chinese: topicSwitchesZH, english: topicSwitchesEN)
+        let topicSwitch = VoicePolishLayoutExpectation.containsComplexTopicSwitchEvidence(
+            in: source
+        )
         let ambiguousEntity = containsAny(in: normalized, chinese: ambiguousEntitiesZH, english: ambiguousEntitiesEN)
         let aiConstraintCount = distinctMatchCount(
             in: normalized,
@@ -75,12 +75,20 @@ enum VoicePolishComplexityRouter {
             || ambiguousEntity
             || (request.context.scene == .aiPrompt && aiConstraintCount >= 2)
 
-        // Provider 的切段数量和纯文本长度都不代表语义复杂度。把它们直接提升到
-        // Structured 会让普通长口述或两段 ASR 结果进入 JSON + Repair 链路，既慢
-        // 又不能提高事实安全；真正需要规划时仍由改口、旁注、枚举和事实数量提升。
+        let listContractNeedsPlanner = (layoutExpectation.kind == .numberedList
+                || layoutExpectation.kind == .bulletList)
+            && !VoicePolishFallbackFormatter.canSafelySatisfyListLayout(
+                source,
+                expectation: layoutExpectation
+            )
+
+        // Provider 的切段数量和纯文本长度不代表需要 JSON 规划。能够由本地
+        // Formatter 严格保真排版的列表继续保持一次 Fast；任何已形成列表契约、
+        // 但本地无法证明可排版的文本统一交给 Structured，避免 Fast 失败后回退
+        // 成一整段。
         let isStructured = correctionCount == 1
             || sideNote
-            || enumeration
+            || listContractNeedsPlanner
             || factCandidates.count >= 9
 
         let route: VoicePolishRoute
@@ -112,6 +120,12 @@ enum VoicePolishComplexityRouter {
         case .balanced:
             return decision.route
         case .quality:
+            if decision.route == .fast,
+               decision.matchedSignalCategories.contains("enumeration") {
+                // 用户主动选择“深度整理”时仍尊重质量偏好；标准/快速档的纯枚举
+                // 则保持一次 Fast 请求。
+                return .deep
+            }
             guard decision.route == .structured else { return decision.route }
             let elevatedSignals: Set<String> = [
                 "immediate_correction",

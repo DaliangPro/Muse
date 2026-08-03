@@ -706,7 +706,13 @@ struct VoicePolishPipeline: Sendable {
         ) else {
             return text
         }
-        return candidate
+        // 总数同步是独立于通用纯版式门禁的窄规则：仅当本地能证明
+        // “原 N 项 + 明确新增 1 项 = 连续 N+1 项”时，定点修正唯一声明数字。
+        return VoicePolishListCountConsistency
+            .synchronizeDeclaredCountForProvenTrailingAddition(
+                in: candidate,
+                canonicalSource: request.fallbackText
+            )
     }
 
     private func normalizedStructuredResponse(
@@ -860,7 +866,11 @@ struct VoicePolishPipeline: Sendable {
             candidate: fallbackCandidate,
             expectation: expectation
         ) {
-            fallbackText = fallbackCandidate
+            fallbackText = VoicePolishListCountConsistency
+                .synchronizeDeclaredCountForProvenTrailingAddition(
+                    in: fallbackCandidate,
+                    canonicalSource: request.fallbackText
+                )
         } else {
             fallbackText = request.fallbackText
         }

@@ -126,6 +126,37 @@ enum VoicePolishFallbackFormatter {
         candidateNeutral = removingContinuousInlineOrdinalMarkers(in: candidateNeutral)
         return compactText(sourceNeutral) == compactText(candidateNeutral)
     }
+
+    /// 路由器只在本地能够把原文直接整理成满足契约的列表时，才允许纯枚举走
+    /// 单次 Fast。这样即使未来 Expectation 增加了新枚举语法，也不会出现
+    /// “识别成列表却无法本地排版，最后回退成一坨”的能力错位。
+    static func canSafelySatisfyListLayout(
+        _ text: String,
+        expectation: VoicePolishLayoutExpectation
+    ) -> Bool {
+        guard expectation.kind == .numberedList || expectation.kind == .bulletList else {
+            return false
+        }
+        let candidate = formatCandidate(text, expectation: expectation)
+        guard isStrictlySafeTransformation(
+            source: text,
+            candidate: candidate,
+            expectation: expectation
+        ) else {
+            return false
+        }
+        let count = VoicePolishNumbering.listItemCount(
+            in: candidate,
+            kind: expectation.kind
+        )
+        if let expected = expectation.expectedListItemCount {
+            return count == expected
+        }
+        if let minimum = expectation.minimumListItemCount {
+            return count >= minimum
+        }
+        return count >= 2
+    }
 }
 
 private extension VoicePolishFallbackFormatter {
@@ -137,6 +168,11 @@ private extension VoicePolishFallbackFormatter {
     struct InlineMarker: Sendable, Equatable {
         let range: Range<String.Index>
         let ordinal: Int
+    }
+
+    struct RetainedStepMarker: Sendable, Equatable {
+        let range: Range<String.Index>
+        let token: String
     }
 
     struct ProvenSegmentParts: Sendable, Equatable {
@@ -450,10 +486,24 @@ private extension VoicePolishFallbackFormatter {
 
         for markers in inlineMarkerCandidates(in: source) {
             guard markerSequenceIsValid(markers),
-                  countSatisfiesContract(markers.count, expectation: expectation),
                   let parts = inlineListParts(source: source, markers: markers) else {
                 continue
             }
+            if countSatisfiesContract(parts.items.count, expectation: expectation) {
+                return render(parts, expectation: expectation)
+            }
+            if let augmented = appendingProvenTrailingAddition(
+                to: parts,
+                expectation: expectation
+            ) {
+                return render(augmented, expectation: expectation)
+            }
+        }
+
+        // “先/然后/最后”等隐式步骤同样可以走一次 Fast 请求。连接词完整保留
+        // 在各项正文中，本地只增加换行和连续列表标记，因此仍满足严格字符门禁。
+        if let parts = retainedImplicitStepParts(in: source),
+           countSatisfiesContract(parts.items.count, expectation: expectation) {
             return render(parts, expectation: expectation)
         }
 
@@ -468,9 +518,16 @@ private extension VoicePolishFallbackFormatter {
         }
 
         if allowsSemicolonSplitting,
-           let parts = semicolonSeparatedParts(in: source),
-           countSatisfiesContract(parts.items.count, expectation: expectation) {
-            return render(parts, expectation: expectation)
+           let parts = semicolonSeparatedParts(in: source) {
+            if countSatisfiesContract(parts.items.count, expectation: expectation) {
+                return render(parts, expectation: expectation)
+            }
+            if let augmented = appendingProvenTrailingAddition(
+                to: parts,
+                expectation: expectation
+            ) {
+                return render(augmented, expectation: expectation)
+            }
         }
         if let parts = ideographicSeparatedParts(
             in: source,
@@ -508,9 +565,153 @@ private extension VoicePolishFallbackFormatter {
         ]
     }
 
+    static func retainedImplicitStepParts(in source: String) -> ListParts? {
+        guard !containsCodePathOrCommandRisk(source) else { return nil }
+        let candidates = [
+            chineseColloquialStepMarkers(in: source),
+            chineseFormalStepMarkers(in: source),
+            englishStepMarkers(in: source),
+        ]
+        for markers in candidates where retainedStepSequenceIsValid(markers) {
+            if let parts = retainedStepParts(source: source, markers: markers) {
+                return parts
+            }
+        }
+        return nil
+    }
+
+    static func chineseColloquialStepMarkers(in source: String) -> [RetainedStepMarker] {
+        let action = #"(?:要|把|从|对|将|去|来|做|说|讲|看|读|写|问|查|找|开|关|发|给|用|让|确认|处理|完成|说明|安排|检查|梳理|讨论|准备|建立|设置|选择|明确|定义|提交|进入|运行|测试|分析|收集|整理|联系|等待|解决|确保|核对|部署|上线)"#
+        guard let first = retainedStepMarkers(
+            pattern: #"(?m)(?:^|[，,；;。！？\s])[ \t]*(?:(?:我们|咱们|我|你们|大家)[ \t]*)?(先(?="# + action + #"))"#,
+            in: source
+        ).first else {
+            return []
+        }
+        let later = retainedStepMarkers(
+            pattern: #"(?:[，,；;。！？\n])[ \t]*((?:然后|接着|随后)|(?:再|最后)(?="# + action + #"))"#,
+            in: source
+        ).filter { $0.range.lowerBound > first.range.lowerBound }
+        return [first] + later
+    }
+
+    static func chineseFormalStepMarkers(in source: String) -> [RetainedStepMarker] {
+        guard let first = retainedStepMarkers(
+            pattern: #"(首先)"#,
+            in: source
+        ).first else {
+            return []
+        }
+        let later = retainedStepMarkers(
+            pattern: #"(?:[，,；;。！？\n])[ \t]*(其次|再次|最后)"#,
+            in: source
+        ).filter { $0.range.lowerBound > first.range.lowerBound }
+        return [first] + later
+    }
+
+    static func englishStepMarkers(in source: String) -> [RetainedStepMarker] {
+        guard let first = retainedStepMarkers(
+            pattern: #"(?i)\b((?:first(?:ly)?|start\s+by|begin\s+by)\b)"#,
+            in: source
+        ).first else {
+            return []
+        }
+        let later = retainedStepMarkers(
+            pattern: #"(?i)(?:[,;.!?\n])[ \t]*((?:then|next|after\s+that|finally|lastly)\b)"#,
+            in: source
+        ).filter { $0.range.lowerBound > first.range.lowerBound }
+        return [first] + later
+    }
+
+    static func retainedStepMarkers(
+        pattern: String,
+        in source: String
+    ) -> [RetainedStepMarker] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        return regex.matches(in: source, range: fullRange).compactMap { match in
+            guard match.numberOfRanges >= 2,
+                  let range = Range(match.range(at: 1), in: source) else {
+                return nil
+            }
+            return RetainedStepMarker(range: range, token: String(source[range]))
+        }
+    }
+
+    static func retainedStepSequenceIsValid(_ markers: [RetainedStepMarker]) -> Bool {
+        guard markers.count >= 3,
+              let first = markers.first?.token.lowercased() else {
+            return false
+        }
+
+        if first == "先" {
+            return markers.dropFirst().allSatisfy {
+                ["然后", "接着", "随后", "再", "最后"].contains($0.token)
+            }
+        }
+        if first == "首先" {
+            return markers.dropFirst().allSatisfy {
+                ["其次", "再次", "最后"].contains($0.token)
+            }
+        }
+        let englishFirst = first == "first" || first == "firstly"
+            || first == "start by" || first == "begin by"
+        return englishFirst && markers.dropFirst().allSatisfy {
+            ["then", "next", "after that", "finally", "lastly"]
+                .contains($0.token.lowercased())
+        }
+    }
+
+    static func retainedStepParts(
+        source: String,
+        markers: [RetainedStepMarker]
+    ) -> ListParts? {
+        guard let first = markers.first else { return nil }
+        let rawPrefix = source[..<first.range.lowerBound]
+        let prefix = rawPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        var renderedPrefix: String?
+        var firstItemStart = first.range.lowerBound
+        if !prefix.isEmpty {
+            if let final = prefix.last,
+               (final == "：" || final == ":"),
+               isSafeListHeading(String(prefix.dropLast())) {
+                renderedPrefix = String(prefix)
+            } else {
+                guard isSafeRetainedStepLeadIn(String(prefix)) else { return nil }
+                // “好的，先……”或“我们首先……”中的简短引导语属于第一项，
+                // 不能在拆行时被丢弃或误当成列表标题。
+                firstItemStart = source.startIndex
+            }
+        }
+
+        let items = markers.indices.compactMap { index -> String? in
+            let start = index == 0 ? firstItemStart : markers[index].range.lowerBound
+            let end = index + 1 < markers.count
+                ? markers[index + 1].range.lowerBound
+                : source.endIndex
+            let item = source[start..<end]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard item.count > markers[index].token.count else { return nil }
+            return String(item)
+        }
+        guard items.count == markers.count else { return nil }
+        return ListParts(prefix: renderedPrefix, items: items)
+    }
+
+    static func isSafeRetainedStepLeadIn(_ prefix: String) -> Bool {
+        guard prefix.count <= 24,
+              prefix.split(whereSeparator: \.isWhitespace).count <= 6,
+              prefix.rangeOfCharacter(from: CharacterSet(charactersIn: "。！？!?；;：:\n")) == nil,
+              prefix.rangeOfCharacter(from: CharacterSet(charactersIn: "“”\"「」『』`{}")) == nil,
+              !containsCodePathOrCommandRisk(prefix) else {
+            return false
+        }
+        return true
+    }
+
     static func chineseOrdinalMarkers(in source: String) -> [InlineMarker] {
         regexMarkers(
-            pattern: #"第([一二三四五六七八九十]{1,3}|\d+)(?:个|点|条|项|步|部分|方面)?(?:是|[，、,:：.）)]|[ \t]+)"#,
+            pattern: #"第([一二三四五六七八九十]{1,3}|\d+)(?:个|点|条|项|步|部分|方面)?(?:就是|是|[，、,:：.）)]|[ \t]+)"#,
             source: source
         ) { captured in
             integer(fromChineseOrArabic: captured)
@@ -587,6 +788,83 @@ private extension VoicePolishFallbackFormatter {
         return ListParts(prefix: prefix.isEmpty ? nil : prefix, items: items)
     }
 
+    /// 口述者先连续编号，再明确说“再补充一个事”时，最后一项虽然没有编号，
+    /// 仍然具有足够强的列表边界。只有版式契约恰好还缺这一项时才采用，避免把
+    /// 普通的后续话题误拆为列表项；提示语本身完整保留，不做文案改写。
+    static func appendingProvenTrailingAddition(
+        to parts: ListParts,
+        expectation: VoicePolishLayoutExpectation
+    ) -> ListParts? {
+        guard parts.items.count >= 3,
+              !countSatisfiesContract(parts.items.count, expectation: expectation),
+              countSatisfiesContract(parts.items.count + 1, expectation: expectation),
+              let finalItem = parts.items.last,
+              let additionStart = provenTrailingAdditionStart(in: finalItem) else {
+            return nil
+        }
+
+        let numberedItem = finalItem[..<additionStart]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let addition = finalItem[additionStart...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !numberedItem.isEmpty,
+              !addition.isEmpty,
+              !containsCodePathOrCommandRisk(String(addition)) else {
+            return nil
+        }
+
+        return ListParts(
+            prefix: parts.prefix,
+            items: Array(parts.items.dropLast()) + [String(numberedItem), String(addition)]
+        )
+    }
+
+    static func provenTrailingAdditionStart(in item: String) -> String.Index? {
+        // 必须是 LayoutExpectation 同样认可的明确追加 1 项；仅“再说一个话题”
+        // 或普通转折不构成列表边界。
+        let lead = #"(?:(?:另外|此外)?还有|另有|另(?:外)?|再(?:补充|加|增加)|额外(?:增加|补充)?|加上)"#
+        let oneUnit = #"(?:一个(?:事(?:情|项)?|问题|原因|建议|方案|任务|风险|事项|要点|结论|观点|方法|要求|目标|主题|阶段|选择|选项)|一件事|一项|一条|一点|一步|一部分|一方面)"#
+        let pattern = #"(?:哦|噢|对了)?[ \t]*[，,]?[ \t]*"# + lead
+            + #"[ \t]*"# + oneUnit
+            + #"(?:吧|啊|呀)?(?:[ \t]*[，,:：][ \t]*(?:就是|是|要|需要)?)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(
+                  in: item,
+                  range: NSRange(item.startIndex..<item.endIndex, in: item)
+              ),
+              let range = Range(match.range(at: 0), in: item),
+              trailingAdditionIsAffirmative(range, in: item) else {
+            return nil
+        }
+
+        var cursor = range.lowerBound
+        while cursor > item.startIndex {
+            let previous = item.index(before: cursor)
+            guard item[previous].isWhitespace else { break }
+            cursor = previous
+        }
+        guard cursor > item.startIndex else { return nil }
+        let boundary = item[item.index(before: cursor)]
+        guard "。！？!?；;".contains(boundary) else { return nil }
+        return range.lowerBound
+    }
+
+    static func trailingAdditionIsAffirmative(
+        _ range: Range<String.Index>,
+        in item: String
+    ) -> Bool {
+        let before = String(item[..<range.lowerBound])
+        let clausePrefix = before.split(whereSeparator: { "。！？!?；;\n".contains($0) })
+            .last
+            .map(String.init) ?? before
+        let suffix = String(item[range.upperBound...])
+        let prefixRejecting = #"(?:不要|不用|无需|别|不再|本来想|原本想|只是想|假如|如果|若|例如|比如|示例|反例)[，,\s]*$"#
+        let suffixCancelling = #"(?:算了|作罢)(?=$|[，,。.!?！？；;\s])|(?:撤回|取消|删除|删掉|去掉)(?:(?:这个|该|这|那)(?:补充|新增|事项|一项|安排)?|(?:该)?(?:补充|新增)(?:事项|一项)?|它)|不算(?:了|这项|该项|这个|那个)?(?=$|[，,。.!?！？；;\s])|不(?:再)?加了|不补充了|不用了|不要了|别加了|就当没说|别做了"#
+        return clausePrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+            .range(of: prefixRejecting, options: .regularExpression) == nil
+            && suffix.range(of: suffixCancelling, options: .regularExpression) == nil
+    }
+
     static func semicolonSeparatedParts(in source: String) -> ListParts? {
         guard let colon = safeIntroductoryColon(in: source) else { return nil }
         let afterColon = source.index(after: colon)
@@ -627,9 +905,17 @@ private extension VoicePolishFallbackFormatter {
                 )
                 if !prefix.isEmpty,
                    !isCodeOrCommandHeading(heading),
-                   !containsCodePathOrCommandRisk(body),
-                   countSatisfiesContract(items.count, expectation: expectation) {
-                    return ListParts(prefix: prefix, items: items)
+                   !containsCodePathOrCommandRisk(body) {
+                    let parts = ListParts(prefix: prefix, items: items)
+                    if countSatisfiesContract(items.count, expectation: expectation) {
+                        return parts
+                    }
+                    if let augmented = appendingProvenTrailingAddition(
+                        to: parts,
+                        expectation: expectation
+                    ) {
+                        return augmented
+                    }
                 }
             }
 
@@ -645,11 +931,19 @@ private extension VoicePolishFallbackFormatter {
             guard !heading.isEmpty,
                   isSafeListHeading(heading),
                   !isCodeOrCommandHeading(heading),
-                  !containsCodePathOrCommandRisk(items.joined()),
-                  countSatisfiesContract(items.count, expectation: expectation) else {
+                  !containsCodePathOrCommandRisk(items.joined()) else {
                 continue
             }
-            return ListParts(prefix: first, items: items)
+            let listParts = ListParts(prefix: first, items: items)
+            if countSatisfiesContract(items.count, expectation: expectation) {
+                return listParts
+            }
+            if let augmented = appendingProvenTrailingAddition(
+                to: listParts,
+                expectation: expectation
+            ) {
+                return augmented
+            }
         }
         return nil
     }

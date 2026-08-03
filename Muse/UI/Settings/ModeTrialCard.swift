@@ -326,6 +326,7 @@ private extension ModeTrialCard {
         let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
 
         if draftMode.kind == .voicePolish {
+            let trialStartedAt = ContinuousClock.now
             let voicePolishConfig: LLMConfig
             if let modelOverride = VoicePolishSettings.modelOverride() {
                 voicePolishConfig = llmConfig.withModel(modelOverride)
@@ -400,10 +401,14 @@ private extension ModeTrialCard {
                 client: client,
                 config: voicePolishConfig
             ).process(voicePolishRequest)
+            let elapsedMilliseconds = milliseconds(
+                ContinuousClock.now - trialStartedAt
+            )
             trialOutput = result.text
             trialDiagnostics = voicePolishDiagnostics(
                 result,
-                layoutExpectation: layoutExpectation
+                layoutExpectation: layoutExpectation,
+                elapsedMilliseconds: elapsedMilliseconds
             )
             return
         }
@@ -440,7 +445,8 @@ private extension ModeTrialCard {
 
     func voicePolishDiagnostics(
         _ result: VoicePolishResult,
-        layoutExpectation: VoicePolishLayoutExpectation
+        layoutExpectation: VoicePolishLayoutExpectation,
+        elapsedMilliseconds: Int64
     ) -> String {
         let routes = "\(result.detectedRoute.rawValue.capitalized) → \(result.executedRoute.rawValue.capitalized)"
         let calls = L("\(result.llmAttemptCount) 次", "\(result.llmAttemptCount) call(s)")
@@ -459,6 +465,18 @@ private extension ModeTrialCard {
             ? L("校验通过", "Validated")
             : result.validationCodes.map(\.rawValue).joined(separator: ",")
         let fallback = result.usedFallback ? L(" · 原文回退", " · Fallback") : ""
-        return "\(routes) · \(L("版式", "Layout"))：\(layout) · \(calls) · \(validation)\(fallback)"
+        return "\(routes) · \(L("版式", "Layout"))：\(layout) · \(calls) · \(durationText(elapsedMilliseconds)) · \(validation)\(fallback)"
+    }
+
+    func milliseconds(_ duration: Duration) -> Int64 {
+        duration.components.seconds * 1_000
+            + Int64(duration.components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    func durationText(_ milliseconds: Int64) -> String {
+        if milliseconds < 1_000 {
+            return "\(milliseconds) ms"
+        }
+        return String(format: "%.1f s", Double(milliseconds) / 1_000)
     }
 }

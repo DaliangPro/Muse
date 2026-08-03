@@ -295,15 +295,83 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
     }
 
     func testChineseImplicitStepsProduceNumberedListWithoutInventingExactCount() {
-        let expectation = infer(
+        let samples = [
             "先确认需求，然后安排开发，最后完成回归测试。",
-            scene: .document
+            "先确认需求，然后安排开发，接着完成回归测试。",
+            "我们先确认需求，然后安排开发，最后完成回归测试。",
+            "先确认需求，再安排开发，然后完成回归测试。",
+            "Start by confirming scope, then assign owners, next run regression tests.",
+        ]
+
+        for sample in samples {
+            let expectation = infer(sample, scene: .document)
+            XCTAssertEqual(expectation.kind, .numberedList, sample)
+            XCTAssertNil(expectation.expectedListItemCount, sample)
+            XCTAssertEqual(expectation.minimumListItemCount, 3, sample)
+            XCTAssertEqual(expectation.numberingPreference, .arabic, sample)
+        }
+    }
+
+    func testMediumUnpunctuatedTopicSwitchRequestsNaturalParagraphs() {
+        let expectation = infer(
+            "我今天想跟团队同步一下项目进度目前核心功能已经开发完成但是测试还没跑完另外预算还需要再确认明天下午我们开会讨论上线时间",
+            scene: .workChat
         )
 
-        XCTAssertEqual(expectation.kind, .numberedList)
-        XCTAssertNil(expectation.expectedListItemCount)
-        XCTAssertEqual(expectation.minimumListItemCount, 3)
-        XCTAssertEqual(expectation.numberingPreference, .arabic)
+        XCTAssertEqual(expectation.kind, .paragraphs)
+        XCTAssertEqual(expectation.minimumParagraphCount, 2)
+    }
+
+    func testMediumBareAdditionalModifierDoesNotForceParagraphs() {
+        let samples = [
+            "请把另外三个文件也一起发给我，文件名保持不变，压缩后放到共享目录，完成后把下载链接发到工作群里，谢谢。",
+            "这项服务需要另外收费，具体价格会在确认需求之后给出，请先把公司名称和联系人信息发给我。",
+            "请再提供另外一种写法，保持原来的事实和语气，只需要调整几个词，让整句话读起来更自然一些。",
+            "请把另外一个文件也一起发给我，文件名保持不变，压缩后放到共享目录，完成后把下载链接发到工作群里，谢谢。",
+            "这次订单里另外一件商品需要单独包装，请保持原来的收货地址，并在发货以后把物流单号发给我。",
+            "合同里另外一点费用需要重新核对，请先确认计费周期和服务范围，然后把更新后的报价发给客户。",
+            "请把另外一个问题的答案也补充到同一份报告中，保持原有章节顺序和所有引用内容不变，完成后直接发给客户确认。",
+        ]
+
+        for sample in samples {
+            XCTAssertEqual(infer(sample, scene: .workChat).kind, .sentence, sample)
+        }
+    }
+
+    func testCodeSceneDoesNotInferAutomaticParagraphsFromTopicWords() {
+        let source = "let message = \"另外预算还需要确认\"; // 接下来仍按原来的函数结构处理，变量名称和字符串内容都不能改变。"
+        XCTAssertEqual(infer(source, scene: .code).kind, .sentence)
+    }
+
+    func testNegatedCancelledOrQuotedIncrementDoesNotIncreaseListMinimum() {
+        let samples = [
+            "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。不要再补充一个事情，三项就够了。",
+            "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。本来想再补充一个事情，但算了。",
+            "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。示例里可以说“再补充一个事情”。",
+            "今天有三件事。第一，确认需求。第二，安排开发。第三，完成验收。另外还要完成测试，但算了。",
+            "今天有三件事。第一，确认需求。第二，安排开发。第三，完成验收。再补充一项：发布。算了，这项不用了。",
+        ]
+
+        for sample in samples {
+            let expectation = infer(sample, scene: .workChat)
+            XCTAssertEqual(expectation.kind, .numberedList, sample)
+            XCTAssertEqual(expectation.minimumListItemCount, 3, sample)
+        }
+    }
+
+    func testAffirmativeIncrementKeepsNegativeFactInsideNewItem() {
+        let samples = [
+            "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。哦，再补充一个事情，就是预算还没有确认。",
+            "今天有三件事。第一，确认需求。第二，安排开发。第三，完成测试。虽然没有新增预算，另外还有一项需要确认，就是通知团队。",
+            "今天有三件事。第一，确认需求。第二，安排开发。第三，完成测试。再补充一项：取消周五会议。",
+            "今天有三件事。第一，确认需求。第二，安排开发。第三，完成测试。再补充一项：删掉过期文件。",
+        ]
+
+        for sample in samples {
+            let expectation = infer(sample, scene: .workChat)
+            XCTAssertEqual(expectation.kind, .numberedList, sample)
+            XCTAssertEqual(expectation.minimumListItemCount, 4, sample)
+        }
     }
 
     func testChineseUserOneTwoThreePreferenceControlsNumberingStyle() {

@@ -74,9 +74,299 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, output)
     }
 
+    func testMediumTopicSwitchUsesFastRequestAndLocallyCreatesParagraphs() async {
+        let request = makeRequest(
+            "我今天想跟团队同步一下项目进度目前核心功能已经开发完成但是测试还没跑完另外预算还需要再确认明天下午我们开会讨论上线时间",
+            scene: .workChat
+        )
+        let client = LayoutPipelineScriptedLLM(responses: [
+            "我今天想跟团队同步一下项目进度：核心功能已经开发完成，但测试还没跑完；另外预算还需要再确认。明天下午我们开会讨论上线时间。",
+        ])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(VoicePolishLayoutExpectation.infer(from: request).kind, .paragraphs)
+        XCTAssertEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            "我今天想跟团队同步一下项目进度：核心功能已经开发完成，但测试还没跑完；另外预算还需要再确认。\n\n明天下午我们开会讨论上线时间。"
+        )
+    }
+
+    func testLiveFourItemSampleUsesOneFastRequestAndKeepsTrailingAddition() async {
+        let source = "今天我有三件事要做。第一个是我要给自己买一个沙发套。第二个是我希望 把我下一周的稿子都集中写完，至少也要把选题写完。第三个就是就是 就是把快递都拿了。哦，再补充一个事吧，就是 给自己选一身适合健身穿的衣服。"
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [source])
+
+        let result = await pipeline(client).process(request)
+
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        XCTAssertEqual(expectation.kind, .numberedList)
+        XCTAssertEqual(expectation.minimumListItemCount, 4)
+        XCTAssertEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            """
+            今天我有四件事要做。
+
+            一、我要给自己买一个沙发套。
+            二、我希望 把我下一周的稿子都集中写完，至少也要把选题写完。
+            三、就是 就是把快递都拿了。
+            四、哦，再补充一个事吧，就是 给自己选一身适合健身穿的衣服。
+            """
+        )
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast])
+    }
+
+    func testParallelThreeItemsPlusTrailingAdditionStayOneFastRequest() async {
+        let source = "今天有三项：确认需求、安排开发、完成测试。再补充一项：通知团队。"
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [source])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            """
+            今天有四项：
+
+            1. 确认需求、
+            2. 安排开发、
+            3. 完成测试。
+            4. 再补充一项：通知团队。
+            """
+        )
+    }
+
+    func testEquivalentTrailingAdditionPhraseUsesOneFastRequestAndUpdatesTotal() async {
+        let source = "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。额外增加一项，就是通知团队。"
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [source])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            """
+            今天有四件事。
+
+            一、确认需求。
+            二、安排开发。
+            三、完成测试。
+            四、额外增加一项，就是通知团队。
+            """
+        )
+    }
+
+    func testLiveFourItemSampleFallbackStillSynchronizesDeclaredCount() async {
+        let source = "今天我有三件事要做。第一个是确认需求。第二个是安排开发。第三个就是完成测试。哦，再补充一个事吧，就是通知团队。"
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            """
+            今天我有四件事要做。
+
+            一、确认需求。
+            二、安排开发。
+            三、完成测试。
+            四、哦，再补充一个事吧，就是通知团队。
+            """
+        )
+    }
+
+    func testBulletFallbackSynchronizesDeclaredCountFromCanonicalProof() async {
+        let source = "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。此外还有一项：通知团队。"
+        let request = makeRequest(
+            source,
+            requirements: "请使用项目符号列表。",
+            scene: .workChat
+        )
+        let client = LayoutPipelineScriptedLLM(responses: [])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            """
+            今天有四件事。
+
+            - 确认需求。
+            - 安排开发。
+            - 完成测试。
+            - 此外还有一项：通知团队。
+            """
+        )
+    }
+
+    func testModelHallucinatedFourthItemCannotTriggerCountSynchronization() async {
+        let source = "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。"
+        let request = makeRequest(source, scene: .workChat)
+        let hallucinated = """
+        今天有三件事。
+
+        一、确认需求。
+        二、安排开发。
+        三、完成测试。
+        四、哦，再补充一个事吧，就是发布上线。
+        """
+        let client = LayoutPipelineScriptedLLM(responses: [hallucinated])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertTrue(result.validationCodes.contains(.layoutRequirementUnmet))
+        XCTAssertFalse(result.text.contains("四件事"))
+        XCTAssertFalse(result.text.contains("发布上线"))
+    }
+
+    func testBulletCountMismatchWithQuotedCommandAndFooterIsRejected() async {
+        let source = "这里有三项：第一，保留引用“例如”的原话。第二，执行命令 `git status`。第三，完成发布。"
+        let request = makeRequest(
+            source,
+            requirements: "请使用项目符号列表。",
+            scene: .workChat
+        )
+        let inconsistent = """
+        这里有两项：
+        - 保留引用“例如”的原话。
+        - 执行命令 `git status`。
+        - 完成发布。
+
+        以上是普通收束段落。
+        """
+        let client = LayoutPipelineScriptedLLM(responses: [inconsistent])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertTrue(result.validationCodes.contains(.layoutRequirementUnmet))
+    }
+
+    func testDeclaredCountMismatchIsRejectedAndFallsBackToConsistentList() async {
+        let source = "今天有四件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。第四个是通知团队。"
+        let request = makeRequest(source, scene: .workChat)
+        let inconsistentOutput = """
+        今天有三件事。
+
+        1. 确认需求。
+        2. 安排开发。
+        3. 完成测试。
+        4. 通知团队。
+        """
+        let client = LayoutPipelineScriptedLLM(responses: [inconsistentOutput])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertTrue(result.validationCodes.contains(.layoutRequirementUnmet))
+        XCTAssertEqual(
+            result.text,
+            """
+            今天有四件事。
+
+            一、确认需求。
+            二、安排开发。
+            三、完成测试。
+            四、通知团队。
+            """
+        )
+    }
+
+    func testImplicitStepsUseOneFastRequestAndLocalListLayout() async {
+        let cases = [
+            (
+                "先确认需求，然后安排开发，最后完成回归测试。",
+                "1. 先确认需求，\n2. 然后安排开发，\n3. 最后完成回归测试。"
+            ),
+            (
+                "First, confirm scope. Then assign owners. Finally run regression tests.",
+                "1. First, confirm scope.\n2. Then assign owners.\n3. Finally run regression tests."
+            ),
+            (
+                "好的，先确认需求，然后安排开发，最后完成测试。",
+                "1. 好的，先确认需求，\n2. 然后安排开发，\n3. 最后完成测试。"
+            ),
+            (
+                "We first confirm scope. Then assign owners. Finally run regression tests.",
+                "1. We first confirm scope.\n2. Then assign owners.\n3. Finally run regression tests."
+            ),
+            (
+                "先确认需求，然后安排开发，接着完成测试。",
+                "1. 先确认需求，\n2. 然后安排开发，\n3. 接着完成测试。"
+            ),
+            (
+                "Start by confirming scope, then assign owners, next run regression tests.",
+                "1. Start by confirming scope,\n2. then assign owners,\n3. next run regression tests."
+            ),
+            (
+                "我们先确认需求，然后安排开发，最后完成测试。",
+                "1. 我们先确认需求，\n2. 然后安排开发，\n3. 最后完成测试。"
+            ),
+            (
+                "先确认需求，再安排开发，然后完成测试。",
+                "1. 先确认需求，\n2. 再安排开发，\n3. 然后完成测试。"
+            ),
+        ]
+
+        for (source, expected) in cases {
+            let request = makeRequest(source, scene: .workChat)
+            let client = LayoutPipelineScriptedLLM(responses: [source])
+            let result = await pipeline(client).process(request)
+
+            XCTAssertEqual(result.detectedRoute, .fast, source)
+            XCTAssertEqual(result.executedRoute, .fast, source)
+            XCTAssertEqual(result.llmAttemptCount, 1, source)
+            XCTAssertFalse(result.usedFallback, source)
+            XCTAssertEqual(result.text, expected, source)
+        }
+    }
+
+    func testFormalChineseStepLeadInStillUsesOneFastRequest() async {
+        let source = "我们首先确认需求，其次安排开发，最后完成测试。"
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [source])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            "一、我们首先确认需求，\n二、其次安排开发，\n三、最后完成测试。"
+        )
+    }
+
     func testBlobAndWrongPlanTriggerRepairThenArabicNumberedListSucceeds() async throws {
         let request = makeRequest(
-            "First, confirm scope. Second, assign owners. Third, run regression tests.",
+            "Side note. First, confirm scope. Second, assign owners. Third, run regression tests.",
             requirements: "Use a numbered list.",
             scene: .workChat
         )
@@ -116,7 +406,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
 
     func testStructuredMinimumOnlyContractDoesNotAdoptModelGuessedExactCount() async throws {
         let request = makeRequest(
-            "先确认需求，然后安排开发，最后完成测试。",
+            "顺便说一下，先确认需求，然后安排开发，最后完成测试。",
             scene: .workChat
         )
         let finalText = """
@@ -145,23 +435,23 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
 
     func testThreeParagraphPreferenceRejectsBlobAndAcceptsThreeParagraphs() async throws {
         let request = makeRequest(
-            "先说明项目背景。接下来解释当前问题。最后给出下一步安排。",
+            "顺便说一下，先说明项目背景。接下来解释当前问题。最后给出下一步安排。",
             requirements: "请分成三段，每段只讲一个主题。",
             scene: .document,
             segments: [
-                "先说明项目背景。",
+                "顺便说一下，先说明项目背景。",
                 "接下来解释当前问题。",
                 "最后给出下一步安排。",
             ]
         )
         let blob = response(
             for: request,
-            finalText: "先说明项目背景，接着解释当前问题，最后给出下一步安排。",
+            finalText: "顺便说一下，先说明项目背景，接着解释当前问题，最后给出下一步安排。",
             kind: .paragraphs,
             expectedListCount: nil
         )
         let paragraphText = """
-        先说明项目背景。
+        顺便说一下，先说明项目背景。
 
         接下来解释当前问题。
 
@@ -186,6 +476,10 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, paragraphText)
         let requests = await client.recordedRequests()
         XCTAssertEqual(requests.map(\.task), [.voicePolishStructured, .voicePolishRepair])
+        guard requests.count > 1 else {
+            XCTFail("缺少预期的排版修复请求")
+            return
+        }
         XCTAssertTrue(requests[1].user.contains(VoicePolishValidationCode.layoutRequirementUnmet.rawValue))
     }
 
@@ -201,13 +495,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         2. Assign owners.
         3. Run regression tests.
         """
-        let valid = response(
-            for: request,
-            finalText: finalText,
-            kind: .numberedList,
-            expectedListCount: 3
-        )
-        let client = LayoutPipelineScriptedLLM(responses: [try encoded(valid)])
+        let client = LayoutPipelineScriptedLLM(responses: [finalText])
 
         let result = await pipeline(client).process(request)
         let requests = await client.recordedRequests()
@@ -232,13 +520,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         二、安排开发。
         三、完成回归测试。
         """
-        let valid = response(
-            for: request,
-            finalText: finalText,
-            kind: .numberedList,
-            expectedListCount: 3
-        )
-        let client = LayoutPipelineScriptedLLM(responses: [try encoded(valid)])
+        let client = LayoutPipelineScriptedLLM(responses: [finalText])
 
         let result = await pipeline(client).process(request)
 
@@ -292,7 +574,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
 
     func testStructuredBlobIsLocallyFormattedWithoutRepair() async throws {
         let request = makeRequest(
-            "这次有三点：第一，确认需求。第二，安排开发。第三，完成测试。",
+            "这次有三点：第一，确认需求。第二，安排开发。第三，完成测试。顺便说一下。",
             scene: .workChat
         )
         let blob = "这次有三点：确认需求，安排开发，完成测试。"
@@ -370,11 +652,11 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
 
         let result = await pipeline(client).process(request)
 
-        XCTAssertEqual(result.executedRoute, .fast)
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.executedRoute, .structured)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.text, source)
-        XCTAssertTrue(result.validationCodes.contains(.layoutRequirementUnmet))
+        XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
     }
 
     func testNewNumericFactAfterSafeFormattingIsRejectedAndCanonicalFallbackIsFormatted() async {

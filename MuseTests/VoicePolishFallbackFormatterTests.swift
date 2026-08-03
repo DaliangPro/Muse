@@ -72,6 +72,282 @@ final class VoicePolishFallbackFormatterTests: XCTestCase {
         )
     }
 
+    func testSpokenOrdinalListAppendsExplicitTrailingAdditionAsFourthItem() {
+        let source = "今天我有三件事要做。第一个是我要给自己买一个沙发套。第二个是我希望 把我下一周的稿子都集中写完，至少也要把选题写完。第三个就是就是 就是把快递都拿了。哦，再补充一个事吧，就是 给自己选一身适合健身穿的衣服。"
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 4,
+            numberingPreference: .arabic
+        )
+        let expected = """
+        今天我有三件事要做。
+
+        1. 我要给自己买一个沙发套。
+        2. 我希望 把我下一周的稿子都集中写完，至少也要把选题写完。
+        3. 就是 就是把快递都拿了。
+        4. 哦，再补充一个事吧，就是 给自己选一身适合健身穿的衣服。
+        """
+
+        let formatted = VoicePolishFallbackFormatter.format(
+            request: makeRequest(source),
+            expectation: expectation
+        )
+        XCTAssertEqual(formatted, expected)
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                source,
+                expectation: expectation
+            ),
+            expected
+        )
+        XCTAssertTrue(VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+            source: source,
+            candidate: formatted,
+            expectation: expectation
+        ))
+    }
+
+    func testEquivalentExplicitTrailingAdditionPhrasesBecomeFourthItem() {
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 4,
+            numberingPreference: .arabic
+        )
+        let additions = [
+            "还有一项，就是通知团队。",
+            "另外还有一项，就是通知团队。",
+            "此外还有一项，就是通知团队。",
+            "另有一项，就是通知团队。",
+            "另一个问题，就是通知团队。",
+            "另外一项，就是通知团队。",
+            "额外增加一项，就是通知团队。",
+            "额外一个事项，就是通知团队。",
+            "加上一项，就是通知团队。",
+        ]
+
+        for addition in additions {
+            let source = "今天有三件事。第一个是确认需求。第二个是安排开发。第三个是完成测试。\(addition)"
+            let expected = """
+            今天有三件事。
+
+            1. 确认需求。
+            2. 安排开发。
+            3. 完成测试。
+            4. \(addition)
+            """
+            XCTAssertEqual(
+                VoicePolishFallbackFormatter.formatCandidate(
+                    source,
+                    expectation: expectation
+                ),
+                expected,
+                addition
+            )
+        }
+    }
+
+    func testSpokenOrdinalListDoesNotInventFourthItemFromOrdinaryNewTopic() {
+        let source = "今天我有三件事要做。第一个是确认需求。第二个是安排开发。第三个就是完成测试。哦，再说一个话题吧，就是团队氛围。"
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 4,
+            numberingPreference: .arabic
+        )
+
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                source,
+                expectation: expectation
+            ),
+            source
+        )
+    }
+
+    func testSpokenOrdinalListDoesNotSplitTrailingCommandAsFourthItem() {
+        let source = "今天有三件事。第一个是确认需求。第二个是安排开发。第三个就是完成测试。哦，再补充一个事吧，就是运行 git status; npm test。"
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 4,
+            numberingPreference: .arabic
+        )
+
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                source,
+                expectation: expectation
+            ),
+            source
+        )
+    }
+
+    func testChineseImplicitStepsKeepConnectorsAndBecomeNumberedList() {
+        let source = "先确认需求，然后安排开发，最后完成回归测试。"
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 3,
+            numberingPreference: .arabic
+        )
+        let expected = """
+        1. 先确认需求，
+        2. 然后安排开发，
+        3. 最后完成回归测试。
+        """
+
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                source,
+                expectation: expectation
+            ),
+            expected
+        )
+        XCTAssertTrue(VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+            source: source,
+            candidate: expected,
+            expectation: expectation
+        ))
+    }
+
+    func testFormalChineseAndEnglishImplicitStepsBecomeNumberedLists() {
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 3,
+            numberingPreference: .arabic
+        )
+        let cases = [
+            (
+                "首先确认需求，其次安排开发，最后完成测试。",
+                "1. 首先确认需求，\n2. 其次安排开发，\n3. 最后完成测试。"
+            ),
+            (
+                "First, confirm scope. Then assign owners. Finally run regression tests.",
+                "1. First, confirm scope.\n2. Then assign owners.\n3. Finally run regression tests."
+            ),
+            (
+                "好的，先确认需求，然后安排开发，最后完成测试。",
+                "1. 好的，先确认需求，\n2. 然后安排开发，\n3. 最后完成测试。"
+            ),
+            (
+                "我们首先确认需求，其次安排开发，最后完成测试。",
+                "1. 我们首先确认需求，\n2. 其次安排开发，\n3. 最后完成测试。"
+            ),
+            (
+                "We first confirm scope. Then assign owners. Finally run regression tests.",
+                "1. We first confirm scope.\n2. Then assign owners.\n3. Finally run regression tests."
+            ),
+            (
+                "先确认需求，然后安排开发，接着完成测试。",
+                "1. 先确认需求，\n2. 然后安排开发，\n3. 接着完成测试。"
+            ),
+            (
+                "Start by confirming scope, then assign owners, next run regression tests.",
+                "1. Start by confirming scope,\n2. then assign owners,\n3. next run regression tests."
+            ),
+            (
+                "我们先确认需求，然后安排开发，最后完成测试。",
+                "1. 我们先确认需求，\n2. 然后安排开发，\n3. 最后完成测试。"
+            ),
+            (
+                "先确认需求，再安排开发，然后完成测试。",
+                "1. 先确认需求，\n2. 再安排开发，\n3. 然后完成测试。"
+            ),
+        ]
+
+        for (source, expected) in cases {
+            XCTAssertEqual(
+                VoicePolishFallbackFormatter.formatCandidate(
+                    source,
+                    expectation: expectation
+                ),
+                expected,
+                source
+            )
+            XCTAssertTrue(VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+                source: source,
+                candidate: expected,
+                expectation: expectation
+            ))
+        }
+    }
+
+    func testParallelItemsCanAppendOneProvenTrailingAddition() {
+        let source = "今天有三项：确认需求、安排开发、完成测试。再补充一项：通知团队。"
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 4,
+            numberingPreference: .arabic
+        )
+        let expected = """
+        今天有三项：
+
+        1. 确认需求、
+        2. 安排开发、
+        3. 完成测试。
+        4. 再补充一项：通知团队。
+        """
+
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                source,
+                expectation: expectation
+            ),
+            expected
+        )
+        XCTAssertTrue(VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+            source: source,
+            candidate: expected,
+            expectation: expectation
+        ))
+    }
+
+    func testTrailingAdditionKeepsRealCancelActionButRejectsLaterRetraction() {
+        let expectation = VoicePolishLayoutExpectation(
+            kind: .numberedList,
+            minimumParagraphCount: 1,
+            expectedListItemCount: nil,
+            minimumListItemCount: 4,
+            numberingPreference: .arabic
+        )
+        let valid = "今天有三件事。第一，确认需求。第二，安排开发。第三，完成测试。再补充一项：取消周五会议。"
+        let expected = """
+        今天有三件事。
+
+        1. 确认需求。
+        2. 安排开发。
+        3. 完成测试。
+        4. 再补充一项：取消周五会议。
+        """
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                valid,
+                expectation: expectation
+            ),
+            expected
+        )
+
+        let cancelled = "今天有三件事。第一，确认需求。第二，安排开发。第三，完成测试。再补充一项：发布。算了，这项不用了。"
+        XCTAssertEqual(
+            VoicePolishFallbackFormatter.formatCandidate(
+                cancelled,
+                expectation: expectation
+            ),
+            cancelled
+        )
+    }
+
     func testEnglishExplicitEnumerationBecomesArabicNumberedList() {
         let source = "Three tasks: first, confirm requirements; second, add tests; third, rehearse release."
         let request = makeRequest(source)

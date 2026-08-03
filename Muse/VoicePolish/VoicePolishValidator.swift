@@ -383,9 +383,24 @@ enum VoicePolishValidator {
         _ output: String,
         request: VoicePolishRequest
     ) -> [SourceFactCandidate] {
+        let projectedOutput: String
+        if request.context.scene == .code {
+            projectedOutput = output
+        } else {
+            // 事实校验只在来源与成稿双重证明合法 N -> N+1 同步时，临时把
+            // 列表头声明逆投影回旧值。其余字符保持原样，随后仍由通用提取器
+            // 校验普通数字、金额、日期、版本等事实。
+            projectedOutput = VoicePolishListCountConsistency
+                .projectedTextForFactValidation(
+                    in: output,
+                    canonicalSource: request.fallbackText
+                ) ?? output
+        }
         let factText = request.context.scene == .code
-            ? output
-            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(in: output)
+            ? projectedOutput
+            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(
+                in: projectedOutput
+            )
         return ProtectedFactExtractor.extract(from: [outputSegment(factText)])
     }
 
@@ -431,6 +446,10 @@ enum VoicePolishValidator {
             kind: .bulletList
         )
         let recognizedListCount = numberedCount + bulletCount
+
+        if VoicePolishListCountConsistency.declaredCountMatchesList(in: output) == false {
+            append(.layoutRequirementUnmet, to: &codes)
+        }
 
         if expectation.forbidsLists, recognizedListCount > 0 {
             append(.layoutRequirementUnmet, to: &codes)

@@ -227,6 +227,29 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
         return sentence(preferences: preferences)
     }
 
+    /// 供版式判断与复杂度路由共用同一套“换话题”证据，避免 Router 仅凭
+    /// “另外一个问题”这样的名词修饰语就错误进入 Deep。
+    static func containsTopicSwitchEvidence(in text: String) -> Bool {
+        topicSwitchEvidenceCount(in: text) > 0
+    }
+
+    /// 只有明确宣布切换议题、或“另外一个问题是/在于……”这类强语义转折，
+    /// 才值得提高模型推理档位。普通的“另外预算”“接下来”仍由一次 Fast
+    /// 请求和本地自然分段处理。
+    static func containsComplexTopicSwitchEvidence(in text: String) -> Bool {
+        regexMatchCount(
+            #"换个话题|回到刚才|先说另一件事|另外(?:一个|一件|一点)(?:问题|事情|事项|任务|主题|话题|需求|风险|建议|方案|原因|要点|安排|选择|选项)(?=\s*(?:是|在于|[：:]))|(?i:\bdifferent\s+topic\b|\bback\s+to\s+the\s+earlier\s+(?:point|topic)\b|\banother\s+(?:issue|topic)\s+(?:is|:))"#,
+            in: text
+        ) > 0
+    }
+
+    private static func topicSwitchEvidenceCount(in text: String) -> Int {
+        regexMatchCount(
+            #"另外(?:[，,]|(?:一个|一件|一点)(?:问题|事情|事项|任务|主题|话题|需求|风险|建议|方案|原因|要点|安排|选择|选项)(?=\s*(?:是|在于|还|也|需要|需|要|得|应该|必须|尚未|没有|没|已经|目前|仍|方面|[：:,，])))|另外(?=(?:预算|成本|费用|进度|测试|排期|上线|交付|合同|人员|资源|时间|风险|权限|数据|模型|方案|需求|提示词)(?:还|也|需要|需|要|得|应该|必须|尚未|没有|没|已经|目前|仍|方面))|另一方面|接下来|再说|先说另一件事|关于|至于|换个话题|回到刚才|第二个(?:问题|主题)|(?i:\banother\s+topic\b|\bon\s+the\s+other\s+hand\b|\bmoving\s+on\b|\bas\s+for\b|\bregarding\b|\bseparately\b|\bin\s+addition\b)"#,
+            in: text
+        )
+    }
+
     private static func sentence(
         preferences: FormatPreferences
     ) -> VoicePolishLayoutExpectation {
@@ -811,7 +834,8 @@ private extension VoicePolishLayoutExpectation {
             ].compactMap { $0 }.max()
             implicitStepCount = Self.implicitStepCount(in: text, hasCJK: hasCJK)
             parallelItemCount = parallelItems
-            topicSwitchCount = Self.topicSwitchCount(in: text)
+            topicSwitchCount = VoicePolishLayoutExpectation
+                .topicSwitchEvidenceCount(in: text)
             aiSectionCount = Self.aiSectionCount(in: text)
             hasStrongParallelIntroduction = Self.hasStrongParallelIntroduction(in: text)
             strongParallelItemCount = Self.strongParallelItemCount(
@@ -827,6 +851,7 @@ private extension VoicePolishLayoutExpectation {
             isLong = hasCJK ? cjkLength >= 80 : wordLength >= 60
             isLongEnoughForRequestedParagraphs = hasCJK ? cjkLength >= 80 : wordLength >= 60
             let isVeryLong = hasCJK ? cjkLength >= 180 : wordLength >= 110
+            let isMediumLength = hasCJK ? cjkLength >= 45 : wordLength >= 35
             let sceneNaturallyUsesParagraphs: Bool
             switch scene {
             case .email, .document, .note, .socialPost, .aiPrompt:
@@ -838,8 +863,11 @@ private extension VoicePolishLayoutExpectation {
                 || sentenceCount >= 3
                 || aiSectionCount >= 3
                 || (sceneNaturallyUsesParagraphs && self.segmentCount >= 2 && sentenceCount >= 2)
-            isLongMultiTopic = (isLong && hasMultipleTopics)
-                || (isVeryLong && sentenceCount >= 2)
+            isLongMultiTopic = scene != .code && (
+                (isLong && hasMultipleTopics)
+                    || (isMediumLength && topicSwitchCount > 0)
+                    || (isVeryLong && sentenceCount >= 2)
+            )
 
             if arabicMarkers >= 2 || englishWordMarkers >= 2 {
                 explicitNumberingPreference = .arabic
@@ -1007,7 +1035,7 @@ private extension VoicePolishLayoutExpectation {
         ) -> DeclaredCountSummary {
             let countToken = #"([1-9]|1[0-9]|[一二两三四五六七八九十]{1,3})"#
             let countTokenNoCapture = #"(?:[1-9]|1[0-9]|[一二两三四五六七八九十]{1,3})"#
-            let chineseUnit = #"(?:点|条|项|步|个步骤|部分|方面|件事|(?:个)?(?:问题|原因|建议|方案|任务|风险|事项|要点|结论|观点|方法|要求|目标|主题|阶段|选择|选项))"#
+            let chineseUnit = #"(?:点|条|项|步|个步骤|部分|方面|件事|个事(?:情)?|(?:个)?(?:问题|原因|建议|方案|任务|风险|事项|要点|结论|观点|方法|要求|目标|主题|阶段|选择|选项))"#
             let englishCount = #"(one|two|three|four|five|six|seven|eight|nine|ten|[1-9]|1[0-9])"#
             let englishCountNoCapture = #"(?:one|two|three|four|five|six|seven|eight|nine|ten|[1-9]|1[0-9])"#
             let englishUnit = #"(?:points?|items?|steps?|parts?|topics?|things?|problems?|reasons?|suggestions?|recommendations?|plans?|solutions?|tasks?|risks?|requirements?|goals?|options?)"#
@@ -1055,7 +1083,7 @@ private extension VoicePolishLayoutExpectation {
             let mentions = capturedSmallCountMentions(patterns: patterns, in: text)
             let incrementalPatterns: [(pattern: String, isCorrection: Bool)] = [
                 (
-                    #"(?:(?:另外|此外)?(?:还有|另有)|另(?:外)?|再(?:加|补充|增加)|额外(?:增加|补充)?|加上)[，,、：:\s]*"#
+                    #"(?:(?:另外|此外)?还有|另有|另(?:外)?|再(?:加|补充|增加)|额外(?:增加|补充)?|加上)[，,、：:\s]*"#
                         + countToken + #"\s*"# + chineseUnit,
                     false
                 ),
@@ -1072,7 +1100,7 @@ private extension VoicePolishLayoutExpectation {
             let increments = capturedSmallCountMentions(
                 patterns: incrementalPatterns,
                 in: text
-            )
+            ).filter { isAffirmativeCountIncrement($0, in: text) }
             let incrementLocations = Set(increments.map(\.location))
             let baseMentions = mentions.filter { !incrementLocations.contains($0.location) }
 
@@ -1151,19 +1179,28 @@ private extension VoicePolishLayoutExpectation {
             after lastExplicitMarkerLocation: Int?
         ) -> Int {
             guard let lastExplicitMarkerLocation else { return 0 }
-            let locations = regexMatchLocations(
-                patterns: [
-                    #"(?:^|[。.!?！？；;\n])\s*(?:另外|此外)\s*(?:还)?(?:要|需要|需|得|应当?|必须|完成|处理|确认|安排|补充|检查|测试|部署|解决|确保|推进|准备|提交|上线|说明|梳理|讨论|实现|加入|增加)"#,
-                ],
-                in: text
-            )
-            return locations.contains { $0 > lastExplicitMarkerLocation } ? 1 : 0
+            let pattern = #"(?:^|[。.!?！？；;\n])\s*(?:另外|此外)\s*(?:还)?(?:要|需要|需|得|应当?|必须|完成|处理|确认|安排|补充|检查|测试|部署|解决|确保|推进|准备|提交|上线|说明|梳理|讨论|实现|加入|增加)"#
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return 0 }
+            let source = text as NSString
+            let fullRange = NSRange(location: 0, length: source.length)
+            let hasAffirmativeTrailingItem = regex.matches(in: text, range: fullRange)
+                .contains { match in
+                    guard match.range.location > lastExplicitMarkerLocation else {
+                        return false
+                    }
+                    let suffix = countIncrementCancellationWindow(
+                        afterUTF16Location: NSMaxRange(match.range),
+                        in: source
+                    )
+                    return !hasExplicitCountIncrementCancellation(in: suffix)
+                }
+            return hasAffirmativeTrailingItem ? 1 : 0
         }
 
         private static func implicitStepCount(in text: String, hasCJK: Bool) -> Int {
             if hasCJK {
                 return regexMatchCount(
-                    #"(?:^|[，,；;。！？\s])先(?=(?:要|把|从|对|将|去|来|做|说|讲|看|读|写|问|查|找|开|关|发|给|用|让|确认|处理|完成|说明|安排|检查|梳理|讨论|准备|建立|设置|选择|明确|定义|提交|进入|运行|测试|分析|收集|整理|联系|等待|解决|确保|核对|部署|上线))|然后|接着|随后|最后|(?:^|[，,；;。！？\s])再(?=(?:要|把|从|对|将|去|来|做|说|讲|看|读|写|问|查|找|开|关|发|给|用|让|确认|处理|完成|说明|安排|检查|梳理|讨论|准备|建立|设置|选择|明确|定义|提交|进入|运行|测试|分析|收集|整理|联系|等待|解决|确保|核对|部署|上线))"#,
+                    #"(?:^|[，,；;。！？\s])(?:(?:我们|咱们|我|你们|大家)\s*)?先(?=(?:要|把|从|对|将|去|来|做|说|讲|看|读|写|问|查|找|开|关|发|给|用|让|确认|处理|完成|说明|安排|检查|梳理|讨论|准备|建立|设置|选择|明确|定义|提交|进入|运行|测试|分析|收集|整理|联系|等待|解决|确保|核对|部署|上线))|然后|接着|随后|最后|(?:^|[，,；;。！？\s])再(?=(?:要|把|从|对|将|去|来|做|说|讲|看|读|写|问|查|找|开|关|发|给|用|让|确认|处理|完成|说明|安排|检查|梳理|讨论|准备|建立|设置|选择|明确|定义|提交|进入|运行|测试|分析|收集|整理|联系|等待|解决|确保|核对|部署|上线))"#,
                     in: text
                 )
             }
@@ -1226,13 +1263,6 @@ private extension VoicePolishLayoutExpectation {
             return 0
         }
 
-        private static func topicSwitchCount(in text: String) -> Int {
-            regexMatchCount(
-                #"另外(?:一个|一件|一点|，|,)|另一方面|接下来|再说|关于|至于|换个话题|回到刚才|第二个(?:问题|主题)|(?i:\banother\s+topic\b|\bon\s+the\s+other\s+hand\b|\bmoving\s+on\b|\bas\s+for\b|\bregarding\b|\bseparately\b|\bin\s+addition\b)"#,
-                in: text
-            )
-        }
-
         private static func aiSectionCount(in text: String) -> Int {
             let chineseLabels = ["目标", "背景", "要求", "输入", "输出", "限制", "格式", "步骤"]
                 .filter { text.contains("\($0)：") || text.contains("\($0):") }
@@ -1278,6 +1308,7 @@ private func regexLastMatchLocation(_ pattern: String, in text: String) -> Int? 
 
 private struct SmallCountMention {
     let location: Int
+    let fullRange: NSRange
     let count: Int
     let isCorrection: Bool
 }
@@ -1296,6 +1327,7 @@ private func capturedSmallCountMentions(
                   count >= 1 else { return nil }
             return SmallCountMention(
                 location: match.range(at: 1).location,
+                fullRange: match.range,
                 count: count,
                 isCorrection: entry.isCorrection
             )
@@ -1311,6 +1343,96 @@ private func capturedSmallCountMentions(
         unique[candidate.location] = candidate
     }
     return unique.values.sorted { $0.location < $1.location }
+}
+
+/// 数量递增只接受肯定式口述。否定、取消、假设、示例和引号中的“再补充一项”
+/// 都不能改变最终列表契约，否则正确的三项成稿会被错误要求制造第四项。
+private func isAffirmativeCountIncrement(
+    _ mention: SmallCountMention,
+    in text: String
+) -> Bool {
+    let source = text as NSString
+    guard mention.fullRange.location != NSNotFound,
+          NSMaxRange(mention.fullRange) <= source.length else {
+        return false
+    }
+
+    let quotePatterns = [
+        #"“[^”\r\n]*”"#,
+        #"「[^」\r\n]*」"#,
+        #"『[^』\r\n]*』"#,
+        #"\"[^\"\r\n]*\""#,
+        #"(?<![\p{L}\p{N}])'[^'\r\n]*'(?![\p{L}\p{N}])"#,
+        #"`[^`\r\n]*`"#,
+    ]
+    let fullTextRange = NSRange(location: 0, length: source.length)
+    for pattern in quotePatterns {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        if regex.matches(in: text, range: fullTextRange).contains(where: {
+            $0.range.location <= mention.fullRange.location
+                && NSMaxRange($0.range) >= NSMaxRange(mention.fullRange)
+        }) {
+            return false
+        }
+    }
+
+    let separators = CharacterSet(charactersIn: "；;。.!?！？\n")
+    let before = source.rangeOfCharacter(
+        from: separators,
+        options: .backwards,
+        range: NSRange(location: 0, length: mention.fullRange.location)
+    )
+    let clauseStart = before.location == NSNotFound ? 0 : NSMaxRange(before)
+    let prefix = source.substring(with: NSRange(
+        location: clauseStart,
+        length: max(0, mention.fullRange.location - clauseStart)
+    ))
+    let suffix = countIncrementCancellationWindow(
+        afterUTF16Location: NSMaxRange(mention.fullRange),
+        in: source
+    )
+
+    // 否定或假设必须出现在“新增”之前；新增后的普通负面事实（例如
+    // “预算还没有确认”）仍然是有效的新事项。否定只在紧贴追加动作时生效，
+    // 避免“虽然没有新增预算，另外还有一项……”被前文误伤。
+    let trimmedPrefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefixRejectingPattern = #"(?:不要|不用|无需|别|不再|没有|并未|未曾|取消|放弃|本来想|原本想|只是想|假如|如果|若|例如|比如|示例|反例)[，,\s]*$|(?i:\b(?:do\s+not|don't|dont|no\s+longer|never|for\s+example|example|if|would\s+have|was\s+going\s+to)\s*$)"#
+    return trimmedPrefix.range(
+        of: prefixRejectingPattern,
+        options: .regularExpression
+    ) == nil && !hasExplicitCountIncrementCancellation(in: suffix)
+}
+
+/// 追加事项允许包含“取消会议”“删掉旧文件”这样的真实动作；只有明确指回
+/// 当前追加动作的撤销语才算取消。窗口覆盖当前句及紧随的一句，既识别
+/// “算了，这项不用了”，又不让很远的后文影响当前列表。
+private func hasExplicitCountIncrementCancellation(in text: String) -> Bool {
+    let pattern = #"(?:算了|作罢)(?=$|[，,。.!?！？；;\s])|(?:撤回|取消|删除|删掉|去掉)(?:(?:这个|该|这|那)(?:补充|新增|事项|一项|安排)?|(?:该)?(?:补充|新增)(?:事项|一项)?|它)|不算(?:了|这项|该项|这个|那个)?(?=$|[，,。.!?！？；;\s])|不(?:再)?加了|不补充了|不用了|不要了|别加了|就当没说|别做了|就(?:三|3)项就够了|(?i:\b(?:never\s+mind|scratch\s+that|do\s+not\s+add|don't\s+add|cancel(?:led|ed)?\s+(?:this|that)\s+(?:addition|item))\b)"#
+    return text.range(of: pattern, options: .regularExpression) != nil
+}
+
+private func countIncrementCancellationWindow(
+    afterUTF16Location start: Int,
+    in source: NSString
+) -> String {
+    guard start >= 0, start < source.length else { return "" }
+    let hardEnd = min(source.length, start + 160)
+    let separators = CharacterSet(charactersIn: "。.!?！？；;\n")
+    var cursor = start
+    var end = hardEnd
+    var boundaryCount = 0
+    while cursor < hardEnd, boundaryCount < 2 {
+        let boundary = source.rangeOfCharacter(
+            from: separators,
+            options: [],
+            range: NSRange(location: cursor, length: hardEnd - cursor)
+        )
+        guard boundary.location != NSNotFound else { break }
+        boundaryCount += 1
+        cursor = NSMaxRange(boundary)
+        if boundaryCount == 2 { end = cursor }
+    }
+    return source.substring(with: NSRange(location: start, length: max(0, end - start)))
 }
 
 private func regexMatchLocations(patterns: [String], in text: String) -> [Int] {

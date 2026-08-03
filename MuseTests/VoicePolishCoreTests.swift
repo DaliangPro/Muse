@@ -10,9 +10,28 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(route("顺便说一下，预算也要再确认。"), .structured)
         XCTAssertEqual(route("这句不用写，只是给你解释背景。"), .deep)
         XCTAssertEqual(route("还有一项，发布前补回归测试。"), .deep)
-        XCTAssertEqual(route("第一，写方案。第二，补测试。"), .structured)
+        XCTAssertEqual(route("第一，写方案。第二，补测试。"), .fast)
         XCTAssertEqual(route("I mean, ship it tomorrow."), .structured)
         XCTAssertEqual(route("Scratch that. I mean, ship it Friday."), .deep)
+    }
+
+    func testRouterUsesSharedTopicSwitchEvidenceAndPlansUnsafeListContracts() {
+        XCTAssertEqual(
+            route("请把另外一个问题的答案也补充到同一份报告中，保持原有章节顺序和所有引用内容不变，完成后直接发给客户确认。"),
+            .fast
+        )
+        XCTAssertEqual(
+            route("另外一个问题是测试还没完成，我们需要重新确认上线时间。"),
+            .deep
+        )
+        XCTAssertEqual(
+            route(
+                "步骤包括：for i in a; do echo i; done",
+                requirements: "请使用数字列表。",
+                scene: .workChat
+            ),
+            .structured
+        )
     }
 
     func testRouterDoesNotUseLengthAloneToAddASecondModelCall() {
@@ -51,9 +70,13 @@ final class VoicePolishCoreTests: XCTestCase {
 
     func testQualityModesApplyDeterministicExecutionPolicy() {
         let simple = makeRequest("今天下午把方案发出去。")
-        let structured = makeRequest("第一，写方案。第二，补测试。")
+        let enumeration = makeRequest("第一，写方案。第二，补测试。")
+        let structured = makeRequest("顺便说一下，预算也要再确认。")
         let deep = makeRequest("先用红色，不对，我改一下，应该是蓝色。")
 
+        XCTAssertEqual(executedRoute(enumeration, quality: .fast), .fast)
+        XCTAssertEqual(executedRoute(enumeration, quality: .balanced), .fast)
+        XCTAssertEqual(executedRoute(enumeration, quality: .quality), .deep)
         XCTAssertEqual(executedRoute(simple, quality: .fast), .fast)
         XCTAssertEqual(executedRoute(structured, quality: .fast), .structured)
         XCTAssertEqual(executedRoute(deep, quality: .fast), .structured)
@@ -378,8 +401,12 @@ final class VoicePolishCoreTests: XCTestCase {
         )])
     }
 
-    private func route(_ text: String, scene: WritingScene = .unknown) -> VoicePolishRoute {
-        let request = makeRequest(text, scene: scene)
+    private func route(
+        _ text: String,
+        requirements: String = "",
+        scene: WritingScene = .unknown
+    ) -> VoicePolishRoute {
+        let request = makeRequest(text, requirements: requirements, scene: scene)
         let facts = ProtectedFactExtractor.extract(from: request.input.segments)
         return VoicePolishComplexityRouter.decide(
             request: request,
@@ -387,7 +414,11 @@ final class VoicePolishCoreTests: XCTestCase {
         ).route
     }
 
-    private func makeRequest(_ text: String, scene: WritingScene = .unknown) -> VoicePolishRequest {
+    private func makeRequest(
+        _ text: String,
+        requirements: String = "",
+        scene: WritingScene = .unknown
+    ) -> VoicePolishRequest {
         VoicePolishRequest(
             input: VoiceInputEnvelope(
                 providerFinalText: text,
@@ -396,7 +427,7 @@ final class VoicePolishCoreTests: XCTestCase {
                 provider: .volcano
             ),
             context: WritingContext(scene: scene),
-            preferences: UserPolishPreferences(additionalRequirements: ""),
+            preferences: UserPolishPreferences(additionalRequirements: requirements),
             qualityMode: .balanced
         )
     }
