@@ -684,8 +684,9 @@ struct VoicePolishPipeline: Sendable {
         if request.context.scene == .code {
             return text
         }
+        let punctuationRepaired = VoicePolishPunctuationRepair.normalize(text)
         let formatted = VoicePolishFallbackFormatter.formatCandidate(
-            text,
+            punctuationRepaired,
             expectation: expectation
         )
         let candidate: String
@@ -700,11 +701,11 @@ struct VoicePolishPipeline: Sendable {
         // 编号归一也属于本地改写，必须与 Formatter 一起包在最终安全门内。
         // 无法证明只改变空白和完整列表标记时，保留模型原成稿并交给 Validator。
         guard VoicePolishFallbackFormatter.isStrictlySafeTransformation(
-            source: text,
+            source: punctuationRepaired,
             candidate: candidate,
             expectation: expectation
         ) else {
-            return text
+            return punctuationRepaired
         }
         // 总数同步是独立于通用纯版式门禁的窄规则：仅当本地能证明
         // “原 N 项 + 明确新增 1 项 = 连续 N+1 项”时，定点修正唯一声明数字。
@@ -851,28 +852,34 @@ struct VoicePolishPipeline: Sendable {
         codes: [VoicePolishValidationCode],
         reason: VoicePolishFailureReason = .validationFailed
     ) -> VoicePolishResult {
-        // 回退仍以 canonical transcript 为唯一内容来源；只在本地能证明字符与
-        // 顺序完全不变时补上段落/列表结构，避免校验失败后重新退回成一坨文字。
+        // 回退仍以 canonical transcript 为唯一内容来源；先只移除可证明错误的
+        // ASR 标点/空白，再在字符与顺序不变的前提下补段落或列表结构，避免
+        // 校验失败后重新退回错误断句或一坨文字。
         let expectation = VoicePolishLayoutExpectation.infer(from: request)
-        let fallbackCandidate = VoicePolishFallbackFormatter.format(
-            request: request,
-            expectation: expectation
-        )
         let fallbackText: String
         if request.context.scene == .code {
             fallbackText = request.fallbackText
-        } else if VoicePolishFallbackFormatter.isStrictlySafeTransformation(
-            source: request.fallbackText,
-            candidate: fallbackCandidate,
-            expectation: expectation
-        ) {
-            fallbackText = VoicePolishListCountConsistency
-                .synchronizeDeclaredCountForProvenTrailingAddition(
-                    in: fallbackCandidate,
-                    canonicalSource: request.fallbackText
-                )
         } else {
-            fallbackText = request.fallbackText
+            let punctuationRepaired = VoicePolishPunctuationRepair.normalize(
+                request.fallbackText
+            )
+            let fallbackCandidate = VoicePolishFallbackFormatter.formatCandidate(
+                punctuationRepaired,
+                expectation: expectation
+            )
+            if VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+                source: punctuationRepaired,
+                candidate: fallbackCandidate,
+                expectation: expectation
+            ) {
+                fallbackText = VoicePolishListCountConsistency
+                    .synchronizeDeclaredCountForProvenTrailingAddition(
+                        in: fallbackCandidate,
+                        canonicalSource: request.fallbackText
+                    )
+            } else {
+                fallbackText = punctuationRepaired
+            }
         }
         DebugFileLogger.log(
             "voice polish done route=\(detectedRoute.rawValue) executed=\(executedRoute.rawValue) attempts=\(attempts) output=\(fallbackText.count)chars codes=\(codes.map(\.rawValue).joined(separator: ",")) fallback=true"

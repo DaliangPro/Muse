@@ -405,19 +405,24 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 0,
                 timeline.date.timeIntervalSince(processingStartDate ?? timeline.date)
             )
+            let showsLiveElapsed = state.currentMode.kind != .voicePolish
             HStack(spacing: 5) {
                 HStack(spacing: 5) {
                     Text(processingLabel)
-                    Text("· \(String(format: "%.1fs", elapsed))")
-                        .monospacedDigit()
-                        .opacity(0.72)
+                    if showsLiveElapsed {
+                        Text("· \(String(format: "%.1fs", elapsed))")
+                            .monospacedDigit()
+                            .opacity(0.72)
+                    }
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(
-                    L(
-                        "\(processingLabel)，已等待 \(String(format: "%.1f", elapsed)) 秒",
-                        "\(processingLabel), \(String(format: "%.1f", elapsed)) seconds"
-                    )
+                    showsLiveElapsed
+                        ? L(
+                            "\(processingLabel)，已等待 \(String(format: "%.1f", elapsed)) 秒",
+                            "\(processingLabel), \(String(format: "%.1f", elapsed)) seconds"
+                        )
+                        : processingLabel
                 )
 
                 if state.isRequestingVoicePolishCanonicalText {
@@ -741,7 +746,8 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private func processingWidth() -> CGFloat {
-        // 给持续更新的“· 0.0s”留固定宽度，避免 HUD 每半秒抖动。
+        // 普通模式给持续更新的“· 0.0s”留固定宽度；Voice Polish 使用稳定的
+        // “正在润色”文案，不把累计时间误呈现成多个阶段耗时。
         let showsCanonicalExitStatus = state.canUseVoicePolishCanonicalText
             || state.isRequestingVoicePolishCanonicalText
             || state.voicePolishCanonicalExitMessage != nil
@@ -753,20 +759,10 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var processingLabel: String {
-        guard state.currentMode.kind == .voicePolish,
-              let stage = state.voicePolishStage else {
+        guard state.currentMode.kind == .voicePolish else {
             return state.currentMode.processingLabel
         }
-        switch stage {
-        case .polishing:
-            return L("整理成稿", "Polishing")
-        case .analyzing:
-            return L("分析意图", "Analyzing")
-        case .rendering:
-            return L("生成成稿", "Rendering")
-        case .repairing:
-            return L("校验修复", "Repairing")
-        }
+        return L("正在润色", "Polishing")
     }
 
     private var canonicalExitButtonTitle: String {

@@ -116,9 +116,9 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
             今天我有四件事要做。
 
             一、我要给自己买一个沙发套。
-            二、我希望 把我下一周的稿子都集中写完，至少也要把选题写完。
-            三、就是 就是把快递都拿了。
-            四、哦，再补充一个事吧，就是 给自己选一身适合健身穿的衣服。
+            二、我希望把我下一周的稿子都集中写完，至少也要把选题写完。
+            三、就是就是把快递都拿了。
+            四、哦，再补充一个事吧，就是给自己选一身适合健身穿的衣服。
             """
         )
         let requests = await client.recordedRequests()
@@ -829,6 +829,84 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, source)
         XCTAssertFalse(result.validationCodes.contains(.missingProtectedFact))
         XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testUserReportedASRPunctuationIsRepairedWhenFastModelCopiesInput() async {
+        let source = """
+        如果是一段特别长的内容，它的 时间优化过程也会是这样的。因为。
+
+        我看它提示这有多少秒，那有多少秒的，这一共好像花了很长时间。
+
+        但是，Typeless 好像就没有这样的这个提示，同时它也。
+
+        并没有花这么长时间。
+
+        你看，我这段话就是用你的润色模式输入的。可是由于我的 ASR 识别标点符号不准，你的润色模式也不会针对这个句子重新优化标点，只是原样放上去，原样断句。
+        """
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [source])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertFalse(result.text.contains("它的 时间"))
+        XCTAssertFalse(result.text.contains("因为。"))
+        XCTAssertFalse(result.text.contains("同时它也。"))
+        XCTAssertTrue(result.text.contains("因为我看"))
+        XCTAssertTrue(result.text.contains("同时它也并没有"))
+        XCTAssertEqual(
+            VoicePolishPunctuationRepair.issues(in: result.text),
+            []
+        )
+
+        let recorded = await client.recordedRequests()
+        XCTAssertEqual(recorded.count, 1)
+        XCTAssertTrue(recorded[0].user.contains("punctuation_issues"))
+        XCTAssertTrue(recorded[0].user.contains("cjk_inner_space"))
+        XCTAssertTrue(recorded[0].user.contains("dangling_connector"))
+        XCTAssertTrue(recorded[0].user.contains("broken_predicate_boundary"))
+    }
+
+    func testPunctuationRepairKeepsQuotedAndInlineCodeExamplesUntouched() {
+        let source = """
+        他说“因为。”，并要求保留 `同时它也。并没有`。正文结束。因为。
+
+        下一句继续说明。
+        """
+
+        let result = VoicePolishPunctuationRepair.normalize(source)
+
+        XCTAssertTrue(result.contains("“因为。”"))
+        XCTAssertTrue(result.contains("`同时它也。并没有`"))
+        XCTAssertTrue(result.contains("正文结束。因为下一句继续说明。"))
+        XCTAssertEqual(
+            VoicePolishPunctuationRepair.normalize("这是原话。因为。"),
+            "这是原话。因为。"
+        )
+    }
+
+    func testFallbackStillRepairsProvenBrokenASRPunctuation() async {
+        let source = "前面先说明背景。因为。\n\n后面还有原因，而且它也。\n\n并没有结束。"
+        let request = makeRequest(source, scene: .workChat)
+        let client = LayoutPipelineScriptedLLM(responses: [])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertTrue(result.text.contains("因为后面"))
+        XCTAssertTrue(result.text.contains("而且它也并没有"))
+    }
+
+    func testCodeSceneNeverAppliesNaturalLanguagePunctuationRepair() async {
+        let source = "print(\"因为。\")\nlet value = \"同时它也。并没有\""
+        let request = makeRequest(source, scene: .code)
+        let client = LayoutPipelineScriptedLLM(responses: [source])
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertEqual(result.text, source)
     }
 
     private func pipeline(_ client: LayoutPipelineScriptedLLM) -> VoicePolishPipeline {
