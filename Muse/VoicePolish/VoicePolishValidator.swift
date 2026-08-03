@@ -37,18 +37,155 @@ enum VoicePolishValidator {
     ) -> VoicePolishValidationResult {
         var codes = commonCodes(output: output, sourceText: request.fallbackText)
         let outputFacts = protectedFactsFromOutput(output, request: request)
+        let supersededFactIndices = locallySupersededFactIndices(
+            request: request,
+            sourceFacts: sourceFacts
+        )
 
-        if sourceFacts.contains(where: { !containsEquivalent($0, in: outputFacts, output: output) }) {
+        if sourceFacts.enumerated().contains(where: { index, fact in
+            !supersededFactIndices.contains(index)
+                && !containsEquivalent(fact, in: outputFacts, output: output)
+        }) {
             append(.missingProtectedFact, to: &codes)
         }
         if outputFacts.contains(where: { outputFact in
             !sourceFacts.contains(where: { equivalent($0, outputFact) })
+                && !isSourceBackedQuotedFormattingFact(
+                    outputFact,
+                    sourceText: request.fallbackText
+                )
         }) {
             append(.planIntegrityFailure, to: &codes)
+        }
+        if supersededFactIndices.contains(where: { index in
+            let fact = sourceFacts[index]
+            let canonicalIsStillRequired = sourceFacts.enumerated().contains { otherIndex, other in
+                otherIndex != index
+                    && !supersededFactIndices.contains(otherIndex)
+                    && equivalent(fact, other)
+            }
+            return !canonicalIsStillRequired
+                && containsEquivalent(fact, in: outputFacts, output: output)
+        }) {
+            append(.supersededFactRetained, to: &codes)
+        }
+        if retainsExplicitCorrectionNarration(output: output, request: request) {
+            append(.supersededFactRetained, to: &codes)
         }
         appendTerminologyEditCodes(output: output, request: request, to: &codes)
         appendOutputLayoutCodes(output, request: request, to: &codes)
         return VoicePolishValidationResult(codes: codes)
+    }
+
+    /// 模型可能为原文已有词语补中文或英文引号。引号本身属于排版，不应被
+    /// ProtectedFactExtractor 当作“新增引用事实”；只有去掉成对引号后的完整内容
+    /// 已逐字存在于正式输入时才放行。
+    private static func isSourceBackedQuotedFormattingFact(
+        _ fact: SourceFactCandidate,
+        sourceText: String
+    ) -> Bool {
+        guard fact.kind == .quotedPhrase, fact.sourceText.count >= 2 else { return false }
+        let characters = Array(fact.sourceText)
+        let isPairedQuote = (characters.first == "“" && characters.last == "”")
+            || (characters.first == "\"" && characters.last == "\"")
+        guard isPairedQuote else { return false }
+        let interior = String(characters.dropFirst().dropLast())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return !interior.isEmpty && sourceText.contains(interior)
+    }
+
+    /// Fast 路径没有模型生成的 Plan，因此只接受本地能证明的最窄改口事实：
+    /// 同一 segment 中，改口信号前最近的受保护事实，与信号后首个同类型、不同值
+    /// 的事实形成替换关系。其余金额、日期、版本等仍全部要求保留。
+    private static func locallySupersededFactIndices(
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> Set<Int> {
+        struct LocatedFact {
+            let index: Int
+            let location: String.Index
+        }
+
+        let correctionSignals = [
+            "前面那句改成", "刚才那句改成", "把开头改成", "let me correct that",
+            "change the earlier part", "change what i said before", "scratch that",
+            "我的意思是", "我改一下", "说错了", "不对", "应该是", "最后还是",
+            "最终决定", "actually", "i mean", "final decision",
+        ]
+        var superseded: Set<Int> = []
+
+        for segment in request.input.segments {
+            let located = sourceFacts.enumerated().compactMap { index, fact -> LocatedFact? in
+                guard fact.kind != .lexiconEntity,
+                      fact.sourceSegmentIDs.contains(segment.id),
+                      let range = segment.text.range(of: fact.sourceText) else { return nil }
+                return LocatedFact(index: index, location: range.lowerBound)
+            }.sorted { $0.location < $1.location }
+            guard located.count >= 2 else { continue }
+
+            let markers = correctionSignals.flatMap { signal -> [Range<String.Index>] in
+                allRanges(of: signal, in: segment.text)
+            }.sorted { $0.lowerBound < $1.lowerBound }
+
+            for marker in markers {
+                guard let previous = located.last(where: { $0.location < marker.lowerBound }) else {
+                    continue
+                }
+                let previousFact = sourceFacts[previous.index]
+                guard located.contains(where: { candidate in
+                    guard candidate.location >= marker.upperBound else { return false }
+                    let finalFact = sourceFacts[candidate.index]
+                    return finalFact.kind == previousFact.kind
+                        && !equivalent(previousFact, finalFact)
+                }) else { continue }
+                superseded.insert(previous.index)
+            }
+        }
+        return superseded
+    }
+
+    private static func allRanges(
+        of needle: String,
+        in text: String
+    ) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var searchRange = text.startIndex..<text.endIndex
+        while let match = text.range(
+            of: needle,
+            options: [.caseInsensitive],
+            range: searchRange
+        ) {
+            ranges.append(match)
+            guard match.upperBound < text.endIndex else { break }
+            searchRange = match.upperBound..<text.endIndex
+        }
+        return ranges
+    }
+
+    /// Fast 路径必须交付成稿，而不是把用户自我纠正的过程改写一遍。只有正式
+    /// 输入本身包含明确的第一人称改口信号时，才检查输出是否仍泄漏这些过程词，
+    /// 避免把普通的“这个说法不对”讨论误判为口误。
+    private static func retainsExplicitCorrectionNarration(
+        output: String,
+        request: VoicePolishRequest
+    ) -> Bool {
+        let source = normalizedNaturalText(request.fallbackText).lowercased()
+        let explicitSelfCorrectionSignals = [
+            "我说错了", "我刚才说的", "刚才说错了", "我改一下", "我的意思是",
+            "let me correct that", "i said that wrong", "scratch that", "i mean",
+        ]
+        guard explicitSelfCorrectionSignals.contains(where: source.contains) else {
+            return false
+        }
+
+        let normalizedOutput = normalizedNaturalText(output).lowercased()
+        let leakedNarrationSignals = [
+            "我说错了", "说错了", "我刚才说的", "刚才说的", "前面说的",
+            "我改一下", "我的意思是", "正确名字是", "正确说法是",
+            "统一写成", "统一写为", "let me correct that", "i said that wrong",
+            "what i just said", "the correct name is", "scratch that", "i mean",
+        ]
+        return leakedNarrationSignals.contains(where: normalizedOutput.contains)
     }
 
     static func validateStructured(

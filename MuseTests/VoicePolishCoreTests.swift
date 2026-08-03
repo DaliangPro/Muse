@@ -78,10 +78,11 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(executedRoute(enumeration, quality: .balanced), .fast)
         XCTAssertEqual(executedRoute(enumeration, quality: .quality), .deep)
         XCTAssertEqual(executedRoute(simple, quality: .fast), .fast)
-        XCTAssertEqual(executedRoute(structured, quality: .fast), .structured)
-        XCTAssertEqual(executedRoute(deep, quality: .fast), .structured)
-        XCTAssertEqual(executedRoute(structured, quality: .balanced), .structured)
-        XCTAssertEqual(executedRoute(structured, quality: .quality), .deep)
+        XCTAssertEqual(executedRoute(structured, quality: .fast), .fast)
+        XCTAssertEqual(executedRoute(deep, quality: .fast), .fast)
+        XCTAssertEqual(executedRoute(structured, quality: .balanced), .fast)
+        XCTAssertEqual(executedRoute(deep, quality: .balanced), .fast)
+        XCTAssertEqual(executedRoute(structured, quality: .quality), .structured)
         XCTAssertEqual(executedRoute(deep, quality: .quality), .deep)
     }
 

@@ -113,6 +113,109 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
     }
 
+    func testBalancedUsesOnePlainTextCallToApplyContextualEntityCorrection() async {
+        let source = "今天中午我们去食奇家吃饭我刚才说的食奇家不对正确名字是食其家它是一家餐饮品牌以后这段内容里都统一写成食其家然后我们再讨论下午的项目安排"
+        let output = "今天中午我们去食其家吃饭。它是一家餐饮品牌。\n\n然后，我们再讨论下午的项目安排。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.detectedRoute, .structured)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.text.contains("食奇家"))
+        XCTAssertFalse(result.text.contains("说错"))
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast])
+        XCTAssertEqual(requests[0].options.responseFormat, .text)
+    }
+
+    func testBalancedAllowsQuotesAroundVerbatimSourceTermWithoutOpeningFactGate() async {
+        let source = "今天中午我们去食奇家吃饭我刚才说的食奇家不对正确名字是食其家它是一家餐饮品牌以后这段内容里都统一写成食其家然后我们再讨论下午的项目安排"
+        let output = "今天中午我们去“食其家”吃饭，它是一家餐饮品牌。然后，我们再讨论下午的项目安排。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testBalancedRejectsCorrectionNarrationEvenWhenQuotedTermsAreSourceBacked() async {
+        let source = "今天中午我们去食奇家吃饭我刚才说的食奇家不对正确名字是食其家它是一家餐饮品牌以后这段内容里都统一写成食其家然后我们再讨论下午的项目安排"
+        let output = "今天中午我们去食其家吃饭。刚才说的“食奇家”不对，正确名字是“食其家”，它是一家餐饮品牌，后面统一写成“食其家”。然后我们再讨论下午的项目安排。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertTrue(result.validationCodes.contains(.supersededFactRetained))
+    }
+
+    func testBalancedUsesOnePlainTextCallToRemoveMultipleFalseStarts() async {
+        let source = "明天下午三点我们去客户公司开会我说错了不是明天下午三点是后天下午四点地点在客户公司一楼会议室不对刚才地点也说错了是在二楼会议室到时候我带产品方案小王准备报价单"
+        let output = "后天下午四点，我们去客户公司二楼会议室开会。届时我带产品方案，小王准备报价单。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(
+            VoicePolishLayoutExpectation.infer(from: makeRequest(source)).kind,
+            .sentence
+        )
+        XCTAssertEqual(result.detectedRoute, .deep)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.text.contains("明天下午三点"))
+        XCTAssertFalse(result.text.contains("一楼"))
+        XCTAssertFalse(result.text.contains("说错了"))
+    }
+
+    func testBalancedLongDraftUsesOneCallAndKeepsStructuredLayout() async {
+        let detail = String(repeating: "核心功能已经完成，测试记录和上线检查也已经整理清楚。", count: 20)
+        let source = "这次复盘分成三个部分。第一部分是当前进展，\(detail)第二部分是现有问题，排版和标点还需要继续检查。第三部分是下一步安排，先完成回归测试，再确认发布时间。顺便说一下，以上内容要让团队可以直接阅读。"
+        let output = "这次复盘分成三个部分：\n\n1. 当前进展：\(detail)\n2. 现有问题：排版和标点还需要继续检查。\n3. 下一步安排：先完成回归测试，再确认发布时间。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertGreaterThan(source.count, 500)
+        XCTAssertNotEqual(result.detectedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertTrue(result.text.contains("\n\n"))
+        XCTAssertEqual(
+            VoicePolishNumbering.listItemCount(in: result.text, kind: .numberedList),
+            3
+        )
+    }
+
+    func testBalancedFastValidationAcceptsOnlyProvenFinalNumericCorrection() async {
+        let source = "预算 16800 元，不对，最终预算 16000 元，发布时间是 2026-08-10。"
+        let output = "最终预算为 16000 元，发布时间是 2026-08-10。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.validationCodes.contains(.missingProtectedFact))
+        XCTAssertFalse(result.validationCodes.contains(.supersededFactRetained))
+        XCTAssertFalse(result.text.contains("16800"))
+    }
+
     func testStructuredCorrectionSucceedsWithProtectedFinalFacts() async throws {
         let source = "第一期一万六千八，不对，最终每期一万六，总价四万八。"
         let response = structuredResponse(
@@ -121,7 +224,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         )
         let client = ScriptedVoicePolishLLM(steps: [.response(try encoded(response))])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.detectedRoute, .structured)
         XCTAssertEqual(result.executedRoute, .structured)
@@ -145,7 +248,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response(try encoded(repaired)),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertFalse(result.usedFallback)
@@ -166,7 +269,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response("不应调用第三次"),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertTrue(result.usedFallback)
@@ -207,7 +310,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response("最终使用蓝色。"),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.detectedRoute, .deep)
         XCTAssertEqual(result.executedRoute, .deep)
@@ -258,7 +361,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response(finalText),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.detectedRoute, .deep)
         XCTAssertEqual(result.executedRoute, .deep)
@@ -279,7 +382,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response("不应调用第四次"),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.executedRoute, .deep)
         XCTAssertEqual(result.llmAttemptCount, 3)
@@ -300,7 +403,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response("最终使用蓝色。"),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertEqual(result.llmAttemptCount, 3)
         XCTAssertFalse(result.usedFallback)
@@ -357,7 +460,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response(try encoded(invalid)),
         ])
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(makeRequest(source, quality: .quality))
 
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 2)
@@ -375,7 +478,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response(try encoded(invalid)),
             .response(try encoded(invalid)),
         ])
-        let request = makeRequest(source)
+        let request = makeRequest(source, quality: .quality)
 
         let result = await pipeline(client).process(request)
 
@@ -438,7 +541,10 @@ final class VoicePolishPipelineTests: XCTestCase {
         VoicePolishPipeline(client: client, config: config)
     }
 
-    private func makeRequest(_ text: String) -> VoicePolishRequest {
+    private func makeRequest(
+        _ text: String,
+        quality: VoicePolishQualityMode = .balanced
+    ) -> VoicePolishRequest {
         VoicePolishRequest(
             input: VoiceInputEnvelope(
                 providerFinalText: text,
@@ -455,7 +561,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             ),
             context: .phaseOneUnknown,
             preferences: UserPolishPreferences(additionalRequirements: "{text}"),
-            qualityMode: .balanced
+            qualityMode: quality
         )
     }
 

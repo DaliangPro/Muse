@@ -368,7 +368,8 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         let request = makeRequest(
             "Side note. First, confirm scope. Second, assign owners. Third, run regression tests.",
             requirements: "Use a numbered list.",
-            scene: .workChat
+            scene: .workChat,
+            quality: .quality
         )
         let invalid = response(
             for: request,
@@ -407,7 +408,8 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
     func testStructuredMinimumOnlyContractDoesNotAdoptModelGuessedExactCount() async throws {
         let request = makeRequest(
             "顺便说一下，先确认需求，然后安排开发，最后完成测试。",
-            scene: .workChat
+            scene: .workChat,
+            quality: .quality
         )
         let finalText = """
         1. 确认需求。
@@ -438,6 +440,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
             "顺便说一下，先说明项目背景。接下来解释当前问题。最后给出下一步安排。",
             requirements: "请分成三段，每段只讲一个主题。",
             scene: .document,
+            quality: .quality,
             segments: [
                 "顺便说一下，先说明项目背景。",
                 "接下来解释当前问题。",
@@ -575,7 +578,8 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
     func testStructuredBlobIsLocallyFormattedWithoutRepair() async throws {
         let request = makeRequest(
             "这次有三点：第一，确认需求。第二，安排开发。第三，完成测试。顺便说一下。",
-            scene: .workChat
+            scene: .workChat,
+            quality: .quality
         )
         let blob = "这次有三点：确认需求，安排开发，完成测试。"
         let first = response(
@@ -608,7 +612,8 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
     func testDeepRendererBlobIsLocallyFormattedWithoutRepair() async throws {
         let request = makeRequest(
             "这次有三点：第一，确认需求。第二，先安排开发。第三，完成测试。前面那句改成第二，明天安排开发。",
-            scene: .workChat
+            scene: .workChat,
+            quality: .quality
         )
         let blob = "这次有三点：确认需求，明天安排开发，完成测试。"
         let draft = response(
@@ -646,7 +651,8 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         let request = makeRequest(
             source,
             requirements: "请使用数字列表。",
-            scene: .workChat
+            scene: .workChat,
+            quality: .quality
         )
         let client = LayoutPipelineScriptedLLM(responses: [source])
 
@@ -917,6 +923,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         _ text: String,
         requirements: String = "",
         scene: WritingScene,
+        quality: VoicePolishQualityMode = .balanced,
         segments: [String]? = nil
     ) -> VoicePolishRequest {
         let segmentTexts = segments ?? [text]
@@ -943,7 +950,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
                 safety: .unknown
             ),
             preferences: UserPolishPreferences(additionalRequirements: requirements),
-            qualityMode: .balanced
+            qualityMode: quality
         )
     }
 

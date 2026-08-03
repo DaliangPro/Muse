@@ -115,28 +115,19 @@ enum VoicePolishComplexityRouter {
         request: VoicePolishRequest
     ) -> VoicePolishRoute {
         switch request.qualityMode {
-        case .fast:
-            return decision.route == .fast ? .fast : .structured
-        case .balanced:
-            return decision.route
+        case .fast, .balanced:
+            // “快速”和默认“标准”都必须是一次成稿路径。复杂度仍记录在
+            // detectedRoute 中供诊断，但不能让改口、长列表或主题切换自动升级为
+            // 脆弱的 JSON Plan 协议，否则失败时既增加等待，又只能回退原转写。
+            return .fast
         case .quality:
             if decision.route == .fast,
                decision.matchedSignalCategories.contains("enumeration") {
-                // 用户主动选择“深度整理”时仍尊重质量偏好；标准/快速档的纯枚举
-                // 则保持一次 Fast 请求。
+                // 用户主动选择“深度整理”时，显式枚举可进入深度成稿；默认档
+                // 仍保持一次请求。
                 return .deep
             }
-            guard decision.route == .structured else { return decision.route }
-            let elevatedSignals: Set<String> = [
-                "immediate_correction",
-                "side_note",
-                "enumeration",
-            ]
-            if !decision.matchedSignalCategories.isDisjoint(with: elevatedSignals)
-                || decision.factCandidateCount >= 9 {
-                return .deep
-            }
-            return .structured
+            return decision.route
         }
     }
 

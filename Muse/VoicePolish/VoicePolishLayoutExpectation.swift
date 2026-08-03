@@ -1324,7 +1324,8 @@ private func capturedSmallCountMentions(
             guard match.numberOfRanges >= 2,
                   let range = Range(match.range(at: 1), in: text),
                   let count = parseSmallCount(String(text[range])),
-                  count >= 1 else { return nil }
+                  count >= 1,
+                  !isTimeOfDayCountMention(match, in: text) else { return nil }
             return SmallCountMention(
                 location: match.range(at: 1).location,
                 fullRange: match.range,
@@ -1343,6 +1344,29 @@ private func capturedSmallCountMentions(
         unique[candidate.location] = candidate
     }
     return unique.values.sorted { $0.location < $1.location }
+}
+
+/// “下午三点是原计划”中的“三点是”形态会命中“3 点是……”的列表声明正则。
+/// 只在数量词紧邻明确时段前缀且单位确为“点”时排除，保留“这次有三点：”等
+/// 真正的列表契约。
+private func isTimeOfDayCountMention(
+    _ match: NSTextCheckingResult,
+    in text: String
+) -> Bool {
+    let source = text as NSString
+    let countRange = match.range(at: 1)
+    guard countRange.location != NSNotFound,
+          NSMaxRange(countRange) < source.length,
+          source.substring(with: NSRange(location: NSMaxRange(countRange), length: 1)) == "点" else {
+        return false
+    }
+    let prefixLength = min(8, countRange.location)
+    let prefix = source.substring(with: NSRange(
+        location: countRange.location - prefixLength,
+        length: prefixLength
+    )).trimmingCharacters(in: .whitespacesAndNewlines)
+    return ["凌晨", "早上", "上午", "中午", "下午", "傍晚", "晚上", "晚间"]
+        .contains(where: prefix.hasSuffix)
 }
 
 /// 数量递增只接受肯定式口述。否定、取消、假设、示例和引号中的“再补充一项”
