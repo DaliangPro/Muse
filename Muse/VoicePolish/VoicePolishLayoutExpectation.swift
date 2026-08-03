@@ -786,7 +786,11 @@ private extension VoicePolishLayoutExpectation {
             sentenceCount = Self.sentenceCount(in: text)
 
             let arabicMarkerPattern = #"(?m)(?:^|[。.!?！？；;，,\n])\s*(\d{1,2})[.)、）]\s*"#
-            let chineseOrdinalPattern = #"第([一二三四五六七八九十]{1,3}|\d+)(?:点|条|项|步|个|部分|方面|[，、,:：.）)\s])"#
+            // ASR 经常不给“第一、第二、第三”补标点，直接得到
+            // “第一检查……第二测试……第三记录……”。只有序号后紧接明确行动词
+            // 时才把这种零分隔形态当作结构标记，避免“第一次测试”等普通叙述
+            // 被拆成列表。
+            let chineseOrdinalPattern = #"第([一二三四五六七八九十]{1,3}|\d+)(?:点|条|项|步|个|部分|方面|[，、,:：.）)\s]|(?=(?:检查|测试|记录|确认|安排|完成|处理|整理|明确|建立|设置|选择|分析|说明|梳理|准备|提交|部署|解决|确保|联系|通知|查看|评估|核对|推进|制作|填写|收集|验证|判断|优化|修复|设计|实现|输出|把|将|要|需要|必须)))"#
             let chineseNumeralPattern = #"(?m)(?:^|[。！？；;，,\n])\s*([一二三四五六七八九十])(?:是|、|[.)）])"#
             let arabicMarkerValues = Self.capturedMarkerValues(arabicMarkerPattern, in: text)
             let chineseOrdinalValues = Self.capturedMarkerValues(chineseOrdinalPattern, in: text)
@@ -798,7 +802,25 @@ private extension VoicePolishLayoutExpectation {
             let chineseWordMarkers = regexMatchCount(#"首先|其次|再次|最后"#, in: text)
             let englishWordMarkers = englishOrdinalValues.count
             let chineseMarkers = max(chineseOrdinalMarkers, chineseNumeralMarkers, chineseWordMarkers)
-            explicitOrderedCount = max(arabicMarkers, chineseMarkers, englishWordMarkers)
+            let rawExplicitOrderedMarkerCount = max(
+                arabicMarkers,
+                chineseMarkers,
+                englishWordMarkers
+            )
+            // 结构证据必须形成从 1 开始的连续序号。单独或重复提到“第二项”
+            // 只是正文指代，不能因为出现两次就被误认为两条列表项。
+            let arabicSequenceCount = Self.continuousSequenceCount(arabicMarkerValues) ?? 0
+            let chineseOrdinalSequenceCount = Self.continuousSequenceCount(chineseOrdinalValues) ?? 0
+            let chineseNumeralSequenceCount = Self.continuousSequenceCount(chineseNumeralValues) ?? 0
+            let englishSequenceCount = Self.continuousSequenceCount(englishOrdinalValues) ?? 0
+            let rhetoricalSequenceCount = Self.rhetoricalOrderedItemCount(in: text) ?? 0
+            explicitOrderedCount = max(
+                arabicSequenceCount,
+                chineseOrdinalSequenceCount,
+                chineseNumeralSequenceCount,
+                englishSequenceCount,
+                rhetoricalSequenceCount
+            )
             explicitBulletCount = regexMatchCount(#"(?m)^\s*[-*•]\s+"#, in: text)
             let parallelItems = Self.parallelItemCount(in: text)
             let lastExplicitMarkerLocation = [
@@ -817,7 +839,7 @@ private extension VoicePolishLayoutExpectation {
             let declaredCounts: DeclaredCountSummary
             if scene == .aiPrompt,
                !rawDeclaredCounts.overridesExplicitEnumeration,
-               !(explicitOrderedCount == 0
+               !(rawExplicitOrderedMarkerCount == 0
                     && explicitBulletCount == 0
                     && rawDeclaredCounts.minimum >= 2
                     && parallelItems >= rawDeclaredCounts.minimum) {
@@ -995,9 +1017,13 @@ private extension VoicePolishLayoutExpectation {
         }
 
         private static func continuousSequenceCount(_ values: [Int]) -> Int? {
-            guard values.count >= 2,
-                  values == Array(1...values.count) else { return nil }
-            return values.count
+            guard values.first == 1 else { return nil }
+            var count = 0
+            for value in values {
+                guard value == count + 1 else { break }
+                count += 1
+            }
+            return count >= 2 ? count : nil
         }
 
         private static func rhetoricalOrderedItemCount(in text: String) -> Int? {

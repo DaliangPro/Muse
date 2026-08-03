@@ -24,6 +24,32 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         XCTAssertTrue(decision.matchedSignalCategories.contains("layout_contract"))
     }
 
+    func testTextTrialCompactEnumerationAcceptsOneCallNumberedResult() async {
+        let source = "接下来主要做三件事第一检查第一次使用时的引导是不是足够清楚第二测试长内容能不能自动分段和整理标点第三记录每次润色的等待时间和失败情况最后把测试结果统一整理出来"
+        let request = makeRequest(source, scene: .unknown)
+        let output = """
+        接下来主要做三件事：
+
+        一、检查第一次使用时的引导是不是足够清楚。
+        二、测试长内容能不能自动分段和整理标点。
+        三、记录每次润色的等待时间和失败情况。
+
+        最后，把测试结果统一整理出来。
+        """
+        let client = LayoutPipelineScriptedLLM(responses: [output])
+
+        let result = await pipeline(client).process(request)
+
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        XCTAssertEqual(expectation.kind, .numberedList)
+        XCTAssertEqual(expectation.expectedListItemCount, 3)
+        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertFalse(result.validationCodes.contains(.layoutRequirementUnmet))
+        XCTAssertEqual(result.text, output)
+    }
+
     func testProviderSegmentsAndParagraphPreferenceStillUseOneFastRequest() async {
         let source = "今天确认需求。明天安排开发。周五完成回归测试。"
         let request = makeRequest(

@@ -128,6 +128,41 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
         XCTAssertEqual(expectation.numberingPreference, .chinese)
     }
 
+    func testCompactUnpunctuatedChineseActionsProduceNumberedList() {
+        let expectation = infer(
+            "接下来主要做三件事第一检查第一次使用时的引导是不是足够清楚第二测试长内容能不能自动分段和整理标点第三记录每次润色的等待时间和失败情况最后把测试结果统一整理出来",
+            scene: .unknown
+        )
+
+        XCTAssertEqual(expectation.kind, .numberedList)
+        XCTAssertEqual(expectation.expectedListItemCount, 3)
+        XCTAssertEqual(expectation.minimumListItemCount, 3)
+        XCTAssertEqual(expectation.numberingPreference, .chinese)
+    }
+
+    func testSingleOrdinalMentionDoesNotBecomeCompactEnumeration() {
+        let expectation = infer(
+            "现在除了第二项，其他内容都测试成功了。第二项在文字试跑中显示原文回退，但正式润色已经成功。",
+            requirements: "如果确实有多个步骤或并列事项，请使用编号列表。",
+            scene: .unknown
+        )
+
+        XCTAssertNotEqual(expectation.kind, .numberedList)
+        XCTAssertNotEqual(expectation.kind, .bulletList)
+        XCTAssertNil(expectation.expectedListItemCount)
+        XCTAssertNil(expectation.minimumListItemCount)
+    }
+
+    func testSecondTestNarrativeDoesNotBecomeCompactEnumeration() {
+        let expectation = infer(
+            "这是第二次测试的结果，整体已经通过。",
+            scene: .unknown
+        )
+
+        XCTAssertEqual(expectation.kind, .sentence)
+        XCTAssertNil(expectation.minimumListItemCount)
+    }
+
     func testChineseDeclaredCountProducesExactNumberedListContract() {
         let expectation = infer(
             "这次主要有三点：需求要确认；负责人要明确；上线前要完成回归测试。",
