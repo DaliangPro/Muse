@@ -37,7 +37,12 @@ struct VoicePolishPipeline: Sendable {
         startedAt suppliedStart: ContinuousClock.Instant? = nil
     ) async -> VoicePolishResult {
         let startedAt = suppliedStart ?? ContinuousClock.now
-        let sourceFacts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let sourceFactSegments = request.context.scene == .code
+            ? request.input.segments
+            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(
+                from: request.input.segments
+            )
+        let sourceFacts = ProtectedFactExtractor.extract(from: sourceFactSegments)
             + request.resolvedEntities.map {
                 SourceFactCandidate(
                     sourceText: $0.surfaceText,
@@ -199,6 +204,7 @@ struct VoicePolishPipeline: Sendable {
                 )
             }
         }
+        plan = normalizedPlanLayout(plan, request: request)
 
         let planValidation = VoicePolishValidator.validatePlan(
             plan,
@@ -250,7 +256,7 @@ struct VoicePolishPipeline: Sendable {
             )
         }
 
-        guard let rendered = VoicePolishOutputNormalizer.plainText(
+        guard let renderedDraft = VoicePolishOutputNormalizer.plainText(
             renderRaw,
             sourceText: request.fallbackText
         ) else {
@@ -262,6 +268,7 @@ struct VoicePolishPipeline: Sendable {
                 codes: [.abnormalLength]
             )
         }
+        let rendered = normalizedLayoutText(renderedDraft, request: request)
         let validation = VoicePolishValidator.validateStructured(
             response: StructuredVoicePolishResponse(plan: plan, finalText: rendered),
             request: request,
@@ -310,12 +317,13 @@ struct VoicePolishPipeline: Sendable {
                 ),
                 timeout: timeout
             ).text
-            guard let repaired = VoicePolishOutputNormalizer.plainText(
+            guard let repairedDraft = VoicePolishOutputNormalizer.plainText(
                 repairedRaw,
                 sourceText: request.fallbackText
             ) else {
                 throw StructuredLLMDecoderError.invalidJSON
             }
+            let repaired = normalizedLayoutText(repairedDraft, request: request)
             let repairedValidation = VoicePolishValidator.validateStructured(
                 response: StructuredVoicePolishResponse(plan: plan, finalText: repaired),
                 request: request,
@@ -378,7 +386,7 @@ struct VoicePolishPipeline: Sendable {
                 ),
                 timeout: timeout
             )
-            guard let output = VoicePolishOutputNormalizer.plainText(
+            guard let outputDraft = VoicePolishOutputNormalizer.plainText(
                 response.text,
                 sourceText: request.fallbackText
             ) else {
@@ -390,6 +398,7 @@ struct VoicePolishPipeline: Sendable {
                     codes: [.abnormalLength]
                 )
             }
+            let output = normalizedLayoutText(outputDraft, request: request)
             let validation = VoicePolishValidator.validateFast(
                 output: output,
                 request: request,
@@ -509,10 +518,11 @@ struct VoicePolishPipeline: Sendable {
                     ),
                     timeout: timeout
                 ).text
-                let repaired = try StructuredLLMDecoder.decode(
+                let repairedDraft = try StructuredLLMDecoder.decode(
                     StructuredVoicePolishResponse.self,
                     from: repairedRaw
                 )
+                let repaired = normalizedStructuredResponse(repairedDraft, request: request)
                 let validation = VoicePolishValidator.validateStructured(
                     response: repaired,
                     request: request,
@@ -546,14 +556,15 @@ struct VoicePolishPipeline: Sendable {
             }
         }
 
+        let normalizedDecoded = normalizedStructuredResponse(decoded, request: request)
         let validation = VoicePolishValidator.validateStructured(
-            response: decoded,
+            response: normalizedDecoded,
             request: request,
             sourceFacts: sourceFacts
         )
         guard validation.hasHardFailure else {
             return success(
-                text: decoded.finalText,
+                text: normalizedDecoded.finalText,
                 detectedRoute: detectedRoute,
                 executedRoute: .structured,
                 attempts: attempts,
@@ -598,10 +609,11 @@ struct VoicePolishPipeline: Sendable {
                 ),
                 timeout: timeout
             ).text
-            let repaired = try StructuredLLMDecoder.decode(
+            let repairedDraft = try StructuredLLMDecoder.decode(
                 StructuredVoicePolishResponse.self,
                 from: repairedRaw
             )
+            let repaired = normalizedStructuredResponse(repairedDraft, request: request)
             let repairedValidation = VoicePolishValidator.validateStructured(
                 response: repaired,
                 request: request,
@@ -659,6 +671,93 @@ struct VoicePolishPipeline: Sendable {
             )
             throw error
         }
+    }
+
+    /// 在事实校验前执行可逆、确定性的纯版式整理。只有成稿自身已经存在明确的
+    /// 句界、分号边界或连续列表边界时才补换行；代码场景不按分号拆分，避免破坏
+    /// 语法。用户明确要求中文编号时保留中文样式。
+    private func normalizedLayoutText(
+        _ text: String,
+        request: VoicePolishRequest
+    ) -> String {
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        if request.context.scene == .code {
+            return text
+        }
+        let formatted = VoicePolishFallbackFormatter.formatCandidate(
+            text,
+            expectation: expectation
+        )
+        let candidate: String
+        if expectation.numberingPreference == .chinese {
+            candidate = formatted
+        } else {
+            candidate = VoicePolishNumbering.normalizeExistingList(
+                in: formatted,
+                as: expectation.kind
+            )
+        }
+        // 编号归一也属于本地改写，必须与 Formatter 一起包在最终安全门内。
+        // 无法证明只改变空白和完整列表标记时，保留模型原成稿并交给 Validator。
+        guard VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+            source: text,
+            candidate: candidate,
+            expectation: expectation
+        ) else {
+            return text
+        }
+        return candidate
+    }
+
+    private func normalizedStructuredResponse(
+        _ response: StructuredVoicePolishResponse,
+        request: VoicePolishRequest
+    ) -> StructuredVoicePolishResponse {
+        StructuredVoicePolishResponse(
+            plan: normalizedPlanLayout(response.plan, request: request),
+            finalText: normalizedLayoutText(response.finalText, request: request)
+        )
+    }
+
+    /// output_format 是本地版式契约的镜像，不属于模型需要自主判断的事实。
+    /// 统一覆盖它可以避免 Analyzer/Structured 仅因自报格式错误浪费一次请求；
+    /// 最终正文仍由独立 Validator 按真实换行与列表项逐项验收。
+    private func normalizedPlanLayout(
+        _ plan: VoicePolishPlan,
+        request: VoicePolishRequest
+    ) -> VoicePolishPlan {
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        let expectedListCount: Int?
+        switch expectation.kind {
+        case .numberedList, .bulletList:
+            if let exact = expectation.expectedListItemCount {
+                expectedListCount = exact
+            } else {
+                // minimum-only 契约不能把模型猜测的数量升级成硬约束，否则
+                // Structured/Deep 会比 Fast 多出无依据的精确项数要求。
+                expectedListCount = nil
+            }
+        case .sentence, .paragraphs:
+            expectedListCount = nil
+        }
+
+        return VoicePolishPlan(
+            version: plan.version,
+            language: plan.language,
+            scene: plan.scene,
+            finalIntent: plan.finalIntent,
+            orderedBlocks: plan.orderedBlocks,
+            discardedFragments: plan.discardedFragments,
+            corrections: plan.corrections,
+            sideNotes: plan.sideNotes,
+            facts: plan.facts,
+            uncertainEntities: plan.uncertainEntities,
+            outputFormat: VoiceOutputFormat(
+                kind: expectation.kind,
+                expectedListCount: expectedListCount
+            ),
+            confidence: plan.confidence
+        )
     }
 
     private func stage(for task: LLMTask) -> VoicePolishStage {
@@ -746,7 +845,25 @@ struct VoicePolishPipeline: Sendable {
         codes: [VoicePolishValidationCode],
         reason: VoicePolishFailureReason = .validationFailed
     ) -> VoicePolishResult {
-        let fallbackText = request.fallbackText
+        // 回退仍以 canonical transcript 为唯一内容来源；只在本地能证明字符与
+        // 顺序完全不变时补上段落/列表结构，避免校验失败后重新退回成一坨文字。
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        let fallbackCandidate = VoicePolishFallbackFormatter.format(
+            request: request,
+            expectation: expectation
+        )
+        let fallbackText: String
+        if request.context.scene == .code {
+            fallbackText = request.fallbackText
+        } else if VoicePolishFallbackFormatter.isStrictlySafeTransformation(
+            source: request.fallbackText,
+            candidate: fallbackCandidate,
+            expectation: expectation
+        ) {
+            fallbackText = fallbackCandidate
+        } else {
+            fallbackText = request.fallbackText
+        }
         DebugFileLogger.log(
             "voice polish done route=\(detectedRoute.rawValue) executed=\(executedRoute.rawValue) attempts=\(attempts) output=\(fallbackText.count)chars codes=\(codes.map(\.rawValue).joined(separator: ",")) fallback=true"
         )

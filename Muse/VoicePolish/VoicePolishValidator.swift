@@ -21,11 +21,12 @@ enum VoicePolishValidator {
             plan: plan,
             finalText: request.fallbackText
         )
-        let codes = validateStructured(
+        var codes = validateStructured(
             response: provisional,
             request: request,
             sourceFacts: sourceFacts
         ).codes.filter { $0 == .planIntegrityFailure }
+        appendPlanLayoutCodes(plan, request: request, to: &codes)
         return VoicePolishValidationResult(codes: codes)
     }
 
@@ -35,7 +36,7 @@ enum VoicePolishValidator {
         sourceFacts: [SourceFactCandidate]
     ) -> VoicePolishValidationResult {
         var codes = commonCodes(output: output, sourceText: request.fallbackText)
-        let outputFacts = ProtectedFactExtractor.extract(from: [outputSegment(output)])
+        let outputFacts = protectedFactsFromOutput(output, request: request)
 
         if sourceFacts.contains(where: { !containsEquivalent($0, in: outputFacts, output: output) }) {
             append(.missingProtectedFact, to: &codes)
@@ -46,6 +47,7 @@ enum VoicePolishValidator {
             append(.planIntegrityFailure, to: &codes)
         }
         appendTerminologyEditCodes(output: output, request: request, to: &codes)
+        appendOutputLayoutCodes(output, request: request, to: &codes)
         return VoicePolishValidationResult(codes: codes)
     }
 
@@ -74,6 +76,7 @@ enum VoicePolishValidator {
             || hasInvalidSourceIDs(plan: plan, validIDs: validSegmentIDs) {
             append(.planIntegrityFailure, to: &codes)
         }
+        appendPlanLayoutCodes(plan, request: request, to: &codes)
 
         let planFacts = plan.facts
         var matchedCandidateIndices: Set<Int> = []
@@ -135,7 +138,7 @@ enum VoicePolishValidator {
             append(.planIntegrityFailure, to: &codes)
         }
 
-        let outputFacts = ProtectedFactExtractor.extract(from: [outputSegment(output)])
+        let outputFacts = protectedFactsFromOutput(output, request: request)
         if outputFacts.contains(where: { outputFact in
             !sourceFacts.contains(where: { equivalent($0, outputFact) })
         }) {
@@ -190,11 +193,12 @@ enum VoicePolishValidator {
         }
 
         if let expected = plan.outputFormat.expectedListCount,
-           listItemCount(in: output, kind: plan.outputFormat.kind) != expected {
+           VoicePolishNumbering.listItemCount(in: output, kind: plan.outputFormat.kind) != expected {
             append(.ambiguousStructuredResponse, to: &codes)
         }
 
         appendTerminologyEditCodes(output: output, request: request, to: &codes)
+        appendOutputLayoutCodes(output, request: request, to: &codes)
 
         return VoicePolishValidationResult(codes: codes)
     }
@@ -373,22 +377,127 @@ enum VoicePolishValidator {
         )
     }
 
+    /// 连续 `1...N` 行首序号属于排版，不是用户口述的新数字事实。只剥离可以
+    /// 证明连续的编号；年份、错误码、乱序及孤立数字仍交给事实校验保护。
+    private static func protectedFactsFromOutput(
+        _ output: String,
+        request: VoicePolishRequest
+    ) -> [SourceFactCandidate] {
+        let factText = request.context.scene == .code
+            ? output
+            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(in: output)
+        return ProtectedFactExtractor.extract(from: [outputSegment(factText)])
+    }
+
     private static func normalizedNaturalText(_ text: String) -> String {
         text.precomposedStringWithCompatibilityMapping
             .lowercased()
             .filter { !$0.isWhitespace && !$0.isPunctuation }
     }
 
-    private static func listItemCount(in text: String, kind: OutputKind) -> Int {
-        guard kind == .numberedList || kind == .bulletList else { return 0 }
-        let pattern = kind == .numberedList
-            ? #"(?m)^\s*\d+[.)、]\s*"#
-            : #"(?m)^\s*[-*•]\s+"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return 0 }
-        return regex.numberOfMatches(
-            in: text,
-            range: NSRange(text.startIndex..<text.endIndex, in: text)
+    private static func appendPlanLayoutCodes(
+        _ plan: VoicePolishPlan,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        guard plan.outputFormat.kind.rawValue == expectation.kind.rawValue else {
+            append(.layoutRequirementUnmet, to: &codes)
+            return
+        }
+
+        if let expected = expectation.expectedListItemCount,
+           plan.outputFormat.expectedListCount != expected {
+            append(.layoutRequirementUnmet, to: &codes)
+        } else if let minimum = expectation.minimumListItemCount,
+                  let planned = plan.outputFormat.expectedListCount,
+                  planned < minimum {
+            append(.layoutRequirementUnmet, to: &codes)
+        }
+    }
+
+    private static func appendOutputLayoutCodes(
+        _ output: String,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        let numberedCount = VoicePolishNumbering.listItemCount(
+            in: output,
+            kind: .numberedList
         )
+        let bulletCount = VoicePolishNumbering.listItemCount(
+            in: output,
+            kind: .bulletList
+        )
+        let recognizedListCount = numberedCount + bulletCount
+
+        if expectation.forbidsLists, recognizedListCount > 0 {
+            append(.layoutRequirementUnmet, to: &codes)
+        }
+        if expectation.forbidsNumberedList, numberedCount > 0 {
+            append(.layoutRequirementUnmet, to: &codes)
+        }
+        if expectation.forbidsBulletList, bulletCount > 0 {
+            append(.layoutRequirementUnmet, to: &codes)
+        }
+        if expectation.forbidsLineBreaks, paragraphCount(in: output) > 1 {
+            append(.layoutRequirementUnmet, to: &codes)
+        }
+
+        switch expectation.kind {
+        case .sentence:
+            // `.sentence` 是“没有本地最低结构要求”，不是禁止模型按语义或用户
+            // 自定义 Prompt 使用轻量结构。明确的禁列表/禁换行已由上方独立校验。
+            break
+        case .paragraphs:
+            if paragraphCount(in: output) < expectation.minimumParagraphCount {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+            if recognizedListCount >= 2 {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+        case .numberedList:
+            let count = numberedCount
+            if let expected = expectation.expectedListItemCount {
+                if count != expected { append(.layoutRequirementUnmet, to: &codes) }
+            } else if count < (expectation.minimumListItemCount ?? 2) {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+            if bulletCount > 0 {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+            if !VoicePolishNumbering.matchesNumberingPreference(
+                   in: output,
+                   preference: expectation.numberingPreference
+               ) {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+        case .bulletList:
+            let count = bulletCount
+            if let expected = expectation.expectedListItemCount {
+                if count != expected { append(.layoutRequirementUnmet, to: &codes) }
+            } else if count < (expectation.minimumListItemCount ?? 2) {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+            if numberedCount > 0 {
+                append(.layoutRequirementUnmet, to: &codes)
+            }
+        }
+    }
+
+    private static func paragraphCount(in text: String) -> Int {
+        let normalized = VoicePolishCharacterSafety.normalizedLineEndings(text)
+        let blankLineBlocks = normalized
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if blankLineBlocks.count > 1 { return blankLineBlocks.count }
+        return normalized
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .count
     }
 
     private static func append(

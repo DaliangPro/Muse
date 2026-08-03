@@ -15,16 +15,16 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(route("Scratch that. I mean, ship it Friday."), .deep)
     }
 
-    func testRouterUsesLengthOnlyForStructuredAndNeverForDeep() {
+    func testRouterDoesNotUseLengthAloneToAddASecondModelCall() {
         XCTAssertEqual(route(String(repeating: "中", count: 120)), .fast)
-        XCTAssertEqual(route(String(repeating: "中", count: 121)), .structured)
-        XCTAssertEqual(route(String(repeating: "中", count: 501)), .structured)
+        XCTAssertEqual(route(String(repeating: "中", count: 121)), .fast)
+        XCTAssertEqual(route(String(repeating: "中", count: 501)), .fast)
         XCTAssertEqual(route(Array(repeating: "word", count: 80).joined(separator: " ")), .fast)
-        XCTAssertEqual(route(Array(repeating: "word", count: 81).joined(separator: " ")), .structured)
-        XCTAssertEqual(route(Array(repeating: "word", count: 301).joined(separator: " ")), .structured)
+        XCTAssertEqual(route(Array(repeating: "word", count: 81).joined(separator: " ")), .fast)
+        XCTAssertEqual(route(Array(repeating: "word", count: 301).joined(separator: " ")), .fast)
     }
 
-    func testRouterDoesNotUseSegmentCountAloneForDeep() {
+    func testRouterDoesNotUseProviderSegmentCountAloneToAddASecondModelCall() {
         let request = VoicePolishRequest(
             input: VoiceInputEnvelope(
                 providerFinalText: "今天整理方案。明天发给团队。",
@@ -46,7 +46,7 @@ final class VoicePolishCoreTests: XCTestCase {
 
         let decision = VoicePolishComplexityRouter.decide(request: request, factCandidates: [])
 
-        XCTAssertEqual(decision.route, .structured)
+        XCTAssertEqual(decision.route, .fast)
     }
 
     func testQualityModesApplyDeterministicExecutionPolicy() {

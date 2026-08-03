@@ -137,8 +137,8 @@ private extension VoicePolishSettingsTab {
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 Text(L(
-                    "可选。这里控制语气、简洁度和格式，不需要在 Prompt 里重复编写术语纠正或事实保护规则。",
-                    "Optional. This controls tone, brevity, and formatting; terminology correction and fact protection are handled by Muse."
+                    "可选。这里的语气、简洁度、分段和列表偏好会进入每次成稿契约；术语纠正和事实保护由 Muse 单独处理。",
+                    "Optional. Tone, brevity, paragraph, and list preferences become part of every writing contract; Muse handles terminology and fact protection separately."
                 ))
                 .font(TF.settingsFontCaption)
                 .foregroundStyle(TF.settingsTextTertiary)
@@ -150,8 +150,8 @@ private extension VoicePolishSettingsTab {
 
                     if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text(L(
-                            "例如：保留我的口语感，表达简洁，不要随便使用列表。",
-                            "For example: Keep my natural voice, stay concise, and avoid unnecessary lists."
+                            "例如：保留我的口语感；按语义自然分段；多个事项自动用 1. 2. 3. 排列。",
+                            "For example: Keep my natural voice, use semantic paragraphs, and format multiple items as 1. 2. 3."
                         ))
                         .font(TF.settingsFontReading)
                         .foregroundStyle(TF.settingsTextTertiary.opacity(0.58))

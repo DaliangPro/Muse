@@ -179,7 +179,7 @@ final class VoicePolishPipelineTests: XCTestCase {
     func testDeepUsesAnalyzeThenRenderWithinTwoAttempts() async throws {
         let source = "先用红色，不对，我改一下，应该是蓝色。"
         let plan = VoicePolishPlan(
-                version: 1,
+                version: VoicePolishPrompts.version,
                 language: "zh",
                 scene: .unknown,
                 finalIntent: "最终使用蓝色",
@@ -219,6 +219,54 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertFalse(requests[1].user.contains("original_payload"))
         XCTAssertFalse(requests[1].user.contains("provider_final_text"))
         XCTAssertTrue(requests[1].user.contains("source_segments"))
+    }
+
+    func testDeepUsesLocalLayoutContractWhenAnalyzerReportsWrongFormat() async throws {
+        let source = "第一，先用红色。不对，我改一下，应该是蓝色。第二，完成测试。第三，发布。"
+        let plan = VoicePolishPlan(
+            version: VoicePolishPrompts.version,
+            language: "zh",
+            scene: .unknown,
+            finalIntent: "最终使用蓝色并完成后续事项",
+            orderedBlocks: [VoicePolishBlock(
+                id: "b1",
+                text: source,
+                sourceSegmentIDs: ["s1"],
+                kind: .content
+            )],
+            discardedFragments: [],
+            corrections: [VoiceCorrection(
+                previousText: "红色",
+                finalText: "蓝色",
+                sourceSegmentIDs: ["s1"],
+                isFinal: true
+            )],
+            sideNotes: [],
+            facts: [],
+            uncertainEntities: [],
+            // Analyzer 自报 sentence；Pipeline 应以本地契约覆盖，而不是直接回退。
+            outputFormat: VoiceOutputFormat(kind: .sentence, expectedListCount: nil),
+            confidence: 0.9
+        )
+        let finalText = """
+        一、最终使用蓝色。
+        二、完成测试。
+        三、发布。
+        """
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(try encoded(plan)),
+            .response(finalText),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertEqual(result.detectedRoute, .deep)
+        XCTAssertEqual(result.executedRoute, .deep)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, finalText)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishAnalyze, .voicePolishRender])
     }
 
     func testDeepAnalyzerFormatRepairConsumesThirdAttemptBeforeRender() async throws {
@@ -265,7 +313,8 @@ final class VoicePolishPipelineTests: XCTestCase {
     }
 
     func testStructuredRejectsModelSuppliedCanonicalValueMismatch() async throws {
-        let source = "报价 49800 元，" + String(repeating: "请按原文整理。", count: 20)
+        let source = "报价 49800 元，不对，最终仍按 49800 元，"
+            + String(repeating: "请按原文整理。", count: 20)
         let candidate = ProtectedFactExtractor.extract(from: [RecognitionSegment(
             id: "s1",
             text: source,
@@ -276,7 +325,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         )]).first!
         let invalid = StructuredVoicePolishResponse(
             plan: VoicePolishPlan(
-                version: 1,
+                version: VoicePolishPrompts.version,
                 language: "zh",
                 scene: .unknown,
                 finalIntent: "保留报价",
@@ -316,7 +365,8 @@ final class VoicePolishPipelineTests: XCTestCase {
     }
 
     func testStructuredRejectsNewNumericFactOutsideSourceAndPlan() async throws {
-        let source = "报价 49800 元，" + String(repeating: "请按原文整理。", count: 20)
+        let source = "报价 49800 元，不对，最终仍按 49800 元，"
+            + String(repeating: "请按原文整理。", count: 20)
         let invalid = structuredResponse(
             source: source,
             finalText: source + "另加 500 元。"
@@ -325,12 +375,24 @@ final class VoicePolishPipelineTests: XCTestCase {
             .response(try encoded(invalid)),
             .response(try encoded(invalid)),
         ])
+        let request = makeRequest(source)
 
-        let result = await pipeline(client).process(makeRequest(source))
+        let result = await pipeline(client).process(request)
 
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.failureReason, .validationFailed)
-        XCTAssertEqual(result.text, source)
+        XCTAssertEqual(
+            result.text,
+            VoicePolishFallbackFormatter.format(
+                request: request,
+                expectation: VoicePolishLayoutExpectation.infer(from: request)
+            )
+        )
+        XCTAssertEqual(
+            result.text.filter { !$0.isWhitespace },
+            source.filter { !$0.isWhitespace }
+        )
+        XCTAssertTrue(result.text.contains("\n\n"))
         XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
     }
 
@@ -421,7 +483,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         }
         return StructuredVoicePolishResponse(
             plan: VoicePolishPlan(
-                version: 1,
+                version: VoicePolishPrompts.version,
                 language: "zh",
                 scene: .unknown,
                 finalIntent: "采用最终金额",
@@ -450,7 +512,7 @@ final class VoicePolishPipelineTests: XCTestCase {
 
     private func simpleCorrectionPlan() -> VoicePolishPlan {
         VoicePolishPlan(
-            version: 1,
+            version: VoicePolishPrompts.version,
             language: "zh",
             scene: .unknown,
             finalIntent: "最终使用蓝色",

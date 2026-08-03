@@ -85,9 +85,9 @@ enum VoicePolishFixtureCatalog {
         case .shortChat:
             return (["我晚一点到，你们先开始。"], .chat, .fast, [], [])
         case .workChat:
-            return (["今天先确认需求。", "明天再补完整排期。"], .workChat, .structured, [], [])
+            return (["今天先确认需求。", "明天再补完整排期。"], .workChat, .fast, [], [])
         case .email:
-            return ([String(repeating: "请把本周进展和下周安排整理清楚，", count: 9)], .email, .structured, [], [])
+            return ([String(repeating: "请把本周进展和下周安排整理清楚，", count: 9)], .email, .fast, [], [])
         case .immediateCorrection:
             return (["会议定在周四，不对，改成周五下午。"], .workChat, .structured, [], [])
         case .delayedCorrection:

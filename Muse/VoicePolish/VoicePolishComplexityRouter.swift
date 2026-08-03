@@ -8,7 +8,7 @@ struct VoicePolishRouteDecision: Sendable, Equatable {
 }
 enum VoicePolishComplexityRouter {
 
-    static let signalConfigurationVersion = 2
+    static let signalConfigurationVersion = 3
 
     private static let immediateCorrectionsZH = ["不对", "我改一下", "应该是", "我的意思是", "说错了"]
     private static let immediateCorrectionsEN = ["actually", "i mean", "let me correct that", "scratch that"]
@@ -35,11 +35,6 @@ enum VoicePolishComplexityRouter {
     ) -> VoicePolishRouteDecision {
         let source = request.input.segments.map(\.text).joined(separator: "\n")
         let normalized = source.precomposedStringWithCompatibilityMapping.lowercased()
-        let hasChinese = normalized.unicodeScalars.contains { scalar in
-            (0x3400...0x4DBF).contains(scalar.value)
-                || (0x4E00...0x9FFF).contains(scalar.value)
-        }
-        let length = hasChinese ? normalized.count : englishWordCount(normalized)
 
         let correctionCount = countNonOverlapping(
             in: normalized,
@@ -58,6 +53,7 @@ enum VoicePolishComplexityRouter {
             chinese: aiConstraintsZH,
             english: aiConstraintsEN
         )
+        let layoutExpectation = VoicePolishLayoutExpectation.infer(from: request)
 
         var categories: Set<String> = []
         if correctionCount > 0 { categories.insert("immediate_correction") }
@@ -69,6 +65,7 @@ enum VoicePolishComplexityRouter {
         if topicSwitch { categories.insert("topic_switch") }
         if ambiguousEntity { categories.insert("ambiguous_entity") }
         if aiConstraintCount >= 2 { categories.insert("ai_constraints") }
+        if layoutExpectation.kind != .sentence { categories.insert("layout_contract") }
 
         let isDeep = correctionCount >= 2
             || delayed
@@ -78,12 +75,13 @@ enum VoicePolishComplexityRouter {
             || ambiguousEntity
             || (request.context.scene == .aiPrompt && aiConstraintCount >= 2)
 
+        // Provider 的切段数量和纯文本长度都不代表语义复杂度。把它们直接提升到
+        // Structured 会让普通长口述或两段 ASR 结果进入 JSON + Repair 链路，既慢
+        // 又不能提高事实安全；真正需要规划时仍由改口、旁注、枚举和事实数量提升。
         let isStructured = correctionCount == 1
             || sideNote
             || enumeration
             || factCandidates.count >= 9
-            || request.input.segments.count > 1
-            || (hasChinese ? length > 120 : length > 80)
 
         let route: VoicePolishRoute
         if isDeep {
@@ -134,12 +132,6 @@ enum VoicePolishComplexityRouter {
             chinese: explicitExclusionsZH,
             english: explicitExclusionsEN
         )
-    }
-
-    private static func englishWordCount(_ text: String) -> Int {
-        text.split { character in
-            character.isWhitespace || character.isPunctuation
-        }.count
     }
 
     private static func containsAny(

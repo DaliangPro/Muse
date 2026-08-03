@@ -131,6 +131,24 @@ final class ProcessingModeCleanupTests: XCTestCase {
         XCTAssertEqual(finalized, leaked)
     }
 
+    func testVoicePolishFinalizationPreservesParagraphAndListLineBreaks() {
+        let polished = """
+        这次主要有三个问题：
+
+        1. 识别速度慢。
+        2. 不会自动分段。
+        3. 没有执行提示词要求。
+        """
+
+        let finalized = RecognitionSession.finalizeInsertionText(
+            polished,
+            mode: .formalWriting,
+            isLLMOutput: true
+        )
+
+        XCTAssertEqual(finalized, polished)
+    }
+
     func testPromptOptimizerKeepsGeneratedPromptHeadings() {
         let generated = """
         # 角色

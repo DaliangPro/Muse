@@ -383,10 +383,7 @@ private extension ModeTrialCard {
             } else {
                 styleProfile = nil
             }
-            let result = await VoicePolishPipeline(
-                client: client,
-                config: voicePolishConfig
-            ).process(VoicePolishRequest(
+            let voicePolishRequest = VoicePolishRequest(
                 input: envelope,
                 context: trialContext,
                 preferences: UserPolishPreferences(
@@ -395,9 +392,19 @@ private extension ModeTrialCard {
                 ),
                 qualityMode: VoicePolishSettings.qualityMode(),
                 resolvedEntities: resolvedEntities
-            ))
+            )
+            let layoutExpectation = VoicePolishLayoutExpectation.infer(
+                from: voicePolishRequest
+            )
+            let result = await VoicePolishPipeline(
+                client: client,
+                config: voicePolishConfig
+            ).process(voicePolishRequest)
             trialOutput = result.text
-            trialDiagnostics = voicePolishDiagnostics(result)
+            trialDiagnostics = voicePolishDiagnostics(
+                result,
+                layoutExpectation: layoutExpectation
+            )
             return
         }
 
@@ -431,13 +438,27 @@ private extension ModeTrialCard {
         trialDiagnostics = ""
     }
 
-    func voicePolishDiagnostics(_ result: VoicePolishResult) -> String {
+    func voicePolishDiagnostics(
+        _ result: VoicePolishResult,
+        layoutExpectation: VoicePolishLayoutExpectation
+    ) -> String {
         let routes = "\(result.detectedRoute.rawValue.capitalized) → \(result.executedRoute.rawValue.capitalized)"
         let calls = L("\(result.llmAttemptCount) 次", "\(result.llmAttemptCount) call(s)")
+        let layout: String
+        switch layoutExpectation.kind {
+        case .sentence:
+            layout = L("普通正文", "Plain text")
+        case .paragraphs:
+            layout = L("自然分段", "Paragraphs")
+        case .numberedList:
+            layout = L("编号列表", "Numbered list")
+        case .bulletList:
+            layout = L("项目列表", "Bullet list")
+        }
         let validation = result.validationCodes.isEmpty
             ? L("校验通过", "Validated")
             : result.validationCodes.map(\.rawValue).joined(separator: ",")
         let fallback = result.usedFallback ? L(" · 原文回退", " · Fallback") : ""
-        return "\(routes) · \(calls) · \(validation)\(fallback)"
+        return "\(routes) · \(L("版式", "Layout"))：\(layout) · \(calls) · \(validation)\(fallback)"
     }
 }

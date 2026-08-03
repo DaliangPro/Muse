@@ -340,6 +340,7 @@ enum VoicePolishValidationCode: String, Codable, Sendable, Equatable, CaseIterab
     case abnormalLength
     case unsafeCharacters
     case planIntegrityFailure
+    case layoutRequirementUnmet
     case excessiveParagraphs
     case sceneStyleMismatch
     case harmlessRepetition
