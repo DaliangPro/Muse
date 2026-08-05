@@ -42,6 +42,21 @@ final class LLMStreamingParserTests: XCTestCase {
         XCTAssertTrue(parser.isComplete)
     }
 
+    func testLengthFinishReasonIsReportedAsTruncated() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertThrowsError(try parser.finish()) { error in
+            guard case LLMError.truncatedResponse(let count) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(count, 7)
+        }
+    }
+
     func testFinishReasonWithoutDeltaStillCompletes() throws {
         var parser = LLMStreamingParser()
         try parser.consume(line: #"data: {"choices":[{"delta":{"content":"body"},"finish_reason":null}]}"#)
@@ -204,5 +219,15 @@ final class LLMStreamingParserTests: XCTestCase {
 
         XCTAssertNil(empty.thinkingEvidence.reasoningObserved)
         XCTAssertEqual(populated.thinkingEvidence.reasoningObserved, true)
+    }
+
+    func testNonStreamingLengthFinishReasonIsMarkedAsTruncated() throws {
+        let data = Data(
+            #"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#.utf8
+        )
+
+        let response = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
+
+        XCTAssertTrue(response.hitOutputTokenLimit)
     }
 }

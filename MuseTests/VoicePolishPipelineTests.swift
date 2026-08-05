@@ -23,6 +23,11 @@ final class VoicePolishPipelineTests: XCTestCase {
         let requests = await client.recordedRequests()
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests[0].task, .voicePolishFast)
+        XCTAssertEqual(requests[0].options.maxOutputTokens, 2_048)
+        XCTAssertEqual(
+            VoicePolishPipeline.defaultFirstRequestTimeout(for: makeRequest(source)),
+            .seconds(30)
+        )
         XCTAssertFalse(requests[0].system?.contains(source) == true)
         XCTAssertTrue(requests[0].user.contains(source))
         XCTAssertTrue(requests[0].user.contains(#""user_preferences":"""#))
@@ -197,6 +202,55 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(
             VoicePolishNumbering.listItemCount(in: result.text, kind: .numberedList),
             3
+        )
+    }
+
+    func testLongFastDraftExpandsBoundedOutputAndTimeoutBudgets() async {
+        let unit = "这是一段需要完整保留并认真整理的长内容。"
+        let paragraph = String(repeating: unit, count: 40)
+        let source = String(repeating: paragraph, count: 4)
+        let output = [paragraph, paragraph, paragraph, paragraph].joined(separator: "\n\n")
+        let request = makeRequest(source)
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        XCTAssertGreaterThan(EstimatedTokenCounter.count(in: source), 2_048)
+        XCTAssertGreaterThan(
+            VoicePolishPipeline.outputTokenBudget(for: request, task: .voicePolishFast),
+            2_048
+        )
+        XCTAssertLessThanOrEqual(
+            VoicePolishPipeline.outputTokenBudget(for: request, task: .voicePolishFast),
+            8_192
+        )
+        XCTAssertGreaterThan(
+            VoicePolishPipeline.defaultFirstRequestTimeout(for: request),
+            .seconds(30)
+        )
+        XCTAssertLessThanOrEqual(
+            VoicePolishPipeline.defaultFirstRequestTimeout(for: request),
+            .seconds(90)
+        )
+        let oversizedRequest = makeRequest(String(repeating: unit, count: 600))
+        XCTAssertEqual(
+            VoicePolishPipeline.outputTokenBudget(
+                for: oversizedRequest,
+                task: .voicePolishFast
+            ),
+            8_192
+        )
+        XCTAssertEqual(
+            VoicePolishPipeline.defaultFirstRequestTimeout(for: oversizedRequest),
+            .seconds(90)
+        )
+
+        let result = await pipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(
+            requests.first?.options.maxOutputTokens,
+            VoicePolishPipeline.outputTokenBudget(for: request, task: .voicePolishFast)
         )
     }
 

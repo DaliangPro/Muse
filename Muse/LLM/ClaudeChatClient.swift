@@ -84,7 +84,7 @@ actor ClaudeChatClient: LLMClient {
             url: url,
             textLength: request.user.count,
             config: requestConfig,
-            maxTokens: 4_096,
+            maxTokens: request.options.maxOutputTokens ?? 4_096,
             system: promptParts.system,
             user: promptParts.user,
             stream: true,
@@ -414,6 +414,9 @@ actor ClaudeChatClient: LLMClient {
         else {
             throw LLMError.emptyResponse(nil)
         }
+        guard !LLMCompletionTermination.hitOutputTokenLimit(decoded.stop_reason) else {
+            throw LLMError.truncatedResponse(decoded.text.count)
+        }
         return ClaudeExecutionResult(
             text: decoded.text,
             evidence: LLMThinkingProbeEvidence(
@@ -470,6 +473,7 @@ private struct ClaudeExecutionResult: Sendable {
 
 private struct ClaudeResponse: Decodable, Sendable {
     let content: [ClaudeContentBlock]
+    let stop_reason: String?
 
     var text: String {
         content.compactMap(\.text).joined()
@@ -495,6 +499,7 @@ private struct ClaudeDelta: Decodable, Sendable {
     let type: String?
     let text: String?
     let thinking: String?
+    let stop_reason: String?
 }
 
 private struct ClaudeStreamingParser: Sendable {
@@ -503,6 +508,7 @@ private struct ClaudeStreamingParser: Sendable {
     private var resultBytes = 0
     private(set) var isComplete = false
     private(set) var reasoningObserved = false
+    private var hitOutputTokenLimit = false
 
     mutating func consume(line: String) throws {
         guard !isComplete else { return }
@@ -518,6 +524,9 @@ private struct ClaudeStreamingParser: Sendable {
             }
         }
         guard isComplete else {
+            throw LLMError.truncatedResponse(result.count)
+        }
+        guard !hitOutputTokenLimit else {
             throw LLMError.truncatedResponse(result.count)
         }
         guard !result.isEmpty else {
@@ -574,6 +583,10 @@ private struct ClaudeStreamingParser: Sendable {
             }
             result += text
             resultBytes += additionalBytes
+        case "message_delta":
+            if LLMCompletionTermination.hitOutputTokenLimit(event.delta?.stop_reason) {
+                hitOutputTokenLimit = true
+            }
         case "message_stop":
             isComplete = true
         default:

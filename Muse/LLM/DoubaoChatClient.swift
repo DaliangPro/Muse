@@ -444,10 +444,12 @@ actor DoubaoChatClient: LLMClient {
         )
 
         guard let json = try? JSONDecoder().decode(ChatCompletionResponse.self, from: data),
-              let content = json.choices.first?.message.content, !content.isEmpty
-        else {
+              let content = json.choices.first?.message.content, !content.isEmpty else {
             DebugFileLogger.log("LLM[\(model)]: non-streaming empty; raw bytes=\(min(data.count, 300))")
             throw LLMError.emptyResponse(nil)
+        }
+        guard !json.hitOutputTokenLimit else {
+            throw LLMError.truncatedResponse(content.count)
         }
         return LLMExecutionResult(text: content, evidence: json.thinkingEvidence)
     }
@@ -520,10 +522,17 @@ struct ChatCompletionResponse: Decodable, Sendable {
             reasoningObserved: observed
         )
     }
+
+    var hitOutputTokenLimit: Bool {
+        choices.contains {
+            LLMCompletionTermination.hitOutputTokenLimit($0.finish_reason)
+        }
+    }
 }
 
 struct CompletionChoice: Decodable, Sendable {
     let message: CompletionMessage
+    let finish_reason: String?
 }
 
 struct CompletionMessage: Decodable, Sendable {

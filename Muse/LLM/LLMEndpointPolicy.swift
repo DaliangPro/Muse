@@ -353,6 +353,7 @@ struct LLMStreamingParser: Sendable {
     private let maxResponseBytes: Int
     private(set) var isComplete = false
     private(set) var reasoningObserved = false
+    private var hitOutputTokenLimit = false
 
     init(
         maxResponseBytes: Int = defaultMaximumResponseBytes,
@@ -376,6 +377,9 @@ struct LLMStreamingParser: Sendable {
             }
         }
         guard isComplete else {
+            throw LLMError.truncatedResponse(result.count)
+        }
+        guard !hitOutputTokenLimit else {
             throw LLMError.truncatedResponse(result.count)
         }
         guard !result.isEmpty else {
@@ -432,8 +436,23 @@ struct LLMStreamingParser: Sendable {
             }
             if let finishReason = choice.finish_reason?.trimmingCharacters(in: .whitespacesAndNewlines),
                !finishReason.isEmpty {
+                if LLMCompletionTermination.hitOutputTokenLimit(finishReason) {
+                    hitOutputTokenLimit = true
+                }
                 isComplete = true
             }
         }
+    }
+}
+
+enum LLMCompletionTermination {
+    static func hitOutputTokenLimit(_ reason: String?) -> Bool {
+        guard let normalized = reason?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !normalized.isEmpty else { return false }
+        return normalized == "length"
+            || normalized == "max_tokens"
+            || normalized == "max_output_tokens"
     }
 }
