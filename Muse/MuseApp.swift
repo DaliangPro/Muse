@@ -44,6 +44,16 @@ struct MuseApp: App {
         "NSStatusItem Visible Item-0",
     ]
 
+    nonisolated static func statusItemAutosaveName(
+        for operatingSystemVersion: OperatingSystemVersion
+    ) -> String? {
+        // macOS 26 的 Control Center 会先用 Item-0 登记状态项，再把
+        // autosaveName 作为第二个身份处理。当前系统曾同时保存 Muse 自身的允许记录
+        // 与启动器下的错误关联；保留原身份可避免修复后再次产生身份分叉。
+        guard operatingSystemVersion.majorVersion < 26 else { return nil }
+        return menuBarAutosaveName
+    }
+
     nonisolated static func migrateLegacyMenuBarVisibilityIfNeeded(
         defaults: UserDefaults = .standard
     ) {
@@ -290,19 +300,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installMenuBarItem() {
-        MuseApp.migrateLegacyMenuBarVisibilityIfNeeded()
+        let autosaveName = MuseApp.statusItemAutosaveName(
+            for: ProcessInfo.processInfo.operatingSystemVersion
+        )
 
-        // 新状态项若没有用户排序记录，放在右侧常驻区；否则菜单栏拥挤时会被
-        // macOS 排到刘海/ProNotch 覆盖区域。只初始化一次，不覆盖用户后续 Cmd 拖动排序。
-        if UserDefaults.standard.object(forKey: MuseApp.menuBarPreferredPositionKey) == nil {
-            UserDefaults.standard.set(
-                MuseApp.defaultMenuBarPreferredPosition,
-                forKey: MuseApp.menuBarPreferredPositionKey
-            )
+        if autosaveName != nil {
+            MuseApp.migrateLegacyMenuBarVisibilityIfNeeded()
+
+            // 旧版 macOS 的命名状态项若没有用户排序记录，放在右侧常驻区。
+            // 只初始化一次，不覆盖用户后续 Cmd 拖动排序。
+            if UserDefaults.standard.object(forKey: MuseApp.menuBarPreferredPositionKey) == nil {
+                UserDefaults.standard.set(
+                    MuseApp.defaultMenuBarPreferredPosition,
+                    forKey: MuseApp.menuBarPreferredPositionKey
+                )
+            }
         }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.autosaveName = MuseApp.menuBarAutosaveName
+        if let autosaveName {
+            item.autosaveName = autosaveName
+        }
         item.isVisible = true
 
         guard let button = item.button else {
@@ -315,6 +333,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.toolTip = "Muse"
         item.menu = makeStatusMenu()
         statusItem = item
+        DebugFileLogger.log(
+            "menu bar status item installed identity=\(autosaveName ?? "Item-0") visible=\(item.isVisible)"
+        )
     }
 
     private func makeStatusMenu() -> NSMenu {

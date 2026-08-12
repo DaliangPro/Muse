@@ -2,6 +2,21 @@ import XCTest
 @testable import Muse
 
 final class MuseAppMenuBarTests: XCTestCase {
+    func testMacOS26保留系统状态项身份避免身份分叉() {
+        let version = OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
+
+        XCTAssertNil(MuseApp.statusItemAutosaveName(for: version))
+    }
+
+    func test旧版MacOS继续使用稳定状态项名称() {
+        let version = OperatingSystemVersion(majorVersion: 15, minorVersion: 6, patchVersion: 0)
+
+        XCTAssertEqual(
+            MuseApp.statusItemAutosaveName(for: version),
+            MuseApp.menuBarAutosaveName
+        )
+    }
+
     func test首次迁移会清除旧状态项隐藏记录() throws {
         let suiteName = "MuseAppMenuBarTests.首次迁移.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
