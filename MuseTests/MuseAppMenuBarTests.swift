@@ -2,6 +2,10 @@ import XCTest
 @testable import Muse
 
 final class MuseAppMenuBarTests: XCTestCase {
+    func test菜单栏图标保持原尺寸不被AppKit向上放大() {
+        XCTAssertEqual(MuseApp.menuBarImageScaling, .scaleProportionallyDown)
+    }
+
     func testMacOS26保留系统状态项身份避免身份分叉() {
         let version = OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
 

@@ -35,6 +35,7 @@ struct MuseApp: App {
         image.isTemplate = true
         return image
     }()
+    nonisolated static let menuBarImageScaling: NSImageScaling = .scaleProportionallyDown
     nonisolated static let menuBarAutosaveName = "MuseMainStatusItem"
     nonisolated static let menuBarPreferredPositionKey = "NSStatusItem Preferred Position \(menuBarAutosaveName)"
     nonisolated static let defaultMenuBarPreferredPosition = 250.0
@@ -329,7 +330,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         button.image = MuseApp.menuBarIcon
         button.imagePosition = .imageOnly
-        button.imageScaling = .scaleProportionallyUpOrDown
+        // 保留原 SwiftUI MenuBarExtra 的 18pt 视觉尺寸；AppKit 若允许向上缩放，
+        // 会把素材继续撑到状态按钮可用高度，看起来比原图标大一圈。
+        button.imageScaling = MuseApp.menuBarImageScaling
         button.toolTip = "Muse"
         item.menu = makeStatusMenu()
         statusItem = item
