@@ -4,6 +4,13 @@ import XCTest
 final class VoicePolishQualityRunnerTests: XCTestCase {
     func test普通启动不进入质量跑测() throws {
         XCTAssertNil(try VoicePolishQualityRunner.parseInvocation(arguments: ["Muse"]))
+        XCTAssertFalse(VoicePolishQualityRunner.isRequested(arguments: ["Muse"]))
+    }
+
+    func test质量跑测在正常App构建前可被分流() {
+        let arguments = ["Muse", "--voice-polish-quality-run"]
+
+        XCTAssertTrue(VoicePolishQualityRunner.isRequested(arguments: arguments))
     }
 
     func test显式参数可解析且不需要凭据参数() throws {

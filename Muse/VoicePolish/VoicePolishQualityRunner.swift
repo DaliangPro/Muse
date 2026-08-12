@@ -140,8 +140,12 @@ enum VoicePolishQualityRunner {
         return true
     }
 
+    static func isRequested(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
+        arguments.contains("--voice-polish-quality-run")
+    }
+
     static func parseInvocation(arguments: [String]) throws -> Invocation? {
-        guard arguments.contains("--voice-polish-quality-run") else { return nil }
+        guard isRequested(arguments: arguments) else { return nil }
 
         func value(after flag: String) -> String? {
             guard let index = arguments.firstIndex(of: flag), arguments.indices.contains(index + 1) else {

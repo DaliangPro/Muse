@@ -2,10 +2,19 @@ import AppKit
 import SwiftUI
 
 @main
+enum MuseMain {
+    static func main() {
+        if VoicePolishQualityRunner.isRequested() {
+            VoicePolishQualityRunnerApp.main()
+        } else {
+            MuseApp.main()
+        }
+    }
+}
+
 struct MuseApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @State private var isMenuBarExtraInserted = true
 
     /// 菜单栏图标：填满的圆角方 + M 镂空（2026-06-23 大梁老师嫌 m.square.fill 自带留白、比其它图标小一圈，
     /// 改自绘：圆角方撑满菜单栏高度、M 用 destinationOut 镂空、isTemplate 自适应明暗）
@@ -26,17 +35,30 @@ struct MuseApp: App {
         image.isTemplate = true
         return image
     }()
+    nonisolated static let menuBarAutosaveName = "MuseMainStatusItem"
+    nonisolated static let menuBarPreferredPositionKey = "NSStatusItem Preferred Position \(menuBarAutosaveName)"
+    nonisolated static let defaultMenuBarPreferredPosition = 250.0
+    nonisolated static let menuBarVisibilityMigrationKey = "tf_menuBarStatusItemV6VisibilityMigrated"
+    nonisolated static let legacyMenuBarVisibilityKeys = [
+        "NSStatusItem VisibleCC Item-0",
+        "NSStatusItem Visible Item-0",
+    ]
+
+    nonisolated static func migrateLegacyMenuBarVisibilityIfNeeded(
+        defaults: UserDefaults = .standard
+    ) {
+        guard !defaults.bool(forKey: menuBarVisibilityMigrationKey) else { return }
+
+        // NSStatusBar 会先以系统生成的 Item-0 名称创建状态项，再允许设置 autosaveName。
+        // 旧质量跑测曾让 macOS 把 Item-0 持久化为隐藏，必须在创建状态项之前清掉。
+        for key in legacyMenuBarVisibilityKeys {
+            defaults.removeObject(forKey: key)
+        }
+        defaults.set(defaultMenuBarPreferredPosition, forKey: menuBarPreferredPositionKey)
+        defaults.set(true, forKey: menuBarVisibilityMigrationKey)
+    }
 
     var body: some Scene {
-        MenuBarExtra(isInserted: $isMenuBarExtraInserted) {
-            MenuBarContent()
-                .environment(appDelegate.appState)
-                .environment(appDelegate.appUpdater)
-        } label: {
-            // 菜单栏图标：自绘填满圆角方 + M 镂空（m.square.fill 自带留白撑不满，改 NSImage 撑满）
-            Image(nsImage: Self.menuBarIcon)
-        }
-
         Window(L("Muse 设置", "Muse Settings"), id: "settings") {
             SettingsView()
                 .environment(appDelegate.appState)
@@ -60,6 +82,24 @@ struct MuseApp: App {
     }
 }
 
+private struct VoicePolishQualityRunnerApp: App {
+    @NSApplicationDelegateAdaptor(VoicePolishQualityRunnerAppDelegate.self) var appDelegate
+
+    var body: some Scene {
+        // 跑测进程只需要应用生命周期，不得构造生产 MenuBarExtra。
+        Settings {
+            EmptyView()
+        }
+    }
+}
+
+@MainActor
+private final class VoicePolishQualityRunnerAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = VoicePolishQualityRunner.startIfRequested()
+    }
+}
+
 // MARK: - App Delegate
 
 @MainActor
@@ -74,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let session = RecognitionSession()
     private let settingsWindowPresenter = SettingsWindowPresenter()
     private let menuBarVisibilityMonitor = MenuBarVisibilityMonitor()
+    private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if VoicePolishQualityRunner.startIfRequested() {
@@ -244,7 +285,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 启动静默探测三模型连通性，模型设置页的灯开箱即亮（2026-06-12）
         ModelConnectivityProber.probeOnLaunchIfNeeded()
 
+        installMenuBarItem()
         menuBarVisibilityMonitor.start()
+    }
+
+    private func installMenuBarItem() {
+        MuseApp.migrateLegacyMenuBarVisibilityIfNeeded()
+
+        // 新状态项若没有用户排序记录，放在右侧常驻区；否则菜单栏拥挤时会被
+        // macOS 排到刘海/ProNotch 覆盖区域。只初始化一次，不覆盖用户后续 Cmd 拖动排序。
+        if UserDefaults.standard.object(forKey: MuseApp.menuBarPreferredPositionKey) == nil {
+            UserDefaults.standard.set(
+                MuseApp.defaultMenuBarPreferredPosition,
+                forKey: MuseApp.menuBarPreferredPositionKey
+            )
+        }
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = MuseApp.menuBarAutosaveName
+        item.isVisible = true
+
+        guard let button = item.button else {
+            AppLogger.log("[Muse] Failed to create menu bar button")
+            return
+        }
+        button.image = MuseApp.menuBarIcon
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyUpOrDown
+        button.toolTip = "Muse"
+        item.menu = makeStatusMenu()
+        statusItem = item
+    }
+
+    private func makeStatusMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(statusMenuItem(L("设置", "Settings"), action: #selector(openSettingsFromStatusMenu)))
+        menu.addItem(statusMenuItem(L("使用引导", "Setup Guide"), action: #selector(openSetupFromStatusMenu)))
+        menu.addItem(statusMenuItem(L("关于", "About"), action: #selector(openAboutFromStatusMenu)))
+        menu.addItem(statusMenuItem(L("检查更新", "Check for Updates"), action: #selector(checkUpdatesFromStatusMenu)))
+        menu.addItem(.separator())
+        menu.addItem(statusMenuItem(L("退出 Muse", "Quit Muse"), action: #selector(quitFromStatusMenu)))
+        return menu
+    }
+
+    private func statusMenuItem(_ title: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    @objc private func openSettingsFromStatusMenu() {
+        openSettingsWindow(preferManualWindow: true)
+    }
+
+    @objc private func openSetupFromStatusMenu() {
+        if let openSetupAction = Self.openSetupAction {
+            openSetupAction()
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            _ = NSApp.sendAction(Selector(("showSetupWindow:")), to: nil, from: nil)
+        }
+    }
+
+    @objc private func openAboutFromStatusMenu() {
+        openSettingsWindow(preferManualWindow: true)
+        NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.about)
+    }
+
+    @objc private func checkUpdatesFromStatusMenu() {
+        openAboutFromStatusMenu()
+        Task {
+            await GitHubReleaseChecker.shared.checkForUpdates()
+        }
+    }
+
+    @objc private func quitFromStatusMenu() {
+        NSApp.terminate(nil)
     }
 
     private func refreshModeAvailability() {
