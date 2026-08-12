@@ -208,6 +208,29 @@ struct VoicePolishResult: Sendable, Equatable {
     let validationCodes: [VoicePolishValidationCode]
     let usedFallback: Bool
     let failureReason: VoicePolishFailureReason?
+    /// 仅供显式质量跑测诊断校验拒绝原因；普通成功与请求失败均为空，且不会
+    /// 写入用户历史或性能统计。
+    let rejectedDraft: String?
+
+    init(
+        text: String,
+        detectedRoute: VoicePolishRoute,
+        executedRoute: VoicePolishRoute,
+        llmAttemptCount: Int,
+        validationCodes: [VoicePolishValidationCode],
+        usedFallback: Bool,
+        failureReason: VoicePolishFailureReason?,
+        rejectedDraft: String? = nil
+    ) {
+        self.text = text
+        self.detectedRoute = detectedRoute
+        self.executedRoute = executedRoute
+        self.llmAttemptCount = llmAttemptCount
+        self.validationCodes = validationCodes
+        self.usedFallback = usedFallback
+        self.failureReason = failureReason
+        self.rejectedDraft = rejectedDraft
+    }
 }
 
 enum VoicePolishFailureReason: String, Sendable, Equatable {

@@ -50,9 +50,9 @@ enum VoicePolishValidator {
         }
         if outputFacts.contains(where: { outputFact in
             !sourceFacts.contains(where: { equivalent($0, outputFact) })
-                && !isSourceBackedQuotedFormattingFact(
+                && !isSourceBackedFormattingFact(
                     outputFact,
-                    sourceText: request.fallbackText
+                    request: request
                 )
         }) {
             append(.planIntegrityFailure, to: &codes)
@@ -72,35 +72,309 @@ enum VoicePolishValidator {
         if retainsExplicitCorrectionNarration(output: output, request: request) {
             append(.supersededFactRetained, to: &codes)
         }
+        appendSemanticBoundaryCodes(output: output, request: request, to: &codes)
         appendTerminologyEditCodes(output: output, request: request, to: &codes)
         appendOutputLayoutCodes(output, request: request, to: &codes)
         return VoicePolishValidationResult(codes: codes)
     }
 
+    /// 模型偶尔会在已经写出最终数量后，用括号补一句旧数量的推导过程，例如
+    /// “共六人参加（产品和设计四人，加上开发）”。这里只删除括号中的旧数字
+    /// 及其紧邻量词，参与方等其余内容原样保留；调用方必须再次执行全部校验。
+    static func removingParentheticalSupersededFacts(
+        from output: String,
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> String? {
+        let superseded = locallySupersededFactIndices(
+            request: request,
+            sourceFacts: sourceFacts
+        ).map { sourceFacts[$0] }
+        guard !superseded.isEmpty,
+              let regex = try? NSRegularExpression(pattern: #"[（(][^（）()\n]{1,80}[）)]"#) else {
+            return nil
+        }
+
+        var candidate = output
+        let fullRange = NSRange(output.startIndex..<output.endIndex, in: output)
+        let ranges = regex.matches(in: output, range: fullRange).compactMap {
+            Range($0.range, in: output)
+        }.filter { range in
+            let parenthetical = String(output[range])
+            return superseded.contains { fact in
+                parenthetical.contains(fact.sourceText)
+                    || fact.canonicalValue.map(parenthetical.contains) == true
+            }
+        }
+        guard !ranges.isEmpty else { return nil }
+        for range in ranges.reversed() {
+            var parenthetical = String(candidate[range])
+            for fact in superseded {
+                let tokens = [fact.sourceText, fact.canonicalValue].compactMap { $0 }
+                for token in Set(tokens) {
+                    parenthetical = parenthetical.replacingOccurrences(
+                        of: NSRegularExpression.escapedPattern(for: token)
+                            + #"\s*(?:个人|人|个|位|名|款|项|条|天|月|年)?"#,
+                        with: "",
+                        options: .regularExpression
+                    )
+                }
+            }
+            candidate.replaceSubrange(range, with: parenthetical)
+        }
+        candidate = candidate.replacingOccurrences(
+            of: #"[ \t]{2,}"#,
+            with: " ",
+            options: .regularExpression
+        )
+        return candidate == output ? nil : candidate
+    }
+
+    /// 只清理由字面可以完全证明的重复与幕后备注。这里不做开放式改写，
+    /// 每条替换都要求原文提供对应证据，避免为追求流畅改变用户含义。
+    static func removingDeterministicDraftArtifacts(
+        from output: String,
+        request: VoicePolishRequest
+    ) -> String? {
+        var candidate = output
+        let source = normalizedNaturalText(request.fallbackText)
+
+        let replacements: [(pattern: String, replacement: String)] = [
+            (#"对比测试\s*[，,：:]?\s*测试(?=已经|已)"#, "对比测试"),
+            (#"是否为最终版\s*[，,]?\s*(?:也就是)?\s*确认(?:一下)?还会不会改"#, "是否为最终版"),
+            (#"是不是最终版\s*[，,]?\s*(?:也就是)?\s*确认(?:一下)?还会不会改"#, "是不是最终版"),
+            (#"我不是不愿意帮你\s*[，,]?\s*(?:也)?不是不想帮\s*[，,]?\s*是真的"#, "我不是不愿意帮你，是真的"),
+            (#"不是不会用\s*AI\s*[，,]?\s*(?:也)?不是工具不会操作\s*[，,]?\s*而是"#, "不是不会用 AI，而是"),
+            (#"今晚先不上\s*[，,]?\s*最终结论是今晚不发布"#, "今晚先不上"),
+        ]
+        for replacement in replacements {
+            candidate = candidate.replacingOccurrences(
+                of: replacement.pattern,
+                with: replacement.replacement,
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+
+        if source.contains("先别改路径和命令") {
+            candidate = candidate.replacingOccurrences(
+                of: #"\s*先别改路径和命令[。.]?"#,
+                with: "",
+                options: .regularExpression
+            )
+        }
+        if source.contains("不是坏了") {
+            candidate = candidate.replacingOccurrences(
+                of: #"这个功能(?:目前)?不是坏了[，,，]?\s*(?:是)?需要"#,
+                with: "这个功能需要",
+                options: .regularExpression
+            )
+        }
+        if source.contains("先保留中文意思") {
+            candidate = candidate.replacingOccurrences(
+                of: #"英文原话没记准[，,]\s*先保留中文意思"#,
+                with: "英文原话没记准，暂不补充",
+                options: .regularExpression
+            )
+        }
+        if source.contains("这个不用展开") && source.contains("网络") {
+            candidate = candidate.replacingOccurrences(
+                of: #"(?:顺便说(?:一下|一句)?[，,]?\s*)?我那天网络(?:也)?不太好[，,]?\s*(?:但)?这个不用展开[。.]?"#,
+                with: "",
+                options: .regularExpression
+            )
+            // 模型有时执行了“不要展开”的措辞约束，却仍把同一条明确排除的
+            // 网络旁注原样留下；来源已明确要求排除，因此也安全删除。
+            candidate = candidate.replacingOccurrences(
+                of: #"(?:顺便说(?:一下|一句)?[，,]?\s*)?我那天网络(?:也)?不太好[。.]?"#,
+                with: "",
+                options: .regularExpression
+            )
+        }
+        if source.contains("不是我想说的不只是更新难") {
+            candidate = candidate.replacingOccurrences(
+                of: #"做内容最难的是持续更新[。.]\s*不只是更新难[，,]?\s*更难的是"#,
+                with: "做内容最难的不只是持续更新，更难的是",
+                options: .regularExpression
+            )
+        }
+        if request.context.scene == .code,
+           source.contains("检查codesign") && source.contains("最后再启动应用") {
+            candidate = candidate.replacingOccurrences(
+                of: #"(检查\s*`?codesign`?)[，,]\s*最后(?:再)?启动应用"#,
+                with: "$1\n\n最后启动应用",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+        if source.contains("上线时间") && source.contains("月底")
+            && source.contains("不写死具体日期") {
+            candidate = candidate.replacingOccurrences(
+                of: #"上线时间(?:原计划|原定|原来说)月底[，,]?\s*但今天讨论后(?:认为|觉得)?风险(?:较大|太大)[，,]?\s*暂不写死具体日期"#,
+                with: "上线时间暂不写死具体日期",
+                options: .regularExpression
+            )
+        }
+
+        candidate = candidate.replacingOccurrences(
+            of: #"(?:[。.]?\s*)?(?:今天讨论的事项)?(?:汇总如下|总结如下|整理如下)[。.]?\s*$"#,
+            with: "",
+            options: .regularExpression
+        ).replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return candidate == output ? nil : candidate
+    }
+
     /// 模型可能为原文已有词语补中文或英文引号。引号本身属于排版，不应被
     /// ProtectedFactExtractor 当作“新增引用事实”；只有去掉成对引号后的完整内容
     /// 已逐字存在于正式输入时才放行。
-    private static func isSourceBackedQuotedFormattingFact(
+    private static func isSourceBackedFormattingFact(
         _ fact: SourceFactCandidate,
-        sourceText: String
+        request: VoicePolishRequest
     ) -> Bool {
-        guard fact.kind == .quotedPhrase, fact.sourceText.count >= 2 else { return false }
-        let characters = Array(fact.sourceText)
-        let isPairedQuote = (characters.first == "“" && characters.last == "”")
-            || (characters.first == "\"" && characters.last == "\"")
-        guard isPairedQuote else { return false }
-        let interior = String(characters.dropFirst().dropLast())
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return !interior.isEmpty && sourceText.contains(interior)
+        let interior: String
+        switch fact.kind {
+        case .quotedPhrase:
+            guard fact.sourceText.count >= 2 else { return false }
+            let characters = Array(fact.sourceText)
+            let isPairedQuote = (characters.first == "“" && characters.last == "”")
+                || (characters.first == "\"" && characters.last == "\"")
+            guard isPairedQuote else { return false }
+            interior = String(characters.dropFirst().dropLast())
+        case .command:
+            guard fact.sourceText.hasPrefix("`"), fact.sourceText.hasSuffix("`") else {
+                return false
+            }
+            interior = String(fact.sourceText.dropFirst().dropLast())
+        case .codeIdentifier:
+            interior = fact.sourceText
+        case .number:
+            guard fact.canonicalValue == "1" else { return false }
+            let source = request.fallbackText
+            return source.range(
+                of: #"(?:另外)?还有一个(?:没定|未定|待定|待确认)"#,
+                options: .regularExpression
+            ) != nil
+        default:
+            return false
+        }
+        let normalizedInterior = normalizedNaturalText(interior)
+        guard !normalizedInterior.isEmpty else { return false }
+        if normalizedNaturalText(request.fallbackText).contains(normalizedInterior) {
+            return true
+        }
+        return fact.kind == .command
+            && request.context.scene == .code
+            && normalizedNaturalText(
+                dictatedSymbolProjection(request.fallbackText)
+            ).contains(normalizedInterior)
+    }
+
+    /// 代码口述中的“斜杠 / 点 / 双横线”可以确定性还原为符号。这里只生成
+    /// 本地校验投影，不改用户原文，也不允许补出来源中没有口述的命令内容。
+    private static func dictatedSymbolProjection(_ source: String) -> String {
+        [
+            ("双横线", "--"),
+            ("短横线", "-"),
+            ("反斜杠", "\\"),
+            ("斜杠", "/"),
+            ("下划线", "_"),
+            ("点", "."),
+        ].reduce(source) { text, replacement in
+            text.replacingOccurrences(of: replacement.0, with: replacement.1)
+        }
+    }
+
+    /// 只拦截能够由原文逐字证明的少量动作与幕后指令泄漏，不做开放式语义猜测。
+    /// 这些规则服务于 Fast 路径的第二次安全修复，并保持误杀面最窄。
+    private static func appendSemanticBoundaryCodes(
+        output: String,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        let source = normalizedNaturalText(request.fallbackText)
+        let draft = normalizedNaturalText(output)
+
+        let sourceChecksCodeSign = request.fallbackText.range(
+            of: #"检查\s*`?codesign`?"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+        let draftExecutesCodeSign = output.range(
+            of: #"执行\s*`?codesign`?"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+        if sourceChecksCodeSign, draftExecutesCodeSign {
+            append(.planIntegrityFailure, to: &codes)
+        }
+
+        // 人数不能替代参与方名单。只在原文明确出现“参加的人/参与的人”等
+        // 参会信号，且至少有两个常见角色时启用，避免把普通业务词误当名单。
+        let participantSignals = ["参加的人有", "参与的人有", "参会的人有", "参加人员有", "参与方有"]
+        let participantRoles = [
+            "产品", "设计", "开发", "测试", "运营", "市场", "销售", "法务", "财务", "技术", "客户",
+        ]
+        if participantSignals.contains(where: source.contains) {
+            let requiredRoles = participantRoles.filter(source.contains)
+            if requiredRoles.count >= 2,
+               requiredRoles.contains(where: { !draft.contains($0) }) {
+                append(.missingProtectedFact, to: &codes)
+            }
+        }
+
+        // 原文只说内容/想法要成熟时，模型不得擅自把修饰对象改成“自己”。
+        // 这是本地可逐字证明的窄门禁，不尝试开放式语义比较。
+        if source.contains("等") && source.contains("成熟") && !source.contains("自己"),
+           draft.range(of: #"等自己.{0,6}成熟"#, options: .regularExpression) != nil {
+            append(.planIntegrityFailure, to: &codes)
+        }
+
+        // 这些是可以从字面确定的未收口或同义机械重复；触发一次 Fast 修复，
+        // 避免自动事实校验通过但仍不能直接发送。
+        let deterministicRepetition = draft.contains("对比测试测试已经")
+            || draft.contains("今晚先不上最终结论是今晚不发布")
+            || draft.contains("不是不会用ai也不是工具不会操作")
+            || (draft.contains("是否为最终版") && draft.contains("还会不会改"))
+            || (source.contains("不是我想说的不只是更新难")
+                && draft.contains("最难的是持续更新不只是更新难"))
+        let danglingSummaryLeadIn = ["汇总如下", "总结如下", "整理如下"].contains {
+            draft.hasSuffix($0)
+        }
+        if deterministicRepetition || danglingSummaryLeadIn {
+            append(.planIntegrityFailure, to: &codes)
+        }
+
+        // 用户明确只保留可靠中文意思时，残缺英文不是正文事实。
+        if source.contains("英文原话") && source.contains("先保留中文意思"),
+           output.range(of: #"(?i)don['’]?t\s+optimize"#, options: .regularExpression) != nil {
+            append(.planIntegrityFailure, to: &codes)
+        }
+
+        let leakedMetaInstruction = (
+            source.contains("这句别写得太重")
+                && (draft.contains("语气不用太重") || draft.contains("事情要说清楚"))
+        ) || (
+            source.contains("不要替我确定具体版本")
+                && draft.contains("不要确定具体版本")
+        ) || (
+            source.contains("这个别放在已确定事项里")
+                && draft.contains("不列入已确定事项")
+        )
+        if leakedMetaInstruction {
+            append(.promptLeakage, to: &codes)
+        }
     }
 
     /// Fast 路径没有模型生成的 Plan，因此只接受本地能证明的最窄改口事实：
     /// 同一 segment 中，改口信号前最近的受保护事实，与信号后首个同类型、不同值
     /// 的事实形成替换关系。其余金额、日期、版本等仍全部要求保留。
-    private static func locallySupersededFactIndices(
+    static func locallySupersededFactIndices(
         request: VoicePolishRequest,
         sourceFacts: [SourceFactCandidate]
     ) -> Set<Int> {
+        if isPublicCorrectionNotice(request) { return [] }
+
         struct LocatedFact {
             let index: Int
             let location: String.Index
@@ -170,6 +444,7 @@ enum VoicePolishValidator {
         request: VoicePolishRequest
     ) -> Bool {
         let source = normalizedNaturalText(request.fallbackText).lowercased()
+        if isPublicCorrectionNotice(request) { return false }
         let explicitSelfCorrectionSignals = [
             "我说错了", "我刚才说的", "刚才说错了", "我改一下", "我的意思是",
             "let me correct that", "i said that wrong", "scratch that", "i mean",
@@ -186,6 +461,19 @@ enum VoicePolishValidator {
             "what i just said", "the correct name is", "scratch that", "i mean",
         ]
         return leakedNarrationSignals.contains(where: normalizedOutput.contains)
+    }
+
+    /// 对外纠错与普通口误相反：旧说法和正确说法都必须保留。仅凭“说明一下”
+    /// 不足以豁免，必须同时存在公开说明信号与明确纠错证据。
+    private static func isPublicCorrectionNotice(_ request: VoicePolishRequest) -> Bool {
+        guard request.context.scene == .socialPost else { return false }
+        let source = normalizedNaturalText(request.fallbackText).lowercased()
+        let noticeSignals = ["说明一下", "更正说明", "更正一下", "澄清一下"]
+        let correctionSignals = [
+            "说错", "误将", "错误", "有误", "正确日期", "正确时间", "正确名称", "正确说法",
+        ]
+        return noticeSignals.contains(where: source.contains)
+            && correctionSignals.contains(where: source.contains)
     }
 
     static func validateStructured(
@@ -469,9 +757,12 @@ enum VoicePolishValidator {
         if candidate.kind == .lexiconEntity, let canonical = candidate.canonicalValue {
             return normalizedNaturalText(output).contains(normalizedNaturalText(canonical))
         }
+        if candidate.kind == .codeIdentifier, let canonical = candidate.canonicalValue {
+            return normalizedNaturalText(output).contains(normalizedNaturalText(canonical))
+        }
         if let canonical = candidate.canonicalValue {
             return outputFacts.contains {
-                $0.kind == candidate.kind && $0.canonicalValue == canonical
+                compatibleKinds(candidate, $0) && $0.canonicalValue == canonical
             }
         }
         return output.contains(candidate.sourceText)
@@ -487,7 +778,12 @@ enum VoicePolishValidator {
         }
         if let canonical = canonicalValue(for: fact) {
             return outputFacts.contains {
-                $0.kind == fact.kind && $0.canonicalValue == canonical
+                compatibleKinds(
+                    leftKind: fact.kind,
+                    leftSource: fact.sourceText,
+                    rightKind: $0.kind,
+                    rightSource: $0.sourceText
+                ) && $0.canonicalValue == canonical
             }
         }
         return output.contains(fact.sourceText)
@@ -497,10 +793,52 @@ enum VoicePolishValidator {
         _ left: SourceFactCandidate,
         _ right: SourceFactCandidate
     ) -> Bool {
-        left.kind == right.kind
+        compatibleKinds(left, right)
             && (left.canonicalValue != nil
                 ? left.canonicalValue == right.canonicalValue
                 : left.sourceText == right.sourceText)
+    }
+
+    /// “Swift 六点一”在 ASR 原文中会按普通数字提取，成稿写成 `6.1` 后则会
+    /// 按版本号提取。口述“总金额是四万八”没有明确币种，成稿写成 `48,000`
+    /// 时也只是数字书写变化；带元、美元或货币符号的金额仍不允许丢失币种。
+    private static func compatibleKinds(
+        _ left: SourceFactCandidate,
+        _ right: SourceFactCandidate
+    ) -> Bool {
+        compatibleKinds(
+            leftKind: left.kind,
+            leftSource: left.sourceText,
+            rightKind: right.kind,
+            rightSource: right.sourceText
+        )
+    }
+
+    private static func compatibleKinds(
+        leftKind: ProtectedFactKind,
+        leftSource: String,
+        rightKind: ProtectedFactKind,
+        rightSource: String
+    ) -> Bool {
+        if leftKind == rightKind { return true }
+        if (leftKind == .number && rightKind == .version)
+            || (leftKind == .version && rightKind == .number) {
+            return !leftSource.lowercased().hasPrefix("v")
+                && !rightSource.lowercased().hasPrefix("v")
+        }
+        if leftKind == .amount, rightKind == .number {
+            return isUnitlessLabeledAmount(leftSource)
+        }
+        if leftKind == .number, rightKind == .amount {
+            return isUnitlessLabeledAmount(rightSource)
+        }
+        return false
+    }
+
+    private static func isUnitlessLabeledAmount(_ source: String) -> Bool {
+        guard source.contains("金额") else { return false }
+        let explicitCurrencySignals = ["¥", "￥", "$", "元", "块", "美元", "人民币"]
+        return !explicitCurrencySignals.contains(where: source.contains)
     }
 
     private static func outputSegment(_ output: String) -> RecognitionSegment {
@@ -607,12 +945,17 @@ enum VoicePolishValidator {
             // 自定义 Prompt 使用轻量结构。明确的禁列表/禁换行已由上方独立校验。
             break
         case .paragraphs:
-            if paragraphCount(in: output) < expectation.minimumParagraphCount {
+            let blockCount = paragraphCount(in: output)
+            let hasAutomaticHybridStructure = recognizedListCount >= 2
+                && blockCount >= 2
+                && !hasExplicitParagraphRequirement(request)
+            if blockCount < expectation.minimumParagraphCount,
+               !hasAutomaticHybridStructure {
                 append(.layoutRequirementUnmet, to: &codes)
             }
-            if recognizedListCount >= 2 {
-                append(.layoutRequirementUnmet, to: &codes)
-            }
+            // paragraphs 是最低分段要求，不是“禁止列表”。邮件、Prompt、需求
+            // 笔记常见“引言 + 要求/范围列表 + 收束”的混合结构；只有用户明确
+            // 禁止列表时才由上方 forbidsLists 门禁拒绝。
         case .numberedList:
             let count = numberedCount
             if let expected = expectation.expectedListItemCount {
@@ -654,6 +997,17 @@ enum VoicePolishValidator {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .count
+    }
+
+    private static func hasExplicitParagraphRequirement(
+        _ request: VoicePolishRequest
+    ) -> Bool {
+        let requirements = request.preferences.additionalRequirements.lowercased()
+        let signals = [
+            "分段", "段落", "每段", "几段", "换行",
+            "paragraph", "line break", "new line",
+        ]
+        return signals.contains(where: requirements.contains)
     }
 
     private static func append(

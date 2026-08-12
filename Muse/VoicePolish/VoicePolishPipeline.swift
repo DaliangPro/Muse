@@ -460,7 +460,9 @@ struct VoicePolishPipeline: Sendable {
                     system: VoicePolishPrompts.fast,
                     user: payload,
                     options: LLMGenerationOptions(
-                        temperature: 0.2,
+                        // 语音成稿追求同输入稳定收敛，创意随机性只会放大漏约束、
+                        // 旧改口残留和幕后指令泄漏的概率。
+                        temperature: 0,
                         maxOutputTokens: Self.outputTokenBudget(
                             for: request,
                             task: .voicePolishFast
@@ -484,22 +486,128 @@ struct VoicePolishPipeline: Sendable {
                 )
             }
             let output = normalizedLayoutText(outputDraft, request: request)
-            let validation = VoicePolishValidator.validateFast(
-                output: output,
+            var finalOutput = VoicePolishValidator.removingDeterministicDraftArtifacts(
+                from: output,
+                request: request
+            ) ?? output
+            var validation = VoicePolishValidator.validateFast(
+                output: finalOutput,
                 request: request,
                 sourceFacts: sourceFacts
             )
+            if validation.codes.contains(.supersededFactRetained),
+               let cleaned = VoicePolishValidator.removingParentheticalSupersededFacts(
+                   from: finalOutput,
+                   request: request,
+                   sourceFacts: sourceFacts
+               ) {
+                let cleanedValidation = VoicePolishValidator.validateFast(
+                    output: cleaned,
+                    request: request,
+                    sourceFacts: sourceFacts
+                )
+                if !cleanedValidation.hasHardFailure {
+                    finalOutput = cleaned
+                    validation = cleanedValidation
+                }
+            }
+            let repairableFastCodes: Set<VoicePolishValidationCode> = [
+                .explanationOnly,
+                .promptLeakage,
+                .missingProtectedFact,
+                .supersededFactRetained,
+                .excludedSideNoteLeaked,
+                .planIntegrityFailure,
+                .layoutRequirementUnmet,
+            ]
+            let hardCodes = validation.codes.filter(\.isHardFailure)
+            if !hardCodes.isEmpty,
+               hardCodes.allSatisfy(repairableFastCodes.contains) {
+                do {
+                    let timeout = try availableTimeout(
+                        stageLimit: repairTimeout,
+                        startedAt: startedAt,
+                        request: request
+                    )
+                    attempts += 1
+                    let repairPayload = try VoicePolishPrompts.fastRepairPayload(
+                        originalPayload: payload,
+                        rawResponse: finalOutput,
+                        validationCodes: validation.codes.filter(\.isHardFailure),
+                        request: request,
+                        sourceFacts: sourceFacts
+                    )
+                    let repairedRaw = try await generate(
+                        LLMRequest(
+                            context: .processingMode,
+                            task: .voicePolishRepair,
+                            system: VoicePolishPrompts.fastContentRepair,
+                            user: repairPayload,
+                            options: LLMGenerationOptions(
+                                temperature: 0,
+                                maxOutputTokens: Self.outputTokenBudget(
+                                    for: request,
+                                    task: .voicePolishRepair
+                                ),
+                                reasoningPolicy: .disabled,
+                                responseFormat: .text
+                            )
+                        ),
+                        timeout: timeout
+                    ).text
+                    guard let repairedDraft = VoicePolishOutputNormalizer.plainText(
+                        repairedRaw,
+                        sourceText: request.fallbackText
+                    ) else {
+                        throw StructuredLLMDecoderError.invalidJSON
+                    }
+                    let repaired = normalizedLayoutText(repairedDraft, request: request)
+                    let repairedValidation = VoicePolishValidator.validateFast(
+                        output: repaired,
+                        request: request,
+                        sourceFacts: sourceFacts
+                    )
+                    guard !repairedValidation.hasHardFailure else {
+                        return fallback(
+                            request: request,
+                            detectedRoute: detectedRoute,
+                            executedRoute: .fast,
+                            attempts: attempts,
+                            codes: repairedValidation.codes,
+                            rejectedDraft: repaired
+                        )
+                    }
+                    return success(
+                        text: repaired,
+                        detectedRoute: detectedRoute,
+                        executedRoute: .fast,
+                        attempts: attempts,
+                        codes: repairedValidation.codes
+                    )
+                } catch {
+                    return fallback(
+                        request: request,
+                        detectedRoute: detectedRoute,
+                        executedRoute: .fast,
+                        attempts: attempts,
+                        codes: validation.codes,
+                        reason: failureReason(for: error),
+                        rejectedDraft: finalOutput
+                    )
+                }
+            }
             guard !validation.hasHardFailure else {
                 return fallback(
                     request: request,
                     detectedRoute: detectedRoute,
                     executedRoute: .fast,
                     attempts: attempts,
-                    codes: validation.codes
+                    codes: validation.codes,
+                    rejectedDraft: finalOutput
                 )
             }
             return success(
-                text: output,
+                text: finalOutput,
                 detectedRoute: detectedRoute,
                 executedRoute: .fast,
                 attempts: attempts,
@@ -960,7 +1068,8 @@ struct VoicePolishPipeline: Sendable {
         executedRoute: VoicePolishRoute,
         attempts: Int,
         codes: [VoicePolishValidationCode],
-        reason: VoicePolishFailureReason = .validationFailed
+        reason: VoicePolishFailureReason = .validationFailed,
+        rejectedDraft: String? = nil
     ) -> VoicePolishResult {
         // 回退仍以 canonical transcript 为唯一内容来源；先只移除可证明错误的
         // ASR 标点/空白，再在字符与顺序不变的前提下补段落或列表结构，避免
@@ -1001,7 +1110,8 @@ struct VoicePolishPipeline: Sendable {
             llmAttemptCount: attempts,
             validationCodes: codes,
             usedFallback: true,
-            failureReason: reason
+            failureReason: reason,
+            rejectedDraft: rejectedDraft
         )
     }
 }

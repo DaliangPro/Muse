@@ -75,6 +75,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menuBarVisibilityMonitor = MenuBarVisibilityMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if VoicePolishQualityRunner.startIfRequested() {
+            return
+        }
         AppLogger.log("[Muse] applicationDidFinishLaunching")
         AppStartupCoordinator.configureActivationPolicy()
         AppearanceController.start()  // 启动即设 app 级外观，让窗口创建前就定好，避免设置窗口首帧深色

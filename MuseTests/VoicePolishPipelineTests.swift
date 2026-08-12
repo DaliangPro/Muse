@@ -23,6 +23,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         let requests = await client.recordedRequests()
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests[0].task, .voicePolishFast)
+        XCTAssertEqual(requests[0].options.temperature, 0)
         XCTAssertEqual(requests[0].options.maxOutputTokens, 2_048)
         XCTAssertEqual(
             VoicePolishPipeline.defaultFirstRequestTimeout(for: makeRequest(source)),
@@ -44,6 +45,237 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertTrue(result.validationCodes.contains(.emptyOutput))
         let requestCount = await client.requestCount()
         XCTAssertEqual(requestCount, 1)
+    }
+
+    func testBalancedRepairsHardValidatedPlainTextOnce() async {
+        let source = "项目周期是九个月，今天同步一下当前进度。"
+        let firstDraft = "今天同步一下当前进度。"
+        let repaired = "项目周期是 9 个月，今天同步一下当前进度。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(firstDraft),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast, .voicePolishRepair])
+        XCTAssertEqual(requests[1].options.responseFormat, .text)
+        XCTAssertTrue(requests[1].user.contains(#""required_facts""#))
+    }
+
+    func testBalancedFastRepairCarriesLocallyProvenForbiddenOldFact() async {
+        let source = "先看十二个月，不对，数据只有九个月，那就分析全部九个月。"
+        let invalid = "先看十二个月的数据，不对，数据只有九个月，那就分析全部九个月。"
+        let repaired = "分析全部 9 个月数据。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(invalid),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .aiPrompt))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast, .voicePolishRepair])
+        XCTAssertTrue(requests[1].user.contains(#""forbidden_superseded_facts""#))
+        XCTAssertTrue(requests[1].user.contains(#""source_text":"十二""#))
+        XCTAssertTrue(requests[1].user.contains(#""canonical_value":"12""#))
+        XCTAssertTrue(requests[1].user.contains(#""source_text":"九""#))
+    }
+
+    func testBalancedAcceptsSingularPendingItemRestatement() async {
+        let source = "今天会议主要定了三件事：第一，首页不改结构只换文案；第二，小陈周三前补齐数据；第三，我整理测试清单。另外还有一个没定的是发布日期，要等客户回复。"
+        let output = "今天会议主要定了三件事：第一，首页不改结构，只换文案；第二，小陈周三前补齐数据；第三，我整理测试清单。另外还有一项未确定：发布日期要等客户回复。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .document))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertTrue(result.text.contains("另外还有一项未确定"))
+        XCTAssertTrue(result.text.contains("发布日期要等客户回复"))
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testBalancedRepairsParaphrasedMetaInstructionLeakage() async {
+        let source = "这个问题要同步给负责人，已经连续两次延期，如果今天还不能给明确时间，后面的排期都会受影响。这句别写得太重，但事情要说清楚。"
+        let leaked = "这个问题要同步给负责人，已经连续两次延期。如果今天还不能给明确时间，后面的排期都会受影响。语气不用太重，但事情要说清楚。"
+        let repaired = "这个问题需要同步给负责人。已经连续两次延期，如果今天还不能给出明确时间，后面的排期都会受影响。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(leaked),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertFalse(result.validationCodes.contains(.promptLeakage))
+    }
+
+    func testBalancedRejectsCodeActionVerbMutation() async {
+        let source = "部署第四步检查 codesign，最后再启动应用。"
+        let mutated = "部署第四步执行 `codesign`，最后再启动应用。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(mutated),
+            .response(mutated),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .code))
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+        XCTAssertTrue(result.text.contains("检查 codesign"))
+        XCTAssertFalse(result.text.contains("执行 `codesign`"))
+    }
+
+    func testBalancedRepairsMissingParticipantRolesEvenWhenFinalCountIsKept() async {
+        let source = "评审先定周三下午三点，参加的人有产品和设计，一共四个人。不对，开发也要参加，那就是六个人。最终放到周四上午十点。"
+        let incomplete = "评审最终安排在周四上午十点，共六人参加。"
+        let repaired = "评审最终安排在周四上午十点，产品、设计和开发参加，共六人。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(incomplete),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertFalse(result.validationCodes.contains(.missingProtectedFact))
+    }
+
+    func testBalancedRepairsIntroducedMaturitySubject() async {
+        let source = "如果只是为了不断更，内容会像任务；但每次都等特别成熟又永远发不出来，所以我想找一个中间状态，有真实想法但不用完美。"
+        let drifted = "如果只是为了不断更，内容会像任务；但每次都等自己特别成熟再发，又永远发不出来。"
+        let repaired = "如果只是为了不断更，内容会像任务；但每次都等想法完全成熟，又可能永远发不出来。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(drifted),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .socialPost))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testBalancedLocallyRemovesDeterministicRepetitionWithoutSecondCall() async {
+        let source = "同步一下，Typeless 的对比测试测试已经跑完了。"
+        let repeated = "同步一下，Typeless 的对比测试，测试已经跑完了。"
+        let repaired = "同步一下，Typeless 的对比测试已经跑完了。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(repeated)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedLocallyRemovesEquivalentFinalVersionRestatement() async {
+        let source = "小林，确认合同里的三个报价是不是最终版，就是确认一下还会不会改。如果会改请标出来。"
+        let repeated = "小林，请确认合同里的三个报价是否为最终版，也就是确认一下还会不会改。如果会改，请标出来。"
+        let expected = "小林，请确认合同里的三个报价是否为最终版。如果会改，请标出来。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(repeated)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, expected)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedLocallyRemovesEquivalentAbilityRestatement() async {
+        let source = "很多人不是不会用 AI，不是工具不会操作，而是不知道什么时候该用。"
+        let repeated = "很多人不是不会用 AI，也不是工具不会操作，而是不知道什么时候该用。"
+        let expected = "很多人不是不会用 AI，而是不知道什么时候该用。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(repeated)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .note))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, expected)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedLocallyRemovesEquivalentWillingnessRestatement() async {
+        let source = "我不是不愿意帮你，不是说不想帮，是真的这两天排不开。"
+        let repeated = "我不是不愿意帮你，也不是不想帮，是真的这两天排不开。"
+        let expected = "我不是不愿意帮你，是真的这两天排不开。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(repeated)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .chat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, expected)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedLocallyRemovesExplicitlyExcludedNetworkAside() async {
+        let source = "这次分享有三点：第一少讲背景；第二演示提前跑一遍。顺便说一下我那天网络也不太好，但这个不用展开；第三留操作时间。"
+        let leaked = "这次分享有三点：\n\n第一，少讲背景。\n\n第二，演示提前跑一遍。顺便说一句，我那天网络不太好，但这个不用展开。\n\n第三，留操作时间。"
+        let expected = "这次分享有三点：\n\n1. 少讲背景。\n\n2. 演示提前跑一遍。\n\n3. 留操作时间。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(leaked)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .socialPost))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, expected)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedLocallyKeepsOnlyFinalContentDifficultyClaim() async {
+        let source = "做内容最难的是持续更新。不是，我想说的不只是更新难，更难的是每次发布前知道为什么要发。"
+        let conflicting = "做内容最难的是持续更新。不只是更新难，更难的是每次发布前知道为什么要发。"
+        let expected = "做内容最难的不只是持续更新，更难的是每次发布前知道为什么要发。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(conflicting)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .socialPost))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, expected)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedLocallySeparatesCodeSignCheckFromFinalLaunch() async {
+        let source = "第四检查 codesign，最后再启动应用。"
+        let combined = "4. 检查 `codesign`，最后启动应用。"
+        let expected = "4. 检查 `codesign`\n\n最后启动应用。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(combined)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .code))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, expected)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+    }
+
+    func testBalancedRepairsUncertainEnglishWhenUserRequestsChineseMeaningOnly() async {
+        let source = "英文原话我记不准，好像是 don't optimize what you haven't 什么，先保留中文意思，作者不要猜。"
+        let uncertainEnglish = "大意是不要优化还没有验证的东西。英文是 Don't optimize what you haven't...。"
+        let repaired = "大意是：不要优化还没有验证的东西。英文原话和作者都没有记清，暂不补充。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(uncertainEnglish),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .note))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
     }
 
     func testFallbackAppliesOnlyConfirmedCanonicalEntityCorrection() async {
@@ -75,6 +307,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         let raw = "我正在使用 Type less。"
         let canonical = "我正在使用 Typeless。"
         let client = ScriptedVoicePolishLLM(steps: [
+            .response("我正在使用 Typeless（Type less）。"),
             .response("我正在使用 Typeless（Type less）。"),
         ])
         let request = VoicePolishRequest(
@@ -115,13 +348,18 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.text, canonical)
         XCTAssertTrue(result.validationCodes.contains(.supersededFactRetained))
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast, .voicePolishRepair])
     }
 
     func testBalancedUsesOnePlainTextCallToApplyContextualEntityCorrection() async {
         let source = "今天中午我们去食奇家吃饭我刚才说的食奇家不对正确名字是食其家它是一家餐饮品牌以后这段内容里都统一写成食其家然后我们再讨论下午的项目安排"
         let output = "今天中午我们去食其家吃饭。它是一家餐饮品牌。\n\n然后，我们再讨论下午的项目安排。"
-        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(output),
+            .response(output),
+        ])
 
         let result = await pipeline(client).process(makeRequest(source))
 
@@ -159,9 +397,101 @@ final class VoicePolishPipelineTests: XCTestCase {
         let result = await pipeline(client).process(makeRequest(source))
 
         XCTAssertEqual(result.executedRoute, .fast)
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertTrue(result.usedFallback)
         XCTAssertTrue(result.validationCodes.contains(.supersededFactRetained))
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast, .voicePolishRepair])
+    }
+
+    func testBalancedCodeAllowsOnlyProvenDictatedSymbolRestoration() async {
+        let source = "文件在Muse斜杠VoicePolish斜杠VoicePolishPipeline点swift，复现命令是swift test双横线filter VoicePolishPipelineTests。"
+        let output = "文件：`Muse/VoicePolish/VoicePolishPipeline.swift`\n\n复现命令：`swift test --filter VoicePolishPipelineTests`"
+        let accepted = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response(output),
+        ])).process(makeRequest(source, scene: .code))
+
+        XCTAssertFalse(accepted.usedFallback)
+        XCTAssertEqual(accepted.text, output)
+        XCTAssertFalse(accepted.validationCodes.contains(.planIntegrityFailure))
+
+        let invented = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response("复现命令：`swift test --filter SecretTests`"),
+        ])).process(makeRequest(source, scene: .code))
+
+        XCTAssertTrue(invented.usedFallback)
+        XCTAssertTrue(invented.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testBalancedAcceptsLabeledChineseAmountRenderedAsPlainDigits() async {
+        let source = "陈律师您好，请确认合同总金额是四万八。"
+        let output = "陈律师您好，请确认合同总金额是 48,000。"
+        let result = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response(output),
+        ])).process(makeRequest(source, scene: .email))
+
+        XCTAssertFalse(
+            result.usedFallback,
+            "codes=\(result.validationCodes.map(\.rawValue)) rejected=\(String(describing: result.rejectedDraft))"
+        )
+        XCTAssertEqual(result.text, output)
+    }
+
+    func testBalancedAcceptsSourceBackedSwiftDiagnosticInBackticksAfterStutterCleanup() async {
+        let source = "让让AI帮我查这个这个Swift并并发问题现象是偶发出现 MainActor isolated property cannot be referenced 然后不要直接改代码先解释原因列出可能的调用链最后给最小修改方案和需要补的测试"
+        let output = """
+        请帮我排查一个 Swift 并发问题。现象是偶发出现 `MainActor isolated property cannot be referenced` 错误。请先不要直接修改代码，按以下步骤处理：
+
+        1. 解释该错误出现的原因；
+        2. 列出可能导致问题的调用链；
+        3. 给出最小修改方案；
+        4. 列出需要补充的测试。
+        """
+        let result = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response(output),
+        ])).process(makeRequest(source, scene: .aiPrompt))
+
+        let sourceFacts = ProtectedFactExtractor.extract(from: [RecognitionSegment(
+            id: "source",
+            text: source,
+            startTimeMs: nil,
+            endTimeMs: nil,
+            confidence: nil,
+            isFinal: true
+        )])
+        let outputFacts = ProtectedFactExtractor.extract(from: [RecognitionSegment(
+            id: "output",
+            text: output,
+            startTimeMs: nil,
+            endTimeMs: nil,
+            confidence: nil,
+            isFinal: true
+        )])
+        XCTAssertFalse(
+            result.usedFallback,
+            "codes=\(result.validationCodes.map(\.rawValue)) sourceFacts=\(sourceFacts) outputFacts=\(outputFacts) rejected=\(String(describing: result.rejectedDraft))"
+        )
+        XCTAssertEqual(result.text, output)
+    }
+
+    func testPublicCorrectionKeepsOldAndNewFactsButOrdinaryCorrectionDoesNot() async {
+        let publicSource = "更正说明昨天视频把日期说成了八月十八日这是我们说错了正确日期是八月二十八日。"
+        let publicOutput = "更正说明：昨天视频误将日期说成 8 月 18 日，正确日期为 8 月 28 日。"
+        let publicResult = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response(publicOutput),
+        ])).process(makeRequest(publicSource, scene: .socialPost))
+
+        XCTAssertFalse(publicResult.usedFallback)
+        XCTAssertEqual(publicResult.text, publicOutput)
+
+        let ordinarySource = "会议日期是八月十八日，我说错了，正确日期是八月二十八日。"
+        let ordinaryOutput = "会议日期原定为 8 月 18 日，正确日期是 8 月 28 日。"
+        let ordinaryResult = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response(ordinaryOutput),
+        ])).process(makeRequest(ordinarySource, scene: .workChat))
+
+        XCTAssertTrue(ordinaryResult.usedFallback)
+        XCTAssertTrue(ordinaryResult.validationCodes.contains(.supersededFactRetained))
     }
 
     func testBalancedUsesOnePlainTextCallToRemoveMultipleFalseStarts() async {
@@ -268,6 +598,23 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertFalse(result.validationCodes.contains(.missingProtectedFact))
         XCTAssertFalse(result.validationCodes.contains(.supersededFactRetained))
         XCTAssertFalse(result.text.contains("16800"))
+    }
+
+    func testBalancedRemovesParentheticalOldCountAfterProvenCorrection() async {
+        let source = "评审先定周三下午三点，产品和设计一共四个人。不对，开发也参加，那就是六个人，时间最终改到周四上午十点。"
+        let output = "评审最终安排在周四上午十点，共六人参加（产品和设计四人，加上开发）。"
+        let result = await pipeline(ScriptedVoicePolishLLM(steps: [
+            .response(output),
+        ])).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(
+            result.text,
+            "评审最终安排在周四上午十点，共六人参加（产品和设计，加上开发）。"
+        )
+        XCTAssertTrue(result.text.contains("产品和设计"))
+        XCTAssertTrue(result.text.contains("开发"))
+        XCTAssertFalse(result.validationCodes.contains(.supersededFactRetained))
     }
 
     func testStructuredCorrectionSucceedsWithProtectedFinalFacts() async throws {
@@ -597,7 +944,8 @@ final class VoicePolishPipelineTests: XCTestCase {
 
     private func makeRequest(
         _ text: String,
-        quality: VoicePolishQualityMode = .balanced
+        quality: VoicePolishQualityMode = .balanced,
+        scene: WritingScene = .unknown
     ) -> VoicePolishRequest {
         VoicePolishRequest(
             input: VoiceInputEnvelope(
@@ -613,7 +961,7 @@ final class VoicePolishPipelineTests: XCTestCase {
                 durationMs: 2_000,
                 provider: .volcano
             ),
-            context: .phaseOneUnknown,
+            context: WritingContext(scene: scene),
             preferences: UserPolishPreferences(additionalRequirements: "{text}"),
             qualityMode: quality
         )

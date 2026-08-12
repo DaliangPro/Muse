@@ -308,7 +308,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
 
         XCTAssertEqual(result.detectedRoute, .fast)
         XCTAssertEqual(result.executedRoute, .fast)
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertTrue(result.usedFallback)
         XCTAssertTrue(result.validationCodes.contains(.layoutRequirementUnmet))
         XCTAssertEqual(
@@ -705,7 +705,7 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
         let result = await pipeline(client).process(request)
 
         XCTAssertEqual(result.executedRoute, .fast)
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertTrue(result.usedFallback)
         XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
         XCTAssertEqual(

@@ -122,6 +122,27 @@ final class VoicePolishCoreTests: XCTestCase {
         )
     }
 
+    func testFactExtractorKeepsBoundedSingleDigitsAndSpacedChineseAmount() {
+        let facts = ProtectedFactExtractor.extract(from: [segment(
+            "数据只有九个月，至少看五个主流产品，给三条可验证建议，合同总金额是四 万八。"
+        )])
+
+        XCTAssertTrue(facts.contains { $0.kind == .number && $0.canonicalValue == "9" })
+        XCTAssertTrue(facts.contains { $0.kind == .number && $0.canonicalValue == "5" })
+        XCTAssertTrue(facts.contains { $0.kind == .number && $0.canonicalValue == "3" })
+        XCTAssertTrue(facts.contains { $0.kind == .amount && $0.canonicalValue == "48000" })
+
+        let generic = ProtectedFactExtractor.extract(from: [segment("记录一个 bug。")])
+        XCTAssertFalse(generic.contains { $0.kind == .number && $0.canonicalValue == "1" })
+
+        let rewrittenCounters = ProtectedFactExtractor.extract(from: [segment(
+            "至少看 5 款产品，给出 3 项建议，共 6 人参加。"
+        )])
+        XCTAssertTrue(rewrittenCounters.contains { $0.kind == .number && $0.canonicalValue == "5" })
+        XCTAssertTrue(rewrittenCounters.contains { $0.kind == .number && $0.canonicalValue == "3" })
+        XCTAssertTrue(rewrittenCounters.contains { $0.kind == .number && $0.canonicalValue == "6" })
+    }
+
     func testStructuredDecoderAcceptsFencePrefixThinkUnicodeAndTrailingComma() throws {
         let value = SimplePayload(message: "你好")
         let json = try encoded(value)

@@ -1076,6 +1076,11 @@ private extension VoicePolishLayoutExpectation {
             let englishUnit = #"(?:points?|items?|steps?|parts?|topics?|things?|problems?|reasons?|suggestions?|recommendations?|plans?|solutions?|tasks?|risks?|requirements?|goals?|options?)"#
             let patterns: [(pattern: String, isCorrection: Bool)] = [
                 (
+                    #"(?:所以|因此|最终|最后)[，,、：:\s]*(?:一)?共\s*"#
+                        + countToken + #"\s*"# + chineseUnit,
+                    true
+                ),
+                (
                     #"(?:有|共|包括|包含|分为|分成|列出|整理出|原来(?:有)?|本来(?:有)?|之前(?:有)?|(?:先|再)?(?:讲|说|说明|分析|处理|解决|给|提出|讨论|梳理))\s*"#
                         + countToken + #"\s*"# + chineseUnit,
                     false
