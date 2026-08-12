@@ -5,6 +5,7 @@ import SwiftUI
 struct MuseApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @State private var isMenuBarExtraInserted = true
 
     /// 菜单栏图标：填满的圆角方 + M 镂空（2026-06-23 大梁老师嫌 m.square.fill 自带留白、比其它图标小一圈，
     /// 改自绘：圆角方撑满菜单栏高度、M 用 destinationOut 镂空、isTemplate 自适应明暗）
@@ -27,7 +28,7 @@ struct MuseApp: App {
     }()
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: $isMenuBarExtraInserted) {
             MenuBarContent()
                 .environment(appDelegate.appState)
                 .environment(appDelegate.appUpdater)
