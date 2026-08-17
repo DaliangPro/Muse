@@ -68,12 +68,19 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(decision.route, .fast)
     }
 
-    func testQualityModesApplyDeterministicExecutionPolicy() {
+    func testAutomaticModeUsesContentRouteWhileLegacyModesRemainTestOnly() {
         let simple = makeRequest("今天下午把方案发出去。")
         let enumeration = makeRequest("第一，写方案。第二，补测试。")
         let structured = makeRequest("顺便说一下，预算也要再确认。")
         let deep = makeRequest("先用红色，不对，我改一下，应该是蓝色。")
 
+        XCTAssertEqual(executedRoute(simple, quality: .automatic), .fast)
+        XCTAssertEqual(executedRoute(enumeration, quality: .automatic), .fast)
+        XCTAssertEqual(executedRoute(structured, quality: .automatic), .structured)
+        XCTAssertEqual(executedRoute(deep, quality: .automatic), .deep)
+
+        // 旧档位只用于兼容历史数据和既有确定性测试；正式设置读取会统一迁移
+        // 到 automatic，不能再让用户的旧选择改变生产行为。
         XCTAssertEqual(executedRoute(enumeration, quality: .fast), .fast)
         XCTAssertEqual(executedRoute(enumeration, quality: .balanced), .fast)
         XCTAssertEqual(executedRoute(enumeration, quality: .quality), .deep)
@@ -325,13 +332,70 @@ final class VoicePolishCoreTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        XCTAssertEqual(VoicePolishSettings.qualityMode(defaults: defaults), .balanced)
+        XCTAssertEqual(VoicePolishSettings.qualityMode(defaults: defaults), .automatic)
         XCTAssertEqual(VoicePolishSettings.contextLevel(defaults: defaults), .nearbyText)
         XCTAssertTrue(VoicePolishSettings.personalizationEnabled(defaults: defaults))
         XCTAssertTrue(VoicePolishSettings.terminologyLearningEnabled(defaults: defaults))
         XCTAssertTrue(VoicePolishSettings.recentInputContextEnabled(defaults: defaults))
         XCTAssertEqual(VoicePolishSettings.correctionLimit(defaults: defaults), 200)
         XCTAssertNil(VoicePolishSettings.modelOverride(defaults: defaults))
+    }
+
+    func testLegacyQualitySelectionsAllMigrateToSingleAutomaticMode() {
+        let suite = "VoicePolishSingleModeTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        for legacy in ["fast", "balanced", "quality"] {
+            defaults.set(legacy, forKey: DefaultsKeys.voicePolishQualityMode)
+            XCTAssertEqual(
+                VoicePolishSettings.qualityMode(defaults: defaults),
+                .automatic,
+                "旧档位 \(legacy) 不得继续改变产品行为"
+            )
+        }
+    }
+
+    func testCrossSegmentCorrectionMarksOnlyOldFactAsSuperseded() {
+        let segments = [
+            RecognitionSegment(
+                id: "s1",
+                text: "预算先按 16800 元准备。",
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            ),
+            RecognitionSegment(
+                id: "s2",
+                text: "不对，最终预算改成 16000 元，周五发方案。",
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            ),
+        ]
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: segments.map(\.text).joined(),
+                segments: segments,
+                durationMs: 8_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic
+        )
+        let facts = ProtectedFactExtractor.extract(from: segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+
+        let oldIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16800" })
+        let finalIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16000" })
+        XCTAssertTrue(superseded.contains(oldIndex))
+        XCTAssertFalse(superseded.contains(finalIndex))
     }
 
     func testVoicePolishDedicatedModelOverrideIsTrimmedAndOptional() {

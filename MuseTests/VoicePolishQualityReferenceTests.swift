@@ -9,13 +9,12 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
         baseURL: "https://example.com/v1"
     )
 
-    func test77条人工参考成稿全部可通过正式Pipeline校验() async throws {
+    func test107条多维人工参考成稿全部可通过正式Pipeline校验() async throws {
         let fixtures = try loadFixtures()
-        XCTAssertEqual(fixtures.count, 77)
+        XCTAssertEqual(fixtures.count, 107)
         var failures: [String] = []
 
         for fixture in fixtures {
-            let client = QualityReferenceLLM(output: fixture.referenceOutput)
             let request = makeRequest(for: fixture)
             let sourceFactSegments = fixture.scene == .code
                 ? request.input.segments
@@ -23,6 +22,15 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                     from: request.input.segments
                 )
             let sourceFacts = ProtectedFactExtractor.extract(from: sourceFactSegments)
+            let plan = referencePlan(
+                output: fixture.referenceOutput,
+                request: request,
+                sourceFacts: sourceFacts
+            )
+            let client = try QualityReferenceLLM(
+                output: fixture.referenceOutput,
+                plan: plan
+            )
             let directValidation = VoicePolishValidator.validateFast(
                 output: fixture.referenceOutput,
                 request: request,
@@ -48,7 +56,8 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                 )])
                 failures.append(
                     "\(fixture.id): fallback=\(result.usedFallback) "
-                    + "codes=\(directValidation.codes.map { $0.rawValue }) "
+                    + "resultCodes=\(result.validationCodes.map { $0.rawValue }) "
+                    + "directCodes=\(directValidation.codes.map { $0.rawValue }) "
                     + "sourceFacts=\(factDescription(sourceFacts)) "
                     + "outputFacts=\(factDescription(outputFacts)) "
                     + "layout=\(expectation.kind.rawValue)/"
@@ -56,7 +65,7 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                     + "minimum:\(minimumCount)/"
                     + "numbering:\(expectation.numberingPreference.rawValue)/"
                     + "declaredMatches:\(String(describing: VoicePolishListCountConsistency.declaredCountMatchesList(in: fixture.referenceOutput))) "
-                    + "output=\(result.text)"
+                    + "outputLength=\(result.text.count)"
                 )
             }
         }
@@ -83,6 +92,8 @@ private extension VoicePolishQualityReferenceTests {
         let spokenInput: String
         let referenceOutput: String
         let preconditions: [String]?
+        let segmentTexts: [String]
+        let contextFixture: ContextFixture?
     }
 
     struct Variant: Decodable {
@@ -90,6 +101,17 @@ private extension VoicePolishQualityReferenceTests {
         let baseCaseId: String
         let spokenInput: String
         let preconditions: [String]?
+        let segmentTexts: [String]
+        let contextFixture: ContextFixture?
+    }
+
+    struct ContextFixture: Decodable {
+        let level: WritingContextLevel
+        let safety: ContextSafety
+        let selectedText: String?
+        let textBeforeCursor: String?
+        let textAfterCursor: String?
+        let recentMuseInputs: [String]
     }
 
     struct Fixture {
@@ -98,6 +120,8 @@ private extension VoicePolishQualityReferenceTests {
         let spokenInput: String
         let referenceOutput: String
         let preconditions: [String]
+        let segmentTexts: [String]
+        let contextFixture: ContextFixture?
     }
 
     func loadFixtures() throws -> [Fixture] {
@@ -105,7 +129,7 @@ private extension VoicePolishQualityReferenceTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let datasetURL = repositoryRoot
-            .appendingPathComponent("docs/2026-08-12-Muse-Voice-Polish-Quality-Test-Set.json")
+            .appendingPathComponent("docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json")
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let dataset = try decoder.decode(Dataset.self, from: Data(contentsOf: datasetURL))
@@ -116,7 +140,9 @@ private extension VoicePolishQualityReferenceTests {
                 scene: $0.writingScene,
                 spokenInput: $0.spokenInput,
                 referenceOutput: $0.referenceOutput,
-                preconditions: $0.preconditions ?? []
+                preconditions: $0.preconditions ?? [],
+                segmentTexts: $0.segmentTexts,
+                contextFixture: $0.contextFixture
             )
         }
         let variantFixtures = try dataset.stressVariants.map { variant in
@@ -126,7 +152,9 @@ private extension VoicePolishQualityReferenceTests {
                 scene: base.writingScene,
                 spokenInput: variant.spokenInput,
                 referenceOutput: base.referenceOutput,
-                preconditions: (base.preconditions ?? []) + (variant.preconditions ?? [])
+                preconditions: (base.preconditions ?? []) + (variant.preconditions ?? []),
+                segmentTexts: variant.segmentTexts,
+                contextFixture: variant.contextFixture
             )
         }
         return baseFixtures + variantFixtures
@@ -134,54 +162,67 @@ private extension VoicePolishQualityReferenceTests {
 
     func makeRequest(for fixture: Fixture) -> VoicePolishRequest {
         let terminology = terminologyRules(from: fixture.preconditions)
-        let canonical = EntityResolver.applyingKnownCorrections(
-            terminology,
-            to: fixture.spokenInput
-        )
-        let rawSegment = RecognitionSegment(
-            id: "s1",
-            text: fixture.spokenInput,
-            startTimeMs: nil,
-            endTimeMs: nil,
-            confidence: nil,
-            isFinal: true
-        )
-        let canonicalSegment = RecognitionSegment(
-            id: "s1",
-            text: canonical,
-            startTimeMs: nil,
-            endTimeMs: nil,
-            confidence: nil,
-            isFinal: true
-        )
+        let rawSegments = fixture.segmentTexts.enumerated().map { index, text in
+            RecognitionSegment(
+                id: "s\(index + 1)",
+                text: text,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+        }
+        let canonicalSegments = rawSegments.map { segment in
+            RecognitionSegment(
+                id: segment.id,
+                text: EntityResolver.applyingKnownCorrections(terminology, to: segment.text),
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+        }
+        let canonical = canonicalSegments.map(\.text).joined()
         let edits = terminology.compactMap { alias, replacement -> VoiceTerminologyEdit? in
-            guard EntityResolver.applyingKnownCorrections(
-                [alias: replacement],
-                to: fixture.spokenInput
-            ) != fixture.spokenInput else { return nil }
+            let sourceSegmentIDs = rawSegments.compactMap { segment -> String? in
+                EntityResolver.applyingKnownCorrections([alias: replacement], to: segment.text)
+                    == segment.text ? nil : segment.id
+            }
+            guard !sourceSegmentIDs.isEmpty else { return nil }
             return VoiceTerminologyEdit(
                 alias: alias,
                 canonical: replacement,
-                sourceSegmentIDs: ["s1"]
+                sourceSegmentIDs: sourceSegmentIDs
             )
         }
+        let context = fixture.contextFixture.map {
+            WritingContext(
+                scene: fixture.scene,
+                level: $0.level,
+                safety: $0.safety,
+                selectedText: $0.selectedText,
+                textBeforeCursor: $0.textBeforeCursor,
+                textAfterCursor: $0.textAfterCursor,
+                recentMuseInputs: $0.recentMuseInputs
+            )
+        } ?? WritingContext(
+            scene: fixture.scene,
+            level: .metadataOnly,
+            safety: .unknown
+        )
         return VoicePolishRequest(
             input: VoiceInputEnvelope(
                 providerFinalText: fixture.spokenInput,
-                rawSegments: [rawSegment],
+                rawSegments: rawSegments,
                 canonicalText: canonical,
-                segments: [canonicalSegment],
+                segments: canonicalSegments,
                 requiredEntityEdits: edits,
                 durationMs: 0,
                 provider: .volcano
             ),
-            context: WritingContext(
-                scene: fixture.scene,
-                level: .metadataOnly,
-                safety: .unknown
-            ),
+            context: context,
             preferences: UserPolishPreferences(additionalRequirements: ""),
-            qualityMode: .balanced
+            qualityMode: .automatic
         )
     }
 
@@ -208,17 +249,94 @@ private extension VoicePolishQualityReferenceTests {
             "\($0.kind.rawValue):\($0.sourceText):\($0.canonicalValue ?? "nil")"
         }.joined(separator: "|")
     }
+
+    func referencePlan(
+        output: String,
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> VoicePolishPlan {
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        let facts = sourceFacts.enumerated().map { index, candidate in
+            ProtectedFact(
+                sourceText: candidate.sourceText,
+                canonicalValue: candidate.canonicalValue,
+                kind: candidate.kind,
+                disposition: superseded.contains(index) ? .superseded : .mustPreserve,
+                exclusionReason: nil,
+                sourceSegmentIDs: candidate.sourceSegmentIDs
+            )
+        }
+        let corrections = superseded.sorted().map { index in
+            let fact = sourceFacts[index]
+            return VoiceCorrection(
+                previousText: fact.sourceText,
+                finalText: output,
+                sourceSegmentIDs: fact.sourceSegmentIDs,
+                isFinal: true
+            )
+        }
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        return VoicePolishPlan(
+            version: VoicePolishPrompts.version,
+            language: request.input.detectedLanguage,
+            scene: request.context.scene,
+            finalIntent: "按最终意图整理为可直接使用的成稿",
+            orderedBlocks: [VoicePolishBlock(
+                id: "b1",
+                text: output,
+                sourceSegmentIDs: request.input.segments.map(\.id),
+                kind: .content
+            )],
+            discardedFragments: [],
+            corrections: corrections,
+            sideNotes: [],
+            facts: facts,
+            uncertainEntities: [],
+            outputFormat: VoiceOutputFormat(
+                kind: expectation.kind,
+                expectedListCount: expectation.expectedListItemCount
+            ),
+            confidence: 1
+        )
+    }
 }
 
 private actor QualityReferenceLLM: LLMClient {
     let output: String
+    let encodedPlan: String
+    let encodedStructuredResponse: String
 
-    init(output: String) {
+    init(output: String, plan: VoicePolishPlan) throws {
         self.output = output
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = [.sortedKeys]
+        encodedPlan = String(data: try encoder.encode(plan), encoding: .utf8)!
+        encodedStructuredResponse = String(
+            data: try encoder.encode(StructuredVoicePolishResponse(
+                plan: plan,
+                finalText: output
+            )),
+            encoding: .utf8
+        )!
     }
 
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
-        LLMResponse(text: output, model: config.model)
+        let text: String
+        switch request.task {
+        case .voicePolishAnalyze:
+            text = encodedPlan
+        case .voicePolishStructured:
+            text = encodedStructuredResponse
+        case .voicePolishRepair where request.options.responseFormat == .jsonObject:
+            text = encodedStructuredResponse
+        default:
+            text = output
+        }
+        return LLMResponse(text: text, model: config.model)
     }
 
     func process(

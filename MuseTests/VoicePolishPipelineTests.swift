@@ -375,6 +375,42 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(requests[0].options.responseFormat, .text)
     }
 
+    func testSafeSelectedContextCanBackCodeStyleEntityCorrection() async {
+        let source = "森斯 voice服务启动后先看 health"
+        let output = "SenseVoice 服务启动后，先检查 health。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+        let context = WritingContext(
+            scene: .workChat,
+            level: .selectedText,
+            safety: .safe,
+            selectedText: "SenseVoice 服务启动说明"
+        )
+
+        let result = await pipeline(client).process(makeRequest(source, context: context))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testSecureContextCannotAuthorizeInjectedCodeStyleEntity() async {
+        let source = "森斯 voice服务启动后先看 health"
+        let output = "SenseVoice 服务启动后，先检查 health。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output), .response(output)])
+        let context = WritingContext(
+            scene: .workChat,
+            level: .selectedText,
+            safety: .secure,
+            selectedText: "SenseVoice 服务启动说明"
+        )
+
+        let result = await pipeline(client).process(makeRequest(source, context: context))
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.text, source)
+        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
     func testBalancedAllowsQuotesAroundVerbatimSourceTermWithoutOpeningFactGate() async {
         let source = "今天中午我们去食奇家吃饭我刚才说的食奇家不对正确名字是食其家它是一家餐饮品牌以后这段内容里都统一写成食其家然后我们再讨论下午的项目安排"
         let output = "今天中午我们去“食其家”吃饭，它是一家餐饮品牌。然后，我们再讨论下午的项目安排。"
@@ -558,8 +594,12 @@ final class VoicePolishPipelineTests: XCTestCase {
         )
         XCTAssertLessThanOrEqual(
             VoicePolishPipeline.defaultFirstRequestTimeout(for: request),
-            .seconds(90)
+            .seconds(120)
         )
+        XCTAssertGreaterThan(VoicePolishPipeline.defaultAnalyzeTimeout(for: request), .seconds(15))
+        XCTAssertGreaterThan(VoicePolishPipeline.defaultRenderTimeout(for: request), .seconds(20))
+        XCTAssertGreaterThan(VoicePolishPipeline.defaultRepairTimeout(for: request), .seconds(10))
+        XCTAssertGreaterThan(VoicePolishPipeline.defaultTotalTimeout(for: request), .seconds(45))
         let oversizedRequest = makeRequest(String(repeating: unit, count: 600))
         XCTAssertEqual(
             VoicePolishPipeline.outputTokenBudget(
@@ -570,7 +610,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         )
         XCTAssertEqual(
             VoicePolishPipeline.defaultFirstRequestTimeout(for: oversizedRequest),
-            .seconds(90)
+            .seconds(120)
         )
 
         let result = await pipeline(client).process(request)
@@ -582,6 +622,80 @@ final class VoicePolishPipelineTests: XCTestCase {
             requests.first?.options.maxOutputTokens,
             VoicePolishPipeline.outputTokenBudget(for: request, task: .voicePolishFast)
         )
+    }
+
+    func testFastUnchangedNoisyDraftRequiresRepairInsteadOfFalseSuccess() async {
+        let source = "我我我今天大大概七点半到你们不不用等我"
+        let repaired = "我今天大概七点半到，你们不用等我。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(source),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertFalse(result.validationCodes.contains(.unchangedDraft))
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast, .voicePolishRepair])
+    }
+
+    func testAlreadySendReadyShortTextMayRemainUnchanged() async {
+        let source = "谢谢你。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(source)])
+
+        let result = await pipeline(client).process(makeRequest(source))
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.text, source)
+        XCTAssertFalse(result.validationCodes.contains(.unchangedDraft))
+    }
+
+    func testCrossSegmentNumericCorrectionDoesNotFallBackToOldFact() async {
+        let segments = [
+            RecognitionSegment(
+                id: "s1",
+                text: "预算先按 16800 元准备。",
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            ),
+            RecognitionSegment(
+                id: "s2",
+                text: "不对，最终预算改成 16000 元，周五发方案。",
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            ),
+        ]
+        let source = segments.map(\.text).joined()
+        let output = "最终预算为 16000 元，周五发送方案。"
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: source,
+                segments: segments,
+                durationMs: 8_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .balanced
+        )
+
+        let result = await pipeline(
+            ScriptedVoicePolishLLM(steps: [.response(output)])
+        ).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.text.contains("16800"))
+        XCTAssertFalse(result.validationCodes.contains(.missingProtectedFact))
+        XCTAssertFalse(result.validationCodes.contains(.supersededFactRetained))
     }
 
     func testBalancedFastValidationAcceptsOnlyProvenFinalNumericCorrection() async {
@@ -945,7 +1059,8 @@ final class VoicePolishPipelineTests: XCTestCase {
     private func makeRequest(
         _ text: String,
         quality: VoicePolishQualityMode = .balanced,
-        scene: WritingScene = .unknown
+        scene: WritingScene = .unknown,
+        context: WritingContext? = nil
     ) -> VoicePolishRequest {
         VoicePolishRequest(
             input: VoiceInputEnvelope(
@@ -961,7 +1076,7 @@ final class VoicePolishPipelineTests: XCTestCase {
                 durationMs: 2_000,
                 provider: .volcano
             ),
-            context: WritingContext(scene: scene),
+            context: context ?? WritingContext(scene: scene),
             preferences: UserPolishPreferences(additionalRequirements: "{text}"),
             qualityMode: quality
         )

@@ -156,6 +156,7 @@ enum VoicePolishPrompts {
     - 如果 raw_response 与 hard_constraints 冲突，必须修改 raw_response，不能原样返回。
 
     只修复失败并返回完整最终正文：
+    - unchangedDraft：上一版几乎原样照抄了仍包含口误、口吃、错误句界或结构缺口的口述；必须真正清理并成稿，不能再次返回原文；
     - missingProtectedFact：从 original_payload 恢复遗漏的最终事实、数字、范围、实体或要求；
     - supersededFactRetained：删除已被最终版本替代的旧事实，但保留未被替代的参与方和其他信息；
     - planIntegrityFailure：删除来源不支持的事实，恢复被误改的路径、命令、报错、专名、参与方和修饰对象；同时删除可确定的机械/同义重复，不得以“汇总如下”等未完成起步句结束；

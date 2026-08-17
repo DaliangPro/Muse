@@ -10,8 +10,6 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     var showsIntroduction = true
 
     @Environment(AppState.self) private var appState
-    @AppStorage(DefaultsKeys.voicePolishQualityMode)
-    private var qualityRaw = VoicePolishQualityMode.balanced.rawValue
     @AppStorage(DefaultsKeys.voicePolishContextLevel)
     private var contextRaw = WritingContextLevel.nearbyText.rawValue
     @AppStorage(DefaultsKeys.voicePolishPersonalizationEnabled)
@@ -201,7 +199,6 @@ private extension VoicePolishSettingsTab {
     var advancedSettings: some View {
         DisclosureGroup(isExpanded: $isAdvancedSettingsExpanded) {
             VStack(alignment: .leading, spacing: 12) {
-                responseCard
                 contextCard
                 learningCard
                 modelCard
@@ -322,37 +319,6 @@ private extension VoicePolishSettingsTab {
                 foreground: TF.settingsAccentGreen,
                 fill: TF.settingsSuccessFill
             )
-        }
-    }
-
-    var responseCard: some View {
-        settingsGroupCard(
-            L("响应方式", "Response mode"),
-            icon: "speedometer",
-            expandVertically: false
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                SettingsSwitchGroup(width: nil) {
-                    ForEach(VoicePolishQualityMode.allCases, id: \.rawValue) { quality in
-                        SettingsSwitchOption(
-                            title: qualityTitle(quality),
-                            isSelected: qualityRaw == quality.rawValue
-                        ) {
-                            qualityRaw = quality.rawValue
-                        }
-                        .accessibilityHint(qualityDescription(quality))
-                        .accessibilityAddTraits(qualityRaw == quality.rawValue ? .isSelected : [])
-                        .accessibilityValue(qualityRaw == quality.rawValue
-                            ? L("已选择", "Selected")
-                            : L("未选择", "Not selected"))
-                    }
-                }
-
-                Text(qualityDescription(selectedQuality))
-                    .font(TF.settingsFontCaption)
-                    .foregroundStyle(TF.settingsTextTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
     }
 
@@ -613,7 +579,7 @@ private extension VoicePolishSettingsTab {
                     .frame(height: 1)
 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(L("专用快速模型（可选）", "Dedicated fast model (optional)"))
+                    Text(L("语音润色专用模型（可选）", "Dedicated Voice Polish model (optional)"))
                         .font(TF.settingsFontBody)
                         .foregroundStyle(TF.settingsText)
 
@@ -625,7 +591,7 @@ private extension VoicePolishSettingsTab {
                             text: $modelOverride
                         )
                         .textFieldStyle(.roundedBorder)
-                        .accessibilityLabel(L("语音润色专用快速模型", "Dedicated Voice Polish fast model"))
+                        .accessibilityLabel(L("语音润色专用模型", "Dedicated Voice Polish model"))
 
                         SettingsTextButton(L("跟随全局", "Use Global"), controlSize: .compact) {
                             modelOverride = ""
@@ -634,8 +600,8 @@ private extension VoicePolishSettingsTab {
                     }
 
                     Text(L(
-                        "只覆写模型名，仍复用当前 Provider、API Key 和服务地址。请填写同一 Provider 确实支持的快速模型；填错时会安全回退到已纠正的识别文本。",
-                        "Only the model name is overridden. The current provider, API key, and endpoint are reused. Use a supported fast model; failures safely fall back to the corrected transcript."
+                        "只覆写模型名，仍复用当前 Provider、API Key 和服务地址。请填写同一 Provider 确实支持的模型；填错时会安全回退到已纠正的识别文本。",
+                        "Only the model name is overridden. The current provider, API key, and endpoint are reused. Use a supported model; failures safely fall back to the corrected transcript."
                     ))
                     .font(TF.settingsFontCaption)
                     .foregroundStyle(TF.settingsTextTertiary)
@@ -678,18 +644,6 @@ private extension VoicePolishSettingsTab {
                         font: TF.settingsFontMetadata,
                         foreground: TF.settingsTextSecondary
                     )
-                }
-
-                ForEach(performanceSummary.routes, id: \.route.rawValue) { route in
-                    HStack(spacing: 8) {
-                        Text(performanceRouteTitle(route.route))
-                            .font(TF.settingsFontCaption)
-                            .foregroundStyle(TF.settingsTextSecondary)
-                            .frame(width: 74, alignment: .leading)
-                        Text("P50 \(durationText(route.p50Milliseconds))  ·  P95 \(durationText(route.p95Milliseconds))  ·  n=\(route.sampleCount)")
-                            .font(TF.settingsFontMono)
-                            .foregroundStyle(TF.settingsTextTertiary)
-                    }
                 }
 
                 Text(L(
@@ -744,10 +698,6 @@ private extension VoicePolishSettingsTab {
                 blockHeight: 310
             )
         }
-    }
-
-    var selectedQuality: VoicePolishQualityMode {
-        VoicePolishQualityMode(rawValue: qualityRaw) ?? .balanced
     }
 
     var selectedContextLevel: WritingContextLevel {
@@ -835,25 +785,6 @@ private extension VoicePolishSettingsTab {
         return "\(app) · \(Self.contextDiagnosticTimeFormatter.string(from: snapshot.capturedAt)) · \(captured)\(recent)"
     }
 
-    func qualityTitle(_ value: VoicePolishQualityMode) -> String {
-        switch value {
-        case .fast: return L("快速", "Fast")
-        case .balanced: return L("标准（推荐）", "Standard (Recommended)")
-        case .quality: return L("深度整理", "Deep")
-        }
-    }
-
-    func qualityDescription(_ value: VoicePolishQualityMode) -> String {
-        switch value {
-        case .fast:
-            return L("适合短句和即时聊天，优先减少等待。", "Best for short messages and chat, prioritizing lower wait time.")
-        case .balanced:
-            return L("适合大多数消息、邮件和 AI Prompt，在成稿质量与速度之间平衡。", "Best for most messages, emails, and AI prompts, balancing quality and speed.")
-        case .quality:
-            return L("只建议用于多次跨段改口、内容乱序或多主题的复杂口述，等待会更长。", "Use for complex dictation with cross-paragraph corrections, reordered ideas, or multiple topics. It takes longer.")
-        }
-    }
-
     func contextTitle(_ value: WritingContextLevel) -> String {
         switch value {
         case .metadataOnly: return L("不读取正文", "No body text")
@@ -871,19 +802,6 @@ private extension VoicePolishSettingsTab {
         case .nearbyText:
             return L("在安全的标准输入框中参考光标附近文字，帮助延续语气和指代。", "References text around the cursor in a safe standard text field to maintain tone and references.")
         }
-    }
-
-    func performanceRouteTitle(_ route: VoicePolishRoute) -> String {
-        switch route {
-        case .fast: return L("快速", "Fast")
-        case .structured: return L("标准", "Standard")
-        case .deep: return L("深度整理", "Deep")
-        }
-    }
-
-    func durationText(_ milliseconds: Int) -> String {
-        if milliseconds < 1_000 { return "\(milliseconds)ms" }
-        return String(format: "%.1fs", Double(milliseconds) / 1_000)
     }
 
     func percent(_ value: Double?) -> String {

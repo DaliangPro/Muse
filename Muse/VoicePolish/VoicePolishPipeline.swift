@@ -5,8 +5,14 @@ private struct VoicePolishStageTimeoutError: Error {}
 struct VoicePolishPipeline: Sendable {
     private static let baselineFirstRequestTimeout: Duration = .seconds(30)
     private static let baselineTotalTimeout: Duration = .seconds(45)
-    private static let maximumFirstRequestTimeout: Int64 = 90
-    private static let maximumTotalTimeout: Int64 = 105
+    private static let baselineAnalyzeTimeout: Duration = .seconds(15)
+    private static let baselineRenderTimeout: Duration = .seconds(20)
+    private static let baselineRepairTimeout: Duration = .seconds(10)
+    private static let maximumFirstRequestTimeout: Int64 = 120
+    private static let maximumAnalyzeTimeout: Int64 = 60
+    private static let maximumRenderTimeout: Int64 = 120
+    private static let maximumRepairTimeout: Int64 = 90
+    private static let maximumTotalTimeout: Int64 = 240
     private static let maximumOutputTokens = 8_192
 
     private let client: any LLMClient
@@ -18,6 +24,9 @@ struct VoicePolishPipeline: Sendable {
     private let analyzeTimeout: Duration
     private let renderTimeout: Duration
     private let repairTimeout: Duration
+    private let usesAdaptiveAnalyzeTimeout: Bool
+    private let usesAdaptiveRenderTimeout: Bool
+    private let usesAdaptiveRepairTimeout: Bool
     private let onStage: (@Sendable (VoicePolishStage) -> Void)?
 
     init(
@@ -25,9 +34,9 @@ struct VoicePolishPipeline: Sendable {
         config: LLMConfig,
         totalTimeout: Duration? = nil,
         firstRequestTimeout: Duration? = nil,
-        analyzeTimeout: Duration = .seconds(15),
-        renderTimeout: Duration = .seconds(20),
-        repairTimeout: Duration = .seconds(10),
+        analyzeTimeout: Duration? = nil,
+        renderTimeout: Duration? = nil,
+        repairTimeout: Duration? = nil,
         onStage: (@Sendable (VoicePolishStage) -> Void)? = nil
     ) {
         self.client = client
@@ -36,9 +45,12 @@ struct VoicePolishPipeline: Sendable {
         self.firstRequestTimeout = firstRequestTimeout ?? Self.baselineFirstRequestTimeout
         self.usesAdaptiveTotalTimeout = totalTimeout == nil
         self.usesAdaptiveFirstRequestTimeout = firstRequestTimeout == nil
-        self.analyzeTimeout = analyzeTimeout
-        self.renderTimeout = renderTimeout
-        self.repairTimeout = repairTimeout
+        self.analyzeTimeout = analyzeTimeout ?? Self.baselineAnalyzeTimeout
+        self.renderTimeout = renderTimeout ?? Self.baselineRenderTimeout
+        self.repairTimeout = repairTimeout ?? Self.baselineRepairTimeout
+        self.usesAdaptiveAnalyzeTimeout = analyzeTimeout == nil
+        self.usesAdaptiveRenderTimeout = renderTimeout == nil
+        self.usesAdaptiveRepairTimeout = repairTimeout == nil
         self.onStage = onStage
     }
 
@@ -72,17 +84,72 @@ struct VoicePolishPipeline: Sendable {
     }
 
     /// 默认预算才随正文增长；测试或特殊调用显式注入的短超时必须原样保留。
-    /// 按每秒约 96 个输出 tokens 预留增量，且用户仍可通过 HUD 主动使用原文。
+    /// 按每秒约 64 个输出 tokens 预留增量，覆盖长文首包、网络波动和完整收尾；
+    /// 用户仍可通过 HUD 主动使用原文。
     static func defaultFirstRequestTimeout(for request: VoicePolishRequest) -> Duration {
         let outputTokens = outputTokenBudget(for: request, task: .voicePolishFast)
         let extraTokens = max(0, outputTokens - 2_048)
-        let extraSeconds = Int64((extraTokens + 95) / 96)
+        let extraSeconds = Int64((extraTokens + 63) / 64)
         return .seconds(min(maximumFirstRequestTimeout, 30 + extraSeconds))
     }
 
-    private static func defaultTotalTimeout(for request: VoicePolishRequest) -> Duration {
+    static func defaultAnalyzeTimeout(for request: VoicePolishRequest) -> Duration {
+        adaptiveStageTimeout(
+            baselineSeconds: 15,
+            maximumSeconds: maximumAnalyzeTimeout,
+            outputTokens: outputTokenBudget(for: request, task: .voicePolishAnalyze),
+            baselineTokens: 4_096,
+            tokensPerSecond: 128
+        )
+    }
+
+    static func defaultRenderTimeout(for request: VoicePolishRequest) -> Duration {
+        adaptiveStageTimeout(
+            baselineSeconds: 20,
+            maximumSeconds: maximumRenderTimeout,
+            outputTokens: outputTokenBudget(for: request, task: .voicePolishRender),
+            baselineTokens: 3_072,
+            tokensPerSecond: 96
+        )
+    }
+
+    static func defaultRepairTimeout(for request: VoicePolishRequest) -> Duration {
+        adaptiveStageTimeout(
+            baselineSeconds: 10,
+            maximumSeconds: maximumRepairTimeout,
+            outputTokens: outputTokenBudget(for: request, task: .voicePolishRepair),
+            baselineTokens: 4_096,
+            tokensPerSecond: 96
+        )
+    }
+
+    static func defaultTotalTimeout(for request: VoicePolishRequest) -> Duration {
         let firstSeconds = defaultFirstRequestTimeout(for: request).components.seconds
-        return .seconds(min(maximumTotalTimeout, max(45, firstSeconds + 15)))
+        let fastSeconds = firstSeconds + 15
+        let stagedSeconds = defaultAnalyzeTimeout(for: request).components.seconds
+            + defaultRenderTimeout(for: request).components.seconds
+            + defaultRepairTimeout(for: request).components.seconds
+            + 15
+        let sourceNeedsExpandedBudget = outputTokenBudget(
+            for: request,
+            task: .voicePolishFast
+        ) > 2_048
+        let requiredSeconds = sourceNeedsExpandedBudget
+            ? max(fastSeconds, stagedSeconds)
+            : fastSeconds
+        return .seconds(min(maximumTotalTimeout, max(45, requiredSeconds)))
+    }
+
+    private static func adaptiveStageTimeout(
+        baselineSeconds: Int64,
+        maximumSeconds: Int64,
+        outputTokens: Int,
+        baselineTokens: Int,
+        tokensPerSecond: Int
+    ) -> Duration {
+        let extraTokens = max(0, outputTokens - baselineTokens)
+        let extraSeconds = Int64((extraTokens + tokensPerSecond - 1) / tokensPerSecond)
+        return .seconds(min(maximumSeconds, baselineSeconds + extraSeconds))
     }
 
     func process(
@@ -181,7 +248,7 @@ struct VoicePolishPipeline: Sendable {
         let analyzerRaw: String
         do {
             let timeout = try availableTimeout(
-                stageLimit: analyzeTimeout,
+                stageLimit: effectiveAnalyzeTimeout(for: request),
                 startedAt: startedAt,
                 request: request
             )
@@ -231,7 +298,7 @@ struct VoicePolishPipeline: Sendable {
             }
             do {
                 let timeout = try availableTimeout(
-                    stageLimit: repairTimeout,
+                    stageLimit: effectiveRepairTimeout(for: request),
                     startedAt: startedAt,
                     request: request
                 )
@@ -292,7 +359,7 @@ struct VoicePolishPipeline: Sendable {
         let renderRaw: String
         do {
             let timeout = try availableTimeout(
-                stageLimit: renderTimeout,
+                stageLimit: effectiveRenderTimeout(for: request),
                 startedAt: startedAt,
                 request: request
             )
@@ -370,7 +437,7 @@ struct VoicePolishPipeline: Sendable {
         }
         do {
             let timeout = try availableTimeout(
-                stageLimit: repairTimeout,
+                stageLimit: effectiveRepairTimeout(for: request),
                 startedAt: startedAt,
                 request: request
             )
@@ -519,13 +586,14 @@ struct VoicePolishPipeline: Sendable {
                 .excludedSideNoteLeaked,
                 .planIntegrityFailure,
                 .layoutRequirementUnmet,
+                .unchangedDraft,
             ]
             let hardCodes = validation.codes.filter(\.isHardFailure)
             if !hardCodes.isEmpty,
                hardCodes.allSatisfy(repairableFastCodes.contains) {
                 do {
                     let timeout = try availableTimeout(
-                        stageLimit: repairTimeout,
+                        stageLimit: effectiveRepairTimeout(for: request),
                         startedAt: startedAt,
                         request: request
                     )
@@ -691,7 +759,7 @@ struct VoicePolishPipeline: Sendable {
             }
             do {
                 let timeout = try availableTimeout(
-                    stageLimit: repairTimeout,
+                    stageLimit: effectiveRepairTimeout(for: request),
                     startedAt: startedAt,
                     request: request
                 )
@@ -786,7 +854,7 @@ struct VoicePolishPipeline: Sendable {
         // 已有效时进入，因此不会出现“格式修复后再内容修复”的第三次调用。
         do {
             let timeout = try availableTimeout(
-                stageLimit: repairTimeout,
+                stageLimit: effectiveRepairTimeout(for: request),
                 startedAt: startedAt,
                 request: request
             )
@@ -1002,6 +1070,18 @@ struct VoicePolishPipeline: Sendable {
         usesAdaptiveTotalTimeout
             ? Self.defaultTotalTimeout(for: request)
             : totalTimeout
+    }
+
+    private func effectiveAnalyzeTimeout(for request: VoicePolishRequest) -> Duration {
+        usesAdaptiveAnalyzeTimeout ? Self.defaultAnalyzeTimeout(for: request) : analyzeTimeout
+    }
+
+    private func effectiveRenderTimeout(for request: VoicePolishRequest) -> Duration {
+        usesAdaptiveRenderTimeout ? Self.defaultRenderTimeout(for: request) : renderTimeout
+    }
+
+    private func effectiveRepairTimeout(for request: VoicePolishRequest) -> Duration {
+        usesAdaptiveRepairTimeout ? Self.defaultRepairTimeout(for: request) : repairTimeout
     }
 
     private func availableTimeout(

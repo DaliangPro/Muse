@@ -72,6 +72,7 @@ enum VoicePolishValidator {
         if retainsExplicitCorrectionNarration(output: output, request: request) {
             append(.supersededFactRetained, to: &codes)
         }
+        appendUnchangedDraftCode(output: output, request: request, to: &codes)
         appendSemanticBoundaryCodes(output: output, request: request, to: &codes)
         appendTerminologyEditCodes(output: output, request: request, to: &codes)
         appendOutputLayoutCodes(output, request: request, to: &codes)
@@ -265,6 +266,16 @@ enum VoicePolishValidator {
         if normalizedNaturalText(request.fallbackText).contains(normalizedInterior) {
             return true
         }
+        let authorizedContext = [
+            request.context.selectedText,
+            request.context.textBeforeCursor,
+            request.context.textAfterCursor,
+        ].compactMap { $0 } + request.context.recentMuseInputs
+        if authorizedContext.contains(where: {
+            normalizedNaturalText($0).contains(normalizedInterior)
+        }) {
+            return true
+        }
         return fact.kind == .command
             && request.context.scene == .code
             && normalizedNaturalText(
@@ -367,8 +378,9 @@ enum VoicePolishValidator {
     }
 
     /// Fast 路径没有模型生成的 Plan，因此只接受本地能证明的最窄改口事实：
-    /// 同一 segment 中，改口信号前最近的受保护事实，与信号后首个同类型、不同值
-    /// 的事实形成替换关系。其余金额、日期、版本等仍全部要求保留。
+    /// 改口信号前最近的受保护事实，与信号后首个同类型、不同值的事实形成替换
+    /// 关系。ASR 长录音经常把旧值、改口词和最终值切到相邻 segment，因此位置
+    /// 按 segment 顺序统一比较；没有明确改口信号时仍不会跨段猜测。
     static func locallySupersededFactIndices(
         request: VoicePolishRequest,
         sourceFacts: [SourceFactCandidate]
@@ -377,7 +389,14 @@ enum VoicePolishValidator {
 
         struct LocatedFact {
             let index: Int
-            let location: String.Index
+            let segmentIndex: Int
+            let offset: Int
+        }
+
+        struct LocatedMarker {
+            let segmentIndex: Int
+            let startOffset: Int
+            let endOffset: Int
         }
 
         let correctionSignals = [
@@ -386,34 +405,60 @@ enum VoicePolishValidator {
             "我的意思是", "我改一下", "说错了", "不对", "应该是", "最后还是",
             "最终决定", "actually", "i mean", "final decision",
         ]
-        var superseded: Set<Int> = []
-
-        for segment in request.input.segments {
-            let located = sourceFacts.enumerated().compactMap { index, fact -> LocatedFact? in
+        var locatedFacts: [LocatedFact] = []
+        var locatedMarkers: [LocatedMarker] = []
+        for (segmentIndex, segment) in request.input.segments.enumerated() {
+            locatedFacts += sourceFacts.enumerated().compactMap { index, fact -> LocatedFact? in
                 guard fact.kind != .lexiconEntity,
                       fact.sourceSegmentIDs.contains(segment.id),
                       let range = segment.text.range(of: fact.sourceText) else { return nil }
-                return LocatedFact(index: index, location: range.lowerBound)
-            }.sorted { $0.location < $1.location }
-            guard located.count >= 2 else { continue }
-
-            let markers = correctionSignals.flatMap { signal -> [Range<String.Index>] in
-                allRanges(of: signal, in: segment.text)
-            }.sorted { $0.lowerBound < $1.lowerBound }
-
-            for marker in markers {
-                guard let previous = located.last(where: { $0.location < marker.lowerBound }) else {
-                    continue
-                }
-                let previousFact = sourceFacts[previous.index]
-                guard located.contains(where: { candidate in
-                    guard candidate.location >= marker.upperBound else { return false }
-                    let finalFact = sourceFacts[candidate.index]
-                    return finalFact.kind == previousFact.kind
-                        && !equivalent(previousFact, finalFact)
-                }) else { continue }
-                superseded.insert(previous.index)
+                return LocatedFact(
+                    index: index,
+                    segmentIndex: segmentIndex,
+                    offset: segment.text.distance(from: segment.text.startIndex, to: range.lowerBound)
+                )
             }
+            locatedMarkers += correctionSignals.flatMap { signal -> [LocatedMarker] in
+                allRanges(of: signal, in: segment.text)
+                    .map { range in
+                        LocatedMarker(
+                            segmentIndex: segmentIndex,
+                            startOffset: segment.text.distance(
+                                from: segment.text.startIndex,
+                                to: range.lowerBound
+                            ),
+                            endOffset: segment.text.distance(
+                                from: segment.text.startIndex,
+                                to: range.upperBound
+                            )
+                        )
+                    }
+            }
+        }
+
+        locatedFacts.sort {
+            ($0.segmentIndex, $0.offset) < ($1.segmentIndex, $1.offset)
+        }
+        locatedMarkers.sort {
+            ($0.segmentIndex, $0.startOffset) < ($1.segmentIndex, $1.startOffset)
+        }
+
+        var superseded: Set<Int> = []
+        for marker in locatedMarkers {
+            guard let previous = locatedFacts.last(where: {
+                ($0.segmentIndex, $0.offset) < (marker.segmentIndex, marker.startOffset)
+            }) else { continue }
+            let previousFact = sourceFacts[previous.index]
+            guard locatedFacts.contains(where: { candidate in
+                let followsMarker = candidate.segmentIndex > marker.segmentIndex
+                    || (candidate.segmentIndex == marker.segmentIndex
+                        && candidate.offset >= marker.endOffset)
+                guard followsMarker else { return false }
+                let finalFact = sourceFacts[candidate.index]
+                return finalFact.kind == previousFact.kind
+                    && !equivalent(previousFact, finalFact)
+            }) else { continue }
+            superseded.insert(previous.index)
         }
         return superseded
     }
@@ -483,6 +528,7 @@ enum VoicePolishValidator {
     ) -> VoicePolishValidationResult {
         let output = response.finalText
         var codes = commonCodes(output: output, sourceText: request.fallbackText)
+        appendUnchangedDraftCode(output: output, request: request, to: &codes)
         let plan = response.plan
         let validSegmentIDs = Set(request.input.segments.map(\.id))
         let sourceByID = Dictionary(uniqueKeysWithValues: request.input.segments.map { ($0.id, $0.text) })
@@ -566,6 +612,10 @@ enum VoicePolishValidator {
         let outputFacts = protectedFactsFromOutput(output, request: request)
         if outputFacts.contains(where: { outputFact in
             !sourceFacts.contains(where: { equivalent($0, outputFact) })
+                && !isSourceBackedFormattingFact(
+                    outputFact,
+                    request: request
+                )
         }) {
             append(.planIntegrityFailure, to: &codes)
         }
@@ -592,7 +642,23 @@ enum VoicePolishValidator {
 
         for correction in plan.corrections where correction.isFinal {
             let previous = normalizedNaturalText(correction.previousText)
-            if !previous.isEmpty, normalizedNaturalText(output).contains(previous) {
+            let correctionFacts = planFacts.filter { fact in
+                fact.disposition == .superseded
+                    && !fact.sourceSegmentIDs.filter(correction.sourceSegmentIDs.contains).isEmpty
+                    && correction.previousText.contains(fact.sourceText)
+            }
+            let retainsPrevious: Bool
+            if correctionFacts.isEmpty {
+                retainsPrevious = !previous.isEmpty
+                    && normalizedNaturalText(output).contains(previous)
+            } else {
+                // 数字改口必须按受保护事实比较，不能用裸子串判断。例如旧人数
+                // “四个人”已删除后，最终时间“周四上午”仍含“四”，但不是旧事实。
+                retainsPrevious = correctionFacts.contains {
+                    containsEquivalent($0, in: outputFacts, output: output)
+                }
+            }
+            if retainsPrevious {
                 append(.supersededFactRetained, to: &codes)
             }
             let final = normalizedNaturalText(correction.finalText)
@@ -673,6 +739,78 @@ enum VoicePolishValidator {
                 "\(normalizedNaturalText(edit.alias))|\(normalizedNaturalText(edit.canonical))"
             ).inserted
         }
+    }
+
+    /// 明显包含口述残片或结构缺口的输入，模型若原样照抄不能算成稿成功。
+    /// 只使用本地可证明的窄信号；已经自然可发送的短句允许保持不变。
+    private static func appendUnchangedDraftCode(
+        output: String,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        let comparableSource = comparableDraft(request.fallbackText)
+        let comparableOutput = comparableDraft(output)
+        guard comparableSource == comparableOutput, requiresTransformation(request) else {
+            return
+        }
+        append(.unchangedDraft, to: &codes)
+    }
+
+    private static func requiresTransformation(_ request: VoicePolishRequest) -> Bool {
+        let source = request.fallbackText
+        let normalized = normalizedNaturalText(source).lowercased()
+        if terminologyEdits(for: request).contains(where: { edit in
+            EntityResolver.applyingKnownCorrections(
+                [edit.alias: edit.canonical],
+                to: source
+            ) != source
+        }) {
+            return true
+        }
+
+        let correctionSignals = [
+            "我说错了", "我改一下", "我的意思是", "不对", "改成", "应该是",
+            "最终决定", "最后还是", "scratch that", "i mean", "actually",
+        ]
+        if correctionSignals.contains(where: normalized.contains) { return true }
+
+        let obviousDisfluencies = [
+            "我我", "你你", "他他", "她她", "它它", "不不", "第第",
+            "大大概", "突突然", "帮我帮我", "麻烦麻烦", "今天今天",
+        ]
+        if obviousDisfluencies.contains(where: normalized.contains) { return true }
+
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        if (expectation.kind == .numberedList || expectation.kind == .bulletList),
+           VoicePolishNumbering.recognizedListItemCount(in: source) > 0 {
+            // 已经形成完整逐行列表的文本允许原样保留。列表项不以句号结尾并不
+            // 等于“长文本没有标点”，不能因此触发一次注定无意义的修复请求。
+            return false
+        }
+
+        if source.count >= 80,
+           source.range(of: #"[。！？!?]"#, options: .regularExpression) == nil {
+            return true
+        }
+        if source.count >= 80,
+           !VoicePolishPunctuationRepair.issues(in: source).isEmpty {
+            return true
+        }
+
+        switch expectation.kind {
+        case .sentence:
+            return false
+        case .paragraphs:
+            return !source.contains("\n\n")
+        case .numberedList, .bulletList:
+            return VoicePolishNumbering.recognizedListItemCount(in: source) == 0
+        }
+    }
+
+    private static func comparableDraft(_ text: String) -> String {
+        VoicePolishCharacterSafety.normalizedLineEndings(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
 
     private static func commonCodes(

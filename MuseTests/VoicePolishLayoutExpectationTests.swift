@@ -104,6 +104,18 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
         XCTAssertFalse(expectation.forbidsLineBreaks)
     }
 
+    func testDeclaredFortyEightItemLongListKeepsExactContract() {
+        let expectation = infer(
+            "下面共 48 项，请按原顺序逐项整理，每项都要完整保留。",
+            scene: .document
+        )
+
+        XCTAssertEqual(expectation.kind, .numberedList)
+        XCTAssertEqual(expectation.expectedListItemCount, 48)
+        XCTAssertEqual(expectation.minimumListItemCount, 12)
+        XCTAssertEqual(expectation.numberingPreference, .arabic)
+    }
+
     func testMultipleRecognitionSegmentsAloneDoNotCreateListEvidence() {
         let expectation = infer(
             "今天和客户确认了会议时间。",

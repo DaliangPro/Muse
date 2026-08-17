@@ -133,7 +133,7 @@ struct ModeDetailInner: View, SettingsCardHelpers {
                     flushPendingSave()
                     NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.voicePolish)
                 }
-                .accessibilityHint(L("打开附加润色要求、响应方式和上下文设置", "Opens requirements, response, and context settings"))
+                .accessibilityHint(L("打开附加润色要求和上下文设置", "Opens requirements and context settings"))
             }
         }
         .padding(ModeSettingsLayout.modeGutter)

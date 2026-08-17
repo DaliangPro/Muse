@@ -1068,8 +1068,10 @@ private extension VoicePolishLayoutExpectation {
             in text: String,
             lastExplicitMarkerLocation: Int?
         ) -> DeclaredCountSummary {
-            let countToken = #"([1-9]|1[0-9]|[一二两三四五六七八九十]{1,3})"#
-            let countTokenNoCapture = #"(?:[1-9]|1[0-9]|[一二两三四五六七八九十]{1,3})"#
+            // 长语音清单可能远超 19 项；阿拉伯数字支持 1～99，后续仍由
+            // 输出长度预算和列表校验控制，不能因测试集变长就丢失明确项数。
+            let countToken = #"([1-9][0-9]?|[一二两三四五六七八九十]{1,3})"#
+            let countTokenNoCapture = #"(?:[1-9][0-9]?|[一二两三四五六七八九十]{1,3})"#
             let chineseUnit = #"(?:点|条|项|步|个步骤|部分|方面|件事|个事(?:情)?|(?:个)?(?:问题|原因|建议|方案|任务|风险|事项|要点|结论|观点|方法|要求|目标|主题|阶段|选择|选项))"#
             let englishCount = #"(one|two|three|four|five|six|seven|eight|nine|ten|[1-9]|1[0-9])"#
             let englishCountNoCapture = #"(?:one|two|three|four|five|six|seven|eight|nine|ten|[1-9]|1[0-9])"#

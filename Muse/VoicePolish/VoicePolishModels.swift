@@ -117,6 +117,9 @@ struct WritingContext: Sendable, Equatable, Codable {
 }
 
 enum VoicePolishQualityMode: String, Codable, CaseIterable, Sendable, Equatable {
+    /// 唯一生产模式：根据输入内容自动选择内部处理策略。
+    case automatic
+    /// 以下三项仅保留旧数据解码与内部回归测试兼容，不再暴露给用户。
     case fast
     case balanced
     case quality
@@ -368,6 +371,7 @@ enum VoicePolishValidationCode: String, Codable, Sendable, Equatable, CaseIterab
     case sceneStyleMismatch
     case harmlessRepetition
     case semanticDecisionUnverified
+    case unchangedDraft
 
     var isHardFailure: Bool {
         switch self {

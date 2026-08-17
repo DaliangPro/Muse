@@ -20,6 +20,24 @@ enum VoicePolishQualityRunner {
         let stressVariants: [QualityVariant]
     }
 
+    private struct QualityAutomaticChecks: Codable {
+        let requiredSubstrings: [String]
+        let forbiddenSubstrings: [String]
+        let forbiddenContextSubstrings: [String]
+        let minimumParagraphCount: Int?
+        let minimumListItemCount: Int?
+    }
+
+    private struct QualityContextFixture: Decodable {
+        let type: String
+        let level: WritingContextLevel
+        let safety: ContextSafety
+        let selectedText: String?
+        let textBeforeCursor: String?
+        let textAfterCursor: String?
+        let recentMuseInputs: [String]
+    }
+
     private struct QualityBaseCase: Decodable {
         let id: String
         let writingScene: WritingScene
@@ -29,6 +47,13 @@ enum VoicePolishQualityRunner {
         let mustRemove: [String]
         let mustNotInvent: [String]
         let preconditions: [String]?
+        let lengthBucket: String
+        let contextType: String
+        let qualityDimensions: [String]
+        let requiresTransformation: Bool
+        let segmentTexts: [String]
+        let contextFixture: QualityContextFixture?
+        let automaticChecks: QualityAutomaticChecks
     }
 
     private struct QualityVariant: Decodable {
@@ -38,6 +63,13 @@ enum VoicePolishQualityRunner {
         let stutterForm: String?
         let spokenInput: String
         let preconditions: [String]?
+        let lengthBucket: String
+        let contextType: String
+        let qualityDimensions: [String]
+        let requiresTransformation: Bool
+        let segmentTexts: [String]
+        let contextFixture: QualityContextFixture?
+        let automaticChecks: QualityAutomaticChecks
     }
 
     private struct QualityInput {
@@ -53,6 +85,13 @@ enum VoicePolishQualityRunner {
         let mustRemove: [String]
         let mustNotInvent: [String]
         let preconditions: [String]
+        let lengthBucket: String
+        let contextType: String
+        let qualityDimensions: [String]
+        let requiresTransformation: Bool
+        let segmentTexts: [String]
+        let contextFixture: QualityContextFixture?
+        let automaticChecks: QualityAutomaticChecks
     }
 
     private struct QualityCaseReport: Encodable {
@@ -68,6 +107,12 @@ enum VoicePolishQualityRunner {
         let mustPreserve: [String]
         let mustRemove: [String]
         let mustNotInvent: [String]
+        let lengthBucket: String
+        let contextType: String
+        let qualityDimensions: [String]
+        let requiresTransformation: Bool
+        let segmentCount: Int
+        let automaticChecks: QualityAutomaticChecks
         let modelOutput: String
         let rejectedModelOutput: String?
         let detectedRoute: String
@@ -184,7 +229,7 @@ enum VoicePolishQualityRunner {
     @MainActor
     private static func run(_ invocation: Invocation) async {
         let provider = KeychainService.selectedLLMProvider
-        let qualityMode = VoicePolishQualityMode.balanced
+        let qualityMode = VoicePolishQualityMode.automatic
         var report = QualityRunReport(
             schemaVersion: 1,
             status: "running",
@@ -236,52 +281,11 @@ enum VoicePolishQualityRunner {
             var caseReports: [QualityCaseReport] = []
             for (index, input) in inputs.enumerated() {
                 let terminology = terminologyRules(from: input.preconditions)
-                let canonicalInput = EntityResolver.applyingKnownCorrections(
-                    terminology,
-                    to: input.spokenInput
-                )
-                let rawSegment = RecognitionSegment(
-                    id: "s1",
-                    text: input.spokenInput,
-                    startTimeMs: nil,
-                    endTimeMs: nil,
-                    confidence: nil,
-                    isFinal: true
-                )
-                let canonicalSegment = RecognitionSegment(
-                    id: "s1",
-                    text: canonicalInput,
-                    startTimeMs: nil,
-                    endTimeMs: nil,
-                    confidence: nil,
-                    isFinal: true
-                )
-                let edits = terminology.compactMap { alias, canonical -> VoiceTerminologyEdit? in
-                    guard canonicalInput != input.spokenInput,
-                          EntityResolver.applyingKnownCorrections([alias: canonical], to: input.spokenInput)
-                            != input.spokenInput else { return nil }
-                    return VoiceTerminologyEdit(
-                        alias: alias,
-                        canonical: canonical,
-                        sourceSegmentIDs: ["s1"]
-                    )
-                }
-                let envelope = VoiceInputEnvelope(
-                    providerFinalText: input.spokenInput,
-                    rawSegments: [rawSegment],
-                    canonicalText: canonicalInput,
-                    segments: [canonicalSegment],
-                    requiredEntityEdits: edits,
-                    durationMs: 0,
-                    provider: KeychainService.selectedASRProvider
-                )
+                let envelope = makeEnvelope(for: input, terminology: terminology)
+                let canonicalInput = envelope.canonicalText
                 let request = VoicePolishRequest(
                     input: envelope,
-                    context: WritingContext(
-                        scene: input.scene,
-                        level: .metadataOnly,
-                        safety: .unknown
-                    ),
+                    context: makeWritingContext(for: input),
                     preferences: UserPolishPreferences(additionalRequirements: ""),
                     qualityMode: qualityMode
                 )
@@ -301,6 +305,12 @@ enum VoicePolishQualityRunner {
                     mustPreserve: input.mustPreserve,
                     mustRemove: input.mustRemove,
                     mustNotInvent: input.mustNotInvent,
+                    lengthBucket: input.lengthBucket,
+                    contextType: input.contextType,
+                    qualityDimensions: input.qualityDimensions,
+                    requiresTransformation: input.requiresTransformation,
+                    segmentCount: input.segmentTexts.count,
+                    automaticChecks: input.automaticChecks,
                     modelOutput: result.text,
                     rejectedModelOutput: result.rejectedDraft,
                     detectedRoute: result.detectedRoute.rawValue,
@@ -377,7 +387,14 @@ enum VoicePolishQualityRunner {
                 mustPreserve: item.mustPreserve,
                 mustRemove: item.mustRemove,
                 mustNotInvent: item.mustNotInvent,
-                preconditions: item.preconditions ?? []
+                preconditions: item.preconditions ?? [],
+                lengthBucket: item.lengthBucket,
+                contextType: item.contextType,
+                qualityDimensions: item.qualityDimensions,
+                requiresTransformation: item.requiresTransformation,
+                segmentTexts: item.segmentTexts,
+                contextFixture: item.contextFixture,
+                automaticChecks: item.automaticChecks
             ))
         }
         for item in dataset.stressVariants {
@@ -399,10 +416,83 @@ enum VoicePolishQualityRunner {
                 mustPreserve: base.mustPreserve,
                 mustRemove: base.mustRemove,
                 mustNotInvent: base.mustNotInvent,
-                preconditions: (base.preconditions ?? []) + (item.preconditions ?? [])
+                preconditions: (base.preconditions ?? []) + (item.preconditions ?? []),
+                lengthBucket: item.lengthBucket,
+                contextType: item.contextType,
+                qualityDimensions: item.qualityDimensions,
+                requiresTransformation: item.requiresTransformation,
+                segmentTexts: item.segmentTexts,
+                contextFixture: item.contextFixture,
+                automaticChecks: item.automaticChecks
             ))
         }
         return result
+    }
+
+    private static func makeEnvelope(
+        for input: QualityInput,
+        terminology: [String: String]
+    ) -> VoiceInputEnvelope {
+        let rawSegments = input.segmentTexts.enumerated().map { index, text in
+            RecognitionSegment(
+                id: "s\(index + 1)",
+                text: text,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+        }
+        let canonicalSegments = rawSegments.map { segment in
+            RecognitionSegment(
+                id: segment.id,
+                text: EntityResolver.applyingKnownCorrections(terminology, to: segment.text),
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+        }
+        let edits = terminology.compactMap { alias, canonical -> VoiceTerminologyEdit? in
+            let sourceSegmentIDs = rawSegments.compactMap { segment -> String? in
+                EntityResolver.applyingKnownCorrections([alias: canonical], to: segment.text)
+                    == segment.text ? nil : segment.id
+            }
+            guard !sourceSegmentIDs.isEmpty else { return nil }
+            return VoiceTerminologyEdit(
+                alias: alias,
+                canonical: canonical,
+                sourceSegmentIDs: sourceSegmentIDs
+            )
+        }
+        return VoiceInputEnvelope(
+            providerFinalText: input.spokenInput,
+            rawSegments: rawSegments,
+            canonicalText: canonicalSegments.map(\.text).joined(),
+            segments: canonicalSegments,
+            requiredEntityEdits: edits,
+            durationMs: 0,
+            provider: KeychainService.selectedASRProvider
+        )
+    }
+
+    private static func makeWritingContext(for input: QualityInput) -> WritingContext {
+        guard let fixture = input.contextFixture else {
+            return WritingContext(
+                scene: input.scene,
+                level: .metadataOnly,
+                safety: .unknown
+            )
+        }
+        return WritingContext(
+            scene: input.scene,
+            level: fixture.level,
+            safety: fixture.safety,
+            selectedText: fixture.selectedText,
+            textBeforeCursor: fixture.textBeforeCursor,
+            textAfterCursor: fixture.textAfterCursor,
+            recentMuseInputs: fixture.recentMuseInputs
+        )
     }
 
     private static func terminologyRules(from preconditions: [String]) -> [String: String] {
@@ -490,7 +580,7 @@ enum VoicePolishQualityRunner {
             model: nil,
             endpointOrigin: nil,
             promptVersion: VoicePolishPrompts.version,
-            qualityMode: VoicePolishQualityMode.balanced.rawValue,
+            qualityMode: VoicePolishQualityMode.automatic.rawValue,
             commit: "unknown",
             requestedInputCount: 0,
             completedInputCount: 0,

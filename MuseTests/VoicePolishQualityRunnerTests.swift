@@ -39,17 +39,17 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         ]))
     }
 
-    func test产品质量母集可完整解析为77次输入() throws {
+    func test多维产品质量母集可完整解析为107次输入() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let datasetPath = repositoryRoot
-            .appendingPathComponent("docs/2026-08-12-Muse-Voice-Polish-Quality-Test-Set.json")
+            .appendingPathComponent("docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json")
             .path
 
         XCTAssertEqual(
             try VoicePolishQualityRunner.validatedInputCount(at: datasetPath),
-            77
+            107
         )
     }
 }

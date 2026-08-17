@@ -5,16 +5,16 @@ enum VoicePolishSettings {
     static let maximumCorrectionLimit = 200
 
     static func qualityMode(defaults: UserDefaults = .standard) -> VoicePolishQualityMode {
-        guard let raw = defaults.string(forKey: DefaultsKeys.voicePolishQualityMode),
-              let value = VoicePolishQualityMode(rawValue: raw) else { return .balanced }
-        return value
+        // 2026-08-17：用户侧只保留一个语音润色模式。旧安装可能仍保存
+        // fast / balanced / quality，但这些历史值不得继续改变生产行为。
+        .automatic
     }
 
     static func setQualityMode(
         _ value: VoicePolishQualityMode,
         defaults: UserDefaults = .standard
     ) {
-        defaults.set(value.rawValue, forKey: DefaultsKeys.voicePolishQualityMode)
+        defaults.set(VoicePolishQualityMode.automatic.rawValue, forKey: DefaultsKeys.voicePolishQualityMode)
     }
 
     static func contextLevel(defaults: UserDefaults = .standard) -> WritingContextLevel {
@@ -75,7 +75,7 @@ enum VoicePolishSettings {
         defaults.set(data, forKey: DefaultsKeys.voicePolishSceneOverrides)
     }
 
-    /// 可选的同 Provider 专用快速模型；空值表示沿用“文本处理”模型。
+    /// 可选的同 Provider 语音润色专用模型；空值表示沿用“文本处理”模型。
     /// API Key 与 endpoint 始终复用已配置 Provider，避免复制凭证或引入第二套模型配置。
     static func modelOverride(defaults: UserDefaults = .standard) -> String? {
         let value = defaults.string(forKey: DefaultsKeys.voicePolishModelOverride)?

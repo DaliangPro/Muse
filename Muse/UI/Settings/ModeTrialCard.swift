@@ -448,7 +448,6 @@ private extension ModeTrialCard {
         layoutExpectation: VoicePolishLayoutExpectation,
         elapsedMilliseconds: Int64
     ) -> String {
-        let routes = "\(result.detectedRoute.rawValue.capitalized) → \(result.executedRoute.rawValue.capitalized)"
         let calls = L("\(result.llmAttemptCount) 次", "\(result.llmAttemptCount) call(s)")
         let layout: String
         switch layoutExpectation.kind {
@@ -465,7 +464,7 @@ private extension ModeTrialCard {
             ? L("校验通过", "Validated")
             : result.validationCodes.map(\.rawValue).joined(separator: ",")
         let fallback = result.usedFallback ? L(" · 原文回退", " · Fallback") : ""
-        return "\(routes) · \(L("版式", "Layout"))：\(layout) · \(calls) · \(durationText(elapsedMilliseconds)) · \(validation)\(fallback)"
+        return "\(L("版式", "Layout"))：\(layout) · \(calls) · \(durationText(elapsedMilliseconds)) · \(validation)\(fallback)"
     }
 
     func milliseconds(_ duration: Duration) -> Int64 {
