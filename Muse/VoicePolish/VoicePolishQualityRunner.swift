@@ -1,4 +1,5 @@
 import AppKit
+import CommonCrypto
 import Foundation
 
 /// 由签名后的 Muse.app 显式执行的语音润色质量跑测入口。
@@ -6,29 +7,23 @@ import Foundation
 /// XCTest 必须继续使用隔离凭据；该入口只在传入专用参数时运行，复用正式应用
 /// 的 Provider 配置，但不会把 API Key 写入参数、日志或报告。
 enum VoicePolishQualityRunner {
+    private static let reportSchemaVersion = 4
+
     struct Invocation: Equatable {
-        let datasetPath: String
+        let runInputPath: String
         let reportPath: String
+        let providerAuditPath: String
+        let runNonce: String
         let limit: Int?
-        let commit: String
     }
 
-    private struct QualityDataset: Decodable {
+    private struct QualityRunInputDocument: Decodable {
         let schemaVersion: Int
         let name: String
-        let cases: [QualityBaseCase]
-        let stressVariants: [QualityVariant]
+        let inputs: [QualityInput]
     }
 
-    private struct QualityAutomaticChecks: Codable {
-        let requiredSubstrings: [String]
-        let forbiddenSubstrings: [String]
-        let forbiddenContextSubstrings: [String]
-        let minimumParagraphCount: Int?
-        let minimumListItemCount: Int?
-    }
-
-    private struct QualityContextFixture: Decodable {
+    struct QualityContextFixture: Codable, Equatable {
         let type: String
         let level: WritingContextLevel
         let safety: ContextSafety
@@ -36,104 +31,108 @@ enum VoicePolishQualityRunner {
         let textBeforeCursor: String?
         let textAfterCursor: String?
         let recentMuseInputs: [String]
+
+        private enum CodingKeys: String, CodingKey {
+            case type
+            case level
+            case safety
+            case selectedText
+            case textBeforeCursor
+            case textAfterCursor
+            case recentMuseInputs
+        }
+
+        /// 质量报告必须保留完整夹具，包括显式的 `null` 字段，便于独立评审者
+        /// 区分“数据集没有提供”与“Runner 在编码时漏掉了该字段”。
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(type, forKey: .type)
+            try container.encode(level, forKey: .level)
+            try container.encode(safety, forKey: .safety)
+            if let selectedText {
+                try container.encode(selectedText, forKey: .selectedText)
+            } else {
+                try container.encodeNil(forKey: .selectedText)
+            }
+            if let textBeforeCursor {
+                try container.encode(textBeforeCursor, forKey: .textBeforeCursor)
+            } else {
+                try container.encodeNil(forKey: .textBeforeCursor)
+            }
+            if let textAfterCursor {
+                try container.encode(textAfterCursor, forKey: .textAfterCursor)
+            } else {
+                try container.encodeNil(forKey: .textAfterCursor)
+            }
+            try container.encode(recentMuseInputs, forKey: .recentMuseInputs)
+        }
     }
 
-    private struct QualityBaseCase: Decodable {
-        let id: String
+    struct QualityArtifactEvidence: Codable, Equatable {
+        let runInputSHA256: String
+        let executableSHA256: String
+        let sourceCommit: String
+    }
+
+    struct QualityReportInputEvidence: Codable, Equatable {
+        let segmentTexts: [String]
+        let contextFixture: QualityContextFixture
+    }
+
+    struct QualityValidationEvidence: Equatable {
+        let hardValidationCodes: [String]
+        let diagnosticCodes: [String]
+    }
+
+    private struct QualityInput: Decodable {
+        let testInputId: String
+        let baseCaseId: String
+        let inputKind: String
         let writingScene: WritingScene
         let spokenInput: String
-        let referenceOutput: String
-        let mustPreserve: [String]
-        let mustRemove: [String]
-        let mustNotInvent: [String]
-        let preconditions: [String]?
-        let lengthBucket: String
-        let contextType: String
-        let qualityDimensions: [String]
-        let requiresTransformation: Bool
-        let segmentTexts: [String]
-        let contextFixture: QualityContextFixture?
-        let automaticChecks: QualityAutomaticChecks
-    }
-
-    private struct QualityVariant: Decodable {
-        let id: String
-        let baseCaseId: String
-        let inputFactors: [String]
-        let stutterForm: String?
-        let spokenInput: String
-        let preconditions: [String]?
-        let lengthBucket: String
-        let contextType: String
-        let qualityDimensions: [String]
-        let requiresTransformation: Bool
-        let segmentTexts: [String]
-        let contextFixture: QualityContextFixture?
-        let automaticChecks: QualityAutomaticChecks
-    }
-
-    private struct QualityInput {
-        let testInputID: String
-        let baseCaseID: String
-        let inputKind: String
-        let scene: WritingScene
-        let inputFactors: [String]
-        let stutterForm: String?
-        let spokenInput: String
-        let referenceOutput: String
-        let mustPreserve: [String]
-        let mustRemove: [String]
-        let mustNotInvent: [String]
         let preconditions: [String]
-        let lengthBucket: String
         let contextType: String
-        let qualityDimensions: [String]
-        let requiresTransformation: Bool
         let segmentTexts: [String]
         let contextFixture: QualityContextFixture?
-        let automaticChecks: QualityAutomaticChecks
     }
 
-    private struct QualityCaseReport: Encodable {
+    private struct QualityCaseReport: Codable {
         let testInputID: String
         let baseCaseID: String
         let inputKind: String
         let writingScene: String
-        let inputFactors: [String]
-        let stutterForm: String?
         let spokenInput: String
         let canonicalInput: String
-        let referenceOutput: String
-        let mustPreserve: [String]
-        let mustRemove: [String]
-        let mustNotInvent: [String]
-        let lengthBucket: String
-        let contextType: String
-        let qualityDimensions: [String]
-        let requiresTransformation: Bool
         let segmentCount: Int
-        let automaticChecks: QualityAutomaticChecks
+        let segmentTexts: [String]
+        let contextFixture: QualityContextFixture
         let modelOutput: String
         let rejectedModelOutput: String?
         let detectedRoute: String
         let executedRoute: String
+        let internalChunkCount: Int
         let llmCallCount: Int
         let latencyMilliseconds: Int64
         let fallbackUsed: Bool
-        let validationCodes: [String]
+        let hardValidationCodes: [String]
+        let diagnosticCodes: [String]
         let failureReason: String?
     }
 
-    private struct QualityRunReport: Encodable {
+    private struct QualityRunReport: Codable {
         let schemaVersion: Int
         let status: String
         let error: String?
         let runAt: Date
-        let datasetName: String?
-        let datasetSchemaVersion: Int?
+        let runNonce: String
+        let processID: Int32
+        let runInputName: String?
+        let runInputSchemaVersion: Int?
+        let runInputSHA256: String?
+        let executableSHA256: String?
         let provider: String
         let model: String?
-        let endpointOrigin: String?
+        let endpointURL: String?
         let promptVersion: Int
         let qualityMode: String
         let commit: String
@@ -145,9 +144,15 @@ enum VoicePolishQualityRunner {
     private enum RunnerError: LocalizedError {
         case missingArgument(String)
         case invalidLimit(String)
+        case invalidRunNonce(String)
         case duplicateCaseID(String)
-        case missingBaseCase(String)
+        case invalidRunInput
+        case forbiddenRunInputField(String)
         case missingLLMConfig
+        case missingExecutableURL
+        case missingSourceCommit
+        case invalidSourceCommit(String)
+        case evidenceFileReadFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -155,12 +160,24 @@ enum VoicePolishQualityRunner {
                 return "缺少参数 \(argument)"
             case .invalidLimit(let value):
                 return "limit 必须是正整数，当前为 \(value)"
+            case .invalidRunNonce(let value):
+                return "run nonce 必须是 64 位小写十六进制，当前为 \(value)"
             case .duplicateCaseID(let id):
-                return "测试集存在重复 ID：\(id)"
-            case .missingBaseCase(let id):
-                return "专项变体指向不存在的基准样本：\(id)"
+                return "运行输入存在重复 ID：\(id)"
+            case .invalidRunInput:
+                return "运行输入必须是由 evaluator 生成的无答案 inputs 清单"
+            case .forbiddenRunInputField(let field):
+                return "运行输入包含禁止交给 Runner 的答案字段：\(field)"
             case .missingLLMConfig:
                 return "当前 LLM Provider 没有可用配置"
+            case .missingExecutableURL:
+                return "无法确定当前运行二进制路径"
+            case .missingSourceCommit:
+                return "候选应用没有写入 MuseSourceCommit，不能作为质量验收制品"
+            case .invalidSourceCommit(let value):
+                return "候选应用的 MuseSourceCommit 无效：\(value)"
+            case .evidenceFileReadFailed(let path):
+                return "无法读取质量验收证据文件：\(path)"
             }
         }
     }
@@ -199,11 +216,23 @@ enum VoicePolishQualityRunner {
             return arguments[index + 1]
         }
 
-        guard let datasetPath = value(after: "--dataset") else {
-            throw RunnerError.missingArgument("--dataset")
+        guard let runInputPath = value(after: "--run-input") else {
+            throw RunnerError.missingArgument("--run-input")
         }
         guard let reportPath = value(after: "--report") else {
             throw RunnerError.missingArgument("--report")
+        }
+        guard let providerAuditPath = value(after: "--provider-audit") else {
+            throw RunnerError.missingArgument("--provider-audit")
+        }
+        guard let runNonce = value(after: "--run-nonce") else {
+            throw RunnerError.missingArgument("--run-nonce")
+        }
+        guard runNonce.count == 64,
+              runNonce.unicodeScalars.allSatisfy({
+                  (48...57).contains($0.value) || (97...102).contains($0.value)
+              }) else {
+            throw RunnerError.invalidRunNonce(runNonce)
         }
         let limit: Int?
         if let rawLimit = value(after: "--limit") {
@@ -215,15 +244,16 @@ enum VoicePolishQualityRunner {
             limit = nil
         }
         return Invocation(
-            datasetPath: datasetPath,
+            runInputPath: runInputPath,
             reportPath: reportPath,
-            limit: limit,
-            commit: value(after: "--commit") ?? "unknown"
+            providerAuditPath: providerAuditPath,
+            runNonce: runNonce,
+            limit: limit
         )
     }
 
-    static func validatedInputCount(at datasetPath: String) throws -> Int {
-        try flattenedInputs(from: loadDataset(at: datasetPath)).count
+    static func validatedInputCount(at runInputPath: String) throws -> Int {
+        try validatedInputs(from: loadRunInput(at: runInputPath)).count
     }
 
     @MainActor
@@ -231,26 +261,33 @@ enum VoicePolishQualityRunner {
         let provider = KeychainService.selectedLLMProvider
         let qualityMode = VoicePolishQualityMode.automatic
         var report = QualityRunReport(
-            schemaVersion: 1,
+            schemaVersion: reportSchemaVersion,
             status: "running",
             error: nil,
             runAt: Date(),
-            datasetName: nil,
-            datasetSchemaVersion: nil,
+            runNonce: invocation.runNonce,
+            processID: ProcessInfo.processInfo.processIdentifier,
+            runInputName: nil,
+            runInputSchemaVersion: nil,
+            runInputSHA256: nil,
+            executableSHA256: nil,
             provider: provider.rawValue,
             model: nil,
-            endpointOrigin: nil,
+            endpointURL: nil,
             promptVersion: VoicePolishPrompts.version,
             qualityMode: qualityMode.rawValue,
-            commit: invocation.commit,
+            commit: "unverified",
             requestedInputCount: 0,
             completedInputCount: 0,
             cases: []
         )
 
         do {
-            let dataset = try loadDataset(at: invocation.datasetPath)
-            var inputs = try flattenedInputs(from: dataset)
+            let artifactEvidence = try runtimeArtifactEvidence(
+                runInputPath: invocation.runInputPath
+            )
+            let runInput = try loadRunInput(at: invocation.runInputPath)
+            var inputs = try validatedInputs(from: runInput)
             if let limit = invocation.limit {
                 inputs = Array(inputs.prefix(limit))
             }
@@ -264,14 +301,21 @@ enum VoicePolishQualityRunner {
                 status: report.status,
                 error: nil,
                 runAt: report.runAt,
-                datasetName: dataset.name,
-                datasetSchemaVersion: dataset.schemaVersion,
+                runNonce: report.runNonce,
+                processID: report.processID,
+                runInputName: runInput.name,
+                runInputSchemaVersion: runInput.schemaVersion,
+                runInputSHA256: artifactEvidence.runInputSHA256,
+                executableSHA256: artifactEvidence.executableSHA256,
                 provider: provider.rawValue,
                 model: config.model,
-                endpointOrigin: endpointOrigin(config.baseURL),
+                endpointURL: try endpointIdentity(
+                    rawBaseURL: config.baseURL,
+                    provider: provider
+                ),
                 promptVersion: report.promptVersion,
                 qualityMode: report.qualityMode,
-                commit: report.commit,
+                commit: artifactEvidence.sourceCommit,
                 requestedInputCount: inputs.count,
                 completedInputCount: 0,
                 cases: []
@@ -283,42 +327,63 @@ enum VoicePolishQualityRunner {
                 let terminology = terminologyRules(from: input.preconditions)
                 let envelope = makeEnvelope(for: input, terminology: terminology)
                 let canonicalInput = envelope.canonicalText
+                let writingContext = makeWritingContext(for: input)
+                let inputEvidence = reportInputEvidence(
+                    segmentTexts: envelope.rawSegments.map(\.text),
+                    contextFixture: input.contextFixture,
+                    contextType: input.contextType,
+                    appliedContext: writingContext
+                )
+                // 与正式 RecognitionSession 保持同一条链路：安全上下文先参与
+                // 高置信实体解析，再随 payload 交给模型。否则质量跑测只测到了
+                // Prompt 是否偶然看懂上下文，不能代表安装版的真实行为。
+                let resolvedEntities = EntityResolver.resolve(
+                    segments: envelope.segments,
+                    lexicon: .empty,
+                    snippets: [],
+                    hotwords: [],
+                    context: writingContext
+                )
                 let request = VoicePolishRequest(
                     input: envelope,
-                    context: makeWritingContext(for: input),
+                    context: writingContext,
                     preferences: UserPolishPreferences(additionalRequirements: ""),
-                    qualityMode: qualityMode
+                    qualityMode: qualityMode,
+                    resolvedEntities: resolvedEntities
                 )
                 let startedAt = ContinuousClock.now
-                let result = await VoicePolishPipeline(client: client, config: config).process(request)
+                let result = await VoicePolishProviderAudit.withContext(
+                    runNonce: invocation.runNonce,
+                    testInputID: input.testInputId,
+                    receiptPath: invocation.providerAuditPath
+                ) {
+                    await VoicePolishPipeline(client: client, config: config).process(request)
+                }
                 let elapsed = ContinuousClock.now - startedAt
+                let validationEvidence = validationEvidence(for: result.validationCodes)
                 caseReports.append(QualityCaseReport(
-                    testInputID: input.testInputID,
-                    baseCaseID: input.baseCaseID,
+                    testInputID: input.testInputId,
+                    baseCaseID: input.baseCaseId,
                     inputKind: input.inputKind,
-                    writingScene: input.scene.rawValue,
-                    inputFactors: input.inputFactors,
-                    stutterForm: input.stutterForm,
+                    writingScene: input.writingScene.rawValue,
                     spokenInput: input.spokenInput,
                     canonicalInput: canonicalInput,
-                    referenceOutput: input.referenceOutput,
-                    mustPreserve: input.mustPreserve,
-                    mustRemove: input.mustRemove,
-                    mustNotInvent: input.mustNotInvent,
-                    lengthBucket: input.lengthBucket,
-                    contextType: input.contextType,
-                    qualityDimensions: input.qualityDimensions,
-                    requiresTransformation: input.requiresTransformation,
-                    segmentCount: input.segmentTexts.count,
-                    automaticChecks: input.automaticChecks,
+                    segmentCount: inputEvidence.segmentTexts.count,
+                    segmentTexts: inputEvidence.segmentTexts,
+                    contextFixture: inputEvidence.contextFixture,
                     modelOutput: result.text,
                     rejectedModelOutput: result.rejectedDraft,
                     detectedRoute: result.detectedRoute.rawValue,
                     executedRoute: result.executedRoute.rawValue,
+                    internalChunkCount: internalChunkCount(
+                        for: request.fallbackText,
+                        executedRoute: result.executedRoute
+                    ),
                     llmCallCount: result.llmAttemptCount,
                     latencyMilliseconds: milliseconds(elapsed),
                     fallbackUsed: result.usedFallback,
-                    validationCodes: result.validationCodes.map(\.rawValue),
+                    hardValidationCodes: validationEvidence.hardValidationCodes,
+                    diagnosticCodes: validationEvidence.diagnosticCodes,
                     failureReason: result.failureReason?.rawValue
                 ))
                 report = replacing(
@@ -329,7 +394,7 @@ enum VoicePolishQualityRunner {
                     cases: caseReports
                 )
                 try write(report, to: invocation.reportPath)
-                print("VOICE_POLISH_QUALITY_PROGRESS \(index + 1)/\(inputs.count) \(input.testInputID)")
+                print("VOICE_POLISH_QUALITY_PROGRESS \(index + 1)/\(inputs.count) \(input.testInputId)")
             }
 
             report = replacing(
@@ -354,79 +419,45 @@ enum VoicePolishQualityRunner {
         }
     }
 
-    private static func loadDataset(at path: String) throws -> QualityDataset {
+    private static let forbiddenRunInputFields: Set<String> = [
+        "automatic_checks",
+        "factor_assertions",
+        "must_not_invent",
+        "must_preserve",
+        "must_remove",
+        "quality_dimensions",
+        "reference_output",
+        "requires_transformation",
+    ]
+
+    /// Runner 只接受 evaluator 派生的无答案输入清单。先检查原始 JSON 键，避免
+    /// `JSONDecoder` 静默忽略答案字段后，让完整母集看起来也像合法运行输入。
+    private static func loadRunInput(at path: String) throws -> QualityRunInputDocument {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawInputs = object["inputs"] as? [[String: Any]] else {
+            throw RunnerError.invalidRunInput
+        }
+        for rawInput in rawInputs {
+            if let forbidden = forbiddenRunInputFields.first(where: rawInput.keys.contains) {
+                throw RunnerError.forbiddenRunInputField(forbidden)
+            }
+        }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(QualityDataset.self, from: data)
+        return try decoder.decode(QualityRunInputDocument.self, from: data)
     }
 
-    private static func flattenedInputs(from dataset: QualityDataset) throws -> [QualityInput] {
-        var baseByID: [String: QualityBaseCase] = [:]
-        for item in dataset.cases {
-            guard baseByID.updateValue(item, forKey: item.id) == nil else {
-                throw RunnerError.duplicateCaseID(item.id)
-            }
-        }
-
+    private static func validatedInputs(
+        from document: QualityRunInputDocument
+    ) throws -> [QualityInput] {
         var seenIDs = Set<String>()
-        var result: [QualityInput] = []
-        for item in dataset.cases {
-            guard seenIDs.insert(item.id).inserted else {
-                throw RunnerError.duplicateCaseID(item.id)
+        for item in document.inputs {
+            guard seenIDs.insert(item.testInputId).inserted else {
+                throw RunnerError.duplicateCaseID(item.testInputId)
             }
-            result.append(QualityInput(
-                testInputID: item.id,
-                baseCaseID: item.id,
-                inputKind: "base",
-                scene: item.writingScene,
-                inputFactors: [],
-                stutterForm: nil,
-                spokenInput: item.spokenInput,
-                referenceOutput: item.referenceOutput,
-                mustPreserve: item.mustPreserve,
-                mustRemove: item.mustRemove,
-                mustNotInvent: item.mustNotInvent,
-                preconditions: item.preconditions ?? [],
-                lengthBucket: item.lengthBucket,
-                contextType: item.contextType,
-                qualityDimensions: item.qualityDimensions,
-                requiresTransformation: item.requiresTransformation,
-                segmentTexts: item.segmentTexts,
-                contextFixture: item.contextFixture,
-                automaticChecks: item.automaticChecks
-            ))
         }
-        for item in dataset.stressVariants {
-            guard seenIDs.insert(item.id).inserted else {
-                throw RunnerError.duplicateCaseID(item.id)
-            }
-            guard let base = baseByID[item.baseCaseId] else {
-                throw RunnerError.missingBaseCase(item.baseCaseId)
-            }
-            result.append(QualityInput(
-                testInputID: item.id,
-                baseCaseID: item.baseCaseId,
-                inputKind: "stress_variant",
-                scene: base.writingScene,
-                inputFactors: item.inputFactors,
-                stutterForm: item.stutterForm,
-                spokenInput: item.spokenInput,
-                referenceOutput: base.referenceOutput,
-                mustPreserve: base.mustPreserve,
-                mustRemove: base.mustRemove,
-                mustNotInvent: base.mustNotInvent,
-                preconditions: (base.preconditions ?? []) + (item.preconditions ?? []),
-                lengthBucket: item.lengthBucket,
-                contextType: item.contextType,
-                qualityDimensions: item.qualityDimensions,
-                requiresTransformation: item.requiresTransformation,
-                segmentTexts: item.segmentTexts,
-                contextFixture: item.contextFixture,
-                automaticChecks: item.automaticChecks
-            ))
-        }
-        return result
+        return document.inputs
     }
 
     private static func makeEnvelope(
@@ -479,19 +510,42 @@ enum VoicePolishQualityRunner {
     private static func makeWritingContext(for input: QualityInput) -> WritingContext {
         guard let fixture = input.contextFixture else {
             return WritingContext(
-                scene: input.scene,
+                scene: input.writingScene,
                 level: .metadataOnly,
                 safety: .unknown
             )
         }
         return WritingContext(
-            scene: input.scene,
+            scene: input.writingScene,
             level: fixture.level,
             safety: fixture.safety,
             selectedText: fixture.selectedText,
             textBeforeCursor: fixture.textBeforeCursor,
             textAfterCursor: fixture.textAfterCursor,
             recentMuseInputs: fixture.recentMuseInputs
+        )
+    }
+
+    /// 报告记录 Runner 实际用于构造请求的分段，同时完整保留数据集上下文夹具。
+    /// 没有显式夹具时也写出真实采用的默认上下文，而不是省略字段。
+    static func reportInputEvidence(
+        segmentTexts: [String],
+        contextFixture: QualityContextFixture?,
+        contextType: String,
+        appliedContext: WritingContext
+    ) -> QualityReportInputEvidence {
+        let completeFixture = contextFixture ?? QualityContextFixture(
+            type: contextType,
+            level: appliedContext.level,
+            safety: appliedContext.safety,
+            selectedText: appliedContext.selectedText,
+            textBeforeCursor: appliedContext.textBeforeCursor,
+            textAfterCursor: appliedContext.textAfterCursor,
+            recentMuseInputs: appliedContext.recentMuseInputs
+        )
+        return QualityReportInputEvidence(
+            segmentTexts: segmentTexts,
+            contextFixture: completeFixture
         )
     }
 
@@ -513,12 +567,146 @@ enum VoicePolishQualityRunner {
         return rules
     }
 
-    private static func endpointOrigin(_ rawValue: String) -> String? {
-        guard let components = URLComponents(string: rawValue),
+    /// 报告的是客户端最终请求地址，而不是设置里保存的 base URL。
+    static func endpointIdentity(
+        rawBaseURL: String,
+        provider: LLMProvider,
+        localQwenPort: Int? = nil
+    ) throws -> String {
+        let baseURL = try LLMEndpointPolicy.normalizedBaseURL(
+            rawValue: rawBaseURL,
+            provider: provider,
+            localQwenPort: provider == .localQwen
+                ? (localQwenPort ?? LLMEndpointPolicy.currentLocalQwenPort)
+                : nil
+        )
+        let endpoint = try LLMEndpointPolicy.endpoint(
+            baseURL: baseURL,
+            pathComponents: provider == .claude ? ["messages"] : ["chat", "completions"]
+        )
+        guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
               let scheme = components.scheme,
-              let host = components.host else { return nil }
+              let host = components.host else {
+            throw LLMEndpointPolicyError.invalidURL
+        }
         let port = components.port.map { ":\($0)" } ?? ""
-        return "\(scheme)://\(host)\(port)"
+        var path = components.percentEncodedPath
+        while path.count > 1, path.hasSuffix("/") {
+            path.removeLast()
+        }
+        return "\(scheme.lowercased())://\(host.lowercased())\(port)\(path)"
+    }
+
+    static func validationEvidence(
+        for codes: [VoicePolishValidationCode]
+    ) -> QualityValidationEvidence {
+        QualityValidationEvidence(
+            hardValidationCodes: codes.filter(\.isHardFailure).map(\.rawValue),
+            diagnosticCodes: codes.filter { !$0.isHardFailure }.map(\.rawValue)
+        )
+    }
+
+    static func internalChunkCount(
+        for text: String,
+        executedRoute: VoicePolishRoute,
+        maximumSourceTokens: Int = VoicePolishPipeline.fastChunkSourceTokenLimit
+    ) -> Int {
+        guard executedRoute == .fast else { return 1 }
+        return max(
+            1,
+            VoicePolishPipeline.fastChunkTexts(
+                from: text,
+                maximumSourceTokens: maximumSourceTokens
+            ).count
+        )
+    }
+
+    /// 测试可显式注入伪二进制；生产路径不接受 CLI 或调用方传入的二进制地址，
+    /// 始终从 `Bundle.main.executableURL` 读取当前进程制品。
+    static func artifactEvidenceForTesting(
+        runInputURL: URL,
+        executableURL: URL,
+        sourceCommit: String = String(repeating: "0", count: 40)
+    ) throws -> QualityArtifactEvidence {
+        try makeArtifactEvidence(
+            runInputURL: runInputURL,
+            executableURL: executableURL,
+            sourceCommit: sourceCommit
+        )
+    }
+
+    private static func makeArtifactEvidence(
+        runInputURL: URL,
+        executableURL: URL,
+        sourceCommit: String
+    ) throws -> QualityArtifactEvidence {
+        let normalizedCommit = try validatedSourceCommit(sourceCommit)
+        let runInputSHA256 = try sha256(fileAt: runInputURL)
+        let executableSHA256 = try sha256(fileAt: executableURL)
+        return QualityArtifactEvidence(
+            runInputSHA256: runInputSHA256,
+            executableSHA256: executableSHA256,
+            sourceCommit: normalizedCommit
+        )
+    }
+
+    private static func validatedSourceCommit(_ rawValue: String?) throws -> String {
+        guard let rawValue else { throw RunnerError.missingSourceCommit }
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard value.count == 40,
+              value.unicodeScalars.allSatisfy({
+                  (48...57).contains($0.value) || (97...102).contains($0.value)
+              }) else {
+            throw RunnerError.invalidSourceCommit(value)
+        }
+        return value
+    }
+
+    private static func runtimeArtifactEvidence(
+        runInputPath: String
+    ) throws -> QualityArtifactEvidence {
+        guard let executableURL = Bundle.main.executableURL else {
+            throw RunnerError.missingExecutableURL
+        }
+        let sourceCommit = try validatedSourceCommit(
+            Bundle.main.object(forInfoDictionaryKey: "MuseSourceCommit") as? String
+        )
+        return try makeArtifactEvidence(
+            runInputURL: URL(fileURLWithPath: runInputPath),
+            executableURL: executableURL,
+            sourceCommit: sourceCommit
+        )
+    }
+
+    private static func sha256(fileAt url: URL) throws -> String {
+        guard let stream = InputStream(url: url) else {
+            throw RunnerError.evidenceFileReadFailed(url.path)
+        }
+        stream.open()
+        defer { stream.close() }
+
+        var context = CC_SHA256_CTX()
+        CC_SHA256_Init(&context)
+
+        let bufferSize = 1024 * 1024
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+
+        while true {
+            let count = stream.read(buffer, maxLength: bufferSize)
+            if count > 0 {
+                CC_SHA256_Update(&context, buffer, CC_LONG(count))
+            } else if count == 0 {
+                break
+            } else {
+                throw stream.streamError
+                    ?? RunnerError.evidenceFileReadFailed(url.path)
+            }
+        }
+
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        CC_SHA256_Final(&digest, &context)
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private static func milliseconds(_ duration: Duration) -> Int64 {
@@ -538,11 +726,15 @@ enum VoicePolishQualityRunner {
             status: status,
             error: error,
             runAt: report.runAt,
-            datasetName: report.datasetName,
-            datasetSchemaVersion: report.datasetSchemaVersion,
+            runNonce: report.runNonce,
+            processID: report.processID,
+            runInputName: report.runInputName,
+            runInputSchemaVersion: report.runInputSchemaVersion,
+            runInputSHA256: report.runInputSHA256,
+            executableSHA256: report.executableSHA256,
             provider: report.provider,
             model: report.model,
-            endpointOrigin: report.endpointOrigin,
+            endpointURL: report.endpointURL,
             promptVersion: report.promptVersion,
             qualityMode: report.qualityMode,
             commit: report.commit,
@@ -569,19 +761,37 @@ enum VoicePolishQualityRunner {
     private static func writeStartupFailure(_ error: Error, arguments: [String]) {
         guard let reportIndex = arguments.firstIndex(of: "--report"),
               arguments.indices.contains(reportIndex + 1) else { return }
+        let runNonce: String
+        if let nonceIndex = arguments.firstIndex(of: "--run-nonce"),
+           arguments.indices.contains(nonceIndex + 1) {
+            runNonce = arguments[nonceIndex + 1]
+        } else {
+            runNonce = "invalid"
+        }
+        var artifactEvidence: QualityArtifactEvidence?
+        if let runInputIndex = arguments.firstIndex(of: "--run-input"),
+           arguments.indices.contains(runInputIndex + 1) {
+            artifactEvidence = try? runtimeArtifactEvidence(
+                runInputPath: arguments[runInputIndex + 1]
+            )
+        }
         let report = QualityRunReport(
-            schemaVersion: 1,
+            schemaVersion: reportSchemaVersion,
             status: "failed",
             error: LogRedactor.redact(error.localizedDescription),
             runAt: Date(),
-            datasetName: nil,
-            datasetSchemaVersion: nil,
+            runNonce: runNonce,
+            processID: ProcessInfo.processInfo.processIdentifier,
+            runInputName: nil,
+            runInputSchemaVersion: nil,
+            runInputSHA256: artifactEvidence?.runInputSHA256,
+            executableSHA256: artifactEvidence?.executableSHA256,
             provider: "unknown",
             model: nil,
-            endpointOrigin: nil,
+            endpointURL: nil,
             promptVersion: VoicePolishPrompts.version,
             qualityMode: VoicePolishQualityMode.automatic.rawValue,
-            commit: "unknown",
+            commit: artifactEvidence?.sourceCommit ?? "unknown",
             requestedInputCount: 0,
             completedInputCount: 0,
             cases: []

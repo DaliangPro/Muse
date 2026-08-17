@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 
 struct VoicePolishValidationResult: Sendable, Equatable {
     let codes: [VoicePolishValidationCode]
@@ -9,6 +10,20 @@ struct VoicePolishValidationResult: Sendable, Equatable {
 }
 
 enum VoicePolishValidator {
+
+    struct SupersededFactOccurrence: Hashable, Sendable {
+        let factIndex: Int
+        let segmentIndex: Int
+        let offset: Int
+        let length: Int
+        let globalOffset: Int
+        let replacementFactIndex: Int?
+        let relationAnchor: String?
+        let factDescriptor: String?
+        let replacementDescriptor: String?
+
+        var globalEndOffset: Int { globalOffset + length }
+    }
 
     static func validatePlan(
         _ plan: VoicePolishPlan,
@@ -37,6 +52,10 @@ enum VoicePolishValidator {
     ) -> VoicePolishValidationResult {
         var codes = commonCodes(output: output, sourceText: request.fallbackText)
         let outputFacts = protectedFactsFromOutput(output, request: request)
+        let supersededOccurrences = locallySupersededFactOccurrences(
+            request: request,
+            sourceFacts: sourceFacts
+        )
         let supersededFactIndices = locallySupersededFactIndices(
             request: request,
             sourceFacts: sourceFacts
@@ -72,11 +91,105 @@ enum VoicePolishValidator {
         if retainsExplicitCorrectionNarration(output: output, request: request) {
             append(.supersededFactRetained, to: &codes)
         }
+        appendSupersededRelationCodes(
+            output: output,
+            sourceFacts: sourceFacts,
+            supersededOccurrences: supersededOccurrences,
+            fullySupersededFactIndices: supersededFactIndices,
+            to: &codes
+        )
+        appendDeliberateRepetitionCodes(output: output, request: request, to: &codes)
         appendUnchangedDraftCode(output: output, request: request, to: &codes)
         appendSemanticBoundaryCodes(output: output, request: request, to: &codes)
         appendTerminologyEditCodes(output: output, request: request, to: &codes)
         appendOutputLayoutCodes(output, request: request, to: &codes)
         return VoicePolishValidationResult(codes: codes)
+    }
+
+    /// 极短口语里的重复不都属于口吃。三连回应词和少数双词强调具有明确的
+    /// 语气功能；模型若机械压成一次，会把“行行行”从带情绪的确认改成普通
+    /// 应答。这里只收录高置信模式，避免把“我我”“今天今天”等口吃误保留。
+    static func deliberateRepetitionPhrases(in text: String) -> [String] {
+        guard text.count <= 32 else { return [] }
+        let normalized = normalizedNaturalText(text)
+        var phrases: [String] = []
+        for word in ["真的", "确实", "特别", "绝对", "非常"] {
+            let phrase = word + word
+            if normalized.contains(normalizedNaturalText(phrase)),
+               hasUnretractedOccurrence(of: phrase, in: text) {
+                phrases.append(phrase)
+            }
+        }
+        for word in ["行", "对", "好"] {
+            let phrase = String(repeating: word, count: 3)
+            if hasDelimitedResponsePhrase(phrase, in: text),
+               hasUnretractedOccurrence(of: phrase, in: text) {
+                phrases.append(phrase)
+            }
+        }
+        return Array(Set(phrases)).sorted()
+    }
+
+    private static func hasUnretractedOccurrence(of phrase: String, in text: String) -> Bool {
+        allRanges(of: phrase, in: text).contains { range in
+            let nearbySuffix = String(text[range.upperBound...].prefix(18))
+            var normalizedSuffix = normalizedNaturalText(nearbySuffix).lowercased()
+            // 口述里常在真正的改口词前夹一个“呃/那个”。这些填充词不能把
+            // 已经撤回的强调伪装成仍需保护的有意重复。
+            let correctionFillers = ["嗯", "呃", "额", "那个", "就是", "然后"]
+            var removedFiller = true
+            while removedFiller {
+                removedFiller = false
+                for filler in correctionFillers where normalizedSuffix.hasPrefix(filler) {
+                    normalizedSuffix.removeFirst(filler.count)
+                    removedFiller = true
+                    break
+                }
+            }
+            let immediateCorrectionSignals = [
+                "不对", "我改一下", "我说错了", "说错了", "我的意思是",
+                "应该是", "最后改成", "改成", "改为", "调整为", "现定为",
+                "scratchthat", "imean", "actually",
+            ]
+            return !immediateCorrectionSignals.contains(where: normalizedSuffix.hasPrefix)
+        }
+    }
+
+    private static func hasDelimitedResponsePhrase(_ phrase: String, in text: String) -> Bool {
+        guard let range = text.range(of: phrase) else { return false }
+        let hasLeftBoundary = range.lowerBound == text.startIndex
+            || text[text.index(before: range.lowerBound)].isWhitespace
+            || text[text.index(before: range.lowerBound)].isPunctuation
+        let hasRightBoundary = range.upperBound == text.endIndex
+            || text[range.upperBound].isWhitespace
+            || text[range.upperBound].isPunctuation
+        guard hasLeftBoundary else { return false }
+        if hasRightBoundary { return true }
+
+        // ASR 经常不在句首三连回应后补停顿：“行行行我知道了”“对对对我明白”。
+        // “行/对”的句首三连本身已经是高置信语用回应；“好好好”则只在后面
+        // 明确进入人称或行动小句时保护，避免把“好｜好像可以”的起步重来误保留。
+        if phrase == "行行行" || phrase == "对对对" { return true }
+        guard phrase == "好好好" else { return false }
+        let suffix = String(text[range.upperBound...])
+        let independentStarts = [
+            "我", "你", "他", "她", "它", "我们", "你们", "他们",
+            "这", "那", "就", "先", "马上", "现在", "请",
+        ]
+        return independentStarts.contains(where: suffix.hasPrefix)
+    }
+
+    private static func appendDeliberateRepetitionCodes(
+        output: String,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        let normalizedOutput = normalizedNaturalText(output)
+        if deliberateRepetitionPhrases(in: request.fallbackText).contains(where: {
+            !normalizedOutput.contains(normalizedNaturalText($0))
+        }) {
+            append(.missingProtectedFact, to: &codes)
+        }
     }
 
     /// 模型偶尔会在已经写出最终数量后，用括号补一句旧数量的推导过程，例如
@@ -131,101 +244,16 @@ enum VoicePolishValidator {
         return candidate == output ? nil : candidate
     }
 
-    /// 只清理由字面可以完全证明的重复与幕后备注。这里不做开放式改写，
-    /// 每条替换都要求原文提供对应证据，避免为追求流畅改变用户含义。
+    /// 不在本地对模型成稿做语义改写。过去这里按少量测试夹具删除固定短语，
+    /// 会把“先别改路径”“不是故障”等真实否定意图一并删掉。语义整理必须由
+    /// 模型完成并接受校验；本地层只负责验证，不能静默替用户改意思。
     static func removingDeterministicDraftArtifacts(
         from output: String,
         request: VoicePolishRequest
     ) -> String? {
-        var candidate = output
-        let source = normalizedNaturalText(request.fallbackText)
-
-        let replacements: [(pattern: String, replacement: String)] = [
-            (#"对比测试\s*[，,：:]?\s*测试(?=已经|已)"#, "对比测试"),
-            (#"是否为最终版\s*[，,]?\s*(?:也就是)?\s*确认(?:一下)?还会不会改"#, "是否为最终版"),
-            (#"是不是最终版\s*[，,]?\s*(?:也就是)?\s*确认(?:一下)?还会不会改"#, "是不是最终版"),
-            (#"我不是不愿意帮你\s*[，,]?\s*(?:也)?不是不想帮\s*[，,]?\s*是真的"#, "我不是不愿意帮你，是真的"),
-            (#"不是不会用\s*AI\s*[，,]?\s*(?:也)?不是工具不会操作\s*[，,]?\s*而是"#, "不是不会用 AI，而是"),
-            (#"今晚先不上\s*[，,]?\s*最终结论是今晚不发布"#, "今晚先不上"),
-        ]
-        for replacement in replacements {
-            candidate = candidate.replacingOccurrences(
-                of: replacement.pattern,
-                with: replacement.replacement,
-                options: [.regularExpression, .caseInsensitive]
-            )
-        }
-
-        if source.contains("先别改路径和命令") {
-            candidate = candidate.replacingOccurrences(
-                of: #"\s*先别改路径和命令[。.]?"#,
-                with: "",
-                options: .regularExpression
-            )
-        }
-        if source.contains("不是坏了") {
-            candidate = candidate.replacingOccurrences(
-                of: #"这个功能(?:目前)?不是坏了[，,，]?\s*(?:是)?需要"#,
-                with: "这个功能需要",
-                options: .regularExpression
-            )
-        }
-        if source.contains("先保留中文意思") {
-            candidate = candidate.replacingOccurrences(
-                of: #"英文原话没记准[，,]\s*先保留中文意思"#,
-                with: "英文原话没记准，暂不补充",
-                options: .regularExpression
-            )
-        }
-        if source.contains("这个不用展开") && source.contains("网络") {
-            candidate = candidate.replacingOccurrences(
-                of: #"(?:顺便说(?:一下|一句)?[，,]?\s*)?我那天网络(?:也)?不太好[，,]?\s*(?:但)?这个不用展开[。.]?"#,
-                with: "",
-                options: .regularExpression
-            )
-            // 模型有时执行了“不要展开”的措辞约束，却仍把同一条明确排除的
-            // 网络旁注原样留下；来源已明确要求排除，因此也安全删除。
-            candidate = candidate.replacingOccurrences(
-                of: #"(?:顺便说(?:一下|一句)?[，,]?\s*)?我那天网络(?:也)?不太好[。.]?"#,
-                with: "",
-                options: .regularExpression
-            )
-        }
-        if source.contains("不是我想说的不只是更新难") {
-            candidate = candidate.replacingOccurrences(
-                of: #"做内容最难的是持续更新[。.]\s*不只是更新难[，,]?\s*更难的是"#,
-                with: "做内容最难的不只是持续更新，更难的是",
-                options: .regularExpression
-            )
-        }
-        if request.context.scene == .code,
-           source.contains("检查codesign") && source.contains("最后再启动应用") {
-            candidate = candidate.replacingOccurrences(
-                of: #"(检查\s*`?codesign`?)[，,]\s*最后(?:再)?启动应用"#,
-                with: "$1\n\n最后启动应用",
-                options: [.regularExpression, .caseInsensitive]
-            )
-        }
-        if source.contains("上线时间") && source.contains("月底")
-            && source.contains("不写死具体日期") {
-            candidate = candidate.replacingOccurrences(
-                of: #"上线时间(?:原计划|原定|原来说)月底[，,]?\s*但今天讨论后(?:认为|觉得)?风险(?:较大|太大)[，,]?\s*暂不写死具体日期"#,
-                with: "上线时间暂不写死具体日期",
-                options: .regularExpression
-            )
-        }
-
-        candidate = candidate.replacingOccurrences(
-            of: #"(?:[。.]?\s*)?(?:今天讨论的事项)?(?:汇总如下|总结如下|整理如下)[。.]?\s*$"#,
-            with: "",
-            options: .regularExpression
-        ).replacingOccurrences(
-            of: #"\n{3,}"#,
-            with: "\n\n",
-            options: .regularExpression
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return candidate == output ? nil : candidate
+        _ = output
+        _ = request
+        return nil
     }
 
     /// 模型可能为原文已有词语补中文或英文引号。引号本身属于排版，不应被
@@ -312,11 +340,15 @@ enum VoicePolishValidator {
             of: #"检查\s*`?codesign`?"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+        let sourceAlreadyMentionsExecution = request.fallbackText.range(
+            of: #"执行\s*`?codesign`?"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
         let draftExecutesCodeSign = output.range(
             of: #"执行\s*`?codesign`?"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
-        if sourceChecksCodeSign, draftExecutesCodeSign {
+        if sourceChecksCodeSign, !sourceAlreadyMentionsExecution, draftExecutesCodeSign {
             append(.planIntegrityFailure, to: &codes)
         }
 
@@ -334,47 +366,589 @@ enum VoicePolishValidator {
             }
         }
 
-        // 原文只说内容/想法要成熟时，模型不得擅自把修饰对象改成“自己”。
-        // 这是本地可逐字证明的窄门禁，不尝试开放式语义比较。
-        if source.contains("等") && source.contains("成熟") && !source.contains("自己"),
-           draft.range(of: #"等自己.{0,6}成熟"#, options: .regularExpression) != nil {
-            append(.planIntegrityFailure, to: &codes)
-        }
-
-        // 这些是可以从字面确定的未收口或同义机械重复；触发一次 Fast 修复，
-        // 避免自动事实校验通过但仍不能直接发送。
-        let deterministicRepetition = draft.contains("对比测试测试已经")
-            || draft.contains("今晚先不上最终结论是今晚不发布")
-            || draft.contains("不是不会用ai也不是工具不会操作")
-            || (draft.contains("是否为最终版") && draft.contains("还会不会改"))
-            || (source.contains("不是我想说的不只是更新难")
-                && draft.contains("最难的是持续更新不只是更新难"))
+        // 句末只剩“汇总如下”却没有正文，是可由结构直接证明的未完成成稿。
+        // 不再按测试夹具里的完整句子做本地语义改写或判定。
         let danglingSummaryLeadIn = ["汇总如下", "总结如下", "整理如下"].contains {
             draft.hasSuffix($0)
         }
-        if deterministicRepetition || danglingSummaryLeadIn {
+        if danglingSummaryLeadIn {
             append(.planIntegrityFailure, to: &codes)
         }
 
-        // 用户明确只保留可靠中文意思时，残缺英文不是正文事实。
-        if source.contains("英文原话") && source.contains("先保留中文意思"),
-           output.range(of: #"(?i)don['’]?t\s+optimize"#, options: .regularExpression) != nil {
+        // 用户明确表示英文原话不可靠且只保留中文时，任何连续三词以上的英文
+        // 都属于未经确认的补写。规则只看语用证据，不绑定某一句测试答案。
+        let sourceMarksEnglishUncertain = source.contains("英文原话")
+            && ["记不准", "没记准", "没记清", "不确定"].contains(where: source.contains)
+            && ["保留中文", "只留中文", "不要猜", "别猜"].contains(where: source.contains)
+        if sourceMarksEnglishUncertain,
+           output.range(
+               of: #"(?i)(?:\b[a-z][a-z'’\-]*\b[\s,，]*){3,}"#,
+               options: .regularExpression
+           ) != nil {
             append(.planIntegrityFailure, to: &codes)
         }
 
-        let leakedMetaInstruction = (
-            source.contains("这句别写得太重")
-                && (draft.contains("语气不用太重") || draft.contains("事情要说清楚"))
-        ) || (
-            source.contains("不要替我确定具体版本")
-                && draft.contains("不要确定具体版本")
-        ) || (
-            source.contains("这个别放在已确定事项里")
-                && draft.contains("不列入已确定事项")
-        )
-        if leakedMetaInstruction {
+        // 只把明确指向“如何写成稿”的话当幕后指令；“给开发说先别改路径”
+        // 是收件人要执行的正文，不能因含“别”字就删除。若输出仍逐字保留这类
+        // 写作指令，或只是换一种幕后措辞复述，则触发修复。
+        let metaPatterns = [
+            #"(?:这个|这句|这段|这部分|上面这(?:句|段)|以下内容).{0,14}(?:别写|不要写|不用展开|别展开|不要展开|别放|不要放)"#,
+            #"(?:不要|别)(?:替我|帮我).{0,14}(?:确定|猜|补写|编)"#,
+            #"(?:不要|别)(?:对客户)?(?:说|写|告诉).{0,18}(?:操作问题|内部原因|猜测)"#,
+        ]
+        let sourceMetaSpans = metaPatterns.flatMap { pattern -> [String] in
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+            let range = NSRange(
+                request.fallbackText.startIndex..<request.fallbackText.endIndex,
+                in: request.fallbackText
+            )
+            return regex.matches(in: request.fallbackText, range: range).compactMap { match in
+                guard let matchRange = Range(match.range, in: request.fallbackText) else {
+                    return nil
+                }
+                return normalizedNaturalText(String(request.fallbackText[matchRange]))
+            }
+        }
+        let repeatsMetaSpan = sourceMetaSpans.contains { !$0.isEmpty && draft.contains($0) }
+        let paraphrasesMetaInstruction = !sourceMetaSpans.isEmpty && [
+            #"(?:语气|措辞).{0,8}(?:不用|不要|别).{0,4}(?:重|强)"#,
+            #"(?:不列入|别放|不要放).{0,8}(?:正文|成稿|已确定)"#,
+            #"(?:不要|别).{0,6}(?:确定|猜).{0,8}(?:版本|名称|名字|日期)"#,
+        ].contains { draft.range(of: $0, options: .regularExpression) != nil }
+        if repeatsMetaSpan || paraphrasesMetaInstruction {
             append(.promptLeakage, to: &codes)
         }
+
+        appendProtectedNegativeIntentCodes(
+            output: output,
+            request: request,
+            to: &codes
+        )
+    }
+
+    /// 保护用户真正要传达给收件人的否定要求与否定事实。这里只覆盖本地可以
+    /// 高置信证明的三类表达：明确禁止某个动作、明确否认故障状态，以及
+    /// “不是不愿意/不想……”这类态度澄清。写作幕后指令仍由上面的 meta 规则
+    /// 处理，不能因为同样含“不要/别”就混为一谈。
+    private static func appendProtectedNegativeIntentCodes(
+        output: String,
+        request: VoicePolishRequest,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        if !protectedNegativeIntentFailures(output: output, request: request).isEmpty {
+            append(.missingProtectedFact, to: &codes)
+        }
+    }
+
+    /// 返回本地可说明的否定意图缺失原因，供回归测试定位误报；生产只把非空
+    /// 结果折叠为一个 missingProtectedFact，不把用户正文写入日志。
+    static func protectedNegativeIntentFailures(
+        output: String,
+        request: VoicePolishRequest
+    ) -> [String] {
+        let source = request.fallbackText
+        // 长口述中的否定约束往往会被自然改写，靠局部字面规则无法可靠证明
+        // “遗漏”还是“同义表达”。把这里限定为短消息的高置信兜底，避免
+        // validator 因误报把已经完成的长文整段退回原文；长文完整性由逐项
+        // claim/关系门禁和真实质量集共同验收。
+        guard source.count <= 300 else { return [] }
+        let outputClauses = semanticClauses(in: output)
+        var failures: [String] = []
+
+        for action in recipientFacingNegativeActions(in: source, scene: request.context.scene) {
+            let normalizedAction = normalizedNaturalText(action)
+            guard !normalizedAction.isEmpty else { continue }
+            let variants = negativeActionVariants(for: normalizedAction)
+                .sorted { $0.count > $1.count }
+            var hasNegatedAction = false
+            var hasAffirmedAction = false
+            for clause in outputClauses {
+                let normalizedClause = normalizedNaturalText(clause)
+                let preservesByInverseState = inverseStatePreservesNegativeAction(
+                    action: normalizedAction,
+                    clause: normalizedClause
+                )
+                if preservesByInverseState {
+                    hasNegatedAction = true
+                }
+                var occurrences: [(range: Range<String.Index>, variant: String)] = []
+                for variant in variants {
+                    var searchStart = normalizedClause.startIndex
+                    while searchStart < normalizedClause.endIndex,
+                          let range = normalizedClause.range(
+                            of: variant,
+                            range: searchStart..<normalizedClause.endIndex
+                          ) {
+                        occurrences.append((range, variant))
+                        searchStart = range.upperBound
+                    }
+                }
+                // “修改方案”同时包含较短变体“改方案”。只让最长、互不重叠的
+                // 动作命中参与极性判断，避免较短子串从否定范围中漏出来，反把
+                // “先不要修改方案”判成既否定又肯定。
+                var selectedRanges: [Range<String.Index>] = []
+                for occurrence in occurrences.sorted(by: {
+                    if $0.variant.count != $1.variant.count {
+                        return $0.variant.count > $1.variant.count
+                    }
+                    return $0.range.lowerBound < $1.range.lowerBound
+                }) {
+                    guard !selectedRanges.contains(where: { $0.overlaps(occurrence.range) }) else {
+                        continue
+                    }
+                    selectedRanges.append(occurrence.range)
+                    if preservesByInverseState,
+                       occurrence.variant != normalizedAction {
+                        // “第一版不包含搜索功能”会自然出现较短概念词“搜索”，
+                        // 但它属于已证明的排除状态，不是肯定执行“做复杂搜索”。
+                        continue
+                    }
+                    if actionIsLocallyNegated(in: normalizedClause, range: occurrence.range) {
+                        hasNegatedAction = true
+                    } else {
+                        hasAffirmedAction = true
+                    }
+                }
+            }
+            if !hasNegatedAction || hasAffirmedAction {
+                failures.append("negative_action:\(normalizedAction)")
+            }
+        }
+
+        for requirement in excludedScopeRequirements(in: source) {
+            if !outputPreservesExcludedScope(requirement, output: output) {
+                failures.append("excluded_scope:\(requirement.item)->\(requirement.scope)")
+            }
+        }
+
+        let normalizedOutput = normalizedNaturalText(output)
+        for requirement in deferredActionOrders(in: source) {
+            guard let deferredRange = firstRange(
+                ofAny: negativeActionVariants(for: requirement.deferredAction),
+                in: normalizedOutput
+            ),
+            let prerequisiteRange = firstRange(
+                ofAny: negativeActionVariants(for: requirement.prerequisiteAction),
+                in: normalizedOutput
+            ) else {
+                // 开放式同义改写无法靠字面规则证明遗漏；这里只拦截两项动作都
+                // 明确出现、但顺序仍与原意相反的高置信情况。
+                continue
+            }
+            if deferredRange.lowerBound < prerequisiteRange.lowerBound {
+                failures.append(
+                    "deferred_action_order:\(requirement.prerequisiteAction)->\(requirement.deferredAction)"
+                )
+            }
+        }
+
+        let failureStates = [
+            "坏了", "故障", "损坏", "失效", "出问题", "崩了", "不可用", "无法使用",
+        ]
+        if containsNegatedTerm(in: source, terms: failureStates),
+           !containsNegatedTerm(in: output, terms: failureStates) {
+            failures.append("negated_failure_state")
+        }
+
+        for attitude in clarifiedPositiveAttitudes(in: source) {
+            if !containsPositiveAttitude(attitude, in: output) {
+                failures.append("clarified_attitude:\(normalizedNaturalText(attitude))")
+            }
+        }
+        return failures
+    }
+
+    private static let negativeMarkers = [
+        "先不要", "先别", "不要", "别", "请勿", "不得", "禁止", "暂不", "不能",
+        "不是", "并非", "没有", "未", "无",
+    ]
+
+    private struct DeferredActionOrder {
+        let deferredAction: String
+        let prerequisiteAction: String
+    }
+
+    private struct ExcludedScopeRequirement {
+        let item: String
+        let scope: String
+    }
+
+    private static func semanticClauses(in text: String) -> [String] {
+        text.components(separatedBy: CharacterSet(charactersIn: "，,。！？!?；;：:\n"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func recipientFacingNegativeActions(
+        in text: String,
+        scene: WritingScene
+    ) -> [String] {
+        let markerPattern = #"(?:先不要|先别|不要|别|请勿|不得|禁止|暂不)"#
+        guard let regex = try? NSRegularExpression(pattern: markerPattern) else { return [] }
+        let explicitMetaSignals = [
+            "正文", "成稿", "这句", "这段", "这部分", "上面这句", "上面这段",
+            "措辞", "语气", "不要替我", "别替我", "不用展开", "不要展开", "别展开",
+        ]
+        let disclosureMetaSignals = [
+            "不要对客户说", "别对客户说", "不要告诉客户", "别告诉客户",
+            "不要写给客户", "别写给客户",
+        ]
+        let disclosureObjects = ["内部原因", "猜测", "操作问题", "旁注"]
+        var actions: [String] = []
+
+        for clause in semanticClauses(in: text) {
+            let normalizedClause = normalizedNaturalText(clause)
+            if !excludedScopeRequirements(in: normalizedClause).isEmpty {
+                // “搜索功能暂不纳入第一版”是 item×scope 的状态关系，不是一个
+                // 缺少宾语的永久禁止动作“不要纳入”。由 typed scope gate 校验。
+                continue
+            }
+            if explicitMetaSignals.contains(where: normalizedClause.contains) {
+                continue
+            }
+            if disclosureMetaSignals.contains(where: normalizedClause.contains),
+               disclosureObjects.contains(where: normalizedClause.contains) {
+                continue
+            }
+            if (scene == .code || scene == .aiPrompt),
+               !containsRecipientCue(normalizedClause) {
+                // “先别改路径和命令”这类位于代码记录或 Prompt 末尾的要求，
+                // 默认是给润色器的幕后约束；只有明确说给某个收件人时才作为
+                // 正文中的禁止动作保护。
+                continue
+            }
+            let searchRange = NSRange(clause.startIndex..<clause.endIndex, in: clause)
+            let markerRanges = regex.matches(in: clause, range: searchRange).compactMap {
+                Range($0.range, in: clause)
+            }.filter { range in
+                let marker = String(clause[range])
+                guard marker == "别" else { return true }
+                if range.lowerBound > clause.startIndex {
+                    let previous = clause[clause.index(before: range.lowerBound)]
+                    if "特个分类区告差辨识".contains(previous) { return false }
+                }
+                if range.upperBound < clause.endIndex,
+                   "人的处样".contains(clause[range.upperBound]) {
+                    return false
+                }
+                return true
+            }
+
+            for (index, markerRange) in markerRanges.enumerated() {
+                let marker = String(clause[markerRange])
+                var actionEnd = clause.endIndex
+                if markerRanges.indices.contains(index + 1) {
+                    actionEnd = markerRanges[index + 1].lowerBound
+                    if actionEnd > markerRange.upperBound {
+                        let previous = clause.index(before: actionEnd)
+                        if clause[previous] == "也" { actionEnd = previous }
+                    }
+                }
+                var action = String(clause[markerRange.upperBound..<actionEnd])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if isDeferredOrderingInstruction(action) {
+                    // “不要先 A 再 B / 不要马上 A，先 B”约束的是顺序，不是
+                    // 永久禁止 A。顺序由 deferredActionOrders 单独做高置信校验。
+                    continue
+                }
+
+                // ASR 常把“不要覆盖安装先跑测试”压成一个无标点句。第二个
+                // “先 + 明确动作”是新行动，不属于前面的禁止对象；若本句以
+                // “把/将”起头，则“先”更可能是同一动作内部的先后修饰，不切。
+                if !action.hasPrefix("把"), !action.hasPrefix("将"), action.count > 2 {
+                    let boundarySearchStart = action.index(
+                        action.startIndex,
+                        offsetBy: min(2, action.count)
+                    )
+                    let boundaryPattern = #"(?:然后|接着|随后|同时|另外|而后|再|(?<!优)先)(?=(?:把|将|去|做|跑|导出|发送|发|修改|改|删除|删|重启|检查|核对|打开|关闭|启动|停止|提交|同步|确认|整理|等待|保留))"#
+                    if let boundary = action.range(
+                        of: boundaryPattern,
+                        options: .regularExpression,
+                        range: boundarySearchStart..<action.endIndex
+                    ) {
+                        action = String(action[..<boundary.lowerBound])
+                    }
+                }
+                if marker == "别",
+                   ["看", "说", "提"].contains(where: action.hasPrefix) {
+                    // “别看今天下雨”“别说三天”“别提多开心”是让步/程度
+                    // 表达，不是收件人的禁止动作；开放语义不能作为硬回退依据。
+                    continue
+                }
+                for prefix in ["把", "将"] where action.hasPrefix(prefix) {
+                    action.removeFirst(prefix.count)
+                    break
+                }
+                if let connector = action.range(
+                    of: #"(?:第[一二三四五六七八九十]+(?!版)|第一版|最后|然后|再|同时|另外|而是|只要|只需|只|改为|改成)"#,
+                    options: .regularExpression
+                ) {
+                    action = String(action[..<connector.lowerBound])
+                }
+                action = action.trimmingCharacters(in: .whitespacesAndNewlines)
+                if scene == .customerSupport,
+                   ["说", "告诉客户", "写给客户", "承诺"].contains(where: action.hasPrefix) {
+                    // 客服口述中的“别说内部原因 / 不要告诉客户未确认信息 / 别承诺
+                    // 一定修好”是在规定成稿边界，不是要逐字写给客户的禁止动作。
+                    continue
+                }
+                if (2...24).contains(normalizedNaturalText(action).count) {
+                    actions.append(action)
+                }
+            }
+        }
+        return Array(Set(actions)).sorted()
+    }
+
+    private static func excludedScopeRequirements(in text: String) -> [ExcludedScopeRequirement] {
+        let scopes = "第一版|本版|这版|当前版本|本期|本轮|范围|计划"
+        let patterns = [
+            #"^([\p{Han}A-Za-z0-9._/-]{2,24}?)(?:暂不|不再|不予|未|没有)(?:纳入|列入|加入|包含在|包含于)("#
+                + scopes + #")$"#,
+            #"^("# + scopes
+                + #")(?:先)?(?:不包含|暂不包含|不加入|暂不加入|不纳入|暂不纳入)([\p{Han}A-Za-z0-9._/-]{2,24})$"#,
+        ]
+        var requirements: [ExcludedScopeRequirement] = []
+        for clause in semanticClauses(in: text) {
+            let normalizedClause = normalizedNaturalText(clause)
+            for (patternIndex, pattern) in patterns.enumerated() {
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                let range = NSRange(
+                    normalizedClause.startIndex..<normalizedClause.endIndex,
+                    in: normalizedClause
+                )
+                guard let match = regex.firstMatch(in: normalizedClause, range: range),
+                      let firstRange = Range(match.range(at: 1), in: normalizedClause),
+                      let secondRange = Range(match.range(at: 2), in: normalizedClause) else {
+                    continue
+                }
+                let first = String(normalizedClause[firstRange])
+                let second = String(normalizedClause[secondRange])
+                requirements.append(ExcludedScopeRequirement(
+                    item: patternIndex == 0 ? first : second,
+                    scope: patternIndex == 0 ? second : first
+                ))
+            }
+        }
+        var seen = Set<String>()
+        return requirements.filter {
+            seen.insert("\($0.item)|\($0.scope)").inserted
+        }
+    }
+
+    private static func outputPreservesExcludedScope(
+        _ requirement: ExcludedScopeRequirement,
+        output: String
+    ) -> Bool {
+        let compact = normalizedNaturalText(output)
+        let item = NSRegularExpression.escapedPattern(for: requirement.item)
+        let scope = NSRegularExpression.escapedPattern(for: requirement.scope)
+        let patterns = [
+            "\(item).{0,8}(?:暂不|不再|不予|未|没有)(?:纳入|列入|加入|包含在|包含于).{0,6}\(scope)",
+            "\(scope).{0,8}(?:先)?(?:不包含|暂不包含|不加入|暂不加入|不纳入|暂不纳入).{0,8}\(item)",
+            "\(item).{0,8}(?:排除在|不在).{0,6}\(scope).{0,4}(?:之外|范围外)?",
+        ]
+        return patterns.contains {
+            compact.range(of: $0, options: .regularExpression) != nil
+        }
+    }
+
+    private static func isDeferredOrderingInstruction(_ action: String) -> Bool {
+        let normalized = normalizedNaturalText(action)
+        let pattern = #"^(?:先|马上|立即)[\p{Han}A-Za-z0-9._/-]{2,24}?(?:再|然后|接着|随后|先)[\p{Han}A-Za-z0-9._/-]{2,24}$"#
+        return normalized.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func deferredActionOrders(in text: String) -> [DeferredActionOrder] {
+        let pattern = #"(?:不要|别)(?:先|马上|立即)([\p{Han}A-Za-z0-9._/-]{2,24}?)(?:再|然后|接着|随后|先)([\p{Han}A-Za-z0-9._/-]{2,24})$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return semanticClauses(in: text).compactMap { clause in
+            let normalized = normalizedNaturalText(clause)
+            let searchRange = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+            guard let match = regex.firstMatch(in: normalized, range: searchRange),
+                  let deferredRange = Range(match.range(at: 1), in: normalized),
+                  let prerequisiteRange = Range(match.range(at: 2), in: normalized) else {
+                return nil
+            }
+            return DeferredActionOrder(
+                deferredAction: String(normalized[deferredRange]),
+                prerequisiteAction: String(normalized[prerequisiteRange])
+            )
+        }
+    }
+
+    private static func firstRange(
+        ofAny candidates: [String],
+        in text: String
+    ) -> Range<String.Index>? {
+        candidates.compactMap { candidate in
+            text.range(of: normalizedNaturalText(candidate))
+        }.min { $0.lowerBound < $1.lowerBound }
+    }
+
+    private static func containsRecipientCue(_ text: String) -> Bool {
+        [
+            "给开发说", "告诉开发", "通知开发", "请开发", "让开发",
+            "给客户说", "告诉客户", "通知客户", "请客户", "让客户",
+            "给团队说", "告诉团队", "通知团队", "请团队", "让团队",
+            "给他说", "告诉他", "通知他", "请他", "让他",
+        ].contains(where: text.contains)
+    }
+
+    /// 精确短语之外，只接受少数能证明语义等价的动作变体。例如
+    /// “先别动图片”可以对应“先不要改图片”，“请不要只回复让我耐心等待”
+    /// 可以对应“而不是只让我继续等待”。不再把“重启服务”缩成“服务”，
+    /// 否则另一句“服务无法连接”会替肯定执行的“重启服务”假通过。
+    private static func negativeActionVariants(for action: String) -> [String] {
+        var candidates = [action]
+        if action.hasPrefix("动"), action.count > 1 {
+            let object = String(action.dropFirst())
+            candidates.append("改\(object)")
+            candidates.append("修改\(object)")
+        }
+        if action.hasPrefix("改"), action.count > 1 {
+            let object = action.dropFirst()
+            candidates.append("修改\(object)")
+            candidates.append("调整\(object)")
+            candidates.append("变更\(object)")
+        }
+        if action.hasPrefix("关闭"), action.count > 2 {
+            let object = action.dropFirst(2)
+            candidates.append("关掉\(object)")
+        }
+        if action.contains("等待") { candidates.append("等待") }
+        if action.contains("搜索") { candidates.append("搜索") }
+        if action.contains("一上来") {
+            candidates.append(action.replacingOccurrences(of: "一上来", with: "一开始"))
+        }
+        return Array(Set(candidates.filter { $0.count >= 2 }))
+    }
+
+    private static func inverseStatePreservesNegativeAction(
+        action: String,
+        clause: String
+    ) -> Bool {
+        var patterns: [String] = []
+        if action.hasPrefix("关闭"), action.count > 2 {
+            let object = String(action.dropFirst(2))
+            let escapedObject = NSRegularExpression.escapedPattern(for: object)
+            patterns += [
+                "\(escapedObject).{0,6}(?:保持|继续).{0,4}(?:打开|开启)",
+                "(?:保持|继续).{0,4}\(escapedObject).{0,4}(?:打开|开启)",
+            ]
+        }
+        for prefix in ["开启", "打开", "启用", "启动"] where action.hasPrefix(prefix) && action.count > prefix.count {
+            let object = String(action.dropFirst(prefix.count))
+            let escapedObject = NSRegularExpression.escapedPattern(for: object)
+            patterns += [
+                "\(escapedObject).{0,6}(?:保持|继续)?(?:关闭|停用|禁用)",
+                "(?:保持|继续)(?:关闭|停用|禁用).{0,4}\(escapedObject)",
+            ]
+        }
+        for prefix in ["删除", "清除", "移除"] where action.hasPrefix(prefix) && action.count > prefix.count {
+            let object = String(action.dropFirst(prefix.count))
+            let escapedObject = NSRegularExpression.escapedPattern(for: object)
+            patterns += [
+                "\(escapedObject).{0,4}(?:要|应|必须|继续)?(?:保留|保存)",
+                "(?:保留|保存).{0,4}\(escapedObject)",
+            ]
+        }
+        if action.contains("搜索") {
+            patterns += [
+                #"(?:第一版|本版|这版|当前版本|本期|本轮).{0,6}(?:先)?(?:不包含|不支持|不提供|暂不包含|暂不支持|暂不提供).{0,6}(?:复杂)?搜索(?:功能)?"#,
+                #"(?:复杂)?搜索(?:功能)?.{0,6}(?:暂不|不再|不予|未|没有)(?:纳入|列入)(?:第一版|本版|这版|当前版本|本期|本轮|范围|计划)"#,
+            ]
+        }
+        for pattern in patterns {
+            guard let range = clause.range(of: pattern, options: .regularExpression) else {
+                continue
+            }
+            let prefix = String(clause[..<range.lowerBound].suffix(6))
+            if !["不", "没", "未", "无"].contains(where: prefix.contains) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func actionIsLocallyNegated(
+        in clause: String,
+        range: Range<String.Index>
+    ) -> Bool {
+        let prefix = String(clause[..<range.lowerBound].suffix(12))
+        let suffix = String(clause[range.upperBound...].prefix(10))
+        // 否定词必须直接支配动作。不能因为同一句更早出现了“并非故障”，
+        // 就把后面的“重启服务”误判为禁止动作；也不能把动作后的
+        // “并非禁止 / 不能拖延 / 不需要等待”反向理解为“不执行动作”。
+        let reversedPolarityPattern = #"(?:不能不|不得不|并非(?:不|不要|别|禁止)|不是(?:不|不要|别|禁止)|没有(?:禁止|不让|不准)|未(?:禁止|阻止)|不(?:禁止|反对))(?:再|立即|马上|直接|继续|重新)?$"#
+        if prefix.range(of: reversedPolarityPattern, options: .regularExpression) != nil {
+            return false
+        }
+        let leadingPattern = #"(?:先不要|先别|不要|别|请勿|不得|禁止|暂不|不再|不能|不需要|无需|无须|不必|先不|不|没|未)(?:再|立即|马上|直接|继续|重新)?$"#
+        if prefix.range(of: leadingPattern, options: .regularExpression) != nil {
+            return true
+        }
+        let trailingPatterns = [
+            #"^(?:这项|该项|相关操作)?(?:暂不|不再|不予)(?:执行|进行|安排|启动|实施|操作)?(?:$|[。；;，,])"#,
+            #"^(?:这项|该项|相关操作)?(?:不能|不得|禁止)(?:执行|进行|安排|启动|实施|操作)(?:$|[。；;，,])"#,
+            #"^(?:这项|该项|相关操作)?(?:已)?(?:取消|作废|暂停|停止)(?:执行|进行|安排|启动|实施|操作)?(?:$|[。；;，,])"#,
+            #"^(?:功能|事项|能力|内容|模块)?(?:暂不|不再|不予|未|没有)(?:纳入|列入)(?:第一版|本版|这版|当前版本|本期|本轮|范围|计划)"#,
+        ]
+        if trailingPatterns.contains(where: {
+            suffix.range(of: $0, options: .regularExpression) != nil
+        }) { return true }
+        if prefix.hasSuffix("不是只让我继续") || prefix.hasSuffix("而不是只让我继续") {
+            return true
+        }
+        return false
+    }
+
+    private static func containsNegatedTerm(in text: String, terms: [String]) -> Bool {
+        let normalized = normalizedNaturalText(text)
+        for term in terms {
+            var searchStart = normalized.startIndex
+            while searchStart < normalized.endIndex,
+                  let range = normalized.range(
+                    of: normalizedNaturalText(term),
+                    range: searchStart..<normalized.endIndex
+                  ) {
+                let prefix = String(normalized[..<range.lowerBound].suffix(8))
+                if negativeMarkers.contains(where: prefix.contains) { return true }
+                searchStart = range.upperBound
+            }
+        }
+        return false
+    }
+
+    private static func clarifiedPositiveAttitudes(in text: String) -> [String] {
+        let pattern = #"(?:不是|并非)不(愿意|想|肯|打算|同意|支持)([\p{Han}A-Za-z0-9]{0,10})$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return semanticClauses(in: text).compactMap { clause in
+            let range = NSRange(clause.startIndex..<clause.endIndex, in: clause)
+            guard let match = regex.firstMatch(in: clause, range: range),
+                  let verbRange = Range(match.range(at: 1), in: clause),
+                  let tailRange = Range(match.range(at: 2), in: clause) else { return nil }
+            return String(clause[verbRange.lowerBound..<tailRange.upperBound])
+        }
+    }
+
+    private static func containsPositiveAttitude(_ attitude: String, in text: String) -> Bool {
+        let normalized = normalizedNaturalText(text)
+        let target = normalizedNaturalText(attitude)
+        var searchStart = normalized.startIndex
+        while searchStart < normalized.endIndex,
+              let range = normalized.range(of: target, range: searchStart..<normalized.endIndex) {
+            let prefix = String(normalized[..<range.lowerBound].suffix(3))
+            if !["不", "没", "未", "无"].contains(where: prefix.hasSuffix) {
+                return true
+            }
+            if prefix.hasSuffix("不是不") || prefix.hasSuffix("并非不") {
+                return true
+            }
+            searchStart = range.upperBound
+        }
+        return false
     }
 
     /// Fast 路径没有模型生成的 Plan，因此只接受本地能证明的最窄改口事实：
@@ -385,82 +959,922 @@ enum VoicePolishValidator {
         request: VoicePolishRequest,
         sourceFacts: [SourceFactCandidate]
     ) -> Set<Int> {
+        let supersededOccurrences = locallySupersededFactOccurrences(
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        guard !supersededOccurrences.isEmpty else { return [] }
+        let allOccurrences = ProtectedFactExtractor.locations(
+            of: sourceFacts.filter { $0.kind != .lexiconEntity },
+            in: request.input.segments
+        ).compactMap { location -> SupersededFactOccurrence? in
+            guard let index = sourceFacts.firstIndex(where: {
+                $0.kind == location.candidate.kind
+                    && $0.canonicalValue == location.candidate.canonicalValue
+                    && $0.sourceSegmentIDs == location.candidate.sourceSegmentIDs
+            }) else { return nil }
+            return SupersededFactOccurrence(
+                factIndex: index,
+                segmentIndex: location.segmentIndex,
+                offset: location.offset,
+                length: location.length,
+                globalOffset: 0,
+                replacementFactIndex: nil,
+                relationAnchor: nil,
+                factDescriptor: nil,
+                replacementDescriptor: nil
+            )
+        }
+        let countsByIndex = Dictionary(grouping: allOccurrences, by: \.factIndex)
+        let supersededCounts = Dictionary(grouping: supersededOccurrences, by: \.factIndex)
+        return Set(countsByIndex.compactMap { index, occurrences in
+            supersededCounts[index]?.count == occurrences.count ? index : nil
+        })
+    }
+
+    /// 返回被明确改口覆盖的具体事实出现位置。候选事实会为全局事实校验按
+    /// segment 去重，但长语音内部切片必须区分同一 segment 中两个相同数字：
+    /// 例如北京仍为 3 人、上海从 3 人改为 4 人，只有上海那一次 3 可删除。
+    static func locallySupersededFactOccurrences(
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> Set<SupersededFactOccurrence> {
         if isPublicCorrectionNotice(request) { return [] }
 
-        struct LocatedFact {
-            let index: Int
-            let segmentIndex: Int
-            let offset: Int
-        }
+        typealias LocatedFact = SupersededFactOccurrence
 
         struct LocatedMarker {
-            let segmentIndex: Int
-            let startOffset: Int
-            let endOffset: Int
+            let globalStartOffset: Int
+            let globalEndOffset: Int
+            let signal: String
         }
 
         let correctionSignals = [
             "前面那句改成", "刚才那句改成", "把开头改成", "let me correct that",
-            "change the earlier part", "change what i said before", "scratch that",
+            "change the earlier part", "change what i said before", "scratch that", "把前面",
             "我的意思是", "我改一下", "说错了", "不对", "应该是", "最后还是",
-            "最终决定", "actually", "i mean", "final decision",
+            "最终决定", "改到", "改为", "调整为", "现定为", "改成",
+            "actually", "i mean", "final decision",
         ]
+        let distantSignals = [
+            "前面那句改成", "刚才那句改成", "把开头改成", "把前面",
+            "change the earlier part", "change what i said before",
+        ]
+        let inlineRewriteSignals = ["改到", "改为", "调整为", "现定为", "改成"]
+        let resetSignals = correctionSignals.filter { signal in
+            !distantSignals.contains(signal) && !inlineRewriteSignals.contains(signal)
+        }
+        var segmentGlobalOffsets: [Int] = []
+        var nextGlobalOffset = 0
+        for segment in request.input.segments {
+            segmentGlobalOffsets.append(nextGlobalOffset)
+            nextGlobalOffset += segment.text.count
+        }
+        // Provider segment 只是传输边界，不是用户语义边界。同一段口述无论被
+        // 切成 1 段、4 段，甚至把“不对”拆在两个 segment 中，改口关系都应
+        // 保持一致。因此所有 marker 与距离判断都在无人工分隔符的连续正文上做。
+        let combinedSource = request.input.segments.map(\.text).joined()
+
+        func textBetween(_ start: Int, _ end: Int) -> String {
+            let safeStart = max(0, min(start, combinedSource.count))
+            let safeEnd = max(safeStart, min(end, combinedSource.count))
+            let lower = combinedSource.index(combinedSource.startIndex, offsetBy: safeStart)
+            let upper = combinedSource.index(combinedSource.startIndex, offsetBy: safeEnd)
+            return String(combinedSource[lower..<upper])
+        }
+
+        func hardBoundaryCount(in text: String) -> Int {
+            text.reduce(into: 0) { count, character in
+                if "。！？；.!?;\n".contains(character) { count += 1 }
+            }
+        }
+
+        func containsSignal(_ signal: String, in candidates: [String]) -> Bool {
+            candidates.contains { signal.localizedCaseInsensitiveContains($0) }
+        }
+
+        func quantityDescriptor(after fact: LocatedFact, until limit: Int) -> String? {
+            let raw = textBetween(
+                fact.globalEndOffset,
+                min(limit, fact.globalEndOffset + 18)
+            )
+            let leading = raw
+                .prefix { character in
+                    !"，。！？；,.!?;、\n".contains(character)
+                        && !character.isNumber
+                }
+            var compact = String(leading)
+                .replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
+            // 量词本身不足以证明两个数字描述同一个对象。“3 个问题改成
+            // 1 个表格”两侧都是“个”，但它是格式转换，不是把数量 3 更正为
+            // 1。保留量词后的短对象词，并在改口动词处截断，得到“个问题”与
+            // “个表格”；真正的“3 个问题改成 4 个问题”仍能正确配对。
+            let stopSignals = [
+                "改成", "改为", "改到", "调整为", "现定为", "应该是",
+                "不对", "说错了", "我的意思是", "最后还是", "最终决定",
+            ]
+            if let boundary = stopSignals.compactMap({ compact.range(of: $0)?.lowerBound }).min() {
+                compact = String(compact[..<boundary])
+            }
+            let classifiers = [
+                "分钟", "小时", "个月", "工作日", "公里", "万元",
+                "个", "条", "张", "份", "项", "人", "位", "名", "台",
+                "款", "套", "本", "页", "章", "段", "次", "遍", "场",
+                "组", "种", "件", "家", "只", "天", "周", "月", "年",
+            ]
+            guard let classifier = classifiers
+                .sorted(by: { $0.count > $1.count })
+                .first(where: { compact.hasPrefix($0) }) else { return nil }
+            let maximumLength = classifier.count + 4
+            return String(compact.prefix(maximumLength))
+        }
+
+        func quantityDescriptorParts(_ descriptor: String?) -> (family: String, object: String?)? {
+            guard var descriptor, !descriptor.isEmpty else { return nil }
+            descriptor = normalizedNaturalText(descriptor)
+            let peopleClassifiers = ["个人", "人", "位", "名"]
+            if let classifier = peopleClassifiers.first(where: descriptor.hasPrefix) {
+                let object = String(descriptor.dropFirst(classifier.count))
+                return ("people", object.isEmpty ? nil : object)
+            }
+            let classifiers = [
+                "分钟", "小时", "个月", "工作日", "公里", "万元",
+                "个", "条", "张", "份", "项", "台", "款", "套", "本",
+                "页", "章", "段", "次", "遍", "场", "组", "种", "件",
+                "家", "只", "天", "周", "月", "年",
+            ]
+            guard let classifier = classifiers
+                .sorted(by: { $0.count > $1.count })
+                .first(where: descriptor.hasPrefix) else { return nil }
+            let object = String(descriptor.dropFirst(classifier.count))
+            return (classifier, object.isEmpty ? nil : object)
+        }
+
+        func quantityDescriptorsAreCompatible(_ left: String?, _ right: String?) -> Bool {
+            if left == nil, right == nil { return true }
+            guard let leftParts = quantityDescriptorParts(left),
+                  let rightParts = quantityDescriptorParts(right) else { return false }
+            if let leftObject = leftParts.object,
+               let rightObject = rightParts.object,
+               leftObject != rightObject {
+                return false
+            }
+            if leftParts.family == "people", rightParts.family == "people" {
+                return true
+            }
+            if let leftObject = leftParts.object, let rightObject = rightParts.object {
+                return leftObject == rightObject
+            }
+            return leftParts.family == rightParts.family
+        }
+
+        func relationLabel(before fact: LocatedFact) -> String? {
+            let lower = max(0, fact.globalOffset - 28)
+            let raw = textBetween(lower, fact.globalOffset)
+            let clause = raw.split(
+                whereSeparator: { "，。！？；,.!?;、\n".contains($0) }
+            ).last.map(String.init) ?? raw
+            var label = normalizedNaturalText(clause)
+            // “发布日期从 8 月 20 日改到 8 月 28 日”中，最终值前面的
+            // 整段还包含旧值；明确的“从 A 改到 B / 由 A 改为 B”应取 A
+            // 之前的对象词作为关系标签。
+            for transition in ["从", "由"] {
+                guard let range = label.range(of: transition) else { continue }
+                let suffix = String(label[range.upperBound...])
+                if ["改到", "改为", "改成", "调整为", "现定为"].contains(
+                    where: { suffix.contains($0) }
+                ) {
+                    label = String(label[..<range.lowerBound])
+                    break
+                }
+            }
+            let removablePrefixes = [
+                "不对", "我改一下", "我说错了", "说错了", "我的意思是",
+                "应该是", "刚确认", "确认", "先说", "正确", "最终", "最后", "原来",
+                "原定", "先按", "先记", "预计", "大约", "共", "有", "为", "是",
+            ]
+            var changed = true
+            while changed {
+                changed = false
+                for prefix in removablePrefixes where label.hasPrefix(prefix) {
+                    label.removeFirst(prefix.count)
+                    changed = true
+                    break
+                }
+            }
+            let removableSuffixes = [
+                "也先安排", "最终安排", "最后安排", "先安排", "仍安排", "安排",
+                "改成", "改为", "改到", "调整为", "现定为", "应该是",
+                "最终决定", "最后还是", "先按", "先记", "预计", "大约",
+                "原定", "最终", "最后", "仍是", "也是", "共", "有", "为",
+                "是", "从", "由",
+            ]
+            changed = true
+            while changed {
+                changed = false
+                for suffix in removableSuffixes where label.hasSuffix(suffix) {
+                    label.removeLast(suffix.count)
+                    changed = true
+                    break
+                }
+            }
+            return label.isEmpty ? nil : label
+        }
+
+        func relationLabelsAreCompatible(_ left: String, _ right: String) -> Bool {
+            if left == right { return true }
+            let genericAnchors = [
+                "预算", "费用", "总价", "单价", "报价", "金额", "日期", "时间",
+                "期限", "截止", "排期", "周期", "附件", "页数", "页面", "人数",
+                "名额", "数量", "版本", "地址", "路径", "端口", "比例", "折扣",
+            ]
+            return genericAnchors.contains { anchor in
+                (left == anchor && right.hasSuffix(anchor))
+                    || (right == anchor && left.hasSuffix(anchor))
+            }
+        }
+
+        func minimalRelationAnchor(_ label: String?) -> String? {
+            guard var label, !label.isEmpty else { return nil }
+            // “上海团队参会人数”真正稳定的对象是“上海”；模型自然可简写成
+            // “上海安排 4 人”。只剥离明确的数量/金额字段后缀，剩余对象词
+            // 为空时不建立关系硬门禁，避免对开放实体做猜测。
+            let fieldSuffixes = [
+                "参会人数", "参与人数", "安排人数", "人员数量", "人数",
+                "名额", "数量", "预算", "价格", "费用", "金额",
+            ]
+            for suffix in fieldSuffixes
+            where label.hasSuffix(suffix) && label.count > suffix.count {
+                label.removeLast(suffix.count)
+                break
+            }
+            return label.isEmpty ? nil : label
+        }
+
+        func relationAnchorsAreCompatible(_ left: String, _ right: String) -> Bool {
+            if left == right { return true }
+            let genericSubjectSuffixes = ["团队", "项目", "小组", "部门"]
+            return genericSubjectSuffixes.contains { suffix in
+                left == right + suffix || right == left + suffix
+            }
+        }
+
+        /// “前面上海团队参会人数说错了”把撤回对象放在 marker 前，而旧值和
+        /// 最终值附近使用的动词可能完全不同。只接受以明确事实字段结尾、且不含
+        /// 数值的对象短语，避免把普通“预算 3 万说错了”整句误作对象标签。
+        func explicitRetractionLabel(before marker: LocatedMarker) -> String? {
+            let raw = textBetween(max(0, marker.globalStartOffset - 48), marker.globalStartOffset)
+            let clause = raw.split(
+                whereSeparator: { "，。！？；,.!?;、\n".contains($0) }
+            ).last.map(String.init) ?? raw
+            var label = normalizedNaturalText(clause)
+            for prefix in ["前面", "刚才", "刚刚", "上面", "前述", "这里", "这个"]
+            where label.hasPrefix(prefix) {
+                label.removeFirst(prefix.count)
+                break
+            }
+            let fieldSuffixes = [
+                "参会人数", "参与人数", "安排人数", "人员数量", "人数", "名额",
+                "数量", "预算", "价格", "费用", "金额", "日期", "时间", "期限",
+                "截止时间", "版本", "地址", "路径", "端口", "比例", "折扣",
+            ]
+            guard (2...32).contains(label.count),
+                  fieldSuffixes.contains(where: label.hasSuffix),
+                  label.range(of: #"[0-9一二三四五六七八九十百千万亿两]"#, options: .regularExpression) == nil else {
+                return nil
+            }
+            return label
+        }
+
         var locatedFacts: [LocatedFact] = []
         var locatedMarkers: [LocatedMarker] = []
-        for (segmentIndex, segment) in request.input.segments.enumerated() {
-            locatedFacts += sourceFacts.enumerated().compactMap { index, fact -> LocatedFact? in
-                guard fact.kind != .lexiconEntity,
-                      fact.sourceSegmentIDs.contains(segment.id),
-                      let range = segment.text.range(of: fact.sourceText) else { return nil }
-                return LocatedFact(
-                    index: index,
-                    segmentIndex: segmentIndex,
-                    offset: segment.text.distance(from: segment.text.startIndex, to: range.lowerBound)
+        locatedFacts = ProtectedFactExtractor.locations(
+            of: sourceFacts.filter { $0.kind != .lexiconEntity },
+            in: request.input.segments
+        ).compactMap { location in
+            guard let index = sourceFacts.firstIndex(where: {
+                $0.kind == location.candidate.kind
+                    && $0.canonicalValue == location.candidate.canonicalValue
+                    && $0.sourceSegmentIDs == location.candidate.sourceSegmentIDs
+            }) else { return nil }
+            let globalOffset = segmentGlobalOffsets[location.segmentIndex] + location.offset
+            return LocatedFact(
+                factIndex: index,
+                segmentIndex: location.segmentIndex,
+                offset: location.offset,
+                length: location.length,
+                globalOffset: globalOffset,
+                replacementFactIndex: nil,
+                relationAnchor: nil,
+                factDescriptor: nil,
+                replacementDescriptor: nil
+            )
+        }
+        locatedMarkers = correctionSignals.flatMap { signal -> [LocatedMarker] in
+            correctionRanges(of: signal, in: combinedSource).map { range in
+                LocatedMarker(
+                    globalStartOffset: combinedSource.distance(
+                        from: combinedSource.startIndex,
+                        to: range.lowerBound
+                    ),
+                    globalEndOffset: combinedSource.distance(
+                        from: combinedSource.startIndex,
+                        to: range.upperBound
+                    ),
+                    signal: signal
                 )
             }
-            locatedMarkers += correctionSignals.flatMap { signal -> [LocatedMarker] in
-                allRanges(of: signal, in: segment.text)
-                    .map { range in
-                        LocatedMarker(
-                            segmentIndex: segmentIndex,
-                            startOffset: segment.text.distance(
-                                from: segment.text.startIndex,
-                                to: range.lowerBound
-                            ),
-                            endOffset: segment.text.distance(
-                                from: segment.text.startIndex,
-                                to: range.upperBound
-                            )
-                        )
+        }
+
+        locatedFacts.sort { $0.globalOffset < $1.globalOffset }
+        locatedMarkers.sort {
+            if $0.globalStartOffset != $1.globalStartOffset {
+                return $0.globalStartOffset < $1.globalStartOffset
+            }
+            return $0.globalEndOffset > $1.globalEndOffset
+        }
+        locatedMarkers = locatedMarkers.reduce(into: []) { result, marker in
+            let isContained = result.contains {
+                $0.globalStartOffset <= marker.globalStartOffset
+                    && $0.globalEndOffset >= marker.globalEndOffset
+            }
+            if !isContained { result.append(marker) }
+        }
+        // “不对，最终预算……改成……”中的复位词和改写动词描述的是同一次
+        // 改口。把二者合成一个定位范围，既能跨一个 ASR segment 找到最终值，
+        // 也不会像直接丢弃后一个关键词那样截断事实。“不对，应该是”这类
+        // 连续复位词只有在中间没有事实时合并；一旦出现 4，再遇到“不对”，
+        // 就会开始新的事件，因此连续两次改口仍分别处理。
+        let rawMarkers = locatedMarkers
+        locatedMarkers = rawMarkers.reduce(into: []) { result, marker in
+            guard let previous = result.last,
+                  containsSignal(previous.signal, in: resetSignals),
+                  (containsSignal(marker.signal, in: inlineRewriteSignals)
+                    || containsSignal(marker.signal, in: resetSignals)),
+                  marker.globalStartOffset - previous.globalEndOffset <= 96 else {
+                result.append(marker)
+                return
+            }
+            let gap = textBetween(previous.globalEndOffset, marker.globalStartOffset)
+            let containsInterveningFact = locatedFacts.contains {
+                $0.globalOffset >= previous.globalEndOffset
+                    && $0.globalEndOffset <= marker.globalStartOffset
+            }
+            guard hardBoundaryCount(in: gap) <= 2, !containsInterveningFact else {
+                result.append(marker)
+                return
+            }
+            result[result.count - 1] = LocatedMarker(
+                globalStartOffset: previous.globalStartOffset,
+                globalEndOffset: marker.globalEndOffset,
+                signal: previous.signal + "|" + marker.signal
+            )
+        }
+        var superseded: Set<SupersededFactOccurrence> = []
+        for (markerIndex, marker) in locatedMarkers.enumerated() {
+            let allowsDistantPrevious = containsSignal(marker.signal, in: distantSignals)
+            let isResetSignal = containsSignal(marker.signal, in: resetSignals)
+            let isInlineRewrite = containsSignal(marker.signal, in: inlineRewriteSignals)
+                && !isResetSignal
+            let nextMarker = locatedMarkers.indices.contains(markerIndex + 1)
+                ? locatedMarkers[markerIndex + 1]
+                : nil
+            let possibleFinals = locatedFacts.filter { candidate in
+                let followsMarker = candidate.globalOffset >= marker.globalEndOffset
+                let precedesNextMarker = nextMarker.map {
+                    candidate.globalOffset < $0.globalStartOffset
+                } ?? true
+                let gap = textBetween(marker.globalEndOffset, candidate.globalOffset)
+                let isNearby = candidate.globalOffset - marker.globalEndOffset <= 96
+                    && hardBoundaryCount(in: gap) <= 1
+                return followsMarker && precedesNextMarker && isNearby
+            }
+
+            for final in possibleFinals {
+                let finalFact = sourceFacts[final.factIndex]
+                let finalLabel = relationLabel(before: final)
+                let hasExplicitRetraction = [
+                        "不对", "说错了", "我说错了", "我改一下", "我的意思是",
+                        "scratch that", "let me correct that", "actually", "i mean",
+                    ].contains(where: {
+                        marker.signal.localizedCaseInsensitiveContains($0)
+                    })
+                let explicitRetractionAnchor = hasExplicitRetraction
+                    ? minimalRelationAnchor(explicitRetractionLabel(before: marker))
+                    : nil
+                let finalAnchor = minimalRelationAnchor(finalLabel)
+                if let explicitRetractionAnchor,
+                   let finalAnchor,
+                   !relationAnchorsAreCompatible(explicitRetractionAnchor, finalAnchor) {
+                    continue
+                }
+                let previousCandidates = locatedFacts.filter { candidate in
+                    let precedesMarker = candidate.globalEndOffset <= marker.globalStartOffset
+                    let followsPreviousCorrection = allowsDistantPrevious
+                        || markerIndex == 0
+                        || candidate.globalOffset >= locatedMarkers[markerIndex - 1].globalEndOffset
+                    let gap = textBetween(candidate.globalEndOffset, marker.globalStartOffset)
+                    let boundaryCount = hardBoundaryCount(in: gap)
+                    let distance = marker.globalStartOffset - candidate.globalEndOffset
+                    let candidateLabel = relationLabel(before: candidate)
+                    let exactAnchoredRetraction = hasExplicitRetraction
+                        && ((finalLabel != nil && candidateLabel == finalLabel)
+                            || (explicitRetractionAnchor != nil
+                                && minimalRelationAnchor(candidateLabel).map {
+                                    relationAnchorsAreCompatible(explicitRetractionAnchor!, $0)
+                                } == true))
+                        && distance <= 512
+                        && boundaryCount <= 12
+                    let isNearby = allowsDistantPrevious
+                        || (distance <= 128
+                            && (boundaryCount == 0 || (isResetSignal && boundaryCount <= 2)))
+                        || exactAnchoredRetraction
+                    return precedesMarker
+                        && followsPreviousCorrection
+                        && isNearby
+                        && sourceFacts[candidate.factIndex].kind == finalFact.kind
+                }
+                guard !previousCandidates.isEmpty else { continue }
+
+                let nextFactOffset = locatedFacts.first(where: {
+                    $0.globalOffset > final.globalEndOffset
+                })?.globalOffset ?? combinedSource.count
+                let finalDescriptor = finalFact.kind == .number
+                    ? quantityDescriptor(after: final, until: nextFactOffset)
+                    : nil
+                let compatiblePrevious = previousCandidates.filter { candidate in
+                    guard finalFact.kind == .number else { return true }
+                    let candidateDescriptor = quantityDescriptor(
+                        after: candidate,
+                        until: marker.globalStartOffset
+                    )
+                    return quantityDescriptorsAreCompatible(
+                        candidateDescriptor,
+                        finalDescriptor
+                    )
+                }
+                guard !compatiblePrevious.isEmpty else { continue }
+                let exactLabelMatches = compatiblePrevious.filter { candidate in
+                    guard let finalLabel, let candidateLabel = relationLabel(before: candidate) else {
+                        return false
                     }
+                    return candidateLabel == finalLabel
+                }
+                let compatibleLabelMatches = compatiblePrevious.filter { candidate in
+                    guard let finalLabel, let candidateLabel = relationLabel(before: candidate) else {
+                        return false
+                    }
+                    return relationLabelsAreCompatible(candidateLabel, finalLabel)
+                }
+                let explicitAnchorMatches = compatiblePrevious.filter { candidate in
+                    guard let explicitRetractionAnchor,
+                          let candidateAnchor = minimalRelationAnchor(
+                            relationLabel(before: candidate)
+                          ) else { return false }
+                    return relationAnchorsAreCompatible(explicitRetractionAnchor, candidateAnchor)
+                }
+                // 同类事实之间优先按“预算/附件/发布日期”等局部对象标签配对；
+                // 完全相同的对象标签优先。若最终只说“预算”，同时可匹配“项目
+                // 预算”和“附件预算”，指向并不唯一，不能再靠最近位置猜一个。
+                let previous: LocatedFact?
+                if explicitAnchorMatches.count == 1 {
+                    previous = explicitAnchorMatches[0]
+                } else if explicitAnchorMatches.count > 1 {
+                    previous = nil
+                } else if !exactLabelMatches.isEmpty {
+                    previous = exactLabelMatches.last
+                } else if compatibleLabelMatches.count == 1 {
+                    previous = compatibleLabelMatches[0]
+                } else if compatibleLabelMatches.count > 1 {
+                    previous = nil
+                } else if compatiblePrevious.count == 1 {
+                    let onlyCandidate = compatiblePrevious[0]
+                    let candidateLabel = relationLabel(before: onlyCandidate)
+                    // 两侧只要都有明确对象词却无法证明兼容，就不能因为同类型
+                    // 事实只剩一个而强行配对。对象词是开放集合，不能依赖“预算/
+                    // 日期”等有限白名单；例如“基础版价格 2 万，高级版改成 3 万”
+                    // 也是并列事实，不是把基础版价格改掉。
+                    if !allowsDistantPrevious,
+                       !hasExplicitRetraction,
+                       finalLabel != nil,
+                       candidateLabel != nil {
+                        previous = nil
+                    } else {
+                        previous = onlyCandidate
+                    }
+                } else {
+                    // 多个同类型、同量词事实都可能成为旧值，而最终事实又没有
+                    // 可与之绑定的对象标签时，不能靠“离改口词最近”猜测。
+                    previous = nil
+                }
+                guard let previous else { continue }
+                let previousFact = sourceFacts[previous.factIndex]
+                guard !equivalent(previousFact, finalFact) else { continue }
+
+                // “应该是 / 最后还是 / 最终决定”也常用于并列说明，而非撤回前
+                // 一项，例如“基础版 2 万，高级版应该是 3 万”。没有显式撤回
+                // 词时，只有同一明确对象标签才能建立替换关系。
+                let weakStandaloneSignals = ["应该是", "最后还是", "最终决定"]
+                if containsSignal(marker.signal, in: weakStandaloneSignals),
+                   !hasExplicitRetraction {
+                    guard let finalLabel,
+                          let previousLabel = relationLabel(before: previous),
+                          finalLabel == previousLabel else {
+                        continue
+                    }
+                }
+
+                // “改成/改为”等普通动词只有在同一语义小句内明确出现 A→B 时
+                // 才算事实改口；否则它很可能只是“改成营销文案”这类写作要求。
+                if isInlineRewrite && !allowsDistantPrevious {
+                    let previousGap = textBetween(
+                        previous.globalEndOffset,
+                        marker.globalStartOffset
+                    )
+                    let semanticGap = normalizedNaturalText(previousGap)
+                    guard hardBoundaryCount(in: previousGap) == 0,
+                          semanticGap.count <= 4 else {
+                        continue
+                    }
+
+                    // “把这 3 个问题改成 1 张表格”是对成稿形式的要求，不是
+                    // 把同一个数量从 3 更正为 1。裸“改成/改为”只有在数字前后
+                    // 的量词与对象一致（或双方都没有对象）时，才允许建立 A→B
+                    // 的事实替换关系；无法证明时宁可继续保护两个数字。
+                    if previousFact.kind == .number, finalFact.kind == .number {
+                        let oldDescriptor = quantityDescriptor(
+                            after: previous,
+                            until: marker.globalStartOffset
+                        )
+                        let newDescriptor = quantityDescriptor(
+                            after: final,
+                            until: nextFactOffset
+                        )
+                        if !quantityDescriptorsAreCompatible(oldDescriptor, newDescriptor) {
+                            continue
+                        }
+                    }
+                }
+
+                superseded.insert(SupersededFactOccurrence(
+                    factIndex: previous.factIndex,
+                    segmentIndex: previous.segmentIndex,
+                    offset: previous.offset,
+                    length: previous.length,
+                    globalOffset: previous.globalOffset,
+                    replacementFactIndex: final.factIndex,
+                    relationAnchor: explicitRetractionAnchor ?? minimalRelationAnchor(finalLabel),
+                    factDescriptor: previousFact.kind == .number
+                        ? quantityDescriptor(after: previous, until: marker.globalStartOffset)
+                        : nil,
+                    replacementDescriptor: finalFact.kind == .number
+                        ? quantityDescriptor(after: final, until: nextFactOffset)
+                        : nil
+                ))
+                break
+            }
+        }
+        return superseded
+    }
+
+    /// 只有当同一语义值在全文中没有仍然有效的另一处来源时，才可以把它作为
+    /// “全文禁用事实”交给模型。相同的 3 可能同时表示仍有效的北京人数和已被
+    /// 改成 4 的上海人数；这时关系可在对应片段内处理，但绝不能全局禁止 3。
+    static func unambiguouslySupersededFactIndices(
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> Set<Int> {
+        let superseded = locallySupersededFactIndices(
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        return Set(superseded.filter { index in
+            !sourceFacts.enumerated().contains { otherIndex, other in
+                otherIndex != index
+                    && !superseded.contains(otherIndex)
+                    && equivalent(sourceFacts[index], other)
+            }
+        })
+    }
+
+    /// 当同一个 canonical 值在别处仍然有效时，集合校验不能区分“北京 3 人”
+    /// 与已经被推翻的“上海 3 人”。这里消费改口定位阶段保留下来的对象关系：
+    /// 成稿必须把对象绑定到最终值，同时不得继续把它绑定到旧值。
+    private static func appendSupersededRelationCodes(
+        output: String,
+        sourceFacts: [SourceFactCandidate],
+        supersededOccurrences: Set<SupersededFactOccurrence>,
+        fullySupersededFactIndices: Set<Int>,
+        to codes: inout [VoicePolishValidationCode]
+    ) {
+        let relationOccurrences = supersededOccurrences.filter {
+            guard sourceFacts.indices.contains($0.factIndex) else { return false }
+            let oldFact = sourceFacts[$0.factIndex]
+            let canonicalStillRequired = sourceFacts.enumerated().contains { index, fact in
+                !fullySupersededFactIndices.contains(index) && equivalent(oldFact, fact)
+            }
+            return canonicalStillRequired
+                && $0.replacementFactIndex != nil
+                && !($0.relationAnchor ?? "").isEmpty
+        }
+        guard !relationOccurrences.isEmpty else { return }
+
+        func sentenceParts(_ text: String) -> [String] {
+            text.split(whereSeparator: { "。！？；.!?;".contains($0) })
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+
+        func relationBlocks(_ text: String) -> [String] {
+            let listMarker = #"^\s*(?:(?:\d{1,3}[.)、）]|[一二三四五六七八九十]{1,3}[、.)）])\s*|[-*•]\s+)"#
+            var blocks: [String] = []
+            var currentListItem: [String] = []
+            var currentParagraph: [String] = []
+
+            func flushParagraph() {
+                guard !currentParagraph.isEmpty else { return }
+                blocks.append(contentsOf: sentenceParts(currentParagraph.joined(separator: " ")))
+                currentParagraph.removeAll(keepingCapacity: true)
+            }
+
+            func flushListItem() {
+                guard !currentListItem.isEmpty else { return }
+                blocks.append(currentListItem.joined(separator: " "))
+                currentListItem.removeAll(keepingCapacity: true)
+            }
+
+            for rawLine in VoicePolishCharacterSafety.normalizedLineEndings(text)
+                .split(separator: "\n", omittingEmptySubsequences: false) {
+                let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+                if line.isEmpty {
+                    flushParagraph()
+                    flushListItem()
+                } else if line.range(of: listMarker, options: .regularExpression) != nil {
+                    flushParagraph()
+                    flushListItem()
+                    currentListItem = [line]
+                } else if !currentListItem.isEmpty {
+                    // 同一列表项允许“对象：\n最终值”这种自然换行；遇到下一项
+                    // 会在上面的 list marker 分支立刻截断，绝不跨项借词。
+                    currentListItem.append(line)
+                } else {
+                    currentParagraph.append(line)
+                }
+            }
+            flushParagraph()
+            flushListItem()
+            return blocks
+        }
+
+        let blocks = relationBlocks(output)
+
+        func descriptorParts(_ descriptor: String?) -> (family: String, object: String?)? {
+            guard var descriptor, !descriptor.isEmpty else { return nil }
+            descriptor = normalizedNaturalText(descriptor)
+            for classifier in ["个人", "人", "位", "名"] where descriptor.hasPrefix(classifier) {
+                let object = String(descriptor.dropFirst(classifier.count))
+                return ("people", object.isEmpty ? nil : object)
+            }
+            let classifiers = [
+                "分钟", "小时", "个月", "工作日", "公里", "万元",
+                "个", "条", "张", "份", "项", "台", "款", "套", "本",
+                "页", "章", "段", "次", "遍", "场", "组", "种", "件",
+                "家", "只", "天", "周", "月", "年",
+            ]
+            guard let classifier = classifiers
+                .sorted(by: { $0.count > $1.count })
+                .first(where: descriptor.hasPrefix) else { return nil }
+            let object = String(descriptor.dropFirst(classifier.count))
+            return (classifier, object.isEmpty ? nil : object)
+        }
+
+        func descriptorsAreCompatible(_ expected: String?, _ actual: String?) -> Bool {
+            guard let expected else { return true }
+            guard let expectedParts = descriptorParts(expected),
+                  let actualParts = descriptorParts(actual) else { return false }
+            if let expectedObject = expectedParts.object,
+               let actualObject = actualParts.object,
+               expectedObject != actualObject {
+                return false
+            }
+            if expectedParts.family == "people", actualParts.family == "people" {
+                return true
+            }
+            if let expectedObject = expectedParts.object,
+               let actualObject = actualParts.object {
+                return expectedObject == actualObject
+            }
+            return expectedParts.family == actualParts.family
+        }
+
+        func outputDescriptor(
+            in block: String,
+            after location: ProtectedFactExtractor.FactLocation
+        ) -> String? {
+            let factEnd = block.index(
+                block.startIndex,
+                offsetBy: location.offset + location.length
+            )
+            let raw = String(block[factEnd...].prefix(10))
+            let leading = raw.prefix { character in
+                !"，。！？；,.!?;、\n".contains(character) && !character.isNumber
+            }
+            let compact = String(leading)
+                .replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
+            let classifiers = [
+                "分钟", "小时", "个月", "工作日", "公里", "万元",
+                "个", "条", "张", "份", "项", "人", "位", "名", "台",
+                "款", "套", "本", "页", "章", "段", "次", "遍", "场",
+                "组", "种", "件", "家", "只", "天", "周", "月", "年",
+            ]
+            guard let classifier = classifiers.sorted(by: { $0.count > $1.count })
+                .first(where: { compact.hasPrefix($0) }) else { return nil }
+            return String(compact.prefix(classifier.count + 4))
+        }
+
+        func hasCompatibleOutputDescriptor(
+            in block: String,
+            location: ProtectedFactExtractor.FactLocation,
+            expected: String?
+        ) -> Bool {
+            guard let expected else { return true }
+            if descriptorsAreCompatible(
+                expected,
+                outputDescriptor(in: block, after: location)
+            ) {
+                return true
+            }
+            guard descriptorParts(expected)?.family == "people" else { return false }
+            let factStart = block.index(block.startIndex, offsetBy: location.offset)
+            let prefix = normalizedNaturalText(String(block[..<factStart].suffix(12)))
+            return prefix.range(
+                of: #"(?:参会|参与|安排|团队|项目)?人数(?:为|是|有|共)?$"#,
+                options: .regularExpression
+            ) != nil
+        }
+
+        func blockExpresses(
+            _ block: String,
+            anchor: String,
+            fact: SourceFactCandidate,
+            descriptor: String?
+        ) -> Bool {
+            let normalizedAnchor = normalizedNaturalText(anchor)
+            guard !normalizedAnchor.isEmpty else { return false }
+            let segment = RecognitionSegment(
+                id: "relation-output",
+                text: block,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+            let outputFacts = ProtectedFactExtractor.extract(from: [segment])
+            let locations = ProtectedFactExtractor.locations(of: outputFacts, in: [segment])
+
+            // “北京团队和上海团队分别安排 3 人和 4 人”必须按两边顺序绑定，
+            // 不能因为上海出现在第一个数字之前，就把 3 也误判成上海人数。
+            if let separateRange = block.range(of: "分别") {
+                let subjectPrefix = String(block[..<separateRange.lowerBound])
+                let subjectClause = subjectPrefix.split(
+                    whereSeparator: { "，。！？；,.!?;\n".contains($0) }
+                ).last.map(String.init) ?? subjectPrefix
+                let subjects = subjectClause.components(
+                    separatedBy: CharacterSet(charactersIn: "和与、及")
+                ).map(normalizedNaturalText).filter { !$0.isEmpty }
+                if subjects.count >= 2,
+                   let anchorIndex = subjects.firstIndex(where: {
+                       $0.contains(normalizedAnchor)
+                   }) {
+                    let separateOffset = block.distance(
+                        from: block.startIndex,
+                        to: separateRange.upperBound
+                    )
+                    let orderedValues = locations.filter { $0.offset >= separateOffset }
+                        .sorted { $0.offset < $1.offset }
+                    if orderedValues.count == subjects.count,
+                       orderedValues.indices.contains(anchorIndex) {
+                        let assigned = orderedValues[anchorIndex]
+                        return equivalent(fact, assigned.candidate)
+                            && hasCompatibleOutputDescriptor(
+                                in: block,
+                                location: assigned,
+                                expected: descriptor
+                            )
+                    }
+                }
+            }
+
+            return locations.contains { location in
+                guard equivalent(fact, location.candidate) else { return false }
+                if !hasCompatibleOutputDescriptor(
+                    in: block,
+                    location: location,
+                    expected: descriptor
+                ) {
+                    return false
+                }
+                let factStart = block.index(block.startIndex, offsetBy: location.offset)
+                let factEnd = block.index(factStart, offsetBy: location.length)
+                let prefix = normalizedNaturalText(String(block[..<factStart]))
+                let trailing = normalizedNaturalText(String(block[factEnd...].prefix(16)))
+                let disqualifiers = [
+                    "不", "未", "没有", "并非", "不是", "不再", "无关", "否认",
+                    "排除", "如果", "假如", "假设", "假定", "举例", "例如",
+                    "曾经", "原定", "之前", "原先", "撤销", "取消", "作废", "不作数",
+                ]
+                if let anchorRange = prefix.range(of: normalizedAnchor, options: .backwards) {
+                    let relationGap = String(prefix[anchorRange.upperBound...])
+                    let leading = String(prefix[..<anchorRange.lowerBound].suffix(10))
+                    let relationContext = leading + relationGap + trailing
+                    let positiveSignals = [
+                        "人数", "人员", "安排", "分配", "共有", "共", "有", "为", "是",
+                        "达到", "调整为", "改为", "现为", "最终",
+                    ]
+                    let directLabelValue = relationGap.isEmpty
+                    if relationGap.count <= 18,
+                       (directLabelValue || positiveSignals.contains(where: relationGap.contains)),
+                       !disqualifiers.contains(where: relationContext.contains) {
+                        return true
+                    }
+                }
+
+                // 同时接受“3 人仍安排给上海”这类 value→subject 句法，但必须
+                // 有明确关系谓词，不能因后文偶然又出现“上海”就借词通过。
+                let nextFactOffset = locations
+                    .filter { $0.offset > location.offset }
+                    .map(\.offset)
+                    .min() ?? block.count
+                let nextFactIndex = block.index(
+                    block.startIndex,
+                    offsetBy: min(nextFactOffset, block.count)
+                )
+                let rawSuffix = String(block[factEnd..<nextFactIndex])
+                let boundedSuffix = rawSuffix.split(
+                    whereSeparator: { "，,；;。！？!?\n".contains($0) }
+                ).first.map(String.init) ?? rawSuffix
+                let suffix = normalizedNaturalText(String(boundedSuffix.prefix(24)))
+                guard let anchorRange = suffix.range(of: normalizedAnchor) else { return false }
+                let relationGap = String(suffix[..<anchorRange.lowerBound])
+                let assignmentSignals = ["安排给", "分配给", "留在", "属于", "交给", "给"]
+                let leading = String(prefix.suffix(10))
+                let afterAnchor = String(suffix[anchorRange.upperBound...].prefix(12))
+                let relationContext = leading + relationGap + afterAnchor
+                return relationGap.count <= 16
+                    && assignmentSignals.contains(where: relationGap.contains)
+                    && !disqualifiers.contains(where: relationContext.contains)
             }
         }
 
-        locatedFacts.sort {
-            ($0.segmentIndex, $0.offset) < ($1.segmentIndex, $1.offset)
+        for occurrence in relationOccurrences {
+            guard sourceFacts.indices.contains(occurrence.factIndex),
+                  let replacementIndex = occurrence.replacementFactIndex,
+                  sourceFacts.indices.contains(replacementIndex),
+                  let anchor = occurrence.relationAnchor else { continue }
+            let oldFact = sourceFacts[occurrence.factIndex]
+            let finalFact = sourceFacts[replacementIndex]
+            if blocks.contains(where: {
+                blockExpresses(
+                    $0,
+                    anchor: anchor,
+                    fact: oldFact,
+                    descriptor: occurrence.factDescriptor
+                )
+            }) {
+                append(.supersededFactRetained, to: &codes)
+            }
+            if !blocks.contains(where: {
+                blockExpresses(
+                    $0,
+                    anchor: anchor,
+                    fact: finalFact,
+                    descriptor: occurrence.replacementDescriptor
+                )
+            }) {
+                append(.missingProtectedFact, to: &codes)
+            }
         }
-        locatedMarkers.sort {
-            ($0.segmentIndex, $0.startOffset) < ($1.segmentIndex, $1.startOffset)
-        }
+    }
 
-        var superseded: Set<Int> = []
-        for marker in locatedMarkers {
-            guard let previous = locatedFacts.last(where: {
-                ($0.segmentIndex, $0.offset) < (marker.segmentIndex, marker.startOffset)
-            }) else { continue }
-            let previousFact = sourceFacts[previous.index]
-            guard locatedFacts.contains(where: { candidate in
-                let followsMarker = candidate.segmentIndex > marker.segmentIndex
-                    || (candidate.segmentIndex == marker.segmentIndex
-                        && candidate.offset >= marker.endOffset)
-                guard followsMarker else { return false }
-                let finalFact = sourceFacts[candidate.index]
-                return finalFact.kind == previousFact.kind
-                    && !equivalent(previousFact, finalFact)
-            }) else { continue }
-            superseded.insert(previous.index)
+    private static func correctionRanges(
+        of signal: String,
+        in text: String
+    ) -> [Range<String.Index>] {
+        allRanges(of: signal, in: text).filter { range in
+            if signal == "不对" {
+                let suffix = String(text[range.upperBound...].prefix(3))
+                let nonCorrectionContinuations = ["外", "内", "应", "等", "劲", "称", "付"]
+                if nonCorrectionContinuations.contains(where: suffix.hasPrefix) {
+                    return false
+                }
+            }
+            guard signal.unicodeScalars.allSatisfy({ $0.isASCII }) else { return true }
+            let leftIsWord = range.lowerBound > text.startIndex
+                && text[text.index(before: range.lowerBound)].isLetter
+            let rightIsWord = range.upperBound < text.endIndex
+                && text[range.upperBound].isLetter
+            return !leftIsWord && !rightIsWord
         }
-        return superseded
     }
 
     private static func allRanges(
@@ -490,6 +1904,16 @@ enum VoicePolishValidator {
     ) -> Bool {
         let source = normalizedNaturalText(request.fallbackText).lowercased()
         if isPublicCorrectionNotice(request) { return false }
+        let inlineCorrectionPattern = #"(?:^|[，,。！？!?；;])\s*不对(?:\s*[，,：:]\s*(?=\S)|\s*(?=还是|应该说|准确地说|更准确地说))"#
+        if request.fallbackText.range(
+            of: inlineCorrectionPattern,
+            options: .regularExpression
+        ) != nil {
+            return output.range(
+                of: inlineCorrectionPattern,
+                options: .regularExpression
+            ) != nil
+        }
         let explicitSelfCorrectionSignals = [
             "我说错了", "我刚才说的", "刚才说错了", "我改一下", "我的意思是",
             "let me correct that", "i said that wrong", "scratch that", "i mean",
@@ -511,14 +1935,43 @@ enum VoicePolishValidator {
     /// 对外纠错与普通口误相反：旧说法和正确说法都必须保留。仅凭“说明一下”
     /// 不足以豁免，必须同时存在公开说明信号与明确纠错证据。
     private static func isPublicCorrectionNotice(_ request: VoicePolishRequest) -> Bool {
-        guard request.context.scene == .socialPost else { return false }
+        let publicScenes: Set<WritingScene> = [
+            .workChat, .email, .document, .socialPost, .customerSupport,
+        ]
+        guard publicScenes.contains(request.context.scene) else { return false }
         let source = normalizedNaturalText(request.fallbackText).lowercased()
-        let noticeSignals = ["说明一下", "更正说明", "更正一下", "澄清一下"]
+        let readerFacingSignals = [
+            "上一条", "上一版", "刚才发的", "刚才写的", "此前发布", "此前发送",
+            "向大家", "请以", "以这条为准", "以本条为准", "更正通知",
+            "纠错通知", "勘误", "公告",
+        ]
         let correctionSignals = [
             "说错", "误将", "错误", "有误", "正确日期", "正确时间", "正确名称", "正确说法",
         ]
-        return noticeSignals.contains(where: source.contains)
-            && correctionSignals.contains(where: source.contains)
+        let publishedArtifactSignals = [
+            "视频", "文章里", "文章中", "公告中", "发布内容",
+            "已经发布", "已发布", "预约链接",
+        ]
+        let audienceSignals = ["大家", "读者", "用户", "客户", "观众", "学员"]
+        let correctionOffsets = correctionSignals.flatMap { signal in
+            allRanges(of: signal, in: source).map {
+                source.distance(from: source.startIndex, to: $0.lowerBound)
+            }
+        }
+        guard !correctionOffsets.isEmpty else { return false }
+        func signalIsNearCorrection(_ signals: [String], maximumDistance: Int = 120) -> Bool {
+            signals.contains { signal in
+                allRanges(of: signal, in: source).contains { range in
+                    let offset = source.distance(from: source.startIndex, to: range.lowerBound)
+                    return correctionOffsets.contains { abs($0 - offset) <= maximumDistance }
+                }
+            }
+        }
+        let hasReaderFacingEvidence = signalIsNearCorrection(readerFacingSignals)
+            || (signalIsNearCorrection(publishedArtifactSignals)
+                && (request.context.scene == .socialPost
+                    || signalIsNearCorrection(audienceSignals)))
+        return hasReaderFacingEvidence
     }
 
     static func validateStructured(
@@ -750,10 +2203,264 @@ enum VoicePolishValidator {
     ) {
         let comparableSource = comparableDraft(request.fallbackText)
         let comparableOutput = comparableDraft(output)
-        guard comparableSource == comparableOutput, requiresTransformation(request) else {
+        let normalizedOutput = normalizedNaturalText(output)
+        // 只加标点或换行、却完整保留“嗯/我我/这个这个”等口述残片，仍然
+        // 不是成稿。长文只检查未处于引号/示例语境的高置信残片，避免文档在
+        // 讲解口吃示例时被误退。
+        let sourceDisfluencies = request.fallbackText.count <= 80
+            ? obviousDisfluencies(in: request.fallbackText)
+            : highConfidenceLongDraftDisfluencies(in: request.fallbackText)
+        let retainsSourceDisfluency = sourceDisfluencies.contains {
+            normalizedOutput.contains(normalizedNaturalText($0))
+        }
+        guard requiresTransformation(request),
+              comparableSource == comparableOutput || retainsSourceDisfluency else {
             return
         }
         append(.unchangedDraft, to: &codes)
+    }
+
+    private static func highConfidenceLongDraftDisfluencies(in text: String) -> [String] {
+        let fixedRestarts = [
+            "我我", "你你", "他他", "她她", "它它", "不不", "第第",
+            "这个这个", "那个那个", "大大概", "突突然", "帮我帮我", "麻烦麻烦",
+        ]
+        var results: [String] = []
+
+        func isInsideQuotedOrLocalExample(
+            _ range: Range<String.Index>,
+            in scope: String
+        ) -> Bool {
+            let before = String(scope[..<range.lowerBound])
+            let after = String(scope[range.upperBound...])
+            let lastOpen = before.lastIndex(where: { "“‘".contains($0) })
+            let lastClose = before.lastIndex(where: { "”’".contains($0) })
+            if let lastOpen,
+               lastClose == nil || lastOpen > lastClose!,
+               after.contains(where: { "”’".contains($0) }) {
+                return true
+            }
+            if before.filter({ $0 == "\"" }).count % 2 == 1,
+               after.contains("\"") {
+                return true
+            }
+            let localSuffix = normalizedNaturalText(String(after.prefix(40)))
+            let metalinguisticPatterns = [
+                #"^.{0,12}(?:属于|是|只是)(?:典型的?)?(?:口吃|示例|样例)"#,
+                #"^.{0,12}保留.{0,8}(?:没有意义|没有必要)"#,
+                #"^.{0,12}(?:应该|需要|应当)(?:被)?清理"#,
+            ]
+            // “比如/例如”也常用于普通叙述，不能因此豁免其后整段里的真实口吃。
+            // 无引号时必须由紧随残片的元语言说明证明“这里正在讲示例”。
+            return metalinguisticPatterns.contains {
+                localSuffix.range(of: $0, options: .regularExpression) != nil
+            }
+        }
+
+        // 口吃示例的解释可能紧跟在逗号后的下一小句中，所以固定残片在全文
+        // 范围定位；填充词仍按小句起点检查，避免正文中普通语气词被误判。
+        for fragment in fixedRestarts {
+            var searchStart = text.startIndex
+            while searchStart < text.endIndex,
+                  let range = text.range(
+                    of: fragment,
+                    range: searchStart..<text.endIndex
+                  ) {
+                if !isInsideQuotedOrLocalExample(range, in: text) {
+                    results.append(fragment)
+                }
+                searchStart = range.upperBound
+            }
+        }
+        for clause in semanticClauses(in: text) {
+            if let filler = clause.range(
+                of: #"^\s*(?:嗯+|呃+|额+)(?=\s|[\p{Han}])"#,
+                options: .regularExpression
+            ), !isInsideQuotedOrLocalExample(filler, in: clause) {
+                let value = String(clause[filler])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty { results.append(value) }
+            }
+        }
+        return Array(Set(results)).sorted()
+    }
+
+    private static func obviousDisfluencies(in text: String) -> [String] {
+        let normalized = normalizedNaturalText(text)
+        var results = [
+            "我我", "你你", "他他", "她她", "它它", "不不", "第第",
+            "大大概", "突突然", "帮我帮我", "麻烦麻烦", "今天今天",
+        ].filter { normalized.contains(normalizedNaturalText($0)) }
+        results.append(contentsOf: repeatedSpeechFragments(in: text))
+        results.append(contentsOf: delimitedFillerWords(in: text))
+        return Array(Set(results)).sorted()
+    }
+
+    private static func delimitedFillerWords(in text: String) -> [String] {
+        guard text.count <= 80 else { return [] }
+        var results: [String] = []
+        if let leading = text.range(
+            of: #"^\s*((?:嗯+|呃+|额+)(?:\s*(?:那个|这个))?)(?=\s|[，,。！？!?；;]|[\p{Han}])"#,
+            options: .regularExpression
+        ) {
+            let value = String(text[leading])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty { results.append(value) }
+        }
+        guard let regex = try? NSRegularExpression(
+                  pattern: #"(?:^|[\s，,。！？!?；;])((?:嗯+|呃+|额+))(?=$|[\s，,。！？!?；;])"#
+              ) else { return results }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        results.append(contentsOf: regex.matches(in: text, range: range).compactMap { match in
+            guard let matchRange = Range(match.range(at: 1), in: text) else { return nil }
+            return String(text[matchRange])
+        })
+        return Array(Set(results)).sorted()
+    }
+
+    /// 捕获开放词汇里的相邻起步重复，例如“这这周五”“功功能”和
+    /// “你明天你明天”。有意强调与常见词汇重叠会被排除，避免把“好好学习”
+    /// 或“真的真的很好”当口吃。这里只用于 80 字以内的残留门禁。
+    private static func repeatedSpeechFragments(in text: String) -> [String] {
+        guard text.count <= 80 else { return [] }
+        let characters = Array(text)
+        let protectedPhrases = deliberateRepetitionPhrases(in: text)
+        var protectedIndices = Set<Int>()
+        for phrase in protectedPhrases {
+            let phraseCharacters = Array(phrase)
+            guard !phraseCharacters.isEmpty, phraseCharacters.count <= characters.count else {
+                continue
+            }
+            for start in 0...(characters.count - phraseCharacters.count) where
+                Array(characters[start..<(start + phraseCharacters.count)]) == phraseCharacters {
+                protectedIndices.formUnion(start..<(start + phraseCharacters.count))
+            }
+        }
+
+        let lexicalReduplications: Set<String> = [
+            "看看", "想想", "说说", "聊聊", "问问", "听听", "试试", "走走",
+            "等等", "找找", "读读", "写写", "学学", "用用", "改改", "尝尝",
+            "谢谢", "妈妈", "爸爸", "爷爷", "奶奶", "哥哥", "姐姐", "弟弟",
+            "妹妹", "宝宝", "星星", "人人", "家家", "户户", "处处", "时时",
+            "天天", "年年", "刚刚", "渐渐", "慢慢", "常常", "往往", "仅仅",
+            "偏偏", "恰恰", "足足", "久久", "轻轻", "纷纷", "明明", "好好",
+            "哈哈", "呵呵", "嘿嘿", "嘻嘻", "彬彬", "楚楚", "津津",
+            "滔滔", "井井", "念念", "欣欣", "亭亭", "落落", "息息",
+            "面面", "头头", "历历", "栩栩", "侃侃", "姗姗", "喋喋",
+        ]
+        let grammaticalRepeatedUnits: Set<String> = [
+            "研究", "考虑", "讨论", "商量", "检查", "确认", "了解", "分析",
+            "比较", "整理", "规划", "调整", "观察", "总结", "沟通", "安排",
+        ]
+
+        func isHan(_ character: Character) -> Bool {
+            guard character.unicodeScalars.count == 1,
+                  let value = character.unicodeScalars.first?.value else { return false }
+            return (0x3400...0x4DBF).contains(value)
+                || (0x4E00...0x9FFF).contains(value)
+                || (0xF900...0xFAFF).contains(value)
+                || (0x20000...0x3134F).contains(value)
+        }
+
+        var fragments: [String] = []
+        guard characters.count >= 2 else { return [] }
+
+        // 借助系统中文分词识别开放词汇里的 partial-word restart：
+        // “可｜可以”“功｜功能”会被分成一个单字残片和一个以它开头的完整词，
+        // 而“太太”“叔叔”仍是一个合法词。对相邻整词重复，仅把非动词视为
+        // 高置信口吃，所以“周五周五发”需清理，“学习学习方案”保留。
+        let tokenizer = NLTokenizer(unit: .word)
+        tokenizer.string = text
+        var wordTokens: [(text: String, range: Range<String.Index>)] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let token = String(text[range])
+            if token.contains(where: isHan) {
+                wordTokens.append((token, range))
+            }
+            return true
+        }
+        let tagger = NLTagger(tagSchemes: [.lexicalClass])
+        tagger.string = text
+        if wordTokens.count >= 2 {
+            for index in 0..<(wordTokens.count - 1) {
+                let first = wordTokens[index]
+                let second = wordTokens[index + 1]
+                let firstText = normalizedNaturalText(first.text)
+                let secondText = normalizedNaturalText(second.text)
+                guard !firstText.isEmpty, !secondText.isEmpty else { continue }
+                let combined = firstText + secondText
+                if protectedPhrases.contains(where: {
+                    normalizedNaturalText($0) == combined
+                }) {
+                    continue
+                }
+                if firstText.count == 1,
+                   secondText.count >= 2,
+                   secondText.hasPrefix(firstText) {
+                    fragments.append(combined)
+                    continue
+                }
+                if firstText == secondText, firstText.count >= 2 {
+                    let lexicalClass = tagger.tag(
+                        at: first.range.lowerBound,
+                        unit: .word,
+                        scheme: .lexicalClass
+                    ).0
+                    if lexicalClass != .verb {
+                        fragments.append(combined)
+                    }
+                }
+            }
+        }
+
+        // “好好好像可以”不是词汇“好好”，而是“好 | 好像”的起步重来。
+        // 三个相同汉字后仍紧接正文时是高置信 partial-word restart；位于句界的
+        // “好好好”仍由 deliberateRepetitionPhrases 保护。
+        if characters.count >= 4 {
+            for start in 0...(characters.count - 4) {
+                let first = characters[start]
+                guard isHan(first),
+                      characters[start + 1] == first,
+                      characters[start + 2] == first,
+                      isHan(characters[start + 3]),
+                      characters[start + 3] != first else { continue }
+                let range = start..<(start + 3)
+                if !range.allSatisfy({ protectedIndices.contains($0) }) {
+                    fragments.append(String(characters[range]))
+                }
+            }
+        }
+
+        let highConfidenceRestartInitials: Set<Character> = [
+            "我", "你", "他", "她", "它", "这", "那", "哪", "谁", "怎",
+            "第", "突", "不", "没", "请", "帮", "麻", "就", "还", "再",
+        ]
+        for unitLength in stride(from: 4, through: 1, by: -1) {
+            guard characters.count >= unitLength * 2 else { continue }
+            for start in 0...(characters.count - unitLength * 2) {
+                let first = Array(characters[start..<(start + unitLength)])
+                let second = Array(characters[(start + unitLength)..<(start + unitLength * 2)])
+                guard first == second, first.allSatisfy(isHan) else { continue }
+                let range = start..<(start + unitLength * 2)
+                if range.allSatisfy({ protectedIndices.contains($0) }) { continue }
+                let fragment = String(characters[range])
+                if unitLength == 1, lexicalReduplications.contains(fragment) { continue }
+                if unitLength >= 2, grammaticalRepeatedUnits.contains(String(first)) { continue }
+                // 未知 AA/ABAB 默认视为可能的合法叠词或语气，不以有限词表
+                // 反推它一定是口吃。只有句首功能词/人称词等高置信 restart 才
+                // 作为硬门禁；其余交给模型保守保留。
+                if unitLength == 1,
+                   !highConfidenceRestartInitials.contains(first[0]) {
+                    continue
+                }
+                if unitLength >= 2,
+                   !highConfidenceRestartInitials.contains(first[0]) {
+                    continue
+                }
+                fragments.append(fragment)
+            }
+        }
+        return Array(Set(fragments)).sorted()
     }
 
     private static func requiresTransformation(_ request: VoicePolishRequest) -> Bool {
@@ -768,17 +2475,31 @@ enum VoicePolishValidator {
             return true
         }
 
-        let correctionSignals = [
-            "我说错了", "我改一下", "我的意思是", "不对", "改成", "应该是",
-            "最终决定", "最后还是", "scratch that", "i mean", "actually",
+        let explicitCorrectionSignals = [
+            "我说错了", "我改一下", "我的意思是", "前面那句改成",
+            "刚才那句改成", "把开头改成", "最终决定", "最后还是",
+            "scratch that", "i mean", "actually",
         ]
-        if correctionSignals.contains(where: normalized.contains) { return true }
+        if explicitCorrectionSignals.contains(where: normalized.contains) { return true }
+        if source.range(
+            of: #"(?:^|[，,。！？!?；;])\s*不对(?:\s*[，,：:]\s*(?=\S)|\s*(?=还是|应该说|准确地说|更准确地说))"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
 
-        let obviousDisfluencies = [
-            "我我", "你你", "他他", "她她", "它它", "不不", "第第",
-            "大大概", "突突然", "帮我帮我", "麻烦麻烦", "今天今天",
-        ]
-        if obviousDisfluencies.contains(where: normalized.contains) { return true }
+        let sourceFacts = ProtectedFactExtractor.extract(from: request.input.segments)
+        if !locallySupersededFactIndices(
+            request: request,
+            sourceFacts: sourceFacts
+        ).isEmpty {
+            return true
+        }
+
+        if !obviousDisfluencies(in: source).isEmpty
+            || !highConfidenceLongDraftDisfluencies(in: source).isEmpty {
+            return true
+        }
 
         let expectation = VoicePolishLayoutExpectation.infer(from: request)
         if (expectation.kind == .numberedList || expectation.kind == .bulletList),
@@ -809,6 +2530,7 @@ enum VoicePolishValidator {
 
     private static func comparableDraft(_ text: String) -> String {
         VoicePolishCharacterSafety.normalizedLineEndings(text)
+            .filter { !$0.isPunctuation }
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
@@ -843,10 +2565,38 @@ enum VoicePolishValidator {
         if trimmed.count > maximum {
             append(.abnormalLength, to: &codes)
         }
-        if trimmed.components(separatedBy: "\n\n").filter({ !$0.isEmpty }).count > 6 {
+        // 长口述的核心目标是整理成可直接发送的完整成稿，不是摘要。只看最大
+        // 长度无法阻止模型把近千字独立约束压成百字套话；同时按原始字符比例
+        // 又会误伤大量口吃/重复。这里先把重复语义片段去重，再使用很保守的 30%
+        // 下限：只拦截明显截断或摘要，正常删口头冗余仍有充分空间。
+        if sourceText.count >= 500 {
+            let sourceSemanticLength = distinctSemanticContentLength(sourceText)
+            let outputSemanticLength = distinctSemanticContentLength(trimmed)
+            if sourceSemanticLength >= 240,
+               outputSemanticLength * 10 < sourceSemanticLength * 3 {
+                append(.abnormalLength, to: &codes)
+            }
+        }
+        // 长文可以天然拥有很多语义段。固定“最多六段”会把正常的会议纪要、
+        // 邮件和文档判成失败，最终又静默退回整段口述。阈值随源文本长度有界
+        // 增长；短文本仍保持原来的六段上限，超长文本最多允许六十四段。
+        // 超长正文按语义分段后可能自然超过 32 段。上限仍随原文长度受控，
+        // 但不能把完整的 6k～8k 字成稿误判成“段落过多”再退回原文。
+        let paragraphLimit = max(6, min(64, sourceText.count / 100 + 8))
+        if trimmed.components(separatedBy: "\n\n").filter({ !$0.isEmpty }).count > paragraphLimit {
             append(.excessiveParagraphs, to: &codes)
         }
         return codes
+    }
+
+    private static func distinctSemanticContentLength(_ text: String) -> Int {
+        var seen = Set<String>()
+        return semanticClauses(in: text).reduce(into: 0) { total, clause in
+            let normalizedClause = normalizedNaturalText(clause).lowercased()
+            guard !normalizedClause.isEmpty,
+                  seen.insert(normalizedClause).inserted else { return }
+            total += normalizedClause.count
+        }
     }
 
     private static func hasInvalidSourceIDs(
@@ -898,6 +2648,12 @@ enum VoicePolishValidator {
         if candidate.kind == .codeIdentifier, let canonical = candidate.canonicalValue {
             return normalizedNaturalText(output).contains(normalizedNaturalText(canonical))
         }
+        if candidate.kind == .filePath, let canonical = candidate.canonicalValue {
+            return output.contains(canonical)
+        }
+        if candidate.kind == .version, let canonical = candidate.canonicalValue {
+            return output.localizedCaseInsensitiveContains(canonical)
+        }
         if let canonical = candidate.canonicalValue {
             return outputFacts.contains {
                 compatibleKinds(candidate, $0) && $0.canonicalValue == canonical
@@ -913,6 +2669,12 @@ enum VoicePolishValidator {
     ) -> Bool {
         if fact.kind == .lexiconEntity, let canonical = canonicalValue(for: fact) {
             return normalizedNaturalText(output).contains(normalizedNaturalText(canonical))
+        }
+        if fact.kind == .filePath, let canonical = canonicalValue(for: fact) {
+            return output.contains(canonical)
+        }
+        if fact.kind == .version, let canonical = canonicalValue(for: fact) {
+            return output.localizedCaseInsensitiveContains(canonical)
         }
         if let canonical = canonicalValue(for: fact) {
             return outputFacts.contains {

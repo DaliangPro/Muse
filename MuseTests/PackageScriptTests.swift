@@ -50,6 +50,30 @@ final class PackageScriptTests: XCTestCase {
         XCTAssertTrue(signingSource.contains("--options runtime"), signingSource)
         XCTAssertTrue(signingSource.contains("--timestamp"), signingSource)
         XCTAssertTrue(signingSource.contains("MUSE_DEFER_GATEKEEPER_ASSESSMENT"), signingSource)
+        XCTAssertTrue(
+            packageSource.contains("Refusing to package a tracked dirty worktree"),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains("MUSE_SOURCE_COMMIT cannot override provenance"),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(#"git -C "$PROJECT_DIR" diff --quiet"#),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(#"git -C "$PROJECT_DIR" diff --cached --quiet"#),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(#"git -C "$PROJECT_DIR" ls-files --others --exclude-standard"#),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains("Refusing to package untracked build inputs"),
+            packageSource
+        )
 
         let outerSign = #"/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH""#
         let strictVerify = #"/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH""#
@@ -131,6 +155,58 @@ final class PackageScriptTests: XCTestCase {
 
         let validation = try runBundleValidation(for: fixture.app, expectsLocalServices: false)
         XCTAssertEqual(validation.status, 0, validation.output)
+    }
+
+    func testPackagingFreezesExternalQualityManifestAfterFinalSignature() throws {
+        let fixture = try makePackagingFixture()
+        defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
+        let manifest = fixture.root.appendingPathComponent("quality-build-manifest.json")
+        let commit = String(repeating: "1", count: 40)
+        let tree = String(repeating: "2", count: 40)
+
+        let packaging = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: [
+                "MUSE_QUALITY_BUILD_MANIFEST_PATH": manifest.path,
+                "MUSE_SOURCE_COMMIT": commit,
+                "MUSE_SOURCE_TREE": tree,
+            ]
+        )
+
+        XCTAssertEqual(packaging.status, 0, packaging.output)
+        XCTAssertTrue(packaging.output.contains("Quality build manifest ready"), packaging.output)
+        let data = try Data(contentsOf: manifest)
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(document["schema_version"] as? Int, 1)
+        XCTAssertEqual(
+            document["artifact_kind"] as? String,
+            "muse_voice_polish_quality_candidate"
+        )
+        XCTAssertEqual(document["package_mode"] as? String, "test")
+        XCTAssertEqual(document["source_commit"] as? String, commit)
+        XCTAssertEqual(document["source_tree"] as? String, tree)
+        let executable = fixture.app.appendingPathComponent("Contents/MacOS/Muse")
+        let executableHash = try run(
+            "/usr/bin/shasum",
+            arguments: ["-a", "256", executable.path]
+        ).output.split(separator: " ").first.map(String.init)
+        XCTAssertEqual(document["executable_sha256"] as? String, executableHash)
+        let requirement = try XCTUnwrap(document["designated_requirement"] as? String)
+        XCTAssertFalse(requirement.isEmpty)
+        XCTAssertEqual(
+            document["designated_requirement_sha256"] as? String,
+            VoicePolishProviderAudit.sha256Hex(Data(requirement.utf8))
+        )
+        let manifestHash = VoicePolishProviderAudit.sha256Hex(data)
+        XCTAssertTrue(
+            packaging.output.contains("MUSE_QUALITY_EXPECTED_MANIFEST_SHA256=\(manifestHash)"),
+            packaging.output
+        )
+        let attributes = try fileManager.attributesOfItem(atPath: manifest.path)
+        XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o444)
     }
 
     func testSigningWindowRequiresHashLockedPrebuiltBinary() throws {

@@ -758,6 +758,80 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
         XCTAssertNil(expectation.minimumListItemCount)
     }
 
+    func testLongDocumentLayoutDoesNotDependOnProviderSegmentCount() {
+        let source = """
+        这次复盘先交代背景。最近两周用户反馈主要集中在等待时间、术语识别和长文完整性，我们需要分别核对原因，不能因为其中某一项容易修就忽略其他问题。
+
+        中间有一个局部检查清单，只有三项：确认日志、核对模型版本、记录发生时间。这个清单只是排查过程的一部分，不代表整篇复盘都要改成列表。
+
+        接下来还要说明处理方案。短期先修复原文回退和错误校验，长期再补真实语料回归，并且每次发布前都要由独立验收确认结果。
+
+        最后保留结论和下一步安排。负责人需要根据失败样本逐条复查，确认事实、语气和段落都完整，再决定是否发布。
+        """
+        let segmentVariants = [
+            [source],
+            source.components(separatedBy: "\n\n"),
+            source.split(separator: "，").map(String.init),
+        ]
+
+        let expectations = segmentVariants.map {
+            infer(source, scene: .document, segments: $0)
+        }
+
+        for expectation in expectations {
+            XCTAssertEqual(expectation.kind, .paragraphs)
+            XCTAssertGreaterThanOrEqual(expectation.minimumParagraphCount, 2)
+            XCTAssertNil(expectation.minimumListItemCount)
+        }
+        XCTAssertEqual(Set(expectations.map(\.kind)).count, 1)
+        XCTAssertEqual(Set(expectations.map(\.minimumParagraphCount)).count, 1)
+    }
+
+    func testMediumTwoSentenceDocumentWithLocalChecklistIgnoresProviderSegments() {
+        let first = "这次复盘先说明最近用户反馈的背景和影响，中间的排查清单只有三项：确认日志、核对模型版本、记录发生时间。"
+        let second = "随后还要单独说明修复方案、发布条件和负责人安排，不能把整篇复盘误排成三条清单。"
+        let source = first + second
+        XCTAssertGreaterThanOrEqual(source.filter { !$0.isWhitespace }.count, 80)
+        XCTAssertLessThan(source.filter { !$0.isWhitespace }.count, 180)
+
+        let expectations = [
+            infer(source, scene: .document, segments: [source]),
+            infer(source, scene: .document, segments: [first, second]),
+        ]
+
+        for expectation in expectations {
+            XCTAssertEqual(expectation.kind, .paragraphs)
+            XCTAssertGreaterThanOrEqual(expectation.minimumParagraphCount, 2)
+            XCTAssertNil(expectation.minimumListItemCount)
+        }
+        XCTAssertEqual(expectations[0], expectations[1])
+    }
+
+    func testLocalExplicitChapterListDoesNotTurnLongNarrativeIntoWholeDocumentList() {
+        let localChapters = [
+            "第一部分讲账号与环境。",
+            "第二部分讲如何提出好问题。",
+            "第三部分讲资料研究。",
+            "第四部分讲语音输入。",
+            "第五部分讲内容生产。",
+            "第六部分讲表格和文档。",
+            "第七部分讲知识库。",
+            "第八部分讲自动化和 Agent。",
+        ].joined()
+        let background = Array(
+            repeating: "课程还需要说明真实截图、隐私边界、作业验收、素材授权、版本更新和售后范围，每一项都要保留原始事实并让普通学员能够复现。",
+            count: 14
+        ).joined(separator: "\n\n")
+        let source = "这是完整课程计划的背景和目标。\n\n\(localChapters)\n\n\(background)"
+
+        for segments in [[source], source.components(separatedBy: "\n\n")] {
+            let expectation = infer(source, scene: .document, segments: segments)
+            XCTAssertEqual(expectation.kind, .paragraphs)
+            XCTAssertGreaterThanOrEqual(expectation.minimumParagraphCount, 2)
+            XCTAssertNil(expectation.minimumListItemCount)
+        }
+    }
+
     private func infer(
         _ text: String,
         requirements: String = "",

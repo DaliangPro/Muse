@@ -1,6 +1,63 @@
 import XCTest
 @testable import Muse
 
+private final class VoicePolishProviderAuditURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Type": "text/event-stream"]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let body = """
+        data: {"id":"chatcmpl-provider-123","model":"deepseek-chat","choices":[{"delta":{"content":"润色完成。"},"finish_reason":"stop"}]}
+
+
+        """
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class VoicePolishProviderAuditMissingIDURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Type": "text/event-stream"]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let body = """
+        data: {"model":"deepseek-chat","choices":[{"delta":{"content":"润色完成。"},"finish_reason":"stop"}]}
+
+
+        """
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 final class DoubaoChatClientTests: XCTestCase {
 
     private func withChineseAppLanguage(_ action: () -> Void) {
@@ -73,5 +130,110 @@ final class DoubaoChatClientTests: XCTestCase {
             String(data: JSONEncoder().encode(request), encoding: .utf8)
         )
         XCTAssertTrue(json.contains(#""response_format":{"type":"json_object"}"#))
+    }
+
+    func test成功Provider响应由网络层写入逐请求审计回执() async throws {
+        let fixtureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseProviderAuditTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: fixtureDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.trashItem(at: fixtureDirectory, resultingItemURL: nil) }
+        let receiptURL = fixtureDirectory.appendingPathComponent("provider-audit.jsonl")
+        XCTAssertTrue(FileManager.default.createFile(atPath: receiptURL.path, contents: Data()))
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [VoicePolishProviderAuditURLProtocol.self]
+        let client = DoubaoChatClient(
+            provider: .deepseek,
+            session: URLSession(configuration: configuration)
+        )
+        let nonce = String(repeating: "b", count: 64)
+        let response = try await VoicePolishProviderAudit.withContext(
+            runNonce: nonce,
+            testInputID: "VP-L15-AUDIT-001",
+            receiptPath: receiptURL.path
+        ) {
+            try await client.generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishFast,
+                    system: "只返回润色后文本。",
+                    user: "嗯润色一下",
+                    options: LLMGenerationOptions(reasoningPolicy: .disabled)
+                ),
+                config: LLMConfig(
+                    apiKey: "test-only-key",
+                    model: "deepseek-chat",
+                    baseURL: "https://api.deepseek.com"
+                )
+            )
+        }
+
+        XCTAssertEqual(response.text, "润色完成。")
+        let lines = try String(contentsOf: receiptURL, encoding: .utf8).split(separator: "\n")
+        XCTAssertEqual(lines.count, 1)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(
+            VoicePolishProviderAuditReceipt.self,
+            from: Data(lines[0].utf8)
+        )
+        XCTAssertEqual(receipt.runNonce, nonce)
+        XCTAssertEqual(receipt.testInputID, "VP-L15-AUDIT-001")
+        XCTAssertEqual(receipt.requestOrdinal, 1)
+        XCTAssertEqual(receipt.llmTask, "voicePolishFast")
+        XCTAssertEqual(receipt.provider, "deepseek")
+        XCTAssertEqual(receipt.endpointURL, "https://api.deepseek.com/chat/completions")
+        XCTAssertEqual(receipt.configuredModel, "deepseek-chat")
+        XCTAssertEqual(receipt.responseModel, "deepseek-chat")
+        XCTAssertEqual(receipt.transport, "stream")
+        XCTAssertEqual(receipt.httpStatus, 200)
+        XCTAssertEqual(receipt.providerResponseID, "chatcmpl-provider-123")
+        XCTAssertTrue(receipt.requestBodySHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil)
+        XCTAssertEqual(
+            receipt.responseTextSHA256,
+            VoicePolishProviderAudit.sha256Hex(Data("润色完成。".utf8))
+        )
+    }
+
+    func testProvider没有ResponseID时不得产生可冒充的成功回执() async throws {
+        let fixtureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseProviderAuditMissingIDTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fixtureDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.trashItem(at: fixtureDirectory, resultingItemURL: nil) }
+        let receiptURL = fixtureDirectory.appendingPathComponent("provider-audit.jsonl")
+        XCTAssertTrue(FileManager.default.createFile(atPath: receiptURL.path, contents: Data()))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [VoicePolishProviderAuditMissingIDURLProtocol.self]
+        let client = DoubaoChatClient(
+            provider: .deepseek,
+            session: URLSession(configuration: configuration)
+        )
+
+        do {
+            _ = try await VoicePolishProviderAudit.withContext(
+                runNonce: String(repeating: "c", count: 64),
+                testInputID: "VP-L15-AUDIT-MISSING-ID",
+                receiptPath: receiptURL.path
+            ) {
+                try await client.generate(
+                    LLMRequest(
+                        context: .processingMode,
+                        task: .voicePolishFast,
+                        system: nil,
+                        user: "润色一下",
+                        options: LLMGenerationOptions(reasoningPolicy: .disabled)
+                    ),
+                    config: LLMConfig(
+                        apiKey: "test-only-key",
+                        model: "deepseek-chat",
+                        baseURL: "https://api.deepseek.com"
+                    )
+                )
+            }
+            XCTFail("缺少 Provider response ID 必须失败")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("response ID"), error.localizedDescription)
+        }
+        XCTAssertEqual(try Data(contentsOf: receiptURL).count, 0)
     }
 }

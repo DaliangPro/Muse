@@ -9,9 +9,9 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
         baseURL: "https://example.com/v1"
     )
 
-    func test107条多维人工参考成稿全部可通过正式Pipeline校验() async throws {
+    func test130条多维人工参考成稿全部可通过正式Pipeline校验() async throws {
         let fixtures = try loadFixtures()
-        XCTAssertEqual(fixtures.count, 107)
+        XCTAssertEqual(fixtures.count, 130)
         var failures: [String] = []
 
         for fixture in fixtures {
@@ -36,7 +36,14 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                 request: request,
                 sourceFacts: sourceFacts
             )
-            let result = await VoicePolishPipeline(client: client, config: config).process(request)
+            // 参考成稿替身每次只能返回整篇冻结答案；分片可靠性由专门的
+            // Pipeline 测试覆盖，这里关闭内部分片以单独验证整篇参考成稿
+            // 能否通过与生产相同的事实、结构和安全门禁。
+            let result = await VoicePolishPipeline(
+                client: client,
+                config: config,
+                fastChunkSourceTokenLimit: Int.max
+            ).process(request)
             if result.usedFallback || result.text != fixture.referenceOutput {
                 let expectation = VoicePolishLayoutExpectation.infer(from: request)
                 let expectedCount = expectation.expectedListItemCount.map(String.init) ?? "nil"
@@ -54,12 +61,20 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                     confidence: nil,
                     isFinal: true
                 )])
+                let superseded = VoicePolishValidator.locallySupersededFactIndices(
+                    request: request,
+                    sourceFacts: sourceFacts
+                ).sorted().map { index in
+                    "\(index):\(sourceFacts[index].sourceText)"
+                }.joined(separator: "|")
                 failures.append(
                     "\(fixture.id): fallback=\(result.usedFallback) "
                     + "resultCodes=\(result.validationCodes.map { $0.rawValue }) "
                     + "directCodes=\(directValidation.codes.map { $0.rawValue }) "
+                    + "negative=\(VoicePolishValidator.protectedNegativeIntentFailures(output: fixture.referenceOutput, request: request)) "
                     + "sourceFacts=\(factDescription(sourceFacts)) "
                     + "outputFacts=\(factDescription(outputFacts)) "
+                    + "superseded=\(superseded) "
                     + "layout=\(expectation.kind.rawValue)/"
                     + "expected:\(expectedCount)/"
                     + "minimum:\(minimumCount)/"
@@ -77,6 +92,77 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                 + failures.prefix(12).joined(separator: "\n")
             )
         }
+    }
+
+    func test安全上下文实体解析不会把测试集旁注写进正文() throws {
+        let fixtures = try loadFixtures().filter { $0.contextFixture != nil }
+        var failures: [String] = []
+
+        for fixture in fixtures {
+            let request = makeRequest(for: fixture)
+            let reference = fixture.referenceOutput
+                .precomposedStringWithCompatibilityMapping
+                .lowercased()
+                .filter { !$0.isWhitespace && !$0.isPunctuation }
+            for resolution in request.resolvedEntities where
+                resolution.candidateSource == .authorizedContext
+                    && resolution.surfaceText != resolution.canonical {
+                let canonical = resolution.canonical
+                    .precomposedStringWithCompatibilityMapping
+                    .lowercased()
+                    .filter { !$0.isWhitespace && !$0.isPunctuation }
+                if canonical.isEmpty || !reference.contains(canonical) {
+                    failures.append(
+                        "\(fixture.id): \(resolution.surfaceText) → \(resolution.canonical)"
+                    )
+                }
+            }
+        }
+
+        XCTAssertTrue(
+            failures.isEmpty,
+            "安全上下文解析产生了参考正文不支持的替换：\n\(failures.joined(separator: "\n"))"
+        )
+    }
+
+    func test六千与近八千字样本真实跨越内部切片完成改口() throws {
+        let fixtures = Dictionary(uniqueKeysWithValues: try loadFixtures().map { ($0.id, $0) })
+        let expectations = [
+            (
+                id: "natural-long-09",
+                old: "质量修复重试次数先按三次",
+                final: "质量修复的重试次数我说错了"
+            ),
+            (
+                id: "natural-long-10",
+                old: "课程资料复核先安排三轮",
+                final: "课程资料复核轮次不对"
+            ),
+        ]
+
+        for expectation in expectations {
+            let fixture = try XCTUnwrap(fixtures[expectation.id])
+            let request = makeRequest(for: fixture)
+            let canonicalSource = request.fallbackText
+            let chunks = VoicePolishPipeline.fastChunkTexts(from: canonicalSource)
+            let oldIndex = try XCTUnwrap(chunks.firstIndex {
+                $0.contains(expectation.old)
+            })
+            let finalIndex = try XCTUnwrap(chunks.firstIndex {
+                $0.contains(expectation.final)
+            })
+
+            XCTAssertGreaterThanOrEqual(chunks.count, 2, expectation.id)
+            XCTAssertNotEqual(oldIndex, finalIndex, "\(expectation.id) 未真实跨内部切片")
+        }
+
+        let contextFixture = try XCTUnwrap(fixtures["natural-long-09"])
+        let contextRequest = makeRequest(for: contextFixture)
+        XCTAssertTrue(
+            contextRequest.fallbackText.contains("Muse进程")
+                || contextRequest.fallbackText.contains("Muse 进程")
+        )
+        XCTAssertFalse(contextRequest.fallbackText.contains("缪斯进程"))
     }
 }
 
@@ -210,6 +296,13 @@ private extension VoicePolishQualityReferenceTests {
             level: .metadataOnly,
             safety: .unknown
         )
+        let resolvedEntities = EntityResolver.resolve(
+            segments: canonicalSegments,
+            lexicon: .empty,
+            snippets: [],
+            hotwords: [],
+            context: context
+        )
         return VoicePolishRequest(
             input: VoiceInputEnvelope(
                 providerFinalText: fixture.spokenInput,
@@ -222,7 +315,8 @@ private extension VoicePolishQualityReferenceTests {
             ),
             context: context,
             preferences: UserPolishPreferences(additionalRequirements: ""),
-            qualityMode: .automatic
+            qualityMode: .automatic,
+            resolvedEntities: resolvedEntities
         )
     }
 

@@ -111,8 +111,8 @@ struct ModeDetailInner: View, SettingsCardHelpers {
             }
 
             Text(L(
-                "这里继续管理快捷键和触发方式。附加润色要求、响应速度、上下文与表达学习已集中到一级“语音润色”页面，避免出现两个互相冲突的编辑入口。",
-                "Keep managing the shortcut and trigger behavior here. Additional requirements, response speed, context, and style learning now live on the top-level Voice Polish page so there is only one editing source."
+                "这里继续管理快捷键和触发方式。附加润色要求、上下文与表达学习已集中到一级“语音润色”页面，避免出现两个互相冲突的编辑入口。",
+                "Keep managing the shortcut and trigger behavior here. Additional requirements, context, and style learning now live on the top-level Voice Polish page so there is only one editing source."
             ))
             .font(TF.settingsFontBody)
             .foregroundStyle(TF.settingsTextSecondary)

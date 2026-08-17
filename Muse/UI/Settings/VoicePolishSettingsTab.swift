@@ -554,7 +554,7 @@ private extension VoicePolishSettingsTab {
 
     var modelCard: some View {
         settingsGroupCard(
-            L("模型与速度", "Model & speed"),
+            L("模型与诊断", "Model & diagnostics"),
             icon: "cpu",
             expandVertically: false
         ) {

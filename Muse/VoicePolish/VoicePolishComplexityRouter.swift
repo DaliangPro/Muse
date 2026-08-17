@@ -116,9 +116,11 @@ enum VoicePolishComplexityRouter {
     ) -> VoicePolishRoute {
         switch request.qualityMode {
         case .automatic:
-            // 用户只看到一个“语音润色”模式；Fast / Structured / Deep 是内容驱动的
-            // 内部实现细节。这里使用已审计的复杂度判断，不再让历史档位影响行为。
-            return decision.route
+            // 生产模式统一走可校验的纯文本成稿协议。真实 Provider 验收已经证明，
+            // 同一批输入在 JSON Plan 协议下会因字段或格式漂移整段回退，尤其会让
+            // 长文本和带改口的短文本直接退回原文。复杂度仍保留在 detectedRoute
+            // 中用于诊断；长度预算、排版契约和修复规则继续按内容自动计算。
+            return .fast
         case .fast, .balanced:
             // “快速”和默认“标准”都必须是一次成稿路径。复杂度仍记录在
             // detectedRoute 中供诊断，但不能让改口、长列表或主题切换自动升级为

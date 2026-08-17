@@ -68,7 +68,7 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertEqual(decision.route, .fast)
     }
 
-    func testAutomaticModeUsesContentRouteWhileLegacyModesRemainTestOnly() {
+    func testAutomaticModeUsesReliableTextProtocolWhileKeepingContentDiagnosis() {
         let simple = makeRequest("今天下午把方案发出去。")
         let enumeration = makeRequest("第一，写方案。第二，补测试。")
         let structured = makeRequest("顺便说一下，预算也要再确认。")
@@ -76,8 +76,8 @@ final class VoicePolishCoreTests: XCTestCase {
 
         XCTAssertEqual(executedRoute(simple, quality: .automatic), .fast)
         XCTAssertEqual(executedRoute(enumeration, quality: .automatic), .fast)
-        XCTAssertEqual(executedRoute(structured, quality: .automatic), .structured)
-        XCTAssertEqual(executedRoute(deep, quality: .automatic), .deep)
+        XCTAssertEqual(executedRoute(structured, quality: .automatic), .fast)
+        XCTAssertEqual(executedRoute(deep, quality: .automatic), .fast)
 
         // 旧档位只用于兼容历史数据和既有确定性测试；正式设置读取会统一迁移
         // 到 automatic，不能再让用户的旧选择改变生产行为。
@@ -118,6 +118,21 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertTrue(facts.contains { $0.kind == .url && $0.canonicalValue == "https://example.com/a" })
     }
 
+    func testFactExtractorKeepsChineseMonthDayAndCleanFilePaths() {
+        let facts = ProtectedFactExtractor.extract(from: [segment(
+            "发布日期从八月二十日改到 8 月 28 日，运行 scripts/package-app.sh，产物在 build/Muse.app，中文文件在 /Users/jiliang/文档/课程.md，素材在“/Users/jiliang/课程 素材/第一章.md”，再检查 /Applications；P50/P95 只是性能指标。"
+        )])
+
+        XCTAssertTrue(facts.contains { $0.kind == .date && $0.canonicalValue == "08-20" })
+        XCTAssertTrue(facts.contains { $0.kind == .date && $0.canonicalValue == "08-28" })
+        XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "scripts/package-app.sh" })
+        XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "build/Muse.app" })
+        XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "/Users/jiliang/文档/课程.md" })
+        XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "/Users/jiliang/课程 素材/第一章.md" })
+        XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "/Applications" })
+        XCTAssertFalse(facts.contains { $0.kind == .filePath && $0.sourceText.contains("P50/P95") })
+    }
+
     func testFactExtractorDeduplicatesSameSemanticFactWithinOneSegment() {
         let facts = ProtectedFactExtractor.extract(from: [
             segment("预算 49,800 元，最后仍按 4.98 万执行。"),
@@ -148,6 +163,13 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertTrue(rewrittenCounters.contains { $0.kind == .number && $0.canonicalValue == "5" })
         XCTAssertTrue(rewrittenCounters.contains { $0.kind == .number && $0.canonicalValue == "3" })
         XCTAssertTrue(rewrittenCounters.contains { $0.kind == .number && $0.canonicalValue == "6" })
+
+        let semanticCounters = ProtectedFactExtractor.extract(from: [segment(
+            "创作者可以选择三个任务路径，新章节必须双人批准，但不要压成十几行摘要。"
+        )])
+        XCTAssertTrue(semanticCounters.contains { $0.kind == .number && $0.canonicalValue == "3" })
+        XCTAssertTrue(semanticCounters.contains { $0.kind == .number && $0.canonicalValue == "2" })
+        XCTAssertFalse(semanticCounters.contains { $0.kind == .number && $0.canonicalValue == "10" })
     }
 
     func testStructuredDecoderAcceptsFencePrefixThinkUnicodeAndTrailingComma() throws {
@@ -396,6 +418,615 @@ final class VoicePolishCoreTests: XCTestCase {
         let finalIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16000" })
         XCTAssertTrue(superseded.contains(oldIndex))
         XCTAssertFalse(superseded.contains(finalIndex))
+    }
+
+    func testExplicitFromToAndDistantCorrectionMarkOnlyOldDate() {
+        let direct = makeRequest("发布日期从八月二十日改到 8 月 28 日。")
+        let directFacts = ProtectedFactExtractor.extract(from: direct.input.segments)
+        let directSuperseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: direct,
+            sourceFacts: directFacts
+        )
+        let oldDirect = try! XCTUnwrap(directFacts.firstIndex { $0.canonicalValue == "08-20" })
+        let finalDirect = try! XCTUnwrap(directFacts.firstIndex { $0.canonicalValue == "08-28" })
+        XCTAssertTrue(directSuperseded.contains(oldDirect))
+        XCTAssertFalse(directSuperseded.contains(finalDirect))
+
+        let segments = [
+            segment("发布日期先记八月二十日。"),
+            RecognitionSegment(id: "s2", text: "中间先说明页面和截图安排。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s3", text: "前面那句改成 8 月 28 日。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+        ]
+        let distant = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: segments.map(\.text).joined(),
+                segments: segments,
+                durationMs: 3_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic
+        )
+        let distantFacts = ProtectedFactExtractor.extract(from: segments)
+        let distantSuperseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: distant,
+            sourceFacts: distantFacts
+        )
+        let oldDistant = try! XCTUnwrap(distantFacts.firstIndex { $0.canonicalValue == "08-20" })
+        XCTAssertTrue(distantSuperseded.contains(oldDistant))
+    }
+
+    func testCorrectionLocatorDoesNotMisreadNotForExternalRelease() {
+        let request = makeRequest("v2.0 不对外发布，v2.1 只用于内部测试。", scene: .workChat)
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+
+        XCTAssertTrue(VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        ).isEmpty)
+    }
+
+    func testRepeatedSameNumberInDifferentRelationsCannotBeGloballySuperseded() {
+        let request = makeRequest(
+            "北京 3 人、上海也是 3 人；不对，上海改为 4 人，北京仍是 3 人。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let sharedThree = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "3" })
+
+        XCTAssertFalse(superseded.contains(sharedThree))
+        let validation = VoicePolishValidator.validateFast(
+            output: "北京仍有 3 人，上海改为 4 人。",
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertFalse(validation.hasHardFailure, "\(validation.codes)")
+    }
+
+    func testRewriteInstructionDoesNotSupersedeUnrelatedCodeIdentifier() {
+        let request = makeRequest(
+            "选题是用 AI 完成真实工作，小林先看逻辑，不要直接改成营销文案。事实核查要看官方页面，涉及 API Key 时一律脱敏。",
+            scene: .email
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let aiIndex = try! XCTUnwrap(facts.firstIndex { $0.sourceText == "AI" })
+
+        XCTAssertFalse(
+            VoicePolishValidator.locallySupersededFactIndices(
+                request: request,
+                sourceFacts: facts
+            ).contains(aiIndex)
+        )
+    }
+
+    func testRewriteInstructionDoesNotSupersedeUnrelatedNumbers() {
+        let request = makeRequest(
+            "这份报告有 3 个问题，把这段改成一分钟口播，再补 2 个例子。",
+            scene: .document
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+
+        XCTAssertTrue(superseded.isEmpty)
+    }
+
+    func testFormatTransformationDoesNotSupersedeQuantitiesWithDifferentObjects() {
+        let request = makeRequest(
+            "请把这 3 个问题改成 1 张表格。",
+            scene: .document
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+
+        XCTAssertTrue(superseded.isEmpty)
+        let validation = VoicePolishValidator.validateFast(
+            output: request.fallbackText,
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertFalse(validation.hasHardFailure, "\(validation.codes)")
+    }
+
+    func testCorrectionSupersedesOnlyMatchingBudgetAcrossAttachmentPages() {
+        let request = makeRequest(
+            "预算先按 3 万元。附件共 2 页。不对，最终预算改成 4 万元。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let oldBudget = try! XCTUnwrap(facts.firstIndex {
+            $0.kind == .amount && $0.canonicalValue == "30000"
+        })
+        let finalBudget = try! XCTUnwrap(facts.firstIndex {
+            $0.kind == .amount && $0.canonicalValue == "40000"
+        })
+
+        XCTAssertEqual(superseded, [oldBudget])
+        XCTAssertFalse(superseded.contains(finalBudget))
+        let validation = VoicePolishValidator.validateFast(
+            output: "最终预算为 4 万元，附件共 2 页。",
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertFalse(validation.hasHardFailure, "\(validation.codes)")
+    }
+
+    func testCorrectionSkipsInterveningSameKindUnrelatedAmount() {
+        let request = makeRequest(
+            "项目预算先按 3 万元，附件制作费是 2 万元。不对，最终项目预算改成 4 万元。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let oldBudget = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "30000" })
+        let attachmentCost = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "20000" })
+        let finalBudget = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "40000" })
+
+        XCTAssertEqual(superseded, [oldBudget])
+        XCTAssertFalse(superseded.contains(attachmentCost))
+        XCTAssertFalse(superseded.contains(finalBudget))
+    }
+
+    func testGenericBudgetCorrectionDoesNotGuessBetweenTwoBudgetObjects() {
+        let request = makeRequest(
+            "项目预算 3 万元，附件预算 2 万元。不对，预算改成 4 万元。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+
+        XCTAssertTrue(VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        ).isEmpty)
+    }
+
+    func testCompactFormatInstructionKeepsQuantitiesWithDifferentObjects() {
+        let request = makeRequest(
+            "请把这3个问题改成1个表格。",
+            scene: .document
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+
+        XCTAssertTrue(VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        ).isEmpty)
+    }
+
+    func testSameCanonicalValueCannotBecomeGlobalForbiddenWhenAnotherSegmentStillNeedsIt() {
+        let segments = [
+            RecognitionSegment(id: "s1", text: "北京 3 人。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s2", text: "上海先按 3 人。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s3", text: "不对，上海改成 4 人。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+        ]
+        let text = segments.map(\.text).joined()
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: text,
+                segments: segments,
+                durationMs: 1_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic
+        )
+        let facts = ProtectedFactExtractor.extract(from: segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+
+        XCTAssertEqual(superseded.count, 1)
+        XCTAssertTrue(VoicePolishValidator.unambiguouslySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        ).isEmpty)
+
+        let collapsedSegment = RecognitionSegment(
+            id: "s1",
+            text: text,
+            startTimeMs: nil,
+            endTimeMs: nil,
+            confidence: nil,
+            isFinal: true
+        )
+        let collapsedRequest = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: text,
+                segments: [collapsedSegment],
+                durationMs: 1_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic
+        )
+        let collapsedFacts = ProtectedFactExtractor.extract(from: [collapsedSegment])
+        XCTAssertEqual(
+            VoicePolishValidator.locallySupersededFactOccurrences(
+                request: collapsedRequest,
+                sourceFacts: collapsedFacts
+            ).count,
+            1
+        )
+        XCTAssertTrue(VoicePolishValidator.locallySupersededFactIndices(
+            request: collapsedRequest,
+            sourceFacts: collapsedFacts
+        ).isEmpty)
+
+        let good = VoicePolishValidator.validateFast(
+            output: "北京安排 3 人，上海最终安排 4 人。",
+            request: collapsedRequest,
+            sourceFacts: collapsedFacts
+        )
+        XCTAssertFalse(good.hasHardFailure, "\(good.codes)")
+
+        let wrongRelation = VoicePolishValidator.validateFast(
+            output: "北京安排 3 人，上海仍安排 3 人；上海最终安排 4 人。",
+            request: collapsedRequest,
+            sourceFacts: collapsedFacts
+        )
+        XCTAssertTrue(wrongRelation.codes.contains(.supersededFactRetained))
+    }
+
+    func testRelationGateAcceptsNaturalPeopleUnitsAndRejectsBorrowedOrNonCurrentFacts() {
+        let request = makeRequest(
+            "北京 3 人。上海先按 3 人。不对，上海改成 4 人。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let relationOccurrence = try! XCTUnwrap(
+            VoicePolishValidator.locallySupersededFactOccurrences(
+                request: request,
+                sourceFacts: facts
+            ).first
+        )
+        XCTAssertEqual(relationOccurrence.relationAnchor, "上海")
+        XCTAssertEqual(relationOccurrence.factDescriptor, "人")
+        XCTAssertEqual(relationOccurrence.replacementDescriptor, "人")
+        for output in [
+            "北京安排 3 人；上海安排 4 人。",
+            "北京安排 3 位；上海安排 4 位。",
+            "北京人数为 3；上海人数为 4。",
+            "北京安排 3 人；上海：\n最终安排 4 人。",
+        ] {
+            let result = VoicePolishValidator.validateFast(
+                output: output,
+                request: request,
+                sourceFacts: facts
+            )
+            XCTAssertFalse(result.hasHardFailure, "\(output): \(result.codes)")
+        }
+
+        for output in [
+            "- 北京 3 人\n- 上海事项另行说明\n- 4 人",
+            "北京仍有 3 人；假如上海安排 4 人，另行讨论。",
+            "北京仍有 3 人；如果上海安排 4 人，另行讨论。",
+            "北京仍有 3 人；曾经上海安排 4 人，现已撤销。",
+            "北京仍有 3 人；上海和北京安排无关，4 人属于北京。",
+        ] {
+            let result = VoicePolishValidator.validateFast(
+                output: output,
+                request: request,
+                sourceFacts: facts
+            )
+            XCTAssertTrue(result.hasHardFailure, "\(output) 不应通过")
+        }
+    }
+
+    func testExplicitRetractionObjectBindsOldFactWhenLocalLabelsChange() {
+        let request = makeRequest(
+            "北京团队先安排 3 个人。上海团队也先安排 3 个人。"
+                + "前面上海团队参会人数说错了，上海团队最终安排 4 个人。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let occurrences = VoicePolishValidator.locallySupersededFactOccurrences(
+            request: request,
+            sourceFacts: facts
+        )
+
+        XCTAssertEqual(occurrences.count, 1, "\(occurrences)")
+        XCTAssertEqual(occurrences.first?.relationAnchor, "上海团队")
+
+        for output in [
+            "北京团队安排 3 人，上海团队安排 4 人。",
+            "北京团队人数为 3，上海团队人数为 4。",
+            "北京团队 3 人；上海团队：\n最终安排 4 人。",
+        ] {
+            let result = VoicePolishValidator.validateFast(
+                output: output,
+                request: request,
+                sourceFacts: facts
+            )
+            XCTAssertFalse(result.hasHardFailure, "\(output): \(result.codes)")
+        }
+
+        for output in [
+            "北京团队安排 4 人，上海团队安排 3 人。",
+            "北京团队安排 3 人；如果上海团队安排 4 人，就再扩会议室。",
+            "北京团队安排 3 人；有人说上海团队安排 4 人，但尚未确认。",
+            "北京团队 3 人。4 人不属于上海团队，只是总人数。",
+        ] {
+            let result = VoicePolishValidator.validateFast(
+                output: output,
+                request: request,
+                sourceFacts: facts
+            )
+            XCTAssertTrue(result.hasHardFailure, "\(output): \(result.codes)")
+        }
+    }
+
+    func testLocalPostProcessorNeverDeletesRecipientFacingNegation() {
+        for source in [
+            "给开发说：先别改路径和命令，先只检查配置。",
+            "这个功能目前不是坏了，是需要重新授权。",
+        ] {
+            let request = makeRequest(source, scene: .workChat)
+            XCTAssertNil(
+                VoicePolishValidator.removingDeterministicDraftArtifacts(
+                    from: source,
+                    request: request
+                )
+            )
+            let result = VoicePolishValidator.validateFast(
+                output: source,
+                request: request,
+                sourceFacts: ProtectedFactExtractor.extract(from: request.input.segments)
+            )
+            XCTAssertFalse(result.hasHardFailure, "\(source): \(result.codes)")
+        }
+    }
+
+    func testShortRestartAndBareCorrectionCannotPassWithPunctuationOnly() {
+        for pair in [
+            ("可可以发了", "可，可以发了。"),
+            ("功功能打不开", "功，功能打不开。"),
+            ("周五周五发", "周五，周五发。"),
+            ("我选红色，不对，蓝色", "我选红色，不对，蓝色。"),
+            ("我先去办公室，不对，去客户那边", "我先去办公室，不对，去客户那边。"),
+        ] {
+            let request = makeRequest(pair.0, scene: .chat)
+            let result = VoicePolishValidator.validateFast(
+                output: pair.1,
+                request: request,
+                sourceFacts: ProtectedFactExtractor.extract(from: request.input.segments)
+            )
+            XCTAssertTrue(result.codes.contains(.unchangedDraft), "\(pair): \(result.codes)")
+        }
+    }
+
+    func testCorrectionMeaningIsInvariantAcrossProviderSegmentPartitions() {
+        let texts = [
+            ["预算先按 16800 元。嗯，不对，应该是 16000 元。"],
+            ["预算先按 16800 元。", "嗯，", "不对，", "应该是 16000 元。"],
+            ["预算先按 16800 元。", "嗯，", "不", "对，", "应该", "是 16000 元。"],
+        ]
+
+        for (partitionIndex, parts) in texts.enumerated() {
+            let segments = parts.enumerated().map { index, part in
+                RecognitionSegment(
+                    id: "p\(partitionIndex)-s\(index)",
+                    text: part,
+                    startTimeMs: nil,
+                    endTimeMs: nil,
+                    confidence: nil,
+                    isFinal: true
+                )
+            }
+            let text = parts.joined()
+            let request = VoicePolishRequest(
+                input: VoiceInputEnvelope(
+                    providerFinalText: text,
+                    segments: segments,
+                    durationMs: 1_000,
+                    provider: .volcano
+                ),
+                context: WritingContext(scene: .workChat),
+                preferences: UserPolishPreferences(additionalRequirements: ""),
+                qualityMode: .automatic
+            )
+            let facts = ProtectedFactExtractor.extract(from: segments)
+            let superseded = VoicePolishValidator.locallySupersededFactIndices(
+                request: request,
+                sourceFacts: facts
+            )
+            let supersededValues = Set(superseded.compactMap { facts[$0].canonicalValue })
+            XCTAssertEqual(supersededValues, ["16800"], "partition=\(parts)")
+        }
+    }
+
+    func testParallelModalAmountsAreNotMistakenForCorrections() {
+        for source in [
+            "基础版价格 2 万元，高级版应该是 3 万元。",
+            "基础版价格 2 万元，高级版改成 3 万元。",
+            "A 方案安排 2 人，B 方案应该是 3 人。",
+        ] {
+            let request = makeRequest(source, scene: .workChat)
+            let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+            XCTAssertTrue(
+                VoicePolishValidator.locallySupersededFactIndices(
+                    request: request,
+                    sourceFacts: facts
+                ).isEmpty,
+                source
+            )
+        }
+
+        let correction = makeRequest(
+            "预算先按 2 万元，不对，应该是 3 万元。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: correction.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: correction,
+            sourceFacts: facts
+        )
+        XCTAssertEqual(Set(superseded.compactMap { facts[$0].canonicalValue }), ["20000"])
+    }
+
+    func testFormatInstructionDoesNotBindLaterIncompleteQuantityAsNewValue() {
+        let request = makeRequest(
+            "请把这 3 个问题改成表格，明天先交 1 版。",
+            scene: .document
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+
+        XCTAssertTrue(VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        ).isEmpty)
+    }
+
+    func testCorrectionCanSpanOldFactResetPhraseAndFinalFactAcrossThreeSegments() {
+        let segments = [
+            RecognitionSegment(id: "s1", text: "预算先按 16800 元准备。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s2", text: "不对，最终预算", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s3", text: "改成 16000 元，周五发方案。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+        ]
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: segments.map(\.text).joined(),
+                segments: segments,
+                durationMs: 3_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic
+        )
+        let facts = ProtectedFactExtractor.extract(from: segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let oldIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16800" })
+        let finalIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16000" })
+
+        XCTAssertTrue(superseded.contains(oldIndex))
+        XCTAssertFalse(superseded.contains(finalIndex))
+    }
+
+    func testCorrectionCanSpanFourProviderSegmentsWithoutChangingMeaning() {
+        let segments = [
+            RecognitionSegment(id: "s1", text: "预算先按 16800 元。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s2", text: "不对，", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s3", text: "最终预算", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+            RecognitionSegment(id: "s4", text: "改成 16000 元。", startTimeMs: nil, endTimeMs: nil, confidence: nil, isFinal: true),
+        ]
+        let text = segments.map(\.text).joined()
+        let request = VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: text,
+                segments: segments,
+                durationMs: 3_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic
+        )
+        let facts = ProtectedFactExtractor.extract(from: segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let oldIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16800" })
+        let finalIndex = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "16000" })
+
+        XCTAssertEqual(superseded, [oldIndex])
+        XCTAssertFalse(superseded.contains(finalIndex))
+    }
+
+    func testTwoConsecutiveCorrectionsKeepOnlyTheLastValue() {
+        let request = makeRequest(
+            "先安排 3 人，不对，应该是 4 人，不对，应该是 5 人。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let three = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "3" })
+        let four = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "4" })
+        let five = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "5" })
+
+        XCTAssertTrue(superseded.contains(three))
+        XCTAssertTrue(superseded.contains(four))
+        XCTAssertFalse(superseded.contains(five))
+    }
+
+    func testMultipleCorrectionWordsDescribeOneDateReplacement() {
+        let request = makeRequest(
+            "课程使用 AI。录制原计划在九月三日完成，这个时间不现实，不对，最终改成九月十日完成；九月十二日复核。不要压成十几行摘要。",
+            scene: .document
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        let oldDate = try! XCTUnwrap(facts.firstIndex { $0.canonicalValue == "09-03" })
+
+        XCTAssertEqual(superseded, [oldDate])
+    }
+
+    func testWorkChatCorrectionNoticePreservesOldAndNewFacts() {
+        let request = makeRequest(
+            "更正一下，上一条把日期写成 8 月 20 日有误，正确日期是 8 月 28 日，请大家以这条为准。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+
+        XCTAssertTrue(VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        ).isEmpty)
+        let validation = VoicePolishValidator.validateFast(
+            output: "更正说明：上一条中的 8 月 20 日有误，正确日期为 8 月 28 日，请大家以此为准。",
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertFalse(validation.hasHardFailure, "\(validation.codes)")
+    }
+
+    func testWorkChatSelfCorrectionIsNotMistakenForPublicNotice() {
+        let request = makeRequest(
+            "说明一下，我刚才说错了，预算先说 2 万元，不对，应该是 3 万元。",
+            scene: .workChat
+        )
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let superseded = VoicePolishValidator.locallySupersededFactIndices(
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertEqual(Set(superseded.compactMap { facts[$0].canonicalValue }), ["20000"])
+
+        let validation = VoicePolishValidator.validateFast(
+            output: "预算为 3 万元。",
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertFalse(validation.hasHardFailure, "\(validation.codes)")
     }
 
     func testVoicePolishDedicatedModelOverrideIsTrimmedAndOptional() {

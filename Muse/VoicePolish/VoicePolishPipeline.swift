@@ -14,6 +14,10 @@ struct VoicePolishPipeline: Sendable {
     private static let maximumRepairTimeout: Int64 = 90
     private static let maximumTotalTimeout: Int64 = 240
     private static let maximumOutputTokens = 8_192
+    /// 单片正文控制在约 2,800 tokens。这样即使成稿接近原文长度，Fast 的
+    /// 输出预算和生成时长仍保有足够余量，不会让 6k～8k 中文一次撞上 8,192
+    /// tokens 与 120 秒硬上限。分片属于内部可靠性策略，不暴露为用户模式。
+    static let fastChunkSourceTokenLimit = 2_800
 
     private let client: any LLMClient
     private let config: LLMConfig
@@ -27,6 +31,7 @@ struct VoicePolishPipeline: Sendable {
     private let usesAdaptiveAnalyzeTimeout: Bool
     private let usesAdaptiveRenderTimeout: Bool
     private let usesAdaptiveRepairTimeout: Bool
+    private let fastChunkTokenLimit: Int
     private let onStage: (@Sendable (VoicePolishStage) -> Void)?
 
     init(
@@ -37,6 +42,7 @@ struct VoicePolishPipeline: Sendable {
         analyzeTimeout: Duration? = nil,
         renderTimeout: Duration? = nil,
         repairTimeout: Duration? = nil,
+        fastChunkSourceTokenLimit: Int = VoicePolishPipeline.fastChunkSourceTokenLimit,
         onStage: (@Sendable (VoicePolishStage) -> Void)? = nil
     ) {
         self.client = client
@@ -51,6 +57,7 @@ struct VoicePolishPipeline: Sendable {
         self.usesAdaptiveAnalyzeTimeout = analyzeTimeout == nil
         self.usesAdaptiveRenderTimeout = renderTimeout == nil
         self.usesAdaptiveRepairTimeout = repairTimeout == nil
+        self.fastChunkTokenLimit = max(1, fastChunkSourceTokenLimit)
         self.onStage = onStage
     }
 
@@ -194,6 +201,21 @@ struct VoicePolishPipeline: Sendable {
         )
 
         do {
+            if executedRoute == .fast {
+                let chunks = Self.fastChunkTexts(
+                    from: request.fallbackText,
+                    maximumSourceTokens: fastChunkTokenLimit
+                )
+                if chunks.count > 1 {
+                    return await runChunkedFast(
+                        request: request,
+                        chunks: chunks,
+                        sourceFacts: sourceFacts,
+                        detectedRoute: decision.route,
+                        startedAt: startedAt
+                    )
+                }
+            }
             let payload = try VoicePolishPrompts.payload(
                 for: request,
                 sourceFacts: sourceFacts,
@@ -234,6 +256,508 @@ struct VoicePolishPipeline: Sendable {
                 codes: [.emptyOutput],
                 reason: .setupFailed
             )
+        }
+    }
+
+    /// 将超长正文切成尽量均衡的内部片段。优先在完整句界、换行和分号处分片，
+    /// 其次才使用逗号或空白；没有任何边界的低标点口述才按字符安全截断。
+    /// 分片不会把紧随其后的显式改口与前文拆开，避免旧事实被局部校验误保留。
+    static func fastChunkTexts(
+        from source: String,
+        maximumSourceTokens: Int = fastChunkSourceTokenLimit
+    ) -> [String] {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        guard maximumSourceTokens > 0,
+              EstimatedTokenCounter.count(in: trimmed) > maximumSourceTokens else {
+            return [trimmed]
+        }
+
+        var remaining = trimmed
+        var chunks: [String] = []
+        while EstimatedTokenCounter.count(in: remaining) > maximumSourceTokens {
+            let remainingTokens = EstimatedTokenCounter.count(in: remaining)
+            let remainingChunkCount = max(
+                2,
+                Int(ceil(Double(remainingTokens) / Double(maximumSourceTokens)))
+            )
+            let idealTokens = Int(
+                ceil(Double(remainingTokens) / Double(remainingChunkCount))
+            )
+            let boundary = preferredChunkBoundary(
+                in: remaining,
+                idealTokens: idealTokens,
+                maximumTokens: maximumSourceTokens
+            )
+            guard boundary > remaining.startIndex, boundary < remaining.endIndex else {
+                return [trimmed]
+            }
+            let chunk = String(remaining[..<boundary])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            remaining = String(remaining[boundary...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !chunk.isEmpty, !remaining.isEmpty else { return [trimmed] }
+            chunks.append(chunk)
+        }
+        chunks.append(remaining)
+        return chunks
+    }
+
+    private static func preferredChunkBoundary(
+        in text: String,
+        idealTokens: Int,
+        maximumTokens: Int
+    ) -> String.Index {
+        struct Candidate {
+            let index: String.Index
+            let tokens: Int
+            let strength: Int
+        }
+
+        let minimumTokens = max(1, idealTokens * 3 / 5)
+        var candidates: [Candidate] = []
+        var safeCandidates: [Candidate] = []
+        var hardBoundary: String.Index?
+        var index = text.startIndex
+
+        while index < text.endIndex {
+            let character = text[index]
+            let next = text.index(after: index)
+            let prefix = String(text[..<next])
+            let tokens = EstimatedTokenCounter.count(in: prefix)
+            if tokens <= maximumTokens {
+                hardBoundary = next
+            } else {
+                break
+            }
+
+            guard let strength = chunkBoundaryStrength(after: character),
+                  !isUnsafeCorrectionBoundary(in: text, at: next) else {
+                index = next
+                continue
+            }
+            let candidate = Candidate(index: next, tokens: tokens, strength: strength)
+            safeCandidates.append(candidate)
+            if tokens >= minimumTokens {
+                candidates.append(candidate)
+            }
+            index = next
+        }
+
+        if let best = candidates.max(by: { left, right in
+            if left.strength != right.strength {
+                return left.strength < right.strength
+            }
+            let leftDistance = abs(left.tokens - idealTokens)
+            let rightDistance = abs(right.tokens - idealTokens)
+            if leftDistance != rightDistance { return leftDistance > rightDistance }
+            return left.tokens > right.tokens
+        }) {
+            return best.index
+        }
+
+        // 理想区间内没有安全边界时，优先退回更早的完整句界。不能因为 token
+        // 上限直接在“改成 | 4 人”“应该是 | 周五”之间硬切；旧事实与最终值
+        // 一旦分到两个请求，局部事实校验会互相冲突并把整篇退回原文。
+        if let fallback = safeCandidates.last {
+            return fallback.index
+        }
+
+        // 纠错短语可能正好横跨上限，且它前后的边界都会因“必须与旧值留在同
+        // 一片”而被判不安全。此时允许最多小幅越过预算，向后找到下一个句号
+        // 或分号；比在“改成 4 人”中间硬切更安全，默认 2,800-token 片仍远低
+        // 于 8,192-token 输出上限。
+        let extensionLimit = maximumTokens + min(128, max(16, maximumTokens / 10))
+        var extendedIndex = index
+        while extendedIndex < text.endIndex {
+            let character = text[extendedIndex]
+            let next = text.index(after: extendedIndex)
+            let tokens = EstimatedTokenCounter.count(in: String(text[..<next]))
+            if tokens > extensionLimit { break }
+            if let strength = chunkBoundaryStrength(after: character),
+               strength >= 1,
+               !isUnsafeCorrectionBoundary(in: text, at: next) {
+                return next
+            }
+            extendedIndex = next
+        }
+
+        guard var boundary = hardBoundary else { return text.endIndex }
+        // 不把英文单词、数字、路径或代码标识符从中间截断。
+        while boundary > text.startIndex, boundary < text.endIndex {
+            let previous = text[text.index(before: boundary)]
+            let next = text[boundary]
+            guard isASCIIWordCharacter(previous), isASCIIWordCharacter(next) else { break }
+            boundary = text.index(before: boundary)
+        }
+        return boundary == text.startIndex ? (hardBoundary ?? text.endIndex) : boundary
+    }
+
+    private static func chunkBoundaryStrength(after character: Character) -> Int? {
+        if "。！？!?\n".contains(character) { return 2 }
+        if "；;".contains(character) { return 1 }
+        if "，,、：:\t ".contains(character) { return 0 }
+        return nil
+    }
+
+    private static func isUnsafeCorrectionBoundary(
+        in text: String,
+        at boundary: String.Index
+    ) -> Bool {
+        let trailing = String(text[..<boundary])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 内部分片可以从“ 不对 / 我说错了 ”开始，因为每片都携带全文只读
+        // 上下文，且旧事实按具体 occurrence 映射处理。真正不能切的是纠错动词
+        // 与其最终值之间，例如“改成 | 4 人”。
+        let trailingSignals = [
+            "不对", "不是", "说错了", "我说错了", "我改一下", "改一下",
+            "应该是", "准确地说", "改成", "改为", "调整为", "现定为",
+        ]
+        let punctuation = CharacterSet.whitespacesAndNewlines
+            .union(CharacterSet(charactersIn: "，,、：:；;。！？!?"))
+        let normalizedTrailing = trailing.trimmingCharacters(in: punctuation)
+        return trailingSignals.contains(where: normalizedTrailing.hasSuffix)
+    }
+
+    private static func isASCIIWordCharacter(_ character: Character) -> Bool {
+        guard character.unicodeScalars.count == 1,
+              let scalar = character.unicodeScalars.first,
+              scalar.isASCII else { return false }
+        return CharacterSet.alphanumerics.contains(scalar)
+            || "_./:-".unicodeScalars.contains(scalar)
+    }
+
+    private func runChunkedFast(
+        request: VoicePolishRequest,
+        chunks: [String],
+        sourceFacts: [SourceFactCandidate],
+        detectedRoute: VoicePolishRoute,
+        startedAt: ContinuousClock.Instant
+    ) async -> VoicePolishResult {
+        DebugFileLogger.log(
+            "voice polish chunked start chunks=\(chunks.count) input=\(request.fallbackText.count)chars"
+        )
+        var outputs: [String] = []
+        var attempts = 0
+        var accumulatedCodes: [VoicePolishValidationCode] = []
+        let supersededOccurrences = VoicePolishValidator.locallySupersededFactOccurrences(
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        let globallyForbiddenSuperseded = VoicePolishValidator
+            .unambiguouslySupersededFactIndices(
+                request: request,
+                sourceFacts: sourceFacts
+            )
+        let factDispositionsByChunk = Self.factDispositionsByChunk(
+            request: request,
+            chunks: chunks,
+            sourceFacts: sourceFacts,
+            supersededOccurrences: supersededOccurrences
+        )
+
+        for (index, chunk) in chunks.enumerated() {
+            let chunkRequest = fastChunkRequest(
+                from: request,
+                text: chunk,
+                index: index,
+                count: chunks.count
+            )
+            let factSegments = chunkRequest.context.scene == .code
+                ? chunkRequest.input.segments
+                : VoicePolishNumbering.removingContinuousNumberedLineMarkers(
+                    from: chunkRequest.input.segments
+                )
+            let supersededKeysInChunk = factDispositionsByChunk[index].superseded
+            let chunkFacts = (ProtectedFactExtractor.extract(from: factSegments)
+                + chunkRequest.resolvedEntities.map {
+                    SourceFactCandidate(
+                        sourceText: $0.surfaceText,
+                        canonicalValue: $0.canonical,
+                        kind: .lexiconEntity,
+                        sourceSegmentIDs: $0.sourceSegmentIDs
+                    )
+                }).filter {
+                    !supersededKeysInChunk.contains(Self.semanticFactIdentity($0))
+                }
+            let payload: String
+            do {
+                payload = try VoicePolishPrompts.chunkPayload(
+                    for: chunkRequest,
+                    sourceFacts: chunkFacts,
+                    documentText: request.fallbackText,
+                    documentSourceFacts: sourceFacts,
+                    supersededFactIndices: globallyForbiddenSuperseded,
+                    chunkIndex: index + 1,
+                    chunkCount: chunks.count
+                )
+            } catch {
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .fast,
+                    attempts: attempts,
+                    codes: [.emptyOutput],
+                    reason: .setupFailed
+                )
+            }
+
+            // 第一片继续尊重从停止录音起算的既有时限；后续每片获得独立生成
+            // 窗口，避免把多次受控请求重新挤回单次 240 秒的总上限。
+            let chunkStartedAt = index == 0 ? startedAt : ContinuousClock.now
+            let result = await runFast(
+                request: chunkRequest,
+                payload: payload,
+                sourceFacts: chunkFacts,
+                detectedRoute: detectedRoute,
+                startedAt: chunkStartedAt
+            )
+            attempts += result.llmAttemptCount
+            appendUnique(result.validationCodes, to: &accumulatedCodes)
+            guard !result.usedFallback else {
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .fast,
+                    attempts: attempts,
+                    codes: accumulatedCodes,
+                    reason: result.failureReason ?? .validationFailed,
+                    rejectedDraft: result.rejectedDraft
+                )
+            }
+            outputs.append(result.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        let combinedDraft = outputs.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let normalized = normalizedLayoutText(combinedDraft, request: request)
+        let finalOutput = VoicePolishValidator.removingDeterministicDraftArtifacts(
+            from: normalized,
+            request: request
+        ) ?? normalized
+        let validation = VoicePolishValidator.validateFast(
+            output: finalOutput,
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        appendUnique(validation.codes, to: &accumulatedCodes)
+        guard !validation.hasHardFailure else {
+            return fallback(
+                request: request,
+                detectedRoute: detectedRoute,
+                executedRoute: .fast,
+                attempts: attempts,
+                codes: accumulatedCodes,
+                rejectedDraft: finalOutput
+            )
+        }
+        DebugFileLogger.log(
+            "voice polish chunked done chunks=\(chunks.count) attempts=\(attempts) output=\(finalOutput.count)chars"
+        )
+        return success(
+            text: finalOutput,
+            detectedRoute: detectedRoute,
+            executedRoute: .fast,
+            attempts: attempts,
+            codes: accumulatedCodes
+        )
+    }
+
+    private func fastChunkRequest(
+        from request: VoicePolishRequest,
+        text: String,
+        index: Int,
+        count: Int
+    ) -> VoicePolishRequest {
+        let segmentID = "voice-polish-chunk-\(index + 1)"
+        let segment = RecognitionSegment(
+            id: segmentID,
+            text: text,
+            startTimeMs: nil,
+            endTimeMs: nil,
+            confidence: nil,
+            isFinal: true
+        )
+        let entityEdits = request.input.requiredEntityEdits.compactMap { edit -> VoiceTerminologyEdit? in
+            guard text.contains(edit.alias) || text.contains(edit.canonical) else { return nil }
+            return VoiceTerminologyEdit(
+                alias: edit.alias,
+                canonical: edit.canonical,
+                sourceSegmentIDs: [segmentID]
+            )
+        }
+        let resolvedEntities = request.resolvedEntities.compactMap { entity -> ResolvedEntity? in
+            guard text.contains(entity.surfaceText) || text.contains(entity.canonical) else {
+                return nil
+            }
+            return ResolvedEntity(
+                surfaceText: entity.surfaceText,
+                canonical: entity.canonical,
+                sourceSegmentIDs: [segmentID],
+                candidateSource: entity.candidateSource,
+                confidence: entity.confidence
+            )
+        }
+        return VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: text,
+                rawSegments: [segment],
+                canonicalText: text,
+                segments: [segment],
+                requiredEntityEdits: entityEdits,
+                durationMs: request.input.durationMs / max(1, count),
+                detectedLanguage: request.input.detectedLanguage,
+                provider: request.input.provider
+            ),
+            context: request.context,
+            preferences: request.preferences,
+            qualityMode: request.qualityMode,
+            resolvedEntities: resolvedEntities
+        )
+    }
+
+    private func appendUnique(
+        _ codes: [VoicePolishValidationCode],
+        to accumulated: inout [VoicePolishValidationCode]
+    ) {
+        for code in codes where !accumulated.contains(code) {
+            accumulated.append(code)
+        }
+    }
+
+    private static func semanticFactIdentity(_ fact: SourceFactCandidate) -> String {
+        "\(fact.kind.rawValue)|\(fact.canonicalValue ?? fact.sourceText)"
+    }
+
+    struct ChunkFactDisposition {
+        let superseded: Set<String>
+    }
+
+    /// 以“事实的具体字符出现位置”映射内部片段，而不是只看 Provider segment。
+    /// 因而即使 Provider 把 8K 正文压成单 segment，仍能区分北京仍有效的 3 与
+    /// 上海被 4 覆盖的 3。无法精确对齐时返回空放宽集合，宁可进入安全修复，
+    /// 也不把同值的有效事实一起删掉。
+    static func factDispositionsByChunk(
+        request: VoicePolishRequest,
+        chunks: [String],
+        sourceFacts: [SourceFactCandidate],
+        supersededOccurrences: Set<VoicePolishValidator.SupersededFactOccurrence>
+    ) -> [ChunkFactDisposition] {
+        guard !chunks.isEmpty else { return [] }
+
+        let resolvedSegmentTexts = request.input.segments.map { segment in
+            let relevantEntities = request.resolvedEntities.filter {
+                $0.sourceSegmentIDs.contains(segment.id)
+            }
+            return EntityResolver.applying(relevantEntities, to: segment.text)
+        }
+        let document = request.fallbackText
+        let conservative = Array(
+            repeating: ChunkFactDisposition(superseded: []),
+            count: chunks.count
+        )
+        let resolvedDocument = resolvedSegmentTexts.joined()
+        let trimSet = CharacterSet.whitespacesAndNewlines
+        let trimmedResolvedDocument = resolvedDocument.trimmingCharacters(in: trimSet)
+        guard trimmedResolvedDocument == document else {
+            return conservative
+        }
+        let leadingTrimCount: Int
+        if let firstContent = resolvedDocument.rangeOfCharacter(from: trimSet.inverted)?.lowerBound {
+            leadingTrimCount = resolvedDocument.distance(
+                from: resolvedDocument.startIndex,
+                to: firstContent
+            )
+        } else {
+            leadingTrimCount = 0
+        }
+
+        var segmentOffsets: [Int] = []
+        var nextSegmentOffset = 0
+        for text in resolvedSegmentTexts {
+            segmentOffsets.append(nextSegmentOffset)
+            nextSegmentOffset += text.count
+        }
+
+        var searchStart = document.startIndex
+        var chunkRanges: [(lower: Int, upper: Int)] = []
+        for chunk in chunks {
+            guard let range = document.range(
+                of: chunk,
+                options: [],
+                range: searchStart..<document.endIndex
+            ) else {
+                return conservative
+            }
+            let lower = document.distance(from: document.startIndex, to: range.lowerBound)
+            let upper = document.distance(from: document.startIndex, to: range.upperBound)
+            chunkRanges.append((lower, upper))
+            searchStart = range.upperBound
+        }
+
+        struct LocatedEvidence {
+            let key: String
+            let lower: Int
+            let upper: Int
+            let isSuperseded: Bool
+        }
+        let evidence = ProtectedFactExtractor.locations(
+            of: sourceFacts.filter { $0.kind != .lexiconEntity },
+            in: request.input.segments
+        ).compactMap { location -> LocatedEvidence? in
+            guard let factIndex = sourceFacts.firstIndex(where: {
+                $0.kind == location.candidate.kind
+                    && $0.canonicalValue == location.candidate.canonicalValue
+                    && $0.sourceSegmentIDs == location.candidate.sourceSegmentIDs
+            }), segmentOffsets.indices.contains(location.segmentIndex) else {
+                return nil
+            }
+            let segment = request.input.segments[location.segmentIndex]
+            let relevantEntities = request.resolvedEntities.filter {
+                $0.sourceSegmentIDs.contains(segment.id)
+            }
+            let prefixEnd = segment.text.index(
+                segment.text.startIndex,
+                offsetBy: location.offset
+            )
+            let factEnd = segment.text.index(
+                prefixEnd,
+                offsetBy: location.length
+            )
+            // 实体纠错可能改变前文长度（Type less → Typeless）。用同一套已确认
+            // 替换分别投影“事实前缀”和“事实结尾”，得到 canonical 正文中的
+            // 精确位置；不能因任意实体替换就退回保守空映射。
+            let resolvedPrefix = EntityResolver.applying(
+                relevantEntities,
+                to: String(segment.text[..<prefixEnd])
+            )
+            let resolvedThroughFact = EntityResolver.applying(
+                relevantEntities,
+                to: String(segment.text[..<factEnd])
+            )
+            let lower = segmentOffsets[location.segmentIndex] + resolvedPrefix.count - leadingTrimCount
+            let upper = segmentOffsets[location.segmentIndex] + resolvedThroughFact.count - leadingTrimCount
+            return LocatedEvidence(
+                key: semanticFactIdentity(sourceFacts[factIndex]),
+                lower: lower,
+                upper: upper,
+                isSuperseded: supersededOccurrences.contains {
+                    $0.factIndex == factIndex
+                        && $0.segmentIndex == location.segmentIndex
+                        && $0.offset == location.offset
+                        && $0.length == location.length
+                }
+            )
+        }
+
+        return chunkRanges.map { chunkRange in
+            let overlapping = evidence.filter {
+                $0.lower < chunkRange.upper && chunkRange.lower < $0.upper
+            }
+            let active = Set(overlapping.filter { !$0.isSuperseded }.map(\.key))
+            let superseded = Set(overlapping.filter { $0.isSuperseded }.map(\.key))
+                .subtracting(active)
+            return ChunkFactDisposition(superseded: superseded)
         }
     }
 
@@ -587,6 +1111,7 @@ struct VoicePolishPipeline: Sendable {
                 .planIntegrityFailure,
                 .layoutRequirementUnmet,
                 .unchangedDraft,
+                .abnormalLength,
             ]
             let hardCodes = validation.codes.filter(\.isHardFailure)
             if !hardCodes.isEmpty,

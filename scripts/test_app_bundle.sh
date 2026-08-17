@@ -36,6 +36,9 @@ esac
 [ "$(read_plist CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType should be APPL"
 [ "$(read_plist CFBundleShortVersionString)" = "$EXPECTED_VERSION" ] || fail "CFBundleShortVersionString should be $EXPECTED_VERSION"
 [ "$(read_plist CFBundleVersion)" = "$EXPECTED_BUILD" ] || fail "CFBundleVersion should be $EXPECTED_BUILD"
+[ -n "$(read_plist MuseSourceCommit)" ] || fail "MuseSourceCommit should be present"
+[[ "$(read_plist MuseSourceCommit)" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "MuseSourceCommit should be a full lowercase Git commit"
 [ "$(read_plist CFBundleIconFile)" = "AppIcon" ] || fail "CFBundleIconFile should be AppIcon"
 [ "$(read_plist LSMinimumSystemVersion)" = "$EXPECTED_MIN_SYSTEM_VERSION" ] || fail "LSMinimumSystemVersion should be $EXPECTED_MIN_SYSTEM_VERSION"
 [ -n "$(read_plist NSMicrophoneUsageDescription)" ] || fail "NSMicrophoneUsageDescription should be present"

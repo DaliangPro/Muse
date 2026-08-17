@@ -10,7 +10,26 @@ enum EntityResolver {
         let alias: String
         let canonical: String
         let source: EntityCandidateSource
+        let allowsFuzzy: Bool
+
+        init(
+            alias: String,
+            canonical: String,
+            source: EntityCandidateSource,
+            allowsFuzzy: Bool = true
+        ) {
+            self.alias = alias
+            self.canonical = canonical
+            self.source = source
+            self.allowsFuzzy = allowsFuzzy
+        }
     }
+
+    /// Muse 是应用自身拥有的产品名，中文口述“缪斯”是确定别名。只有安全上下文
+    /// 已明确出现 canonical 时才启用，并且只做精确别名匹配，不参与开放式跨脚本猜词。
+    private static let applicationOwnedContextAliases = [
+        "Muse": ["缪斯"],
+    ]
 
     private struct NormalizedUnit {
         let character: Character
@@ -41,6 +60,7 @@ enum EntityResolver {
         let candidate: Candidate
         let englishPhoneticKey: String?
         let chinesePinyinSyllables: [String]?
+        let contextPinyinSyllables: [String]?
     }
 
     private struct ReplacementOperation {
@@ -48,6 +68,25 @@ enum EntityResolver {
         let canonical: String
         let sourcePriority: Int
         let confidence: Double
+    }
+
+    private enum AuthorizedContextAssertion {
+        case affirmed
+        case historical
+        case hypothetical
+        case rejected
+        case otherEntity
+        case unrelated
+        case unproven
+
+        var allowsCandidate: Bool {
+            switch self {
+            case .affirmed:
+                return true
+            case .historical, .hypothetical, .rejected, .otherEntity, .unrelated, .unproven:
+                return false
+            }
+        }
     }
 
     static func resolve(
@@ -67,10 +106,14 @@ enum EntityResolver {
             PreparedCandidate(
                 candidate: candidate,
                 englishPhoneticKey: candidate.source == .personalLexicon
+                    || candidate.source == .authorizedContext
                     ? englishPhoneticKey(candidate.alias)
                     : nil,
                 chinesePinyinSyllables: candidate.source == .personalLexicon
                     ? pinyinSyllablesIfChinese(candidate.alias)
+                    : nil,
+                contextPinyinSyllables: candidate.source == .authorizedContext
+                    ? tonelessPinyinSyllablesIfChinese(candidate.alias)
                     : nil
             )
         }
@@ -85,6 +128,14 @@ enum EntityResolver {
             }
             for match in selectedExactMatches(exactMatches, in: segment.text) {
                 let surface = String(segment.text[match.match.sourceRange])
+                guard match.candidate.source != .authorizedContext
+                        || allowsAuthorizedContextMapping(
+                            surface: surface,
+                            canonical: match.candidate.canonical,
+                            in: segment.text
+                        ) else {
+                    continue
+                }
                 let key = "\(segment.id)|\(presentationKey(surface))|\(presentationKey(match.candidate.canonical))"
                 guard keys.insert(key).inserted else { continue }
                 resolutions.append(ResolvedEntity(
@@ -96,15 +147,27 @@ enum EntityResolver {
                 ))
             }
 
+            let activePreparedCandidates = preparedCandidates.filter { $0.candidate.allowsFuzzy }
             let fuzzySurfaces = fuzzySurfaceRanges(
                 in: segment.text,
-                terminologyCandidates: candidates.filter { $0.source == .personalLexicon }
+                terminologyCandidates: candidates.filter {
+                    $0.allowsFuzzy
+                        && ($0.source == .personalLexicon || $0.source == .authorizedContext)
+                }
             )
             for surface in fuzzySurfaces {
                 guard let resolved = resolveSurface(
                     surface.text,
-                    candidates: preparedCandidates
+                    candidates: activePreparedCandidates
                 ) else { continue }
+                guard resolved.source != .authorizedContext
+                        || allowsAuthorizedContextMapping(
+                            surface: surface.text,
+                            canonical: resolved.canonical,
+                            in: segment.text
+                        ) else {
+                    continue
+                }
                 let key = "\(segment.id)|\(presentationKey(surface.text))|\(presentationKey(resolved.canonical))"
                 guard keys.insert(key).inserted else { continue }
                 resolutions.append(ResolvedEntity(
@@ -203,8 +266,8 @@ enum EntityResolver {
             let editScore = editSimilarity(surface, candidate.alias)
             var qualifiedScores = editScore >= similarityThreshold ? [editScore] : []
 
-            // 发音通道只在统一术语白名单（运行时映射为 personalLexicon）中开启。
-            // 固定整句替换和临时上下文不能靠近音猜测，避免把普通正文误当成术语。
+            // 个人词库继续使用带声调的严格发音通道。显式授权的安全上下文可
+            // 作为更低优先级候选，但只允许唯一近似实体，不把上下文整句抄入正文。
             if candidate.source == .personalLexicon {
                 if let leftKey = surfaceEnglishKey,
                    let rightKey = prepared.englishPhoneticKey {
@@ -218,6 +281,13 @@ enum EntityResolver {
                    let score = chinesePinyinSimilarity(leftSyllables, rightSyllables),
                    score >= chinesePinyinThreshold {
                     qualifiedScores.append(score)
+                }
+            } else if candidate.source == .authorizedContext {
+                if let leftSyllables = tonelessPinyinSyllablesIfChinese(surface),
+                   let rightSyllables = prepared.contextPinyinSyllables,
+                   let score = chinesePinyinSimilarity(leftSyllables, rightSyllables),
+                   score >= 0.9 {
+                    qualifiedScores.append(max(0.92, score))
                 }
             }
             guard let score = qualifiedScores.max() else { return nil }
@@ -264,21 +334,277 @@ enum EntityResolver {
         result.append(contentsOf: hotwords.map {
             Candidate(alias: $0, canonical: $0, source: .hotword)
         })
-        if context.safety == .safe, context.level != .metadataOnly {
-            let body = [context.selectedText, context.textBeforeCursor, context.textAfterCursor]
-                .compactMap { $0 }
-                .joined(separator: " ")
-            result.append(contentsOf: tokens(in: body).map {
-                Candidate(alias: $0, canonical: $0, source: .authorizedContext)
+        if context.safety == .safe {
+            var authorizedBodies = context.recentMuseInputs
+            if context.level != .metadataOnly {
+                authorizedBodies.append(contentsOf: [
+                    context.selectedText,
+                    context.textBeforeCursor,
+                    context.textAfterCursor,
+                ].compactMap { $0 })
+            }
+            result.append(contentsOf: authorizedBodies.flatMap { body in
+                authorizedContextTerms(in: body)
+                    .filter { hasAffirmedContextProvenance(for: $0, in: body) }
+                    .flatMap { term -> [Candidate] in
+                        var candidates = [
+                            Candidate(alias: term, canonical: term, source: .authorizedContext),
+                        ]
+                        for alias in applicationOwnedContextAliases[term] ?? [] {
+                            candidates.append(Candidate(
+                                alias: alias,
+                                canonical: term,
+                                source: .authorizedContext,
+                                allowsFuzzy: false
+                            ))
+                        }
+                        return candidates
+                    }
             })
         }
         return deduplicated(result)
     }
 
-    private static func tokens(in text: String) -> [String] {
-        text.split { character in
-            character.isWhitespace || character.isPunctuation
-        }.map(String.init).filter { (2...64).contains($0.count) }
+    private static func authorizedContextTerms(in text: String) -> [String] {
+        let bounded = String(text.prefix(1_024))
+        var terms: [String] = []
+
+        for pattern in [#"[“\"]([^”\"\n]{2,64})[”\"]"#, #"`([^`\n]{2,64})`"#] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(bounded.startIndex..<bounded.endIndex, in: bounded)
+            terms.append(contentsOf: regex.matches(in: bounded, range: range).compactMap { match in
+                guard match.numberOfRanges > 1,
+                      let capture = Range(match.range(at: 1), in: bounded) else { return nil }
+                return String(bounded[capture])
+            })
+        }
+
+        if let asciiRegex = try? NSRegularExpression(
+            pattern: #"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*(?:[ _-]+[A-Za-z][A-Za-z0-9]*){0,2})(?![A-Za-z0-9])"#
+        ) {
+            let range = NSRange(bounded.startIndex..<bounded.endIndex, in: bounded)
+            terms.append(contentsOf: asciiRegex.matches(in: bounded, range: range).compactMap {
+                guard let capture = Range($0.range(at: 1), in: bounded) else { return nil }
+                return String(bounded[capture])
+            })
+        }
+
+        let cueWords = [
+            "刚", "已", "正在", "已经", "即将", "将要", "这次", "本次", "中的",
+            "里面", "排期", "配置", "部署", "构建", "启动", "确认", "更新", "修复",
+            "发布", "上线", "说明", "记录",
+        ]
+        if let hanRegex = try? NSRegularExpression(pattern: #"[\p{Han}]{2,64}"#) {
+            let range = NSRange(bounded.startIndex..<bounded.endIndex, in: bounded)
+            for match in hanRegex.matches(in: bounded, range: range) {
+                guard let runRange = Range(match.range, in: bounded) else { continue }
+                var run = String(bounded[runRange])
+                for prefix in ["当前", "本次", "这次", "这个", "该"] where run.hasPrefix(prefix) {
+                    run.removeFirst(prefix.count)
+                    break
+                }
+                let cueRange = cueWords.compactMap { run.range(of: $0) }
+                    .filter { run.distance(from: run.startIndex, to: $0.lowerBound) >= 2 }
+                    .min { left, right in left.lowerBound < right.lowerBound }
+                if let cueRange {
+                    let term = String(run[..<cueRange.lowerBound])
+                    if (2...16).contains(term.count) { terms.append(term) }
+                }
+            }
+        }
+
+        var seen = Set<String>()
+        return terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { (2...64).contains($0.count) }
+            .filter { seen.insert(normalized($0)).inserted }
+            .prefix(128)
+            .map { $0 }
+    }
+
+    /// 上下文里“出现过某个名称”不等于“已确认它就是当前实体”。每个候选必须
+    /// 至少有一处肯定来源；旧称、假设、错误候选、同名他人和无关实体只淘汰
+    /// 自己所在的语义片段，不会关闭同一段上下文中的其他可靠候选。
+    private static func hasAffirmedContextProvenance(
+        for term: String,
+        in text: String
+    ) -> Bool {
+        let bounded = String(text.prefix(1_024))
+        let matches = flexibleMatches(of: term, in: bounded)
+        guard !matches.isEmpty else { return false }
+        return matches.contains { match in
+            authorizedContextAssertion(
+                for: match.sourceRange,
+                in: bounded
+            ).allowsCandidate
+        }
+    }
+
+    private static func authorizedContextAssertion(
+        for candidateRange: Range<String.Index>,
+        in text: String
+    ) -> AuthorizedContextAssertion {
+        let fragmentRange = semanticFragmentRange(containing: candidateRange, in: text)
+        let prefix = compactAssertionText(String(text[fragmentRange.lowerBound..<candidateRange.lowerBound]))
+        let suffix = compactAssertionText(String(text[candidateRange.upperBound..<fragmentRange.upperBound]))
+        let prefixTail = String(prefix.suffix(40))
+        let suffixHead = String(suffix.prefix(40))
+
+        let historicalPrefixes = [
+            "旧项目", "旧产品", "历史项目", "历史产品", "旧名", "旧称",
+            "曾用名", "以前叫", "过去叫", "原来叫", "曾叫", "曾经叫",
+        ]
+        let historicalSuffixes = [
+            "是旧名", "是旧称", "是曾用名", "只是旧名", "只是旧称",
+        ]
+        if historicalPrefixes.contains(where: prefixTail.contains)
+            || historicalSuffixes.contains(where: suffixHead.contains) {
+            return .historical
+        }
+
+        let hypotheticalPrefixes = [
+            "如果", "假如", "假设", "要是", "若定为", "若命名为", "若改名",
+            "计划改名", "考虑改名", "以后改名", "未来改名", "暂定为",
+        ]
+        let hypotheticalSuffixes = [
+            "未确认", "还未确认", "尚未确认", "还没确认", "没有确认",
+            "待确认", "尚未确定", "还没确定", "仍不确定",
+        ]
+        if hypotheticalPrefixes.contains(where: prefixTail.contains)
+            || hypotheticalSuffixes.contains(where: suffixHead.contains) {
+            return .hypothetical
+        }
+
+        let rejectedPrefixes = [
+            "错误候选", "错误名称", "错误名字", "错误写法", "无效候选",
+            "已否决的候选", "排除的候选", "误写为", "错写成",
+        ]
+        let rejectedSuffixes = [
+            "是错误候选", "是错误名称", "这个写法不对", "不要使用",
+            "不能使用", "已被否决", "已经排除",
+        ]
+        if rejectedPrefixes.contains(where: prefixTail.contains)
+            || rejectedSuffixes.contains(where: suffixHead.contains) {
+            return .rejected
+        }
+
+        let otherEntityPrefixes = [
+            "同名的另一位", "同名另一位", "同名的另一个", "同名另一个",
+            "另一位同名", "另一个同名",
+        ]
+        let otherEntitySuffixes = [
+            "是另一位", "是另一个", "指另一位", "指另一个",
+        ]
+        if otherEntityPrefixes.contains(where: prefixTail.contains)
+            || otherEntitySuffixes.contains(where: suffixHead.contains) {
+            return .otherEntity
+        }
+
+        let unrelatedSuffixes = [
+            "与本次无关", "和本次无关", "与当前无关", "和当前无关",
+            "不是本次的", "不是当前的", "不是本次产品名", "不是当前产品名",
+            "并非本次产品名", "并非当前产品名", "不属于本次", "不属于当前",
+            "不要用于当前", "请勿用于当前", "不能用于当前", "禁止用于当前",
+            "只属于历史记录", "已停用", "已经停用", "已弃用", "已经弃用",
+            "不再使用", "只是演示例子", "仅是演示例子",
+        ]
+        if unrelatedSuffixes.contains(where: suffixHead.contains) {
+            return .unrelated
+        }
+
+        let affirmedPrefixes = [
+            "项目统一名称是", "统一名称是", "正式名称是", "标准名称是",
+            "正确名称是", "正确写法是", "当前项目的名称已确认为", "当前项目的名称是",
+            "当前项目名称已确认为", "当前项目名称是", "当前项目是", "当前项目:",
+            "当前项目：", "当前产品是", "当前产品:", "当前产品：",
+            "本次项目是", "本次项目:", "本次项目：", "本次产品是",
+            "本次产品:", "本次产品：", "当前工单产品:", "当前工单产品：",
+            "客户当前使用的软件是",
+            "当前仓库托管在", "正在审查", "当前使用", "本次使用",
+        ]
+        let affirmedSuffixes = [
+            "刚确认", "已确认", "已经确认", "已确认为", "正在使用", "当前使用",
+            "构建正在", "构建已经", "构建已", "服务启动", "服务部署",
+            "配置", "排期", "部署", "构建", "启动", "更新", "修复",
+            "发布", "上线", "说明", "记录", "审查", "中的", "里面",
+        ]
+        if affirmedPrefixes.contains(where: prefixTail.contains)
+            || affirmedSuffixes.contains(where: suffixHead.contains) {
+            return .affirmed
+        }
+        return .unproven
+    }
+
+    private static func semanticFragmentRange(
+        containing candidateRange: Range<String.Index>,
+        in text: String
+    ) -> Range<String.Index> {
+        var lowerBound = candidateRange.lowerBound
+        while lowerBound > text.startIndex {
+            let previous = text.index(before: lowerBound)
+            guard !isContextFragmentBoundary(text[previous]) else { break }
+            lowerBound = previous
+        }
+
+        var upperBound = candidateRange.upperBound
+        while upperBound < text.endIndex {
+            guard !isContextFragmentBoundary(text[upperBound]) else { break }
+            upperBound = text.index(after: upperBound)
+        }
+        return lowerBound..<upperBound
+    }
+
+    private static func isContextFragmentBoundary(_ character: Character) -> Bool {
+        "，,。！!？?；;\n\r".contains(character)
+    }
+
+    private static func compactAssertionText(_ text: String) -> String {
+        text.precomposedStringWithCompatibilityMapping
+            .lowercased()
+            .filter { !$0.isWhitespace }
+    }
+
+    /// 安全上下文只能帮助纠正用户没有否认的具体 A→B 映射。这里按候选关系
+    /// 局部判断，而不是看到整段任意“不要/保留”就关掉全部上下文纠错：
+    /// “缪斯构建完成，不要把日志发给客户”仍可纠正产品名；
+    /// “别把缪斯换成 Muse”则必须尊重用户对该映射的明确否定。
+    private static func allowsAuthorizedContextMapping(
+        surface: String,
+        canonical: String,
+        in text: String
+    ) -> Bool {
+        let surfaceKey = normalized(surface)
+        let canonicalKey = normalized(canonical)
+        guard !surfaceKey.isEmpty,
+              !canonicalKey.isEmpty,
+              surfaceKey != canonicalKey else { return true }
+
+        let compact = text.filter { !$0.isWhitespace }
+        let alias = NSRegularExpression.escapedPattern(for: surfaceKey)
+        let target = NSRegularExpression.escapedPattern(for: canonicalKey)
+        let sameClause = #"[^，,。！？!?；;\n]{0,18}"#
+        let softSeparator = #"[，,：:]?"#
+        let patterns = [
+            // 用户直接否认 A 与 B 是同一个实体。
+            "\(alias)\(softSeparator)\(sameClause)(?:不是|并非|不等于|不同于)\(sameClause)\(target)",
+            "\(target)\(softSeparator)\(sameClause)(?:不是|并非|不等于|不同于)\(sameClause)\(alias)",
+            "\(alias)\(sameClause)(?:和|与)\(sameClause)\(target)\(sameClause)(?:无关|不是一回事|不是一个东西|不是同一个|不同)",
+            "\(target)\(sameClause)(?:和|与)\(sameClause)\(alias)\(sameClause)(?:无关|不是一回事|不是一个东西|不是同一个|不同)",
+            // 用户明确要求不要把 A 改写成 B。
+            "(?:不要|别|请勿)\(sameClause)(?:把)?\(alias)\(sameClause)(?:改|换|替换|纠正|校正|写)\(sameClause)(?:成|为)?\(sameClause)\(target)",
+            "(?:不要|别|请勿)\(sameClause)(?:把)?\(target)\(sameClause)(?:改|换|替换|纠正|校正|写)\(sameClause)(?:成|为)?\(sameClause)\(alias)",
+            "(?:请)?(?:照录|原样保留|保留原词|维持原词)\(sameClause)\(alias)",
+            "\(alias)\(sameClause)(?:保持原样|保留原文|保留原词|维持原词|别改写|不要改写|暂时别替换|暂不替换)",
+            // 即使没有再次说出 B，只要同一小句明确说 A 尚未确认、有歧义或
+            // 不是产品名，也不能利用上下文替用户作决定。
+            "\(alias)\(sameClause)(?:名字|名称|写法|词|术语)?\(sameClause)(?:没确认|未确认|还没确认|尚未确定|不确定|有歧义|不是产品名)",
+        ]
+        return !patterns.contains { pattern in
+            compact.range(
+                of: pattern,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil
+        }
     }
 
     /// 为编辑距离与两个发音通道提供有界候选窗口。英文最多四个 token；中文只在
@@ -287,8 +613,9 @@ enum EntityResolver {
         in text: String,
         terminologyCandidates: [Candidate]
     ) -> [SurfaceRange] {
-        var surfaces: [SurfaceRange] = tokenRanges(in: text)
-        let wordRanges = surfaces.filter { isASCIIWordLike($0.text) }
+        let baseTokenRanges = tokenRanges(in: text)
+        var surfaces: [SurfaceRange] = baseTokenRanges
+        let wordRanges = baseTokenRanges.filter { isASCIIWordLike($0.text) }
         if wordRanges.count >= 2 {
             for start in wordRanges.indices {
                 let maximumCount = min(4, wordRanges.count - start)
@@ -444,6 +771,16 @@ enum EntityResolver {
     private static func pinyinSyllablesIfChinese(_ value: String) -> [String]? {
         guard isAllHan(value) else { return nil }
         return pinyinSyllables(value)
+    }
+
+    private static func tonelessPinyinSyllablesIfChinese(_ value: String) -> [String]? {
+        guard isAllHan(value),
+              let latin = value.applyingTransform(.mandarinToLatin, reverse: false),
+              let toneless = latin.applyingTransform(.stripDiacritics, reverse: false) else {
+            return nil
+        }
+        let syllables = toneless.lowercased().split { !$0.isLetter }.map(String.init)
+        return syllables.isEmpty ? nil : syllables
     }
 
     private static func pinyinSyllables(_ value: String) -> [String]? {

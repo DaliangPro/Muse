@@ -327,6 +327,32 @@ final class CIWorkflowTests: XCTestCase {
         XCTAssertFalse(updateChecker.contains("static let updateChannelEnabled = true"))
     }
 
+    func testHealthCheckValidatesVoicePolishQualityAssets() throws {
+        let health = try source(at: "scripts/health-check.sh")
+        let evaluator = try source(at: "scripts/evaluate-voice-polish-quality-report.py")
+
+        for path in [
+            "scripts/build-voice-polish-quality-test-set-v2.py",
+            "scripts/validate-voice-polish-quality-test-set.py",
+            "scripts/evaluate-voice-polish-quality-report.py",
+        ] {
+            XCTAssertTrue(health.contains(#"pathlib.Path("\#(path)")"#), health)
+        }
+        XCTAssertTrue(
+            health.contains(
+                #"run_step "voice-polish-quality-test-set" python3 scripts/validate-voice-polish-quality-test-set.py"#
+            ),
+            health
+        )
+        XCTAssertTrue(evaluator.contains("subprocess.Popen(["), evaluator)
+        XCTAssertTrue(evaluator.contains("报告路径已存在，必须使用新的空路径"), evaluator)
+        XCTAssertTrue(evaluator.contains(#"report.get("schema_version") != 4"#), evaluator)
+        XCTAssertTrue(evaluator.contains(#"report.get("run_nonce") != expected_run_nonce"#), evaluator)
+        XCTAssertTrue(evaluator.contains(#"report.get("process_id") != expected_process_id"#), evaluator)
+        XCTAssertTrue(evaluator.contains("llm_call_count < 1"), evaluator)
+        XCTAssertTrue(evaluator.contains("latency < 1"), evaluator)
+    }
+
     private var repositoryRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

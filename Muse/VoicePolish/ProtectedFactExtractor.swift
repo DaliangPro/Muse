@@ -2,6 +2,13 @@ import Foundation
 
 enum ProtectedFactExtractor {
 
+    struct FactLocation {
+        let candidate: SourceFactCandidate
+        let segmentIndex: Int
+        let offset: Int
+        let length: Int
+    }
+
     private struct Pattern {
         let kind: ProtectedFactKind
         let expression: String
@@ -13,6 +20,11 @@ enum ProtectedFactExtractor {
         Pattern(kind: .email, expression: #"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#, canonicalize: lowercased),
         Pattern(kind: .command, expression: #"`[^`\n]+`"#, canonicalize: exact),
         Pattern(kind: .date, expression: #"\b\d{4}(?:[-/.年])\d{1,2}(?:[-/.月])\d{1,2}日?\b"#, canonicalize: compactDate),
+        Pattern(
+            kind: .date,
+            expression: #"(?:\d{1,2}|[零〇一二两三四五六七八九十]+)\s*月\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]+)\s*日"#,
+            canonicalize: compactMonthDay
+        ),
         Pattern(kind: .time, expression: #"\b(?:[01]?\d|2[0-3]):[0-5]\d\b"#, canonicalize: exact),
         Pattern(kind: .percentage, expression: #"[-+]?\d[\d,]*(?:\.\d+)?\s*%"#, canonicalize: canonicalPercentage),
         Pattern(
@@ -27,16 +39,49 @@ enum ProtectedFactExtractor {
             canonicalize: canonicalLabeledChineseAmount
         ),
         Pattern(kind: .version, expression: #"\bv?\d+(?:\.\d+){1,3}\b"#, canonicalize: lowercased),
-        Pattern(kind: .filePath, expression: #"(?:~|/)(?:[^\s/]+/)*[^\s/]+"#, canonicalize: exact),
+        Pattern(
+            kind: .filePath,
+            expression: #"(?<![\p{L}\p{N}._~-])(?:(?<=[“\"'])(?:~?/|\.\.?/)[^“”\"'\r\n]+(?=[”\"'])|(?:~?/|\.\.?/)(?:[\p{L}\p{N}._-]+/)*[\p{L}\p{N}._-]+|(?:[\p{L}\p{N}._-]+/)+[\p{L}\p{N}._-]+\.[\p{L}\p{N}._-]+)"#,
+            canonicalize: exact
+        ),
         Pattern(kind: .number, expression: #"[-+]?\d[\d,]*(?:\.\d+)?"#, canonicalize: canonicalNumber),
-        Pattern(kind: .number, expression: #"[负零〇一二两三四五六七八九十百千万亿点]+"#, canonicalize: canonicalChineseNumber),
+        Pattern(kind: .number, expression: #"[负零〇一二两双三四五六七八九十百千万亿点]+"#, canonicalize: canonicalChineseNumber),
         Pattern(kind: .quotedPhrase, expression: #"[“\"][^”\"\n]+[”\"]"#, canonicalize: exact),
         Pattern(kind: .codeIdentifier, expression: #"\b(?:[A-Za-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*|[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+)\b"#, canonicalize: exact),
     ]
 
     static func extract(from segments: [RecognitionSegment]) -> [SourceFactCandidate] {
-        var candidates: [SourceFactCandidate] = []
-        for segment in segments {
+        var seen: Set<String> = []
+        return extractedLocations(from: segments).map(\.candidate).filter { candidate in
+            let semanticValue = candidate.canonicalValue ?? candidate.sourceText
+            let key = "\(candidate.kind.rawValue)|\(semanticValue)|\(candidate.sourceSegmentIDs.sorted().joined(separator: ","))"
+            return seen.insert(key).inserted
+        }
+    }
+
+    static func locations(
+        of candidates: [SourceFactCandidate],
+        in segments: [RecognitionSegment]
+    ) -> [FactLocation] {
+        // `extract` 会按语义去重，事实校验只需知道“这个值出现过”；改口定位
+        // 则必须保留每一次出现的位置。例如“北京 3 人、上海 3 人……上海改
+        // 4 人、北京仍 3 人”中，同一个 3 不能因为去重而只剩第一次位置。
+        let keys = Set(candidates.map(locationKey))
+        return extractedLocations(from: segments).filter { location in
+            keys.contains(locationKey(location.candidate))
+        }
+    }
+
+    private static func locationKey(_ candidate: SourceFactCandidate) -> String {
+        let semanticValue = candidate.canonicalValue ?? candidate.sourceText
+        return "\(candidate.kind.rawValue)|\(semanticValue)|\(candidate.sourceSegmentIDs.sorted().joined(separator: ","))"
+    }
+
+    private static func extractedLocations(
+        from segments: [RecognitionSegment]
+    ) -> [FactLocation] {
+        var locations: [FactLocation] = []
+        for (segmentIndex, segment) in segments.enumerated() {
             var occupied: [NSRange] = []
             let fullRange = NSRange(segment.text.startIndex..<segment.text.endIndex, in: segment.text)
             for pattern in patterns {
@@ -51,27 +96,29 @@ enum ProtectedFactExtractor {
                     let source = String(segment.text[range])
                     if pattern.kind == .number,
                        source.count == 1,
-                       !"十百千万亿".contains(source),
                        !isBoundedQuantity(numberRange: range, in: segment.text) {
                         continue
                     }
                     guard let canonical = pattern.canonicalize(source) else { continue }
-                    candidates.append(SourceFactCandidate(
-                        sourceText: source,
-                        canonicalValue: canonical,
-                        kind: pattern.kind,
-                        sourceSegmentIDs: [segment.id]
+                    locations.append(FactLocation(
+                        candidate: SourceFactCandidate(
+                            sourceText: source,
+                            canonicalValue: canonical,
+                            kind: pattern.kind,
+                            sourceSegmentIDs: [segment.id]
+                        ),
+                        segmentIndex: segmentIndex,
+                        offset: segment.text.distance(
+                            from: segment.text.startIndex,
+                            to: range.lowerBound
+                        ),
+                        length: source.count
                     ))
                     occupied.append(match.range)
                 }
             }
         }
-        var seen: Set<String> = []
-        return candidates.filter { candidate in
-            let semanticValue = candidate.canonicalValue ?? candidate.sourceText
-            let key = "\(candidate.kind.rawValue)|\(semanticValue)|\(candidate.sourceSegmentIDs.sorted().joined(separator: ","))"
-            return seen.insert(key).inserted
-        }
+        return locations
     }
 
     static func canonicalValue(
@@ -86,7 +133,7 @@ enum ProtectedFactExtractor {
         case .percentage:
             return canonicalPercentage(source) ?? canonicalChinesePercentage(source)
         case .date:
-            return compactDate(source)
+            return compactDate(source) ?? compactMonthDay(source)
         case .email:
             return lowercased(source)
         case .version:
@@ -170,7 +217,7 @@ enum ProtectedFactExtractor {
         switch character {
         case "零", "〇": return 0
         case "一": return 1
-        case "二", "两": return 2
+        case "二", "两", "双": return 2
         case "三": return 3
         case "四": return 4
         case "五": return 5
@@ -276,8 +323,27 @@ enum ProtectedFactExtractor {
         let units = [
             "个月", "月", "天", "年", "周", "小时", "分钟", "秒", "个工作日", "工作日",
             "条", "项", "款", "位", "人", "个人", "个产品", "个渠道", "个问题", "个建议", "个版本",
+            "个任务",
         ]
         if units.contains(where: unitText.hasPrefix) { return true }
+        var labelEnd = numberRange.lowerBound
+        while labelEnd > text.startIndex {
+            let previous = text.index(before: labelEnd)
+            guard text[previous].isWhitespace else { break }
+            labelEnd = previous
+        }
+        let labelText = String(text[..<labelEnd].suffix(12))
+            .filter { !$0.isWhitespace && !$0.isPunctuation }
+        let leadingQuantityLabels = [
+            "人数为", "人数是", "人数有", "人数共", "人员为", "人员是",
+            "名额为", "名额是", "数量为", "数量是",
+        ]
+        if leadingQuantityLabels.contains(where: labelText.hasSuffix) { return true }
+        let numberText = String(text[numberRange])
+        if numberText == "十",
+           unitText.hasPrefix("个是") || unitText.hasPrefix("个为") {
+            return true
+        }
         let countedNouns = ["产品", "渠道", "问题", "建议", "版本"]
         guard unitText.hasPrefix("个") else { return false }
         // 允许“5 个主流产品”这类最多带四个中文修饰字的数量短语，但不要把
@@ -300,5 +366,22 @@ enum ProtectedFactExtractor {
               (1...12).contains(month),
               (1...31).contains(day) else { return nil }
         return String(format: "%04d-%02d-%02d", year, month, day)
+    }
+
+    private static func compactMonthDay(_ source: String) -> String? {
+        let compact = source.filter { !$0.isWhitespace }
+        guard let monthMarker = compact.firstIndex(of: "月"),
+              let dayMarker = compact.firstIndex(of: "日"),
+              monthMarker < dayMarker else { return nil }
+        let monthText = String(compact[..<monthMarker])
+        let dayText = String(compact[compact.index(after: monthMarker)..<dayMarker])
+        func value(_ text: String) -> Int? {
+            Int(text) ?? canonicalChineseNumber(text).flatMap(Int.init)
+        }
+        guard let month = value(monthText),
+              let day = value(dayText),
+              (1...12).contains(month),
+              (1...31).contains(day) else { return nil }
+        return String(format: "%02d-%02d", month, day)
     }
 }

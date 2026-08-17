@@ -46,6 +46,9 @@ import pathlib
 import sys
 
 paths = [
+    pathlib.Path("scripts/build-voice-polish-quality-test-set-v2.py"),
+    pathlib.Path("scripts/validate-voice-polish-quality-test-set.py"),
+    pathlib.Path("scripts/evaluate-voice-polish-quality-report.py"),
     pathlib.Path("sensevoice-server/server.py"),
     pathlib.Path("sensevoice-server/sensevoice_model.py"),
     pathlib.Path("qwen3-asr-server/server.py"),
@@ -192,6 +195,7 @@ run_step "ci-release-policy" ci_release_policy
 run_step "bash-syntax" bash_syntax
 run_step "python-service-syntax" python_service_syntax
 run_step "python-service-tests" python_service_tests
+run_step "voice-polish-quality-test-set" python3 scripts/validate-voice-polish-quality-test-set.py
 
 run_optional_tool "shellcheck" shellcheck shellcheck scripts/*.sh
 run_optional_tool "swiftlint" swiftlint swiftlint lint --strict --config .swiftlint.yml

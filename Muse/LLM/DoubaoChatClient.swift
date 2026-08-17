@@ -1,11 +1,118 @@
+import CommonCrypto
 import Foundation
 import os
+
+/// L15 真实 Provider 验收的网络层审计上下文。Runner 只能声明本次
+/// nonce、样本 ID 和由 Evaluator 预建的空回执路径；真正的回执只有在
+/// `DoubaoChatClient` 收到并解析成功响应后才会写入。
+enum VoicePolishProviderAudit {
+    struct Context: Sendable, Equatable {
+        let runNonce: String
+        let testInputID: String
+        let receiptPath: String
+    }
+
+    @TaskLocal static var currentContext: Context?
+
+    static func withContext<T>(
+        runNonce: String,
+        testInputID: String,
+        receiptPath: String,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await $currentContext.withValue(
+            Context(
+                runNonce: runNonce,
+                testInputID: testInputID,
+                receiptPath: receiptPath
+            ),
+            operation: operation
+        )
+    }
+
+    static func sha256Hex(_ data: Data) -> String {
+        var context = CC_SHA256_CTX()
+        CC_SHA256_Init(&context)
+        data.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress, !bytes.isEmpty {
+                CC_SHA256_Update(&context, baseAddress, CC_LONG(bytes.count))
+            }
+        }
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        CC_SHA256_Final(&digest, &context)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+struct VoicePolishProviderAuditReceipt: Codable, Sendable, Equatable {
+    let schemaVersion: Int
+    let runNonce: String
+    let testInputID: String
+    let requestOrdinal: Int
+    let llmTask: String
+    let provider: String
+    let endpointURL: String
+    let configuredModel: String
+    let responseModel: String?
+    let transport: String
+    let httpStatus: Int
+    let requestBodySHA256: String
+    let responseTextSHA256: String
+    let providerResponseID: String
+    let recordedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case runNonce = "run_nonce"
+        case testInputID = "test_input_id"
+        case requestOrdinal = "request_ordinal"
+        case llmTask = "llm_task"
+        case provider
+        case endpointURL = "endpoint_url"
+        case configuredModel = "configured_model"
+        case responseModel = "response_model"
+        case transport
+        case httpStatus = "http_status"
+        case requestBodySHA256 = "request_body_sha256"
+        case responseTextSHA256 = "response_text_sha256"
+        case providerResponseID = "provider_response_id"
+        case recordedAt = "recorded_at"
+    }
+}
+
+private enum VoicePolishProviderAuditError: LocalizedError {
+    case invalidReceiptPath(String)
+    case receiptWasNotEmpty(String)
+    case missingRequestBody
+    case missingRequestTask
+    case missingResponseIdentity
+    case invalidSuccessfulResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidReceiptPath(let path):
+            return "Provider 审计回执路径不是预建的常规文件：\(path)"
+        case .receiptWasNotEmpty(let path):
+            return "Provider 审计回执在首次请求前已包含内容：\(path)"
+        case .missingRequestBody:
+            return "Provider 审计无法读取实际请求体"
+        case .missingRequestTask:
+            return "Provider 审计缺少 Voice Polish 任务标识"
+        case .missingResponseIdentity:
+            return "Provider 响应没有可验证的 response ID"
+        case .invalidSuccessfulResponse:
+            return "Provider 审计只允许记录已解析的 HTTP 200 响应"
+        }
+    }
+}
 
 actor DoubaoChatClient: LLMClient {
 
     private let logger = Logger(subsystem: "pro.daliang.muse.llm", category: "DoubaoChatClient")
     private let provider: LLMProvider
     private let session: URLSession
+    private var initializedAuditPaths = Set<String>()
+    private var auditOrdinals: [String: Int] = [:]
 
     init(
         provider: LLMProvider = .doubao,
@@ -113,7 +220,8 @@ actor DoubaoChatClient: LLMClient {
             responseFormat: capabilities.supportsJSONMode
                 ? request.options.responseFormat
                 : .text,
-            reasoningPolicy: request.options.reasoningPolicy
+            reasoningPolicy: request.options.reasoningPolicy,
+            auditTask: request.task
         )
         return LLMResponse(text: result.text, model: config.model)
     }
@@ -237,7 +345,8 @@ actor DoubaoChatClient: LLMClient {
         appliesThinkingControl: Bool,
         temperature: Double? = nil,
         responseFormat: LLMResponseFormat = .text,
-        reasoningPolicy: ReasoningPolicy = .providerDefault
+        reasoningPolicy: ReasoningPolicy = .providerDefault,
+        auditTask: LLMTask? = nil
     ) async throws -> LLMExecutionResult {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -276,10 +385,99 @@ actor DoubaoChatClient: LLMClient {
         let controlAccepted = appliesThinkingControl
             && provider.thinkingRequestField(for: config.model).isExplicitlyControllable
         logger.info("LLM result: \(result.text.count) chars")
-        return LLMExecutionResult(
+        let completedResult = LLMExecutionResult(
             text: result.text,
-            evidence: result.evidence.withControlAccepted(controlAccepted)
+            evidence: result.evidence.withControlAccepted(controlAccepted),
+            responseID: result.responseID,
+            responseModel: result.responseModel,
+            httpStatus: result.httpStatus,
+            transport: result.transport
         )
+        try recordProviderAuditIfRequested(
+            request: request,
+            config: config,
+            task: auditTask,
+            result: completedResult
+        )
+        return completedResult
+    }
+
+    private func recordProviderAuditIfRequested(
+        request: URLRequest,
+        config: LLMConfig,
+        task: LLMTask?,
+        result: LLMExecutionResult
+    ) throws {
+        guard let audit = VoicePolishProviderAudit.currentContext else { return }
+        guard let task else { throw VoicePolishProviderAuditError.missingRequestTask }
+        guard let requestBody = request.httpBody else {
+            throw VoicePolishProviderAuditError.missingRequestBody
+        }
+        guard result.httpStatus == 200, let transport = result.transport else {
+            throw VoicePolishProviderAuditError.invalidSuccessfulResponse
+        }
+        guard let rawResponseID = result.responseID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawResponseID.isEmpty,
+              rawResponseID.utf8.count <= 512 else {
+            throw VoicePolishProviderAuditError.missingResponseIdentity
+        }
+        guard let endpointURL = request.url?.absoluteString, !endpointURL.isEmpty else {
+            throw VoicePolishProviderAuditError.invalidSuccessfulResponse
+        }
+
+        let ordinalKey = "\(audit.runNonce)\u{0}\(audit.testInputID)"
+        let nextOrdinal = (auditOrdinals[ordinalKey] ?? 0) + 1
+        let receipt = VoicePolishProviderAuditReceipt(
+            schemaVersion: 1,
+            runNonce: audit.runNonce,
+            testInputID: audit.testInputID,
+            requestOrdinal: nextOrdinal,
+            llmTask: task.rawValue,
+            provider: provider.rawValue,
+            endpointURL: endpointURL,
+            configuredModel: config.model,
+            responseModel: result.responseModel,
+            transport: transport,
+            httpStatus: 200,
+            requestBodySHA256: VoicePolishProviderAudit.sha256Hex(requestBody),
+            responseTextSHA256: VoicePolishProviderAudit.sha256Hex(Data(result.text.utf8)),
+            providerResponseID: rawResponseID,
+            recordedAt: Date()
+        )
+        try appendAuditReceipt(receipt, to: audit.receiptPath)
+        auditOrdinals[ordinalKey] = nextOrdinal
+    }
+
+    private func appendAuditReceipt(
+        _ receipt: VoicePolishProviderAuditReceipt,
+        to path: String
+    ) throws {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        guard path.hasPrefix("/"),
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            throw VoicePolishProviderAuditError.invalidReceiptPath(path)
+        }
+        if !initializedAuditPaths.contains(url.path) {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard (attributes[.size] as? NSNumber)?.intValue == 0 else {
+                throw VoicePolishProviderAuditError.receiptWasNotEmpty(path)
+            }
+            initializedAuditPaths.insert(url.path)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        var line = try encoder.encode(receipt)
+        line.append(0x0A)
+
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        _ = try handle.seekToEnd()
+        try handle.write(contentsOf: line)
+        try handle.synchronize()
     }
 
     static func makeChatRequest(
@@ -362,6 +560,8 @@ actor DoubaoChatClient: LLMClient {
         var didRecordFirstByte = false
         var parser = LLMStreamingParser()
         var decoder = SSEByteStreamDecoder()
+        var responseID: String?
+        var responseModel: String?
         do {
             for try await byte in bytes {
                 if !didRecordFirstByte {
@@ -372,18 +572,30 @@ actor DoubaoChatClient: LLMClient {
                 }
                 if let line = try decoder.consume(byte: byte) {
                     lineCount += 1
+                    if let identity = Self.streamResponseIdentity(from: line) {
+                        responseID = responseID ?? identity.id
+                        responseModel = responseModel ?? identity.model
+                    }
                     try parser.consume(line: line)
                     if parser.isComplete { break }
                 }
             }
             if !parser.isComplete, let line = try decoder.finish() {
                 lineCount += 1
+                if let identity = Self.streamResponseIdentity(from: line) {
+                    responseID = responseID ?? identity.id
+                    responseModel = responseModel ?? identity.model
+                }
                 try parser.consume(line: line)
             }
         } catch {
             if Self.shouldFlushPendingLine(after: error) {
                 do {
                     if let line = try decoder.finish() {
+                        if let identity = Self.streamResponseIdentity(from: line) {
+                            responseID = responseID ?? identity.id
+                            responseModel = responseModel ?? identity.model
+                        }
                         try parser.consume(line: line)
                     }
                 } catch {
@@ -400,7 +612,11 @@ actor DoubaoChatClient: LLMClient {
                 evidence: LLMThinkingProbeEvidence(
                     reportedMode: nil,
                     reasoningObserved: parser.reasoningObserved ? true : nil
-                )
+                ),
+                responseID: responseID,
+                responseModel: responseModel,
+                httpStatus: 200,
+                transport: "stream"
             )
         } catch {
             DebugFileLogger.log("LLM[\(model)]: stream incomplete lines=\(lineCount)")
@@ -412,6 +628,18 @@ actor DoubaoChatClient: LLMClient {
         !(error is LLMError)
             && !(error is CancellationError)
             && (error as? URLError)?.code != .cancelled
+    }
+
+    private static func streamResponseIdentity(from line: String) -> (id: String?, model: String?)? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("data:") else { return nil }
+        let payload = trimmed.dropFirst("data:".count)
+            .trimmingCharacters(in: .whitespaces)
+        guard payload != "[DONE]", let data = payload.data(using: .utf8),
+              let chunk = try? JSONDecoder().decode(ChatStreamChunk.self, from: data) else {
+            return nil
+        }
+        return (chunk.id, chunk.model)
     }
 
     // MARK: - Non-streaming (single JSON response)
@@ -451,7 +679,14 @@ actor DoubaoChatClient: LLMClient {
         guard !json.hitOutputTokenLimit else {
             throw LLMError.truncatedResponse(content.count)
         }
-        return LLMExecutionResult(text: content, evidence: json.thinkingEvidence)
+        return LLMExecutionResult(
+            text: content,
+            evidence: json.thinkingEvidence,
+            responseID: json.id,
+            responseModel: json.model,
+            httpStatus: 200,
+            transport: "nonstream"
+        )
     }
 
     private static func milliseconds(_ duration: Duration) -> Int64 {
@@ -465,6 +700,26 @@ actor DoubaoChatClient: LLMClient {
 private struct LLMExecutionResult: Sendable {
     let text: String
     let evidence: LLMThinkingProbeEvidence
+    let responseID: String?
+    let responseModel: String?
+    let httpStatus: Int?
+    let transport: String?
+
+    init(
+        text: String,
+        evidence: LLMThinkingProbeEvidence,
+        responseID: String? = nil,
+        responseModel: String? = nil,
+        httpStatus: Int? = nil,
+        transport: String? = nil
+    ) {
+        self.text = text
+        self.evidence = evidence
+        self.responseID = responseID
+        self.responseModel = responseModel
+        self.httpStatus = httpStatus
+        self.transport = transport
+    }
 }
 
 struct ThinkingConfig: Encodable, Sendable {
@@ -501,6 +756,8 @@ struct ChatMessage: Encodable, Sendable {
 
 // Non-streaming response
 struct ChatCompletionResponse: Decodable, Sendable {
+    let id: String?
+    let model: String?
     let choices: [CompletionChoice]
     let usage: ChatUsage?
     let muse_thinking_mode: String?
@@ -581,6 +838,8 @@ struct CompletionTokenDetails: Decodable, Sendable {
 
 // Streaming response (SSE chunks)
 struct ChatStreamChunk: Decodable, Sendable {
+    let id: String?
+    let model: String?
     let choices: [ChunkChoice]
     let usage: ChatUsage?
 }

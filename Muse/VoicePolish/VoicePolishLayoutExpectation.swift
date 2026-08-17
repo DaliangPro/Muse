@@ -95,9 +95,6 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
         let preferences = FormatPreferences(text: requirements)
         let signals = SourceSignals(
             text: source,
-            segmentCount: request.input.segments.filter {
-                !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }.count,
             scene: request.context.scene
         )
 
@@ -131,7 +128,8 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
                 )
             }
 
-            if signals.explicitBulletCount >= 2 {
+            if signals.explicitBulletCount >= 2,
+               signals.explicitBulletEvidenceDominatesDocument {
                 return list(
                     kind: preferences.forbidsBulletList ? .numberedList : .bulletList,
                     expectedCount: signals.explicitBulletCount,
@@ -143,7 +141,8 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
                 )
             }
 
-            if signals.explicitOrderedCount >= 2 {
+            if signals.explicitOrderedCount >= 2,
+               signals.explicitOrderedEvidenceDominatesDocument {
                 return list(
                     kind: preferences.forbidsNumberedList ? .bulletList : .numberedList,
                     expectedCount: signals.orderedExpectedItemCount,
@@ -155,7 +154,8 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
                 )
             }
 
-            if signals.declaredMinimumListCount >= 2 {
+            if signals.declaredMinimumListCount >= 2,
+               signals.unmarkedListEvidenceDominatesDocument {
                 return list(
                     kind: preferences.forbidsNumberedList ? .bulletList : .numberedList,
                     expectedCount: signals.declaredListCount,
@@ -167,7 +167,8 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
                 )
             }
 
-            if signals.implicitStepCount >= 3 {
+            if signals.implicitStepCount >= 3,
+               signals.unmarkedListEvidenceDominatesDocument {
                 return list(
                     kind: preferences.forbidsNumberedList ? .bulletList : .numberedList,
                     expectedCount: nil,
@@ -181,6 +182,7 @@ struct VoicePolishLayoutExpectation: Codable, Sendable, Equatable {
 
             if signals.hasStrongParallelIntroduction,
                signals.strongParallelItemCount >= 3,
+               signals.unmarkedListEvidenceDominatesDocument,
                !preferences.prefersParagraphs {
                 return list(
                     kind: preferences.forbidsBulletList ? .numberedList : .bulletList,
@@ -756,10 +758,11 @@ private extension VoicePolishLayoutExpectation {
     struct SourceSignals {
         let text: String
         let hasCJK: Bool
-        let segmentCount: Int
         let sentenceCount: Int
         let explicitOrderedCount: Int
         let explicitBulletCount: Int
+        let explicitOrderedMarkerSpanRatio: Double
+        let explicitBulletMarkerSpanRatio: Double
         let declaredListCount: Int?
         let declaredMinimumListCount: Int
         let declaredFinalSingleItem: Bool
@@ -771,6 +774,7 @@ private extension VoicePolishLayoutExpectation {
         let strongParallelItemCount: Int
         let topicSwitchCount: Int
         let aiSectionCount: Int
+        let structuralUnitEstimate: Int
         let isLong: Bool
         let allowsAutomaticParagraphs: Bool
         let isLongEnoughForRequestedParagraphs: Bool
@@ -779,9 +783,8 @@ private extension VoicePolishLayoutExpectation {
         let explicitNumberingPreference: VoicePolishNumberingPreference
         let defaultNumberingPreference: VoicePolishNumberingPreference
 
-        init(text: String, segmentCount: Int, scene: WritingScene) {
+        init(text: String, scene: WritingScene) {
             self.text = text
-            self.segmentCount = max(1, segmentCount)
             hasCJK = Self.containsCJK(text)
             sentenceCount = Self.sentenceCount(in: text)
 
@@ -821,7 +824,22 @@ private extension VoicePolishLayoutExpectation {
                 englishSequenceCount,
                 rhetoricalSequenceCount
             )
-            explicitBulletCount = regexMatchCount(#"(?m)^\s*[-*•]\s+"#, in: text)
+            let bulletMarkerPattern = #"(?m)^\s*[-*•]\s+"#
+            explicitBulletCount = regexMatchCount(bulletMarkerPattern, in: text)
+            let textUTF16Length = (text as NSString).length
+            let englishMarkerPattern = #"(?im)(?:^|[.!?;\n])\s*(?:first(?:ly)?|second(?:ly)?|third(?:ly)?|fourth(?:ly)?|fifth(?:ly)?|sixth(?:ly)?|seventh(?:ly)?|eighth(?:ly)?|ninth(?:ly)?|tenth(?:ly)?|finally|lastly)\b(?=\s*[,.:：-])"#
+            explicitOrderedMarkerSpanRatio = [
+                regexMatchLocations(patterns: [arabicMarkerPattern], in: text),
+                regexMatchLocations(patterns: [chineseOrdinalPattern], in: text),
+                regexMatchLocations(patterns: [chineseNumeralPattern], in: text),
+                regexMatchLocations(patterns: [englishMarkerPattern], in: text),
+            ].map {
+                Self.markerSpanRatio($0, textUTF16Length: textUTF16Length)
+            }.max() ?? 0
+            explicitBulletMarkerSpanRatio = Self.markerSpanRatio(
+                regexMatchLocations(patterns: [bulletMarkerPattern], in: text),
+                textUTF16Length: textUTF16Length
+            )
             let parallelItems = Self.parallelItemCount(in: text)
             let lastExplicitMarkerLocation = [
                 regexLastMatchLocation(arabicMarkerPattern, in: text),
@@ -870,12 +888,21 @@ private extension VoicePolishLayoutExpectation {
             hasStrongParallelIntroduction = Self.hasStrongParallelIntroduction(in: text)
             strongParallelItemCount = Self.strongParallelItemCount(
                 in: text,
-                parallelItemCount: parallelItemCount,
                 hasIntroduction: hasStrongParallelIntroduction
             )
 
             let cjkLength = text.filter { !$0.isWhitespace }.count
             let wordLength = text.split { $0.isWhitespace || $0.isPunctuation }.count
+            let lengthUnitEstimate = hasCJK
+                ? max(1, (cjkLength + 99) / 100)
+                : max(1, (wordLength + 49) / 50)
+            structuralUnitEstimate = max(
+                1,
+                sentenceCount,
+                topicSwitchCount + 1,
+                aiSectionCount,
+                lengthUnitEstimate
+            )
             // 与 Voice Polish 默认成稿标准保持一致：中文约 80 字、英文约
             // 60 词且存在多主题证据时，就应进入自然分段契约。
             isLong = hasCJK ? cjkLength >= 80 : wordLength >= 60
@@ -893,7 +920,7 @@ private extension VoicePolishLayoutExpectation {
             let hasMultipleTopics = topicSwitchCount > 0
                 || sentenceCount >= 3
                 || aiSectionCount >= 3
-                || (sceneNaturallyUsesParagraphs && self.segmentCount >= 2 && sentenceCount >= 2)
+                || (sceneNaturallyUsesParagraphs && sentenceCount >= 2)
             isLongMultiTopic = scene != .code && (
                 (isLong && hasMultipleTopics)
                     || (isMediumLength && topicSwitchCount > 0)
@@ -933,6 +960,27 @@ private extension VoicePolishLayoutExpectation {
                         explicitBulletCount, implicitStepCount, strongParallelItemCount))
         }
 
+        /// 长篇多主题正文中出现一个局部并列或子清单，不代表整篇都必须转换成
+        /// 单一列表。覆盖度只根据正文自身估算，不能依赖 Provider 怎样切 segment。
+        var unmarkedListEvidenceDominatesDocument: Bool {
+            !isLongMultiTopic
+                || listableItemCount >= max(4, structuralUnitEstimate)
+        }
+
+        /// 长文里的显式编号也可能只是一个局部章节。至少三项且编号横跨正文近
+        /// 一半，或列表项数量足以覆盖全文结构单元，才要求把整篇改成列表。
+        var explicitOrderedEvidenceDominatesDocument: Bool {
+            !isLongMultiTopic
+                || (explicitOrderedCount >= 3 && explicitOrderedMarkerSpanRatio >= 0.45)
+                || explicitOrderedCount >= max(4, structuralUnitEstimate)
+        }
+
+        var explicitBulletEvidenceDominatesDocument: Bool {
+            !isLongMultiTopic
+                || (explicitBulletCount >= 3 && explicitBulletMarkerSpanRatio >= 0.45)
+                || explicitBulletCount >= max(4, structuralUnitEstimate)
+        }
+
         var orderedExpectedItemCount: Int? {
             if declaredCountOverridesExplicitEnumeration {
                 return declaredListCount
@@ -959,13 +1007,13 @@ private extension VoicePolishLayoutExpectation {
         }
 
         var paragraphCandidateCount: Int {
-            min(6, max(1, sentenceCount, segmentCount, topicSwitchCount + 1,
+            min(6, max(1, sentenceCount, topicSwitchCount + 1,
                        aiSectionCount, parallelItemCount))
         }
 
         var recommendedParagraphCount: Int {
             min(4, max(2, topicSwitchCount + 1, min(sentenceCount, 4),
-                       min(segmentCount, 4), min(aiSectionCount, 4)))
+                       min(aiSectionCount, 4)))
         }
 
         static func containsCJK(_ text: String) -> Bool {
@@ -973,6 +1021,18 @@ private extension VoicePolishLayoutExpectation {
                 (0x3400...0x4DBF).contains(scalar.value)
                     || (0x4E00...0x9FFF).contains(scalar.value)
             }
+        }
+
+        private static func markerSpanRatio(
+            _ locations: [Int],
+            textUTF16Length: Int
+        ) -> Double {
+            let sorted = locations.sorted()
+            guard sorted.count >= 2,
+                  let first = sorted.first,
+                  let last = sorted.last,
+                  textUTF16Length > 0 else { return 0 }
+            return Double(last - first) / Double(textUTF16Length)
         }
 
         private static func capturedMarkerValues(
@@ -1275,32 +1335,50 @@ private extension VoicePolishLayoutExpectation {
 
         private static func strongParallelItemCount(
             in text: String,
-            parallelItemCount: Int,
             hasIntroduction: Bool
         ) -> Int {
-            let ideographicCount = text.filter { $0 == "、" }.count
-            let semicolonCount = text.filter { $0 == "；" || $0 == ";" }.count
-            let englishCommaListCount = text
-                .split(whereSeparator: { ".!?;\n".contains($0) })
+            // 只能把同一语义句里的并列项当成列表。旧实现会把整篇长文的逗号
+            // 累加；只要文末出现一次“分别”，十几段自然叙述就会被误判为
+            // 至少十二项的列表，合法长文因版式校验失败而整段回退。
+            let clauses = text
+                .split(whereSeparator: { "。！？!?\n".contains($0) })
                 .map(String.init)
-                .map { clause -> Int in
-                    let commaCount = clause.filter { $0 == "," }.count
-                    return commaCount >= 2
-                        && regexMatchCount(#"(?i)\b(?:and|or)\b"#, in: clause) > 0
-                        ? commaCount + 1
-                        : 0
-                }
-                .max() ?? 0
-            let delimiterEvidence = max(
-                ideographicCount >= 2 ? ideographicCount + 1 : 0,
-                semicolonCount >= 2 ? semicolonCount + 1 : 0,
-                englishCommaListCount
-            )
+            let delimiterEvidence = clauses.map { clause -> Int in
+                let ideographicCount = clause.filter { $0 == "、" }.count
+                let semicolonCount = clause.filter { $0 == "；" || $0 == ";" }.count
+                let commaCount = clause.filter { $0 == "," }.count
+                let englishCommaListCount = commaCount >= 2
+                    && regexMatchCount(#"(?i)\b(?:and|or)\b"#, in: clause) > 0
+                    ? commaCount + 1
+                    : 0
+                return max(
+                    ideographicCount >= 2 ? ideographicCount + 1 : 0,
+                    semicolonCount >= 2 ? semicolonCount + 1 : 0,
+                    englishCommaListCount
+                )
+            }.max() ?? 0
             if delimiterEvidence >= 3 {
                 return delimiterEvidence
             }
-            if hasIntroduction, parallelItemCount >= 3 {
-                return parallelItemCount
+            if hasIntroduction {
+                let introductionPhrases = [
+                    "包括", "分别", "主要有", "有以下", "几个方面", "几件事", "需要做",
+                    "the following", "includes", "include", "several things", "several aspects",
+                    "need to", "needs to",
+                ]
+                let introducedCount = clauses.filter { clause in
+                    introductionPhrases.contains(where: clause.contains)
+                }.map { clause -> Int in
+                    let ideographicCount = clause.filter { $0 == "、" }.count
+                    let chineseCommaCount = clause.filter { $0 == "，" }.count
+                    let semicolonCount = clause.filter { $0 == "；" || $0 == ";" }.count
+                    return max(
+                        ideographicCount >= 2 ? ideographicCount + 1 : 0,
+                        chineseCommaCount >= 2 ? chineseCommaCount + 1 : 0,
+                        semicolonCount >= 2 ? semicolonCount + 1 : 0
+                    )
+                }.max() ?? 0
+                if introducedCount >= 3 { return introducedCount }
             }
             return 0
         }

@@ -11,7 +11,55 @@ if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
 else
     PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)"
 fi
+
+PACKAGING_SOURCE_COMMIT=""
+PACKAGING_SOURCE_TREE=""
+if [ "${MUSE_PACKAGE_TEST_MODE:-0}" != "1" ]; then
+    if [ -n "${MUSE_SOURCE_COMMIT:-}" ]; then
+        echo "MUSE_SOURCE_COMMIT cannot override provenance outside package test mode" >&2
+        exit 1
+    fi
+    if [ -n "${MUSE_SOURCE_TREE:-}" ]; then
+        echo "MUSE_SOURCE_TREE cannot override provenance outside package test mode" >&2
+        exit 1
+    fi
+    git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1 || {
+        echo "Unable to determine Muse source commit for packaged artifact" >&2
+        exit 1
+    }
+    if ! git -C "$PROJECT_DIR" diff --quiet -- \
+        || ! git -C "$PROJECT_DIR" diff --cached --quiet --; then
+        echo "Refusing to package a tracked dirty worktree; commit the exact candidate source first" >&2
+        exit 1
+    fi
+    UNTRACKED_BUILD_INPUTS="$(git -C "$PROJECT_DIR" ls-files --others --exclude-standard -- \
+        Muse Frameworks Package.swift Package.resolved)"
+    if [ -n "$UNTRACKED_BUILD_INPUTS" ]; then
+        echo "Refusing to package untracked build inputs; commit the exact candidate source first" >&2
+        exit 1
+    fi
+    PACKAGING_SOURCE_COMMIT="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+    PACKAGING_SOURCE_TREE="$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')"
+fi
 APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/Muse.app}"
+QUALITY_BUILD_MANIFEST_PATH="${MUSE_QUALITY_BUILD_MANIFEST_PATH:-}"
+if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
+    case "$QUALITY_BUILD_MANIFEST_PATH" in
+        /*) ;;
+        *) echo "MUSE_QUALITY_BUILD_MANIFEST_PATH must be an absolute path" >&2; exit 1 ;;
+    esac
+    if [ -e "$QUALITY_BUILD_MANIFEST_PATH" ] || [ -L "$QUALITY_BUILD_MANIFEST_PATH" ]; then
+        echo "Quality build manifest path must not already exist" >&2
+        exit 1
+    fi
+    case "$QUALITY_BUILD_MANIFEST_PATH" in
+        "$APP_PATH"|"$APP_PATH"/*)
+            echo "Quality build manifest must be stored outside the signed app bundle" >&2
+            exit 1
+            ;;
+    esac
+    /bin/mkdir -p "$(/usr/bin/dirname "$QUALITY_BUILD_MANIFEST_PATH")"
+fi
 APP_NAME="${APP_NAME:-Muse}"
 APP_EXECUTABLE="Muse"
 APP_ICON_NAME="AppIcon"
@@ -185,6 +233,24 @@ if [ ! -f "$BINARY" ]; then
     exit 1
 fi
 
+if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+    MUSE_SOURCE_COMMIT_VALUE="${MUSE_SOURCE_COMMIT:-0000000000000000000000000000000000000000}"
+    MUSE_SOURCE_TREE_VALUE="${MUSE_SOURCE_TREE:-0000000000000000000000000000000000000000}"
+else
+    MUSE_SOURCE_COMMIT_VALUE="$PACKAGING_SOURCE_COMMIT"
+    MUSE_SOURCE_TREE_VALUE="$PACKAGING_SOURCE_TREE"
+fi
+MUSE_SOURCE_COMMIT_VALUE="$(printf '%s' "$MUSE_SOURCE_COMMIT_VALUE" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+MUSE_SOURCE_TREE_VALUE="$(printf '%s' "$MUSE_SOURCE_TREE_VALUE" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+[[ "$MUSE_SOURCE_COMMIT_VALUE" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "MUSE_SOURCE_COMMIT must be a full 40-character Git commit" >&2
+    exit 1
+}
+[[ "$MUSE_SOURCE_TREE_VALUE" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "MUSE_SOURCE_TREE must be a full 40-character Git tree" >&2
+    exit 1
+}
+
 echo "Packaging app bundle at $APP_PATH..."
 trash_path "$APP_PATH/Contents"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
@@ -218,6 +284,8 @@ cat >"$INFO_PLIST" <<EOF
     <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
     <string>${APP_BUILD}</string>
+    <key>MuseSourceCommit</key>
+    <string>${MUSE_SOURCE_COMMIT_VALUE}</string>
     <key>LSMinimumSystemVersion</key>
     <string>${MIN_SYSTEM_VERSION}</string>
     <key>NSMicrophoneUsageDescription</key>
@@ -338,5 +406,80 @@ APP_VERSION="$APP_VERSION" \
 APP_BUILD="$APP_BUILD" \
 MIN_SYSTEM_VERSION="$MIN_SYSTEM_VERSION" \
     /bin/bash "$SCRIPT_DIR/test_app_bundle.sh" "$APP_PATH"
+
+if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
+    PACKAGED_EXECUTABLE="$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
+    PACKAGED_EXECUTABLE_SHA256="$(/usr/bin/shasum -a 256 "$PACKAGED_EXECUTABLE" | /usr/bin/awk '{print $1}')"
+    DESIGNATED_REQUIREMENT_OUTPUT="$(/usr/bin/codesign -dr - "$APP_PATH" 2>&1)"
+    DESIGNATED_REQUIREMENT="$(printf '%s\n' "$DESIGNATED_REQUIREMENT_OUTPUT" | /usr/bin/awk '
+        /^(# )?designated => / {
+            sub(/^(# )?designated => /, "")
+            print
+            exit
+        }
+    ')"
+    [ -n "$DESIGNATED_REQUIREMENT" ] || {
+        echo "Unable to extract packaged app designated requirement" >&2
+        exit 1
+    }
+    DESIGNATED_REQUIREMENT_SHA256="$(printf '%s' "$DESIGNATED_REQUIREMENT" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+    if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+        MANIFEST_PACKAGE_MODE="test"
+    else
+        MANIFEST_PACKAGE_MODE="production"
+    fi
+
+    MUSE_MANIFEST_PACKAGE_MODE="$MANIFEST_PACKAGE_MODE" \
+    MUSE_MANIFEST_BUNDLE_ID="$APP_BUNDLE_ID" \
+    MUSE_MANIFEST_SOURCE_COMMIT="$MUSE_SOURCE_COMMIT_VALUE" \
+    MUSE_MANIFEST_SOURCE_TREE="$MUSE_SOURCE_TREE_VALUE" \
+    MUSE_MANIFEST_EXECUTABLE_SHA256="$PACKAGED_EXECUTABLE_SHA256" \
+    MUSE_MANIFEST_DESIGNATED_REQUIREMENT="$DESIGNATED_REQUIREMENT" \
+    MUSE_MANIFEST_DESIGNATED_REQUIREMENT_SHA256="$DESIGNATED_REQUIREMENT_SHA256" \
+        /usr/bin/python3 - "$QUALITY_BUILD_MANIFEST_PATH" <<'PY'
+import datetime
+import json
+import os
+import sys
+
+path = sys.argv[1]
+document = {
+    "schema_version": 1,
+    "artifact_kind": "muse_voice_polish_quality_candidate",
+    "package_mode": os.environ["MUSE_MANIFEST_PACKAGE_MODE"],
+    "bundle_id": os.environ["MUSE_MANIFEST_BUNDLE_ID"],
+    "source_commit": os.environ["MUSE_MANIFEST_SOURCE_COMMIT"],
+    "source_tree": os.environ["MUSE_MANIFEST_SOURCE_TREE"],
+    "executable_sha256": os.environ["MUSE_MANIFEST_EXECUTABLE_SHA256"],
+    "designated_requirement": os.environ["MUSE_MANIFEST_DESIGNATED_REQUIREMENT"],
+    "designated_requirement_sha256": os.environ[
+        "MUSE_MANIFEST_DESIGNATED_REQUIREMENT_SHA256"
+    ],
+    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    ),
+}
+data = (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+    "utf-8"
+)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags, 0o600)
+try:
+    with os.fdopen(descriptor, "wb", closefd=False) as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.fchmod(descriptor, 0o444)
+finally:
+    os.close(descriptor)
+PY
+    QUALITY_BUILD_MANIFEST_SHA256="$(/usr/bin/shasum -a 256 "$QUALITY_BUILD_MANIFEST_PATH" | /usr/bin/awk '{print $1}')"
+    echo "Quality build manifest ready at $QUALITY_BUILD_MANIFEST_PATH"
+    echo "MUSE_QUALITY_EXPECTED_MANIFEST_SHA256=$QUALITY_BUILD_MANIFEST_SHA256"
+    echo "MUSE_QUALITY_EXPECTED_SOURCE_COMMIT=$MUSE_SOURCE_COMMIT_VALUE"
+    echo "MUSE_QUALITY_EXPECTED_SOURCE_TREE=$MUSE_SOURCE_TREE_VALUE"
+    echo "MUSE_QUALITY_EXPECTED_EXECUTABLE_SHA256=$PACKAGED_EXECUTABLE_SHA256"
+    echo "MUSE_QUALITY_EXPECTED_DESIGNATED_REQUIREMENT_SHA256=$DESIGNATED_REQUIREMENT_SHA256"
+fi
 
 echo "App bundle ready at $APP_PATH"
