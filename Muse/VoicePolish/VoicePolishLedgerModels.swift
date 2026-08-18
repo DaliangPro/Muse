@@ -136,12 +136,20 @@ enum VoicePolishLedgerFailureStage: String, Sendable, Equatable {
     case confirming
 }
 
+struct VoicePolishPlannerValidationTrace: Codable, Sendable, Equatable {
+    let initialCode: String
+    let repairedCode: String?
+}
+
 struct VoicePolishLedgerRunResult: Sendable, Equatable {
     let text: String?
     let attempts: Int
     let validationCodes: [VoicePolishValidationCode]
     let failureReason: VoicePolishFailureReason?
     let failureStage: VoicePolishLedgerFailureStage?
+    /// 仅包含稳定的本地证据错误代码，用于质量跑测比较修复前后结果。
+    /// 不写入正常用户界面、历史记录或性能统计。
+    let plannerValidationTrace: VoicePolishPlannerValidationTrace?
     let rejectedDraft: String?
 
     static func polished(
@@ -155,6 +163,7 @@ struct VoicePolishLedgerRunResult: Sendable, Equatable {
             validationCodes: validationCodes,
             failureReason: nil,
             failureStage: nil,
+            plannerValidationTrace: nil,
             rejectedDraft: nil
         )
     }
@@ -164,6 +173,7 @@ struct VoicePolishLedgerRunResult: Sendable, Equatable {
         attempts: Int,
         codes: [VoicePolishValidationCode],
         reason: VoicePolishFailureReason,
+        plannerValidationTrace: VoicePolishPlannerValidationTrace? = nil,
         rejectedDraft: String? = nil
     ) -> VoicePolishLedgerRunResult {
         VoicePolishLedgerRunResult(
@@ -172,6 +182,7 @@ struct VoicePolishLedgerRunResult: Sendable, Equatable {
             validationCodes: codes,
             failureReason: reason,
             failureStage: stage,
+            plannerValidationTrace: plannerValidationTrace,
             rejectedDraft: rejectedDraft
         )
     }

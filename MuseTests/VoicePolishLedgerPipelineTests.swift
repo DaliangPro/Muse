@@ -272,6 +272,48 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertTrue(requests[1].user.contains("conditionals_invalid"))
     }
 
+    func testPlannerFailureReportsStableEvidenceDiagnostic() async throws {
+        let request = makeRequest(dailySource("证据诊断"))
+        let initiallyInvalid = VoicePolishIntentLedger(
+            audience: [],
+            units: [],
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [],
+            dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: [])
+        )
+        let repairedButInvalid = ledger(unit: VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "整理证据诊断",
+            sourceSpanIds: ["不存在的证据"],
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        ))
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(initiallyInvalid),
+            try encoded(repairedButInvalid),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .validationFailed)
+        XCTAssertEqual(
+            result.plannerValidationTrace,
+            VoicePolishPlannerValidationTrace(
+                initialCode: "units_empty",
+                repairedCode: "unit_identity_enum_or_source_span_invalid"
+            )
+        )
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
     func testDictatedSymbolMappingIsAppliedBeforeReview() async throws {
         let source = "执行scripts斜杠package短横线app点sh，然后检查codesign。"
         let request = makeRequest(source, scene: .code)

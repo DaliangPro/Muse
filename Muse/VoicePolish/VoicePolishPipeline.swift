@@ -291,6 +291,7 @@ struct VoicePolishPipeline: Sendable {
                 validationCodes: ledgerResult.validationCodes,
                 usedFallback: true,
                 failureReason: ledgerResult.failureReason,
+                plannerValidationTrace: ledgerResult.plannerValidationTrace,
                 rejectedDraft: ledgerResult.rejectedDraft
             )
         }

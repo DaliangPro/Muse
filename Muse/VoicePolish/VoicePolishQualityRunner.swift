@@ -186,6 +186,7 @@ enum VoicePolishQualityRunner {
         let hardValidationCodes: [String]
         let diagnosticCodes: [String]
         let failureReason: String?
+        let plannerValidationTrace: VoicePolishPlannerValidationTrace?
     }
 
     private struct QualityRunReport: Codable {
@@ -487,7 +488,8 @@ enum VoicePolishQualityRunner {
                     fallbackUsed: result.usedFallback,
                     hardValidationCodes: validationEvidence.hardValidationCodes,
                     diagnosticCodes: validationEvidence.diagnosticCodes,
-                    failureReason: result.failureReason?.rawValue
+                    failureReason: result.failureReason?.rawValue,
+                    plannerValidationTrace: result.plannerValidationTrace
                 ))
                 report = replacing(
                     report,

@@ -211,6 +211,9 @@ struct VoicePolishResult: Sendable, Equatable {
     let validationCodes: [VoicePolishValidationCode]
     let usedFallback: Bool
     let failureReason: VoicePolishFailureReason?
+    /// 仅供显式质量跑测比较 Planner 修复前后的本地证据门结果；
+    /// 正常用户流程不展示或持久化。
+    let plannerValidationTrace: VoicePolishPlannerValidationTrace?
     /// 仅供显式质量跑测诊断校验拒绝原因；普通成功与请求失败均为空，且不会
     /// 写入用户历史或性能统计。
     let rejectedDraft: String?
@@ -223,6 +226,7 @@ struct VoicePolishResult: Sendable, Equatable {
         validationCodes: [VoicePolishValidationCode],
         usedFallback: Bool,
         failureReason: VoicePolishFailureReason?,
+        plannerValidationTrace: VoicePolishPlannerValidationTrace? = nil,
         rejectedDraft: String? = nil
     ) {
         self.text = text
@@ -232,6 +236,7 @@ struct VoicePolishResult: Sendable, Equatable {
         self.validationCodes = validationCodes
         self.usedFallback = usedFallback
         self.failureReason = failureReason
+        self.plannerValidationTrace = plannerValidationTrace
         self.rejectedDraft = rejectedDraft
     }
 }

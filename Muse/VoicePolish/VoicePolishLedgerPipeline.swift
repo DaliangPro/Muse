@@ -5,6 +5,11 @@ private struct VoicePolishLedgerPlanValidationError: Error, CustomStringConverti
     let detail: String
 
     var description: String { detail }
+
+    var stableDiagnostic: String {
+        detail.split(separator: ":", maxSplits: 1).first.map(String.init)
+            ?? "ledger_validation_failed"
+    }
 }
 
 /// 面向日常复杂短文与约 1K 长文的新流水线。它不调用旧语义 Validator，
@@ -145,18 +150,27 @@ struct VoicePolishLedgerPipeline: Sendable {
                 )
             } catch let finalError {
                 let reason: VoicePolishFailureReason
+                let repairedCode: String?
                 if finalError is VoicePolishLedgerTimeoutError {
                     reason = .timeout
+                    repairedCode = nil
                 } else if finalError is VoicePolishLedgerPlanValidationError {
                     reason = .validationFailed
+                    repairedCode = (finalError as? VoicePolishLedgerPlanValidationError)?
+                        .stableDiagnostic
                 } else {
                     reason = .requestFailed
+                    repairedCode = nil
                 }
                 return .unavailable(
                     stage: .planning,
                     attempts: attempts,
                     codes: [.planIntegrityFailure],
-                    reason: reason
+                    reason: reason,
+                    plannerValidationTrace: VoicePolishPlannerValidationTrace(
+                        initialCode: validationError.stableDiagnostic,
+                        repairedCode: repairedCode
+                    )
                 )
             }
         } catch let error {
@@ -469,8 +483,12 @@ struct VoicePolishLedgerPipeline: Sendable {
                 requiredLogicCues: requiredLogicCues,
                 scene: request.context.scene
             )
+        } catch let error as VoicePolishLedgerIntegrityError {
+            throw VoicePolishLedgerPlanValidationError(detail: error.description)
+        } catch is DecodingError {
+            throw VoicePolishLedgerPlanValidationError(detail: "ledger_json_decode_failed")
         } catch {
-            throw VoicePolishLedgerPlanValidationError(detail: String(describing: error))
+            throw VoicePolishLedgerPlanValidationError(detail: "ledger_validation_failed")
         }
     }
 
