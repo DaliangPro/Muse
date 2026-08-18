@@ -350,6 +350,55 @@ final class VoicePolishCountFactSynchronizationTests: XCTestCase {
         }
     }
 
+    func testDeclaredCountEvidenceRejectsNegatedAssignmentDespiteTokenCooccurrence() {
+        let source = "下面共3项，请按原顺序整理。首页文案由小陈负责，要求周一上午前补齐验收截图。引导页由小林负责，要求周二上午前确认最终文案。权限说明由产品组负责，要求周三上午前完成回归测试。"
+        let output = """
+        1. 首页文案：小陈不负责，周一上午前不用补齐验收截图。
+        2. 引导页：小林负责，周二上午前确认最终文案。
+        3. 权限说明：产品组负责，周三上午前完成回归测试。
+        """
+        let request = makeRequest(source)
+
+        XCTAssertNil(
+            VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                in: output,
+                canonicalSource: source
+            )
+        )
+        XCTAssertTrue(
+            VoicePolishValidator.validateFast(
+                output: output,
+                request: request,
+                sourceFacts: facts(for: request)
+            ).codes.contains(.missingProtectedFact)
+        )
+    }
+
+    func testDeclaredCountEvidenceRejectsNegatedOwnerOnlyAssignments() {
+        let source = "下面共3项，请按原顺序整理。登录失败由小陈负责，支付失败由小林负责，退出失败由产品组负责。"
+        let outputs = [
+            """
+            1. 登录失败：小陈不负责。
+            2. 支付失败：小林负责。
+            3. 退出失败：产品组负责。
+            """,
+            """
+            1. 登录失败：小陈无需负责。
+            2. 支付失败：小林负责。
+            3. 退出失败：产品组负责。
+            """,
+        ]
+        for output in outputs {
+            XCTAssertNil(
+                VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                    in: output,
+                    canonicalSource: source
+                ),
+                output
+            )
+        }
+    }
+
     func testUnpunctuatedLongListDoesNotMakeHeaderCountConditional() {
         let source = "下面共3项请按原顺序逐项整理每项完整保留关于登录失败负责人小陈周一复现如果遇到阻塞就写清真实原因关于支付失败负责人小林周二核对如果外部条件变化只更新受影响部分关于退出失败负责人产品组周三确认如果结果不一致就留下复核结论"
         let output = """
@@ -421,6 +470,46 @@ final class VoicePolishCountFactSynchronizationTests: XCTestCase {
             )
         )
         XCTAssertTrue(validation.codes.contains(.missingProtectedFact))
+    }
+
+    func testDeclaredCountCannotAlsoExemptUnrelatedSameNumberQuantity() {
+        let source = "下面共3项，请按原顺序整理。登录失败由小陈复现，支付失败由小林核对，退出失败由产品组确认。另外，失败请求要重试3次。"
+        let missingRetry = """
+        1. 登录失败：小陈复现。
+        2. 支付失败：小林核对。
+        3. 退出失败：产品组确认。
+        """
+        let preservedRetry = missingRetry + "\n\n失败请求重试 3 次。"
+        let request = makeRequest(source)
+        let sourceFacts = facts(for: request)
+
+        XCTAssertNil(
+            VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                in: missingRetry,
+                canonicalSource: source
+            )
+        )
+        XCTAssertFalse(
+            VoicePolishListCountConsistency.canDeferStructuralDeclaredCountFact(
+                canonicalSource: source,
+                count: 3,
+                numberText: "3"
+            )
+        )
+        XCTAssertTrue(
+            VoicePolishValidator.validateFast(
+                output: missingRetry,
+                request: request,
+                sourceFacts: sourceFacts
+            ).codes.contains(.missingProtectedFact)
+        )
+        XCTAssertFalse(
+            VoicePolishValidator.validateFast(
+                output: preservedRetry,
+                request: request,
+                sourceFacts: sourceFacts
+            ).codes.contains(.missingProtectedFact)
+        )
     }
 
     func testProblemCountCannotBorrowASeparateModuleListAcrossUnrelatedBoundary() {
@@ -522,6 +611,128 @@ final class VoicePolishCountFactSynchronizationTests: XCTestCase {
             sourceFacts: facts(for: request)
         )
         XCTAssertTrue(contradictoryValidation.codes.contains(.planIntegrityFailure))
+    }
+
+    func testCorrectedDateAndCompleteSixItemListDoNotInventFacts() {
+        let source = "先说发布时间原定八月二十日这部分先记一下不对刚确认最终发布时间是八月二十八日要以这个为准下面共 6 项工作关于首页文案，负责人是小陈，要求周一上午前补齐验收截图，这部分别漏，引导截图，由小林负责，截止周二下班前，交付内容是确认最终文案，权限说明，现在归产品组跟进，周三中午前要跑完回归测试，长文润色，由设计组负责，时间是周四下午，动作是整理风险清单，关于历史记录，负责人是开发组，要求周五发布前核对数据来源，安装包签名，由测试组负责，截止下周一十点，交付内容是完成客户复核"
+        let output = """
+        最终发布时间为 8 月 28 日。共 6 项工作：
+
+        1. 首页文案：负责人小陈，周一上午前补齐验收截图。
+        2. 引导截图：负责人小林，截止周二下班前，确认最终文案。
+        3. 权限说明：产品组跟进，周三中午前完成回归测试。
+        4. 长文润色：设计组负责，周四下午整理风险清单。
+        5. 历史记录：开发组负责，周五发布前核对数据来源。
+        6. 安装包签名：测试组负责，截止下周一 10 点，完成客户复核。
+        """
+        let request = makeRequest(source)
+        let sourceFacts = facts(for: request)
+        let outputSegments = VoicePolishNumbering.removingContinuousNumberedLineMarkers(
+            from: [RecognitionSegment(
+                id: "out",
+                text: output,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )]
+        )
+        let outputFacts = ProtectedFactExtractor.extract(from: outputSegments)
+        let validation = VoicePolishValidator.validateFast(
+            output: output,
+            request: request,
+            sourceFacts: sourceFacts
+        )
+
+        XCTAssertFalse(
+            validation.codes.contains(.planIntegrityFailure),
+            "codes=\(validation.codes) source=\(sourceFacts) output=\(outputFacts)"
+        )
+        XCTAssertFalse(validation.codes.contains(.missingProtectedFact))
+        XCTAssertTrue(output.contains("8 月 28 日"))
+        XCTAssertFalse(output.contains("8 月 20 日"))
+    }
+
+    func testFourteenItemListWithRepeatedAssignmentTemplatesProvesDeclaredCount() {
+        let subjects = [
+            "选题确认", "脚本初稿", "事实核查", "口播录制", "界面截图", "图片标注", "字幕校对",
+            "封面设计", "课程剪辑", "素材授权", "章节说明", "学员作业", "发布检查", "数据复盘",
+        ]
+        let owners = ["小陈", "小林", "产品组", "设计组", "开发组", "测试组", "运营组", "大梁老师"]
+        let deadlines = ["周一上午前", "周二下班前", "周三中午前", "周四下午"]
+        let actions = ["补齐验收截图", "确认最终文案", "跑完回归测试", "整理风险清单"]
+        let sourceItems = subjects.indices.map { index in
+            let subject = subjects[index]
+            let owner = owners[index % owners.count]
+            let deadline = deadlines[index % deadlines.count]
+            let action = actions[index % actions.count]
+            switch index % 4 {
+            case 0:
+                return "关于\(subject)，负责人是\(owner)，要求\(deadline)\(action)，验收时逐项核对实际结果与原始要求"
+            case 1:
+                return "\(subject)，由\(owner)负责，截止\(deadline)，交付内容是\(action)，同时说明当前状态和待确认事项"
+            case 2:
+                return "\(subject)，现在归\(owner)跟进，\(deadline)要\(action)，完成后按对应标准复核"
+            default:
+                return "\(subject)，由\(owner)负责，时间是\(deadline)，动作是\(action)，变化原因需要可追溯"
+            }
+        }
+        let source = "下面共 14 项，请按原顺序逐项整理，每项都要完整保留" + sourceItems.joined()
+        let outputItems = subjects.indices.map { index in
+            let subject = subjects[index]
+            let owner = owners[index % owners.count]
+            let deadline = deadlines[index % deadlines.count]
+            let action = actions[index % actions.count]
+            return "\(index + 1). \(subject)：\(owner)负责，\(deadline)\(action)。"
+        }
+        let output = outputItems.joined(separator: "\n")
+
+        XCTAssertEqual(
+            VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                in: output,
+                canonicalSource: source
+            )?.count,
+            14
+        )
+        let request = makeRequest(source)
+        let validation = VoicePolishValidator.validateFast(
+            output: output,
+            request: request,
+            sourceFacts: facts(for: request)
+        )
+        XCTAssertFalse(validation.codes.contains(.missingProtectedFact), "\(validation.codes)")
+
+        let missingOwner = output.replacingOccurrences(
+            of: "1. 选题确认：小陈负责",
+            with: "1. 选题确认：负责人"
+        )
+        XCTAssertNil(
+            VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                in: missingOwner,
+                canonicalSource: source
+            )
+        )
+
+        let swappedOwners = output
+            .replacingOccurrences(of: "1. 选题确认：小陈负责", with: "1. 选题确认：临时负责人负责")
+            .replacingOccurrences(of: "2. 脚本初稿：小林负责", with: "2. 脚本初稿：小陈负责")
+            .replacingOccurrences(of: "临时负责人", with: "小林")
+        XCTAssertNil(
+            VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                in: swappedOwners,
+                canonicalSource: source
+            )
+        )
+
+        let swappedActions = output
+            .replacingOccurrences(of: "1. 选题确认：小陈负责，周一上午前补齐验收截图", with: "1. 选题确认：小陈负责，周一上午前确认最终文案")
+            .replacingOccurrences(of: "2. 脚本初稿：小林负责，周二下班前确认最终文案", with: "2. 脚本初稿：小林负责，周二下班前补齐验收截图")
+        XCTAssertNil(
+            VoicePolishListCountConsistency.preservedDeclaredCountEvidence(
+                in: swappedActions,
+                canonicalSource: source
+            )
+        )
     }
 
     private func pipeline(

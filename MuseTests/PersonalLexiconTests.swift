@@ -332,6 +332,16 @@ final class PersonalLexiconTests: XCTestCase {
                     recentMuseInputs: ["Muse 构建已经通过，等待覆盖安装。"]
                 )
             ),
+            (
+                "我最近重新用缪斯录长语音。",
+                "我最近重新用Muse录长语音。",
+                WritingContext(
+                    scene: .socialPost,
+                    level: .metadataOnly,
+                    safety: .safe,
+                    recentMuseInputs: ["Muse 的长语音测试刚刚结束。"]
+                )
+            ),
         ]
 
         for (source, expected, context) in cases {
@@ -385,6 +395,18 @@ final class PersonalLexiconTests: XCTestCase {
             ),
             (
                 "假设以后改名 Muse，目前没有确认；“飞书”文档已经确认。",
+                "缪斯和飞数文档都要检查。",
+                "缪斯和飞书文档都要检查。",
+                "Muse"
+            ),
+            (
+                "听说 Muse 的长语音测试刚刚结束；“飞书”文档已经确认。",
+                "缪斯和飞数文档都要检查。",
+                "缪斯和飞书文档都要检查。",
+                "Muse"
+            ),
+            (
+                "错误候选 Muse 的长语音测试刚刚结束；“飞书”文档已经确认。",
                 "缪斯和飞数文档都要检查。",
                 "缪斯和飞书文档都要检查。",
                 "Muse"
@@ -591,6 +613,8 @@ final class PersonalLexiconTests: XCTestCase {
         for pair in [
             ("小林老师稍后确认。", "大梁老师刚确认了课程结构。"),
             ("登录失败仍在排查。", "登录流程刚更新。"),
+            ("登录失败仍在排查。", "登录流程刚完成排查。"),
+            ("发布失败仍在复盘。", "发布流程刚完成复盘。"),
             ("接口调试完成以后再定时间。", "接口联调排期与上线检查。"),
         ] {
             let context = WritingContext(
@@ -607,6 +631,109 @@ final class PersonalLexiconTests: XCTestCase {
                 context: context
             )
             XCTAssertEqual(EntityResolver.applying(resolutions, to: pair.0), pair.0)
+        }
+    }
+
+    func testResolverUsesSelectedContextAnchorsForUniqueCanonicalMappings() {
+        let cases: [(source: String, expected: String, context: String, scene: WritingScene)] = [
+            (
+                "接口调试完成以后再定上线时间",
+                "接口联调完成以后再定上线时间",
+                "接口联调排期与上线检查。",
+                .workChat
+            ),
+            (
+                "克劳德桌面版的配置说明下午补一下",
+                "Claude Desktop的配置说明下午补一下",
+                "Claude Desktop 配置与第三方推理说明。",
+                .workChat
+            ),
+            (
+                "赛博沃斯服务重启以后再跑 health 检查",
+                "CyberVoice服务重启以后再跑 health 检查",
+                "CyberVoice 服务部署记录。",
+                .code
+            ),
+        ]
+
+        for item in cases {
+            let context = WritingContext(
+                scene: item.scene,
+                level: .selectedText,
+                safety: .safe,
+                selectedText: item.context
+            )
+            let resolutions = EntityResolver.resolve(
+                segments: [segment(item.source)],
+                lexicon: .empty,
+                snippets: [],
+                hotwords: [],
+                context: context
+            )
+            XCTAssertEqual(
+                EntityResolver.applying(resolutions, to: item.source),
+                item.expected,
+                "context=\(item.context) resolutions=\(resolutions)"
+            )
+            XCTAssertTrue(resolutions.contains { $0.candidateSource == .authorizedContext })
+        }
+    }
+
+    func testResolverRejectsConflictingOrUnrelatedContextAnchors() {
+        let cases: [(source: String, context: String)] = [
+            (
+                "克劳德桌面版的配置说明下午补一下",
+                "Claude Desktop 配置已经确认；Cloud Desktop 配置也已经确认。"
+            ),
+            (
+                "Chrome 的配置说明下午补一下",
+                "Claude Desktop 配置已经确认。"
+            ),
+            (
+                "大梁老师的配置说明下午补一下",
+                "Claude Desktop 配置已经确认。"
+            ),
+            (
+                "克劳德手机版的配置说明下午补一下",
+                "Claude Desktop 配置已经确认。"
+            ),
+            (
+                "小林老师稍后确认。",
+                "大梁老师刚确认了课程结构。"
+            ),
+            (
+                "登录失败仍在排查。",
+                "登录流程刚更新。"
+            ),
+            (
+                "登录失败仍在排查。",
+                "登录流程刚完成排查。"
+            ),
+            (
+                "发布失败仍在复盘。",
+                "发布流程刚完成复盘。"
+            ),
+        ]
+
+        for item in cases {
+            let context = WritingContext(
+                scene: .workChat,
+                level: .selectedText,
+                safety: .safe,
+                selectedText: item.context
+            )
+            let resolutions = EntityResolver.resolve(
+                segments: [segment(item.source)],
+                lexicon: .empty,
+                snippets: [],
+                hotwords: [],
+                context: context
+            )
+            XCTAssertEqual(
+                EntityResolver.applying(resolutions, to: item.source),
+                item.source,
+                "context=\(item.context) resolutions=\(resolutions)"
+            )
         }
     }
 

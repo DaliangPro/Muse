@@ -25,7 +25,16 @@ enum ProtectedFactExtractor {
             expression: #"(?:\d{1,2}|[零〇一二两三四五六七八九十]+)\s*月\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]+)\s*日"#,
             canonicalize: compactMonthDay
         ),
-        Pattern(kind: .time, expression: #"\b(?:[01]?\d|2[0-3]):[0-5]\d\b"#, canonicalize: exact),
+        Pattern(
+            kind: .time,
+            expression: #"(?:(?:今天|明天|后天|(?:本|下)?周[一二三四五六日天]|星期[一二三四五六日天])\s*)?(?:凌晨|早上|上午|中午|下午|晚上|晚间)?\s*(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d\b"#,
+            canonicalize: canonicalTime
+        ),
+        Pattern(
+            kind: .time,
+            expression: #"(?:(?:(?:今天|明天|后天|(?:本|下)?周[一二三四五六日天]|星期[一二三四五六日天])\s*(?:凌晨|早上|上午|中午|下午|晚上|晚间)?|(?:凌晨|早上|上午|中午|下午|晚上|晚间))\s*)(?:[01]?\d|2[0-3]|[零〇一二两三四五六七八九十]{1,3})\s*点(?:半|(?:[0-5]?\d|[零〇一二两三四五六七八九十]{1,3})\s*分)?"#,
+            canonicalize: canonicalTime
+        ),
         Pattern(kind: .percentage, expression: #"[-+]?\d[\d,]*(?:\.\d+)?\s*%"#, canonicalize: canonicalPercentage),
         Pattern(
             kind: .percentage,
@@ -36,6 +45,11 @@ enum ProtectedFactExtractor {
         Pattern(
             kind: .amount,
             expression: #"(?:合同)?(?:总)?金额(?:是|为)?\s*(?:[负零〇一二两三四五六七八九十百千万亿点]\s*)+"#,
+            canonicalize: canonicalLabeledChineseAmount
+        ),
+        Pattern(
+            kind: .amount,
+            expression: #"(?:最终|最后|当前|原定)?(?:总)?(?:预算|报价|费用|成本)(?:先按|暂按|最终(?:是|为)?|是|为|定为|按)\s*(?:[-+]?\d[\d,]*(?:\.\d+)?|[负零〇一二两三四五六七八九十百千万亿点]+)"#,
             canonicalize: canonicalLabeledChineseAmount
         ),
         Pattern(kind: .version, expression: #"\bv?\d+(?:\.\d+){1,3}\b"#, canonicalize: lowercased),
@@ -134,6 +148,8 @@ enum ProtectedFactExtractor {
             return canonicalPercentage(source) ?? canonicalChinesePercentage(source)
         case .date:
             return compactDate(source) ?? compactMonthDay(source)
+        case .time:
+            return canonicalTime(source)
         case .email:
             return lowercased(source)
         case .version:
@@ -302,10 +318,108 @@ enum ProtectedFactExtractor {
     private static func canonicalLabeledChineseAmount(_ source: String) -> String? {
         let compact = source.filter { !$0.isWhitespace }
         guard let range = compact.range(
-            of: #"[负零〇一二两三四五六七八九十百千万亿点]+$"#,
+            of: #"(?:[-+]?\d[\d,]*(?:\.\d+)?|[负零〇一二两三四五六七八九十百千万亿点]+)$"#,
             options: .regularExpression
         ) else { return nil }
-        return canonicalChineseNumber(String(compact[range]))
+        let value = String(compact[range])
+        return canonicalNumber(value) ?? canonicalChineseNumber(value)
+    }
+
+    /// 将“10:00”“上午十点”统一为 24 小时时间；带相对日期或星期的口述
+    /// 还会保留日期维度，例如“今天十点”与“明天十点”分别规范成
+    /// `今天|10:00`、`明天|10:00`。不能只保留 HH:mm，否则模型把日期改掉
+    /// 也会被事实门禁误认为等价。中文口述时间必须带明确时段、相对日期或
+    /// 星期前缀才会被上面的模式提取，避免把“十点建议”误认成时钟事实。
+    private static func canonicalTime(_ source: String) -> String? {
+        let compact = source.filter { !$0.isWhitespace }
+        if let colon = compact.firstIndex(of: ":") {
+            let beforeColon = String(compact[..<colon])
+            guard let hourRange = beforeColon.range(
+                of: #"(?:[01]?\d|2[0-3])$"#,
+                options: .regularExpression
+            ) else { return nil }
+            let hourText = String(beforeColon[hourRange])
+            let minuteText = String(compact[compact.index(after: colon)...])
+            guard let hour = Int(hourText), let minute = Int(minuteText),
+                  (0...23).contains(hour), (0...59).contains(minute) else {
+                return nil
+            }
+            let adjustedHour = adjustedClockHour(hour, in: compact)
+            let clock = String(format: "%02d:%02d", adjustedHour, minute)
+            return canonicalDayPrefix(in: compact).map { "\($0)|\(clock)" } ?? clock
+        }
+
+        guard let point = compact.firstIndex(of: "点") else { return nil }
+        let beforePoint = String(compact[..<point])
+        guard let hourRange = beforePoint.range(
+            of: #"(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})$"#,
+            options: .regularExpression
+        ) else { return nil }
+        let hourText = String(beforePoint[hourRange])
+        guard var hour = Int(hourText)
+                ?? canonicalChineseNumber(hourText).flatMap(Int.init),
+              (0...23).contains(hour) else {
+            return nil
+        }
+
+        let afterPoint = String(compact[compact.index(after: point)...])
+        let minute: Int
+        if afterPoint.hasPrefix("半") {
+            minute = 30
+        } else if let minuteRange = afterPoint.range(
+            of: #"^(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})(?=分)"#,
+            options: .regularExpression
+        ) {
+            let minuteText = String(afterPoint[minuteRange])
+            guard let parsed = Int(minuteText)
+                    ?? canonicalChineseNumber(minuteText).flatMap(Int.init),
+                  (0...59).contains(parsed) else {
+                return nil
+            }
+            minute = parsed
+        } else {
+            minute = 0
+        }
+
+        hour = adjustedClockHour(hour, in: compact)
+        let clock = String(format: "%02d:%02d", hour, minute)
+        return canonicalDayPrefix(in: compact).map { "\($0)|\(clock)" } ?? clock
+    }
+
+    private static func adjustedClockHour(_ rawHour: Int, in compact: String) -> Int {
+        var hour = rawHour
+        if ["下午", "晚上", "晚间"].contains(where: compact.contains), hour < 12 {
+            hour += 12
+        } else if compact.contains("凌晨"), hour == 12 {
+            hour = 0
+        } else if compact.contains("中午"), hour < 6 {
+            hour += 12
+        }
+        return hour
+    }
+
+    private static func canonicalDayPrefix(in compact: String) -> String? {
+        let patterns = [
+            #"今天|明天|后天"#,
+            #"(?:本|下)?周[一二三四五六日天]"#,
+            #"星期[一二三四五六日天]"#,
+        ]
+        for pattern in patterns {
+            guard let range = compact.range(of: pattern, options: .regularExpression) else {
+                continue
+            }
+            var day = String(compact[range])
+            day = day.replacingOccurrences(of: "星期", with: "周")
+            if day.hasPrefix("本周") {
+                day.removeFirst()
+            }
+            if day.hasSuffix("天"), day.contains("周") {
+                day.removeLast()
+                day.append("日")
+            }
+            return day
+        }
+        return nil
     }
 
     /// 单独的“九”“3”可能只是序号或噪声；紧邻明确量词时才升级为必须保留的
@@ -323,8 +437,21 @@ enum ProtectedFactExtractor {
         let units = [
             "个月", "月", "天", "年", "周", "小时", "分钟", "秒", "个工作日", "工作日",
             "条", "项", "款", "位", "人", "个人", "个产品", "个渠道", "个问题", "个建议", "个版本",
-            "个任务",
+            "个任务", "次", "遍", "轮",
         ]
+        if ["次", "遍", "轮"].contains(where: unitText.hasPrefix) {
+            let numberText = String(text[numberRange])
+            let canonical = canonicalNumber(numberText) ?? canonicalChineseNumber(numberText)
+            if canonical == "1" {
+                let prefix = String(text[..<numberRange.lowerBound].suffix(12))
+                    .filter { !$0.isWhitespace && !$0.isPunctuation }
+                let explicitCountSignals = [
+                    "共", "一共", "只有", "仅有", "只安排", "安排", "计划",
+                    "最多", "最少", "上限", "下限", "次数", "轮次",
+                ]
+                return explicitCountSignals.contains(where: prefix.hasSuffix)
+            }
+        }
         if units.contains(where: unitText.hasPrefix) { return true }
         var labelEnd = numberRange.lowerBound
         while labelEnd > text.startIndex {

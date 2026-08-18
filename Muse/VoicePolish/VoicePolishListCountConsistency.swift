@@ -117,6 +117,10 @@ enum VoicePolishListCountConsistency {
               let sourceDeclaration = sourceDeclarations.first,
               sourceDeclaration.count == structure.count,
               declarationIsAffirmative(sourceDeclaration, in: source),
+              declaredCountHasNoUnrelatedFactOccurrence(
+                  sourceDeclaration,
+                  in: source
+              ),
               orderedDistinctAnchors(
                   from: structure.items,
                   around: sourceDeclaration,
@@ -142,6 +146,27 @@ enum VoicePolishListCountConsistency {
                 String(header[$0.numberRange])
             })
         )
+    }
+
+    /// 分片层只有在来源总数声明本身也是该 canonical 数值的唯一事实出现时，
+    /// 才能把它延后到全文结构校验。否则“共 3 项”和“重试 3 次”会因来源事实
+    /// 去重而共用一个 key，片级提示词错误地把重试次数也删掉。
+    static func canDeferStructuralDeclaredCountFact(
+        canonicalSource: String,
+        count: Int,
+        numberText: String
+    ) -> Bool {
+        let source = VoicePolishCharacterSafety
+            .normalizedLineEndings(canonicalSource)
+        let declarations = structuralDeclaredCounts(in: source)
+        guard declarations.count == 1,
+              let declaration = declarations.first,
+              declaration.count == count,
+              String(source[declaration.numberRange]) == numberText,
+              declarationIsAffirmative(declaration, in: source) else {
+            return false
+        }
+        return declaredCountHasNoUnrelatedFactOccurrence(declaration, in: source)
     }
 
     /// 只为事实校验生成逆投影。来源必须证明“原 N 项 + 尾随新增 1 项”，
@@ -377,6 +402,47 @@ private extension VoicePolishListCountConsistency {
         }
     }
 
+    /// 总数结构证据只能豁免“共 N 项”这一处事实，不能按 canonical 数值把
+    /// 全文其他同值数量一并豁免。例如来源同时说“共 3 项”和“重试 3 次”，
+    /// 连续三项清单只能证明前者，不能替代后者。由于来源事实会按 semantic
+    /// value 去重，这里在建立结构证据前回到 occurrence 级别核对：同值数量
+    /// 只要还在声明范围之外出现，就关闭豁免，交回普通事实门禁逐字验证。
+    static func declaredCountHasNoUnrelatedFactOccurrence(
+        _ declaration: Declaration,
+        in source: String
+    ) -> Bool {
+        let segment = RecognitionSegment(
+            id: "declared-count-source",
+            text: source,
+            startTimeMs: nil,
+            endTimeMs: nil,
+            confidence: nil,
+            isFinal: true
+        )
+        let candidates = ProtectedFactExtractor.extract(from: [segment]).filter {
+            $0.kind == .number
+                && $0.canonicalValue == String(declaration.count)
+        }
+        let locations = ProtectedFactExtractor.locations(
+            of: candidates,
+            in: [segment]
+        ).filter {
+            $0.candidate.kind == .number
+                && $0.candidate.canonicalValue == String(declaration.count)
+        }
+        let declarationOffset = source.distance(
+            from: source.startIndex,
+            to: declaration.numberRange.lowerBound
+        )
+        let declarationLength = source.distance(
+            from: declaration.numberRange.lowerBound,
+            to: declaration.numberRange.upperBound
+        )
+        return locations.allSatisfy {
+            $0.offset == declarationOffset && $0.length == declarationLength
+        }
+    }
+
     static func declarationIsAffirmative(
         _ declaration: Declaration,
         in text: String
@@ -449,6 +515,14 @@ private extension VoicePolishListCountConsistency {
                     : normalizedRegion.endIndex
                 return String(normalizedRegion[ranges[index].lowerBound..<upper])
             }
+            guard items.indices.allSatisfy({ index in
+                itemDoesNotNegateStructuredAssignment(
+                    items[index],
+                    in: windows[index]
+                )
+            }) else {
+                continue
+            }
             let detailsMatch = items.indices.allSatisfy { index in
                 itemHasSourceBackedDetail(
                     items[index],
@@ -456,6 +530,9 @@ private extension VoicePolishListCountConsistency {
                     excluding: windows.enumerated().compactMap {
                         $0.offset == index ? nil : $0.element
                     }
+                ) || itemPreservesStructuredAssignment(
+                    items[index],
+                    in: windows[index]
                 )
             }
             if detailsMatch || completeSharedPredicateMatches(
@@ -571,6 +648,173 @@ private extension VoicePolishListCountConsistency {
             normalizedSourceWindow.contains(token)
                 && !normalizedOtherWindows.contains(where: { $0.contains(token) })
         }
+    }
+
+    /// 长清单常会循环复用同一组负责人、截止时间和动作模板，因此某一项可能
+    /// 没有“只在本项出现”的短词。这里改用同一主题项里的负责人、期限、动作
+    /// 三元组证明；三者都必须落在候选的同一项里。这样重复使用小陈或周一不
+    /// 会误拒完整清单，负责人互换、动作互换和复制别项正文仍会失败。
+    static func itemPreservesStructuredAssignment(
+        _ item: String,
+        in sourceWindow: String
+    ) -> Bool {
+        let normalizedItem = normalizedAnchorText(item)
+        let actor = assignmentActor(in: sourceWindow)
+        let deadline = assignmentDeadline(in: sourceWindow)
+        let action = assignmentAction(in: sourceWindow)
+        guard let actor,
+              normalizedItem.contains(normalizedAnchorText(actor)),
+              let deadline,
+              normalizedItem.contains(normalizedAnchorText(deadline)),
+              let action,
+              canonicalAssignmentText(normalizedItem).contains(canonicalAssignmentText(action)) else {
+            return false
+        }
+        return true
+    }
+
+    /// 主题、负责人、期限和动作虽然都逐字出现，也可能处在“并非由小陈负责 /
+    /// 周一不用补齐”的否定关系里。这样的共现不能证明清单项已保留。这里只在
+    /// 来源本身能抽出完整 assignment 时启用，并检查直接作用于负责人、期限或
+    /// 动作的否定及整项撤销；普通“不能遗漏”“不要忘记”不会命中。
+    static func itemDoesNotNegateStructuredAssignment(
+        _ item: String,
+        in sourceWindow: String
+    ) -> Bool {
+        let actor = assignmentActor(in: sourceWindow)
+        let deadline = assignmentDeadline(in: sourceWindow)
+        let action = assignmentAction(in: sourceWindow)
+        let normalized = canonicalAssignmentText(normalizedAnchorText(item))
+        if let actor {
+            let actorText = normalizedAnchorText(actor)
+            let actorNegations = [
+                "不由\(actorText)负责", "并非由\(actorText)负责",
+                "不是由\(actorText)负责", "\(actorText)不负责",
+                "\(actorText)并不负责", "\(actorText)未负责",
+                "\(actorText)不再负责", "\(actorText)无需负责",
+                "\(actorText)不用负责", "\(actorText)不必负责",
+                "\(actorText)只旁听", "\(actorText)仅旁听",
+            ]
+            if actorNegations.contains(where: normalized.contains) { return false }
+        }
+        if let deadline {
+            let deadlineText = normalizedAnchorText(deadline)
+            let deadlineNegations = [
+                "不是\(deadlineText)", "并非\(deadlineText)",
+                "不在\(deadlineText)", "\(deadlineText)不作数",
+            ]
+            if deadlineNegations.contains(where: normalized.contains) { return false }
+        }
+        if let action {
+            let actionText = canonicalAssignmentText(normalizedAnchorText(action))
+            let actionNegations = [
+                "不用\(actionText)", "无需\(actionText)", "不必\(actionText)",
+                "不要\(actionText)", "未\(actionText)", "没有\(actionText)",
+            ]
+            if actionNegations.contains(where: normalized.contains) { return false }
+        }
+        let revocations = [
+            "以上安排作废", "本项安排作废", "该项安排作废", "安排已撤销",
+            "安排已经撤销", "安排不作数", "任务已取消", "任务已经取消",
+        ]
+        return !revocations.contains(where: normalized.contains)
+    }
+
+    static func assignmentActor(in text: String) -> String? {
+        let patterns = [
+            #"负责人(?:是|为)?\s*([\p{Han}A-Za-z0-9·]{1,12}?)(?=负责|跟进|要求|截止|时间|[，,。；;])"#,
+            #"由\s*([\p{Han}A-Za-z0-9·]{1,12}?)\s*负责"#,
+            #"归\s*([\p{Han}A-Za-z0-9·]{1,12}?)\s*跟进"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(
+                      in: text,
+                      range: NSRange(text.startIndex..<text.endIndex, in: text)
+                  ),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: text) else {
+                continue
+            }
+            let actor = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !actor.isEmpty { return actor }
+        }
+        return nil
+    }
+
+    static func assignmentDeadline(in text: String) -> String? {
+        let patterns = [
+            #"(?:要求|截止|时间是)\s*((?:下周)?周[一二三四五六日天](?:上午|中午|下午|晚上|下班前|发布前|十点)?(?:前)?)"#,
+            #"((?:下周)?周[一二三四五六日天](?:上午|中午|下午|晚上|下班前|发布前|十点)?(?:前)?)\s*要"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(
+                      in: text,
+                      range: NSRange(text.startIndex..<text.endIndex, in: text)
+                  ),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: text) else {
+                continue
+            }
+            let deadline = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !deadline.isEmpty { return deadline }
+        }
+        return nil
+    }
+
+    static func assignmentAction(in text: String) -> String? {
+        let clauses = text.components(
+            separatedBy: CharacterSet(charactersIn: "，,。；;：:\n")
+        ).map(normalizedAnchorText).filter { !$0.isEmpty }
+
+        // 优先读取通用字段标签，不依赖质量集里的具体任务措辞。
+        let labeledPattern = #"(?:交付内容|动作)(?:是|为)(.{2,40})$"#
+        if let regex = try? NSRegularExpression(pattern: labeledPattern) {
+            for clause in clauses {
+                let searchRange = NSRange(clause.startIndex..<clause.endIndex, in: clause)
+                guard let match = regex.firstMatch(in: clause, range: searchRange),
+                      match.numberOfRanges > 1,
+                      let range = Range(match.range(at: 1), in: clause) else { continue }
+                let action = boundedAssignmentAction(String(clause[range]))
+                if action.count >= 2 { return action }
+            }
+        }
+
+        // 其余常见口述是“要求/截止 + 时间 + 动作”或“时间 + 要/需 + 动作”。
+        // 只在同一标点小句内取动作，避免吞入后面的验收说明或相邻任务。
+        guard let deadline = assignmentDeadline(in: text) else { return nil }
+        let normalizedDeadline = normalizedAnchorText(deadline)
+        for clause in clauses {
+            guard let deadlineRange = clause.range(of: normalizedDeadline) else { continue }
+            var suffix = String(clause[deadlineRange.upperBound...])
+            for prefix in ["要", "需", "需要", "必须"] where suffix.hasPrefix(prefix) {
+                suffix.removeFirst(prefix.count)
+                break
+            }
+            suffix = boundedAssignmentAction(suffix)
+            if suffix.count >= 2 { return suffix }
+        }
+        return nil
+    }
+
+    /// 来源窗口为便于锚点匹配已经去掉标点，因此只用通用语用边界截断动作：
+    /// 后面的验收说明、条件、否定约束和补充说明不属于负责人要完成的动作。
+    static func boundedAssignmentAction(_ text: String) -> String {
+        let boundaries = [
+            "要完整保留", "验收时", "交付时", "完成后", "同时", "不要", "不能",
+            "如果", "这个", "这部分", "变化原因", "复核时", "遇到阻塞",
+        ]
+        let end = boundaries.compactMap { text.range(of: $0)?.lowerBound }.min()
+            ?? text.endIndex
+        return String(text[..<end])
+    }
+
+    static func canonicalAssignmentText(_ text: String) -> String {
+        normalizedAnchorText(text)
+            .replacingOccurrences(of: "跑完", with: "完成")
+            .replacingOccurrences(of: "做完", with: "完成")
+            .replacingOccurrences(of: "核查", with: "核对")
     }
 
     /// 当各来源项除了主题锚点外完全相同时，它们没有可供逐项区分的额外细节。

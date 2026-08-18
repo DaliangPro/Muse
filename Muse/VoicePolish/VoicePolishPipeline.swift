@@ -3,6 +3,22 @@ import Foundation
 private struct VoicePolishStageTimeoutError: Error {}
 
 struct VoicePolishPipeline: Sendable {
+    private enum FastValidationScope {
+        case document
+        case chunk
+
+        var deferredCodes: Set<VoicePolishValidationCode> {
+            switch self {
+            case .document:
+                return []
+            case .chunk:
+                // “是否原样”和“是否兑现整篇版式”都无法脱离全文判断。
+                // 内容事实、安全字符、旧事实和语义关系仍在片级立即拦截。
+                return [.unchangedDraft, .layoutRequirementUnmet]
+            }
+        }
+    }
+
     private static let baselineFirstRequestTimeout: Duration = .seconds(30)
     private static let baselineTotalTimeout: Duration = .seconds(45)
     private static let baselineAnalyzeTimeout: Duration = .seconds(15)
@@ -19,6 +35,20 @@ struct VoicePolishPipeline: Sendable {
     private static let fastChunkRecoveryMaximumDepth = 1
     private static let fastChunkRecoveryMaximumAdditionalAttempts = 4
     private static let fastChunkMaximumAttemptsPerRun = 2
+    /// 所有片都已成功后，全文门禁只允许一次合并修复。修复稿仍须重新通过
+    /// 完整全文校验；失败后直接停止，不能递归修复或重新跑全部分片。
+    private static let fastMergedRepairMaximumAttempts = 1
+    private static let repairableFastCodes: Set<VoicePolishValidationCode> = [
+        .explanationOnly,
+        .promptLeakage,
+        .missingProtectedFact,
+        .supersededFactRetained,
+        .excludedSideNoteLeaked,
+        .planIntegrityFailure,
+        .layoutRequirementUnmet,
+        .unchangedDraft,
+        .abnormalLength,
+    ]
     private static let recoverableFastChunkCodes: Set<VoicePolishValidationCode> = [
         .explanationOnly,
         .missingProtectedFact,
@@ -242,7 +272,8 @@ struct VoicePolishPipeline: Sendable {
                     payload: payload,
                     sourceFacts: sourceFacts,
                     detectedRoute: decision.route,
-                    startedAt: startedAt
+                    startedAt: startedAt,
+                    validationScope: .document
                 )
             }
             if executedRoute == .deep {
@@ -547,6 +578,169 @@ struct VoicePolishPipeline: Sendable {
         return [first, second]
     }
 
+    private struct DocumentListCountDeclaration {
+        let count: Int
+        let numberText: String
+    }
+
+    private struct MergedFastRepairOutcome {
+        let text: String?
+        let attempts: Int
+        let validationCodes: [VoicePolishValidationCode]
+        let failureReason: VoicePolishFailureReason?
+        let rejectedDraft: String
+    }
+
+    /// 与最终列表门禁相同，只认唯一、明确的结构总数声明。这里不依赖整篇被
+    /// 分类为 numberedList：长口述常被识别为混合结构，但“下面共 48 项”仍然
+    /// 是一个确定的全文契约。
+    private static func documentListCountDeclaration(
+        in request: VoicePolishRequest
+    ) -> DocumentListCountDeclaration? {
+        let count = #"([1-9]\d?|[一二两三四五六七八九十]{1,3})"#
+        let unit = #"(?:点|条|项|步|部分|方面|件事|个事(?:情|项)?|(?:个)?(?:问题|原因|建议|方案|任务|风险|事项|要点|结论|观点|方法|要求|目标|主题|阶段|选择|选项))"#
+        let patterns = [
+            #"(?:一共|总共|共计|共有|主要有|主要讲|归纳为|总结成|需要做|要做|包括|包含|分为|分成|列出|整理出|有|共)\s*"#
+                + count + #"\s*"# + unit,
+            #"(?:^|[。！？!?\n])\s*"# + count + #"\s*"# + unit
+                + #"(?:要做|需要做|是|包括|如下|[：:])"#,
+        ]
+        let source = request.fallbackText
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        var seenRanges: Set<String> = []
+        var declarations: [DocumentListCountDeclaration] = []
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in regex.matches(in: source, range: fullRange) {
+                guard match.numberOfRanges > 1,
+                      let numberRange = Range(match.range(at: 1), in: source) else {
+                    continue
+                }
+                let rawNumber = String(source[numberRange])
+                guard let canonical = ProtectedFactExtractor.canonicalValue(
+                    for: rawNumber,
+                    kind: .number
+                ), let value = Int(canonical), value >= 2 else {
+                    continue
+                }
+                let rangeKey = "\(match.range(at: 1).location):\(match.range(at: 1).length)"
+                if seenRanges.insert(rangeKey).inserted {
+                    declarations.append(DocumentListCountDeclaration(
+                        count: value,
+                        numberText: rawNumber
+                    ))
+                }
+            }
+        }
+        guard declarations.count == 1 else { return nil }
+        return declarations[0]
+    }
+
+    /// “共 N 项”描述的是整篇列表，不是包含声明的首片必须逐字复述的局部事实。
+    /// 金额、日期、普通数量和没有唯一总数声明的开放列表都不会进入延后集合。
+    private static func documentOnlyListCountFactKeys(
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate]
+    ) -> Set<String> {
+        guard let declaration = documentListCountDeclaration(in: request) else {
+            return []
+        }
+        guard VoicePolishListCountConsistency.canDeferStructuralDeclaredCountFact(
+            canonicalSource: request.fallbackText,
+            count: declaration.count,
+            numberText: declaration.numberText
+        ) else {
+            return []
+        }
+        return Set(sourceFacts.compactMap { fact in
+            guard fact.kind == .number,
+                  fact.canonicalValue == String(declaration.count),
+                  fact.sourceText == declaration.numberText else {
+                return nil
+            }
+            return semanticFactIdentity(fact)
+        })
+    }
+
+    /// 各片由模型独立生成时通常都会从 1 开始编号。只有全文明确要求精确 N 项、
+    /// 所有片的顶层编号总数恰好等于 N，且每片自身都是 1...局部项数时，才把
+    /// 这些纯版式标记重排成全文 1...N；缺项、乱序或正文数字一律不改。
+    private static func continuouslyNumberedChunkOutputs(
+        _ outputs: [String],
+        request: VoicePolishRequest
+    ) -> [String] {
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        guard expectation.numberingPreference != .chinese,
+              let declaration = documentListCountDeclaration(in: request),
+              declaration.count >= 2,
+              outputs.count > 1 else {
+            return outputs
+        }
+        let expectedCount = declaration.count
+        let markerPattern = #"^([1-9]\d{0,2})[.)、）．。][ \t]*"#
+        let ordinalsByOutput = outputs.map { output in
+            output.components(separatedBy: "\n").compactMap { line -> Int? in
+                guard let range = line.range(
+                    of: markerPattern,
+                    options: .regularExpression
+                ) else {
+                    return nil
+                }
+                let marker = String(line[range])
+                return Int(marker.prefix { $0.isNumber })
+            }
+        }
+        let flattened = ordinalsByOutput.flatMap { $0 }
+        let expectedSequence = Array(1...expectedCount)
+        guard flattened.count == expectedCount else { return outputs }
+        if flattened == expectedSequence { return outputs }
+        guard ordinalsByOutput.allSatisfy({ ordinals in
+            ordinals.isEmpty || ordinals == Array(1...ordinals.count)
+        }) else {
+            return outputs
+        }
+
+        var nextOrdinal = 1
+        return outputs.map { output in
+            var lines = output.components(separatedBy: "\n")
+            for index in lines.indices {
+                guard let range = lines[index].range(
+                    of: markerPattern,
+                    options: .regularExpression
+                ) else {
+                    continue
+                }
+                lines[index].replaceSubrange(range, with: "\(nextOrdinal). ")
+                nextOrdinal += 1
+            }
+            return lines.joined(separator: "\n")
+        }
+    }
+
+    private static func startsWithTopLevelNumberedListItem(_ text: String) -> Bool {
+        guard let first = text.components(separatedBy: "\n").first(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            return false
+        }
+        return first.range(
+            of: #"^[1-9]\d{0,2}[.)、）．。][ \t]*\S"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func endsWithTopLevelNumberedListItem(_ text: String) -> Bool {
+        guard let last = text.components(separatedBy: "\n").last(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            return false
+        }
+        return last.range(
+            of: #"^[1-9]\d{0,2}[.)、）．。][ \t]*\S"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     private static func combinedChunkOutput(
         _ outputs: [String],
         sourceChunks: [String],
@@ -586,12 +780,55 @@ struct VoicePolishPipeline: Sendable {
                       let lastCharacter = canonicalSource[..<currentRange.upperBound].last,
                       chunkBoundaryStrength(after: lastCharacter) != nil {
                 separator = "\n\n"
+            } else if endsWithTopLevelNumberedListItem(outputs[index]),
+                      startsWithTopLevelNumberedListItem(outputs[index + 1]) {
+                // 硬切是请求边界，普通正文仍连续拼回；但两个已成形的列表片之间
+                // 至少需要一个换行，否则“16. ...17. ...”会被粘成同一项。
+                separator = "\n"
             } else {
                 // 无标点硬切只是请求边界，不是正文段落边界。连续拼回可避免
                 // “一百 | 二十三人”一类事实被凭空插入空行后改变含义。
                 separator = ""
             }
             combined += separator + outputs[index + 1]
+        }
+        return combined
+    }
+
+    /// 只用于全文 unchangedDraft 探针：按 canonical source 中真实存在的片间
+    /// 字符拼回，不把请求边界补成新段落。最终展示文本仍使用上面的语义合并；
+    /// 这份副本只回答“模型是否实质改写过整篇”。
+    private static func sourceFaithfulChunkOutput(
+        _ outputs: [String],
+        sourceChunks: [String],
+        canonicalSource: String
+    ) -> String {
+        guard outputs.count == sourceChunks.count,
+              let firstOutput = outputs.first else {
+            return outputs.joined()
+        }
+
+        var sourceRanges: [Range<String.Index>] = []
+        var searchStart = canonicalSource.startIndex
+        for chunk in sourceChunks {
+            guard let range = canonicalSource.range(
+                of: chunk,
+                range: searchStart..<canonicalSource.endIndex
+            ) else {
+                return outputs.joined()
+            }
+            sourceRanges.append(range)
+            searchStart = range.upperBound
+        }
+
+        var combined = firstOutput
+        for index in 0..<(outputs.count - 1) {
+            let currentRange = sourceRanges[index]
+            let nextRange = sourceRanges[index + 1]
+            combined += String(
+                canonicalSource[currentRange.upperBound..<nextRange.lowerBound]
+            )
+            combined += outputs[index + 1]
         }
         return combined
     }
@@ -621,6 +858,10 @@ struct VoicePolishPipeline: Sendable {
                 request: request,
                 sourceFacts: sourceFacts
             )
+        let documentOnlyFactKeys = Self.documentOnlyListCountFactKeys(
+            request: request,
+            sourceFacts: sourceFacts
+        )
         let factDispositionsByChunk = Self.factDispositionsByChunk(
             request: request,
             chunks: chunks,
@@ -641,6 +882,7 @@ struct VoicePolishPipeline: Sendable {
                 count: executionCount,
                 sourceFacts: sourceFacts,
                 supersededKeys: factDispositionsByChunk[index].superseded,
+                documentOnlyFactKeys: documentOnlyFactKeys,
                 globallyForbiddenSuperseded: globallyForbiddenSuperseded,
                 detectedRoute: detectedRoute,
                 startedAt: chunkStartedAt
@@ -700,6 +942,7 @@ struct VoicePolishPipeline: Sendable {
                     count: expandedChunks.count,
                     sourceFacts: sourceFacts,
                     supersededKeys: recoveryDispositions[expandedIndex].superseded,
+                    documentOnlyFactKeys: documentOnlyFactKeys,
                     globallyForbiddenSuperseded: globallyForbiddenSuperseded,
                     detectedRoute: detectedRoute,
                     startedAt: ContinuousClock.now
@@ -745,8 +988,12 @@ struct VoicePolishPipeline: Sendable {
             outputSourceChunks.append(contentsOf: recoveryChunks)
         }
 
-        let combinedDraft = Self.combinedChunkOutput(
+        let mergeReadyOutputs = Self.continuouslyNumberedChunkOutputs(
             outputs,
+            request: request
+        )
+        let combinedDraft = Self.combinedChunkOutput(
+            mergeReadyOutputs,
             sourceChunks: outputSourceChunks,
             canonicalSource: request.fallbackText
         )
@@ -760,17 +1007,55 @@ struct VoicePolishPipeline: Sendable {
             request: request,
             sourceFacts: sourceFacts
         )
-        appendUnique(validation.codes, to: &accumulatedCodes)
-        guard !validation.hasHardFailure else {
+        var finalValidationCodes = validation.codes
+        let sourceFaithfulDraft = Self.sourceFaithfulChunkOutput(
+            mergeReadyOutputs,
+            sourceChunks: outputSourceChunks,
+            canonicalSource: request.fallbackText
+        )
+        let unchangedProbe = VoicePolishValidator.validateFast(
+            output: sourceFaithfulDraft,
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        if unchangedProbe.codes.contains(.unchangedDraft),
+           !finalValidationCodes.contains(.unchangedDraft) {
+            finalValidationCodes.append(.unchangedDraft)
+        }
+        if finalValidationCodes.contains(where: \.isHardFailure) {
+            let repaired = await repairMergedFastOutput(
+                request: request,
+                sourceFacts: sourceFacts,
+                rejectedDraft: finalOutput,
+                validationCodes: finalValidationCodes
+            )
+            attempts += repaired.attempts
+            if let repairedText = repaired.text {
+                appendUnique(repaired.validationCodes, to: &accumulatedCodes)
+                DebugFileLogger.log(
+                    "voice polish chunked merged repair done chunks=\(chunks.count) attempts=\(attempts) output=\(repairedText.count)chars"
+                )
+                return success(
+                    text: repairedText,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .fast,
+                    attempts: attempts,
+                    codes: accumulatedCodes
+                )
+            }
+            appendUnique(finalValidationCodes, to: &accumulatedCodes)
+            appendUnique(repaired.validationCodes, to: &accumulatedCodes)
             return fallback(
                 request: request,
                 detectedRoute: detectedRoute,
                 executedRoute: .fast,
                 attempts: attempts,
                 codes: accumulatedCodes,
-                rejectedDraft: finalOutput
+                reason: repaired.failureReason ?? .validationFailed,
+                rejectedDraft: repaired.rejectedDraft
             )
         }
+        appendUnique(finalValidationCodes, to: &accumulatedCodes)
         DebugFileLogger.log(
             "voice polish chunked done chunks=\(chunks.count) attempts=\(attempts) output=\(finalOutput.count)chars"
         )
@@ -781,6 +1066,139 @@ struct VoicePolishPipeline: Sendable {
             attempts: attempts,
             codes: accumulatedCodes
         )
+    }
+
+    /// 最终合并稿已经带有所有成功片，只需给模型一次针对全文硬错误的修复机会。
+    /// 请求使用完整 canonical source 和事实约束；响应不会再分片或递归，而是
+    /// 直接走完整全文 Validator。网络、超时和不可修复安全错误均有限停止。
+    private func repairMergedFastOutput(
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate],
+        rejectedDraft: String,
+        validationCodes: [VoicePolishValidationCode]
+    ) async -> MergedFastRepairOutcome {
+        let hardCodes = validationCodes.filter(\.isHardFailure)
+        guard Self.fastMergedRepairMaximumAttempts > 0,
+              !hardCodes.isEmpty,
+              hardCodes.allSatisfy(Self.repairableFastCodes.contains) else {
+            return MergedFastRepairOutcome(
+                text: nil,
+                attempts: 0,
+                validationCodes: [],
+                failureReason: .validationFailed,
+                rejectedDraft: rejectedDraft
+            )
+        }
+
+        let repairPayload: String
+        do {
+            let originalPayload = try VoicePolishPrompts.payload(
+                for: request,
+                sourceFacts: sourceFacts,
+                deepDeferred: false
+            )
+            repairPayload = try VoicePolishPrompts.fastRepairPayload(
+                originalPayload: originalPayload,
+                rawResponse: rejectedDraft,
+                validationCodes: hardCodes,
+                request: request,
+                sourceFacts: sourceFacts
+            )
+        } catch {
+            return MergedFastRepairOutcome(
+                text: nil,
+                attempts: 0,
+                validationCodes: [],
+                failureReason: .setupFailed,
+                rejectedDraft: rejectedDraft
+            )
+        }
+
+        do {
+            let repairStartedAt = ContinuousClock.now
+            let timeout = try availableTimeout(
+                stageLimit: effectiveRepairTimeout(for: request),
+                startedAt: repairStartedAt,
+                request: request
+            )
+            let repairedRaw = try await generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishRepair,
+                    system: VoicePolishPrompts.fastContentRepair,
+                    user: repairPayload,
+                    options: LLMGenerationOptions(
+                        temperature: 0,
+                        maxOutputTokens: Self.outputTokenBudget(
+                            for: request,
+                            task: .voicePolishRepair
+                        ),
+                        reasoningPolicy: .disabled,
+                        responseFormat: .text
+                    )
+                ),
+                timeout: timeout
+            ).text
+            guard let repairedDraft = VoicePolishOutputNormalizer.plainText(
+                repairedRaw,
+                sourceText: request.fallbackText
+            ) else {
+                return MergedFastRepairOutcome(
+                    text: nil,
+                    attempts: 1,
+                    validationCodes: [.abnormalLength],
+                    failureReason: .validationFailed,
+                    rejectedDraft: rejectedDraft
+                )
+            }
+            let normalized = normalizedLayoutText(repairedDraft, request: request)
+            let repaired = VoicePolishValidator.removingDeterministicDraftArtifacts(
+                from: normalized,
+                request: request
+            ) ?? normalized
+            var repairedValidation = VoicePolishValidator.validateFast(
+                output: repaired,
+                request: request,
+                sourceFacts: sourceFacts
+            ).codes
+            if hardCodes.contains(.unchangedDraft),
+               Self.layoutInsensitiveMergedDraft(repaired)
+                    == Self.layoutInsensitiveMergedDraft(request.fallbackText),
+               !repairedValidation.contains(.unchangedDraft) {
+                repairedValidation.append(.unchangedDraft)
+            }
+            guard !repairedValidation.contains(where: \.isHardFailure) else {
+                return MergedFastRepairOutcome(
+                    text: nil,
+                    attempts: 1,
+                    validationCodes: repairedValidation,
+                    failureReason: .validationFailed,
+                    rejectedDraft: repaired
+                )
+            }
+            return MergedFastRepairOutcome(
+                text: repaired,
+                attempts: 1,
+                validationCodes: repairedValidation,
+                failureReason: nil,
+                rejectedDraft: repaired
+            )
+        } catch {
+            let sizeRelated = isSizeRelatedGenerationFailure(error)
+            return MergedFastRepairOutcome(
+                text: nil,
+                attempts: 1,
+                validationCodes: sizeRelated ? [.abnormalLength] : [],
+                failureReason: sizeRelated ? .validationFailed : failureReason(for: error),
+                rejectedDraft: rejectedDraft
+            )
+        }
+    }
+
+    private static func layoutInsensitiveMergedDraft(_ text: String) -> String {
+        String(text.lowercased().filter {
+            !$0.isWhitespace && !$0.isPunctuation && !$0.isSymbol
+        })
     }
 
     private static func shouldRecoverFastChunk(_ result: VoicePolishResult) -> Bool {
@@ -809,6 +1227,7 @@ struct VoicePolishPipeline: Sendable {
         count: Int,
         sourceFacts: [SourceFactCandidate],
         supersededKeys: Set<String>,
+        documentOnlyFactKeys: Set<String>,
         globallyForbiddenSuperseded: Set<Int>,
         detectedRoute: VoicePolishRoute,
         startedAt: ContinuousClock.Instant
@@ -833,7 +1252,9 @@ struct VoicePolishPipeline: Sendable {
                     sourceSegmentIDs: $0.sourceSegmentIDs
                 )
             }).filter {
-                !supersededKeys.contains(Self.semanticFactIdentity($0))
+                let key = Self.semanticFactIdentity($0)
+                return !supersededKeys.contains(key)
+                    && !documentOnlyFactKeys.contains(key)
             }
         let payload: String
         do {
@@ -861,7 +1282,8 @@ struct VoicePolishPipeline: Sendable {
             payload: payload,
             sourceFacts: chunkFacts,
             detectedRoute: detectedRoute,
-            startedAt: startedAt
+            startedAt: startedAt,
+            validationScope: .chunk
         )
     }
 
@@ -1331,12 +1753,31 @@ struct VoicePolishPipeline: Sendable {
         }
     }
 
+    private func fastValidation(
+        output: String,
+        request: VoicePolishRequest,
+        sourceFacts: [SourceFactCandidate],
+        scope: FastValidationScope
+    ) -> VoicePolishValidationResult {
+        let validation = VoicePolishValidator.validateFast(
+            output: output,
+            request: request,
+            sourceFacts: sourceFacts
+        )
+        let deferred = scope.deferredCodes
+        guard !deferred.isEmpty else { return validation }
+        return VoicePolishValidationResult(
+            codes: validation.codes.filter { !deferred.contains($0) }
+        )
+    }
+
     private func runFast(
         request: VoicePolishRequest,
         payload: String,
         sourceFacts: [SourceFactCandidate],
         detectedRoute: VoicePolishRoute,
-        startedAt: ContinuousClock.Instant
+        startedAt: ContinuousClock.Instant,
+        validationScope: FastValidationScope
     ) async -> VoicePolishResult {
         var attempts = 0
         do {
@@ -1383,10 +1824,11 @@ struct VoicePolishPipeline: Sendable {
                 from: output,
                 request: request
             ) ?? output
-            var validation = VoicePolishValidator.validateFast(
+            var validation = fastValidation(
                 output: finalOutput,
                 request: request,
-                sourceFacts: sourceFacts
+                sourceFacts: sourceFacts,
+                scope: validationScope
             )
             if validation.codes.contains(.supersededFactRetained),
                let cleaned = VoicePolishValidator.removingParentheticalSupersededFacts(
@@ -1394,30 +1836,20 @@ struct VoicePolishPipeline: Sendable {
                    request: request,
                    sourceFacts: sourceFacts
                ) {
-                let cleanedValidation = VoicePolishValidator.validateFast(
+                let cleanedValidation = fastValidation(
                     output: cleaned,
                     request: request,
-                    sourceFacts: sourceFacts
+                    sourceFacts: sourceFacts,
+                    scope: validationScope
                 )
                 if !cleanedValidation.hasHardFailure {
                     finalOutput = cleaned
                     validation = cleanedValidation
                 }
             }
-            let repairableFastCodes: Set<VoicePolishValidationCode> = [
-                .explanationOnly,
-                .promptLeakage,
-                .missingProtectedFact,
-                .supersededFactRetained,
-                .excludedSideNoteLeaked,
-                .planIntegrityFailure,
-                .layoutRequirementUnmet,
-                .unchangedDraft,
-                .abnormalLength,
-            ]
             let hardCodes = validation.codes.filter(\.isHardFailure)
             if !hardCodes.isEmpty,
-               hardCodes.allSatisfy(repairableFastCodes.contains) {
+               hardCodes.allSatisfy(Self.repairableFastCodes.contains) {
                 do {
                     let timeout = try availableTimeout(
                         stageLimit: effectiveRepairTimeout(for: request),
@@ -1457,10 +1889,11 @@ struct VoicePolishPipeline: Sendable {
                         throw StructuredLLMDecoderError.invalidJSON
                     }
                     let repaired = normalizedLayoutText(repairedDraft, request: request)
-                    let repairedValidation = VoicePolishValidator.validateFast(
+                    let repairedValidation = fastValidation(
                         output: repaired,
                         request: request,
-                        sourceFacts: sourceFacts
+                        sourceFacts: sourceFacts,
+                        scope: validationScope
                     )
                     guard !repairedValidation.hasHardFailure else {
                         return fallback(

@@ -456,7 +456,10 @@ enum VoicePolishValidator {
         let repeatsMetaSpan = sourceMetaSpans.contains { !$0.isEmpty && draft.contains($0) }
         let paraphrasesMetaInstruction = !sourceMetaSpans.isEmpty && [
             #"(?:语气|措辞).{0,8}(?:不用|不要|别).{0,4}(?:重|强)"#,
-            #"(?:不列入|别放|不要放).{0,8}(?:正文|成稿|已确定)"#,
+            // “暂不列入已确定事项”是在成稿中明确标注待确认状态，不是把
+            // 幕后编辑指令泄漏给读者。只有仍保留“别放/不要放”这类命令式
+            // 说法时才触发；逐字原指令仍会由 repeatsMetaSpan 拦截。
+            #"(?:别放|不要放).{0,8}(?:正文|成稿|已确定)"#,
             #"(?:不要|别).{0,6}(?:确定|猜).{0,8}(?:版本|名称|名字|日期)"#,
         ].contains { draft.range(of: $0, options: .regularExpression) != nil }
         if repeatsMetaSpan || paraphrasesMetaInstruction {
@@ -696,7 +699,10 @@ enum VoicePolishValidator {
                     }
                     if actionIsLocallyNegated(in: normalizedClause, range: occurrence.range) {
                         hasNegatedAction = true
-                    } else {
+                    } else if negativeActionVariantCanProveAffirmation(
+                        occurrence.variant,
+                        for: normalizedAction
+                    ) {
                         hasAffirmedAction = true
                     }
                 }
@@ -1020,6 +1026,17 @@ enum VoicePolishValidator {
         return Array(Set(candidates.filter { $0.count >= 2 }))
     }
 
+    /// “搜索/等待”这类概念级短词可帮助确认某项仍处于否定或延期状态，
+    /// 但单独出现不能证明用户已经改成肯定执行。否则“第一版不做复杂搜索，
+    /// 搜索功能放到后面”会因第二句的“搜索”被错误判成极性翻转。
+    private static func negativeActionVariantCanProveAffirmation(
+        _ variant: String,
+        for action: String
+    ) -> Bool {
+        if variant == action { return true }
+        return variant != "搜索" && variant != "等待"
+    }
+
     private static func inverseStatePreservesNegativeAction(
         action: String,
         clause: String
@@ -1089,6 +1106,7 @@ enum VoicePolishValidator {
             #"^(?:这项|该项|相关操作)?(?:不能|不得|禁止)(?:执行|进行|安排|启动|实施|操作)(?:$|[。；;，,])"#,
             #"^(?:这项|该项|相关操作)?(?:已)?(?:取消|作废|暂停|停止)(?:执行|进行|安排|启动|实施|操作)?(?:$|[。；;，,])"#,
             #"^(?:功能|事项|能力|内容|模块)?(?:暂不|不再|不予|未|没有)(?:纳入|列入)(?:第一版|本版|这版|当前版本|本期|本轮|范围|计划)"#,
+            #"^(?:功能|事项|能力|内容|模块)?(?:先)?(?:放到|留到|推迟到)?(?:后面|后续|以后|下一版)(?:再)?(?:做|开发|处理|考虑|支持)?"#,
         ]
         if trailingPatterns.contains(where: {
             suffix.range(of: $0, options: .regularExpression) != nil
@@ -1183,7 +1201,13 @@ enum VoicePolishValidator {
         let countsByIndex = Dictionary(grouping: allOccurrences, by: \.factIndex)
         let supersededCounts = Dictionary(grouping: supersededOccurrences, by: \.factIndex)
         return Set(countsByIndex.compactMap { index, occurrences in
-            supersededCounts[index]?.count == occurrences.count ? index : nil
+            let sourcePositions = Set(occurrences.map {
+                "\($0.segmentIndex)|\($0.offset)|\($0.length)"
+            })
+            let supersededPositions = Set((supersededCounts[index] ?? []).map {
+                "\($0.segmentIndex)|\($0.offset)|\($0.length)"
+            })
+            return sourcePositions.isSubset(of: supersededPositions) ? index : nil
         })
     }
 
@@ -1207,7 +1231,7 @@ enum VoicePolishValidator {
         let correctionSignals = [
             "前面那句改成", "刚才那句改成", "把开头改成", "let me correct that",
             "change the earlier part", "change what i said before", "scratch that", "把前面",
-            "我的意思是", "我改一下", "说错了", "不对", "应该是", "最后还是",
+            "我的意思是", "我改一下", "我说错了", "说错了", "不对", "应该是", "最后还是",
             "最终决定", "改到", "改为", "调整为", "现定为", "改成",
             "actually", "i mean", "final decision",
         ]
@@ -1330,6 +1354,26 @@ enum VoicePolishValidator {
                 whereSeparator: { "，。！？；,.!?;、\n".contains($0) }
             ).last.map(String.init) ?? raw
             var label = normalizedNaturalText(clause)
+            let localCorrectionCues = [
+                "我说错了", "说错了", "我改一下", "我的意思是", "不对",
+                "应该是", "最终决定", "最后还是",
+            ]
+            if let cue = localCorrectionCues.compactMap({ cue -> Range<String.Index>? in
+                label.range(of: cue, options: .backwards)
+            }).max(by: { $0.lowerBound < $1.lowerBound }) {
+                label = String(label[cue.upperBound...])
+            }
+            // “人数不是 3 人，是 4 人”中，最终值前的局部文本还包含整段旧值。
+            // 关系标签应取“不是”之前的对象（人数），而不是把“不是 3 人”
+            // 当成对象；第一人称“我说错了，不是 A，是 B”没有对象时则留空。
+            for negation in ["不再是", "并非", "不是"] {
+                guard let range = label.range(of: negation),
+                      String(label[range.upperBound...]).contains("是") else {
+                    continue
+                }
+                label = String(label[..<range.lowerBound])
+                break
+            }
             // “发布日期从 8 月 20 日改到 8 月 28 日”中，最终值前面的
             // 整段还包含旧值；明确的“从 A 改到 B / 由 A 改为 B”应取 A
             // 之前的对象词作为关系标签。
@@ -1346,7 +1390,8 @@ enum VoicePolishValidator {
             let removablePrefixes = [
                 "不对", "我改一下", "我说错了", "说错了", "我的意思是",
                 "应该是", "刚确认", "确认", "先说", "正确", "最终", "最后", "原来",
-                "原定", "先按", "先记", "预计", "大约", "共", "有", "为", "是",
+                "原定", "先按", "先记", "预计", "大约", "最多", "最少", "上限",
+                "不超过", "不低于", "共", "有", "为", "是",
             ]
             var changed = true
             while changed {
@@ -1362,7 +1407,7 @@ enum VoicePolishValidator {
                 "改成", "改为", "改到", "调整为", "现定为", "应该是",
                 "最终决定", "最后还是", "先按", "先记", "预计", "大约",
                 "原定", "最终", "最后", "仍是", "也是", "共", "有", "为",
-                "是", "从", "由",
+                "不再是", "并非", "不是", "是", "从", "由",
             ]
             changed = true
             while changed {
@@ -1396,12 +1441,16 @@ enum VoicePolishValidator {
             // 为空时不建立关系硬门禁，避免对开放实体做猜测。
             let fieldSuffixes = [
                 "参会人数", "参与人数", "安排人数", "人员数量", "人数",
-                "名额", "数量", "预算", "价格", "费用", "金额",
+                "名额", "数量", "重试次数", "重试轮次", "次数", "轮次",
+                "预算", "价格", "费用", "金额",
             ]
             for suffix in fieldSuffixes
             where label.hasSuffix(suffix) && label.count > suffix.count {
                 label.removeLast(suffix.count)
                 break
+            }
+            if label.hasSuffix("的"), label.count > 1 {
+                label.removeLast()
             }
             return label.isEmpty ? nil : label
         }
@@ -1423,15 +1472,18 @@ enum VoicePolishValidator {
                 whereSeparator: { "，。！？；,.!?;、\n".contains($0) }
             ).last.map(String.init) ?? raw
             var label = normalizedNaturalText(clause)
-            for prefix in ["前面", "刚才", "刚刚", "上面", "前述", "这里", "这个"]
-            where label.hasPrefix(prefix) {
-                label.removeFirst(prefix.count)
-                break
+            let retractionCues = ["前面", "刚才", "刚刚", "上面", "前述", "这里", "这个"]
+            if let cue = retractionCues.compactMap({ cue -> (String, Range<String.Index>)? in
+                label.range(of: cue, options: .backwards).map { (cue, $0) }
+            }).max(by: { $0.1.lowerBound < $1.1.lowerBound }) {
+                label = String(label[cue.1.upperBound...])
+                if label.hasPrefix("的") { label.removeFirst() }
             }
             let fieldSuffixes = [
                 "参会人数", "参与人数", "安排人数", "人员数量", "人数", "名额",
-                "数量", "预算", "价格", "费用", "金额", "日期", "时间", "期限",
-                "截止时间", "版本", "地址", "路径", "端口", "比例", "折扣",
+                "数量", "重试次数", "重试轮次", "次数", "轮次", "预算", "价格",
+                "费用", "金额", "日期", "时间", "期限", "截止时间", "版本",
+                "地址", "路径", "端口", "比例", "折扣",
             ]
             guard (2...32).contains(label.count),
                   fieldSuffixes.contains(where: label.hasSuffix),
@@ -1572,14 +1624,20 @@ enum VoicePolishValidator {
                     let boundaryCount = hardBoundaryCount(in: gap)
                     let distance = marker.globalStartOffset - candidate.globalEndOffset
                     let candidateLabel = relationLabel(before: candidate)
+                    let matchesExplicitAnchor = explicitRetractionAnchor != nil
+                        && minimalRelationAnchor(candidateLabel).map {
+                            relationAnchorsAreCompatible(explicitRetractionAnchor!, $0)
+                        } == true
                     let exactAnchoredRetraction = hasExplicitRetraction
-                        && ((finalLabel != nil && candidateLabel == finalLabel)
-                            || (explicitRetractionAnchor != nil
-                                && minimalRelationAnchor(candidateLabel).map {
-                                    relationAnchorsAreCompatible(explicitRetractionAnchor!, $0)
-                                } == true))
-                        && distance <= 512
-                        && boundaryCount <= 12
+                        && (
+                            (finalLabel != nil
+                                && candidateLabel == finalLabel
+                                && distance <= 512
+                                && boundaryCount <= 12)
+                            || (matchesExplicitAnchor
+                                && distance <= 4_096
+                                && boundaryCount <= 64)
+                        )
                     let isNearby = allowsDistantPrevious
                         || (distance <= 128
                             && (boundaryCount == 0 || (isResetSignal && boundaryCount <= 2)))
@@ -1726,7 +1784,206 @@ enum VoicePolishValidator {
                         ? quantityDescriptor(after: final, until: nextFactOffset)
                         : nil
                 ))
+                // “我说错了，不是 A，是 B”会在改口过程里把旧值 A 再说一遍。
+                // 这次复述本身也是已撤回内容，不能因为同一 canonical 在来源中
+                // 出现两次，就强迫最终成稿继续保留 A。
+                if hasExplicitRetraction {
+                    for repeated in locatedFacts where repeated.factIndex == previous.factIndex
+                        && repeated.globalOffset >= marker.globalEndOffset
+                        && repeated.globalEndOffset <= final.globalOffset {
+                        let negationPrefix = normalizedNaturalText(
+                            textBetween(marker.globalEndOffset, repeated.globalOffset)
+                        )
+                        let replacementBridge = normalizedNaturalText(
+                            textBetween(repeated.globalEndOffset, final.globalOffset)
+                        )
+                        let explicitlyNegatesRepeatedOld = ["不是", "并非", "不再是"]
+                            .contains(where: negationPrefix.contains)
+                            && ["是", "改为", "改成", "应该是"]
+                                .contains(where: replacementBridge.contains)
+                        if explicitlyNegatesRepeatedOld {
+                            superseded.insert(SupersededFactOccurrence(
+                                factIndex: repeated.factIndex,
+                                segmentIndex: repeated.segmentIndex,
+                                offset: repeated.offset,
+                                length: repeated.length,
+                                globalOffset: repeated.globalOffset,
+                                replacementFactIndex: final.factIndex,
+                                relationAnchor: explicitRetractionAnchor
+                                    ?? minimalRelationAnchor(finalLabel),
+                                factDescriptor: previousFact.kind == .number
+                                    ? quantityDescriptor(
+                                        after: repeated,
+                                        until: final.globalOffset
+                                    )
+                                    : nil,
+                                replacementDescriptor: finalFact.kind == .number
+                                    ? quantityDescriptor(
+                                        after: final,
+                                        until: nextFactOffset
+                                    )
+                                    : nil
+                            ))
+                        }
+                    }
+                }
                 break
+            }
+        }
+
+        // 裸“不是 A，是 B / 并非 A，而是 B”本身就是明确的局部改口，ASR
+        // 不一定会在前面补出“我说错了”之类 marker。只在同一小句内、前后
+        // 事实类型一致、两者之间没有第三个事实，且数字量词/对象兼容时建立
+        // old -> final；因此“不是 3 个问题，是 1 张表格”仍不会被误当成数量
+        // 更正。公开勘误已在函数入口排除，不会删掉读者需要看到的旧值。
+        let bareNegationSignals = ["不再是", "并非", "不是"]
+        let bareReplacementSignals = ["而是", "是", "应该是", "改为", "改成"]
+        for old in locatedFacts {
+            let prefixRaw = textBetween(max(0, old.globalOffset - 48), old.globalOffset)
+            let prefixClause = prefixRaw.split(
+                whereSeparator: { "，。！？；,.!?;、\n".contains($0) }
+            ).last.map(String.init) ?? prefixRaw
+            let prefix = normalizedNaturalText(prefixClause)
+            guard let negation = bareNegationSignals.first(where: prefix.hasSuffix) else {
+                continue
+            }
+            let negationBase = String(prefix.dropLast(negation.count))
+            // “并非不是 A”属于双重否定，不能反向当成撤回 A。
+            guard !["并非", "不是", "不"].contains(where: negationBase.hasSuffix) else {
+                continue
+            }
+
+            let possibleFinals = locatedFacts.filter { final in
+                guard final.globalOffset > old.globalEndOffset,
+                      final.globalOffset - old.globalEndOffset <= 64,
+                      sourceFacts[final.factIndex].kind == sourceFacts[old.factIndex].kind,
+                      !equivalent(sourceFacts[old.factIndex], sourceFacts[final.factIndex]) else {
+                    return false
+                }
+                let bridgeRaw = textBetween(old.globalEndOffset, final.globalOffset)
+                let bridge = normalizedNaturalText(bridgeRaw)
+                guard bareReplacementSignals.contains(where: bridge.hasSuffix),
+                      hardBoundaryCount(in: bridgeRaw) <= 1 else {
+                    return false
+                }
+                return !locatedFacts.contains {
+                    $0.globalOffset >= old.globalEndOffset
+                        && $0.globalEndOffset <= final.globalOffset
+                        && $0.globalOffset != final.globalOffset
+                }
+            }
+            guard let final = possibleFinals.first else { continue }
+            let localPrefix = normalizedNaturalText(prefixClause)
+            let hypotheticalCues = ["如果", "假如", "假设", "要是", "若是", "若"]
+            guard !hypotheticalCues.contains(where: localPrefix.contains) else {
+                continue
+            }
+            let localTail = textBetween(
+                final.globalEndOffset,
+                min(combinedSource.count, final.globalEndOffset + 48)
+            )
+            let firstTerminal = localTail.first(where: { "。！？；.!?;\n".contains($0) })
+            let normalizedTail = normalizedNaturalText(
+                String(localTail.prefix { !"。！？；.!?;\n".contains($0) })
+            )
+            let isQuestion = firstTerminal == "？" || firstTerminal == "?"
+                || normalizedTail.hasPrefix("吗")
+                || normalizedTail.hasPrefix("呢")
+                || normalizedTail.hasSuffix("吗")
+                || normalizedTail.hasSuffix("呢")
+            guard !isQuestion else { continue }
+            let isQuoted = ["“", "「", "『", "\""].contains(where: prefixRaw.contains)
+                && ["”", "」", "』", "\""].contains(where: localTail.contains)
+            guard !isQuoted else { continue }
+            let oldFact = sourceFacts[old.factIndex]
+            let finalFact = sourceFacts[final.factIndex]
+            let nextFactOffset = locatedFacts.first(where: {
+                $0.globalOffset > final.globalEndOffset
+            })?.globalOffset ?? combinedSource.count
+            let oldDescriptor = oldFact.kind == .number
+                ? quantityDescriptor(after: old, until: final.globalOffset)
+                : nil
+            let finalDescriptor = finalFact.kind == .number
+                ? quantityDescriptor(after: final, until: nextFactOffset)
+                : nil
+            if oldFact.kind == .number,
+               !quantityDescriptorsAreCompatible(oldDescriptor, finalDescriptor) {
+                continue
+            }
+            superseded.insert(SupersededFactOccurrence(
+                factIndex: old.factIndex,
+                segmentIndex: old.segmentIndex,
+                offset: old.offset,
+                length: old.length,
+                globalOffset: old.globalOffset,
+                replacementFactIndex: final.factIndex,
+                relationAnchor: minimalRelationAnchor(relationLabel(before: old)),
+                factDescriptor: oldDescriptor,
+                replacementDescriptor: finalDescriptor
+            ))
+        }
+
+        // “时间最终改到 B”或句首承接的“最终放到 B”明确把先前唯一的时间
+        // 改成最终时间。该结构可能跨过一次人数等其他类型的改口，不能让前一
+        // marker 阻断时间配对；同时只在旧时间 canonical 唯一时成立，避免把
+        // 初审、终审等多个独立日程误合并。
+        let explicitTemporalSignals = [
+            "时间最终改到", "时间最后改到", "日期最终改到", "日期最后改到",
+            "排期最终改到", "排期最后改到", "截止时间最终改到", "截止时间最后改到",
+        ]
+        let carriedTemporalSignals = ["最终放到", "最后放到", "最终安排在", "最后安排在"]
+        let temporalMarkerRanges = explicitTemporalSignals.flatMap { signal in
+            allRanges(of: signal, in: combinedSource)
+        } + carriedTemporalSignals.flatMap { signal in
+            allRanges(of: signal, in: combinedSource).filter { range in
+                let prefix = String(combinedSource[..<range.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let previous = prefix.last else { return true }
+                if "。！？；.!?;".contains(previous) { return true }
+                let localPrefix = normalizedNaturalText(String(prefix.suffix(48)))
+                let explicitRewriteCues = [
+                    "时间也改一下", "时间改一下", "日期也改一下", "日期改一下",
+                    "排期也改一下", "排期改一下", "时间需要调整", "日期需要调整",
+                ]
+                return explicitRewriteCues.contains(where: localPrefix.contains)
+            }
+        }
+        for markerRange in temporalMarkerRanges {
+            let markerStart = combinedSource.distance(
+                from: combinedSource.startIndex,
+                to: markerRange.lowerBound
+            )
+            let markerEnd = combinedSource.distance(
+                from: combinedSource.startIndex,
+                to: markerRange.upperBound
+            )
+            guard let final = locatedFacts.first(where: {
+                $0.globalOffset >= markerEnd
+                    && $0.globalOffset - markerEnd <= 24
+                    && sourceFacts[$0.factIndex].kind == .time
+            }) else { continue }
+            let finalFact = sourceFacts[final.factIndex]
+            let previousTimes = locatedFacts.filter {
+                $0.globalEndOffset <= markerStart
+                    && sourceFacts[$0.factIndex].kind == .time
+                    && !equivalent(sourceFacts[$0.factIndex], finalFact)
+            }
+            let previousCanonicalValues = Set(previousTimes.compactMap {
+                sourceFacts[$0.factIndex].canonicalValue
+            })
+            guard previousCanonicalValues.count == 1 else { continue }
+            for previous in previousTimes {
+                superseded.insert(SupersededFactOccurrence(
+                    factIndex: previous.factIndex,
+                    segmentIndex: previous.segmentIndex,
+                    offset: previous.offset,
+                    length: previous.length,
+                    globalOffset: previous.globalOffset,
+                    replacementFactIndex: final.factIndex,
+                    relationAnchor: "时间",
+                    factDescriptor: nil,
+                    replacementDescriptor: nil
+                ))
             }
         }
         return superseded

@@ -31,6 +31,14 @@ enum EntityResolver {
         "Muse": ["缪斯"],
     ]
 
+    /// 已经由产品测试明确确认、且只允许在安全上下文中启用的中文别名。
+    /// 这张表是显式关系，不从共同前缀或全文语义锚点猜测新关系。
+    private static let productConfirmedHanContextAliases: [
+        String: [(alias: String, sharedScopeCues: [String])]
+    ] = [
+        "接口联调": [(alias: "接口调试", sharedScopeCues: ["上线"])],
+    ]
+
     private struct NormalizedUnit {
         let character: Character
         let sourceRange: Range<String.Index>
@@ -68,6 +76,12 @@ enum EntityResolver {
         let canonical: String
         let sourcePriority: Int
         let confidence: Double
+    }
+
+    private struct ContextMappingProposal {
+        let surface: String
+        let canonical: String
+        let segmentID: String
     }
 
     private enum AuthorizedContextAssertion {
@@ -178,6 +192,18 @@ enum EntityResolver {
                     confidence: resolved.score
                 ))
             }
+        }
+
+        // selected/nearby safe context 还允许两类受限映射：可证明的跨脚本
+        // 音译，以及产品明确确认的中文 alias。开放式 Han→Han 音近纠错已在
+        // 上面的唯一高置信通道完成，这里不再从共同前缀或任意锚点猜词。
+        for resolution in contextAnchoredResolutions(
+            segments: segments,
+            context: context
+        ) {
+            let key = "\(resolution.sourceSegmentIDs.first ?? "")|\(presentationKey(resolution.surfaceText))|\(presentationKey(resolution.canonical))"
+            guard keys.insert(key).inserted else { continue }
+            resolutions.append(resolution)
         }
         return resolutions
     }
@@ -365,6 +391,262 @@ enum EntityResolver {
         return deduplicated(result)
     }
 
+    private static func contextAnchoredResolutions(
+        segments: [RecognitionSegment],
+        context: WritingContext
+    ) -> [ResolvedEntity] {
+        guard context.safety == .safe else { return [] }
+        // 开放式“锚点 + 别名”推导只允许用户当前明确授权的选中/邻近文本。
+        // recentMuseInputs 仍可走既有的同文种高置信与应用自有 exact alias，
+        // 但不能仅凭一条历史输入把任意相邻中文短语映射到英文名称。
+        guard context.level != .metadataOnly else { return [] }
+        let bodies = [
+            context.selectedText,
+            context.textBeforeCursor,
+            context.textAfterCursor,
+        ].compactMap { $0 }
+        let evidence = bodies.flatMap { body in
+            authorizedContextTerms(in: body).compactMap { term -> (String, String)? in
+                hasAffirmedContextProvenance(for: term, in: body)
+                    ? (term, body)
+                    : nil
+            }
+        }
+
+        var proposals: [ContextMappingProposal] = []
+        for segment in segments {
+            for (canonical, body) in evidence {
+                let aliases: [String]
+                if canonical.range(of: #"[A-Za-z]"#, options: .regularExpression) != nil {
+                    aliases = asciiContextAliases(
+                        canonical: canonical,
+                        contextBody: body,
+                        source: segment.text
+                    )
+                } else {
+                    aliases = hanContextAliases(
+                        canonical: canonical,
+                        contextBody: body,
+                        source: segment.text
+                    )
+                }
+                for alias in aliases where allowsAuthorizedContextMapping(
+                    surface: alias,
+                    canonical: canonical,
+                    in: segment.text
+                ) {
+                    proposals.append(ContextMappingProposal(
+                        surface: alias,
+                        canonical: canonical,
+                        segmentID: segment.id
+                    ))
+                }
+            }
+        }
+
+        let grouped = Dictionary(grouping: proposals) {
+            "\($0.segmentID)|\(presentationKey($0.surface))"
+        }
+        return grouped.values.compactMap { matches in
+            let canonicals = Set(matches.map { presentationKey($0.canonical) })
+            guard canonicals.count == 1, let match = matches.first else { return nil }
+            return ResolvedEntity(
+                surfaceText: match.surface,
+                canonical: match.canonical,
+                sourceSegmentIDs: [match.segmentID],
+                candidateSource: .authorizedContext,
+                confidence: 0.99
+            )
+        }
+    }
+
+    /// ASCII 标准名只有在它旁边的中文语义锚点也出现在 source，且该锚点前
+    /// 存在唯一中文名称时才建立映射。例如 `Claude Desktop 配置` 可约束
+    /// “克劳德桌面版的配置”，但上下文里孤立出现一个英文词不会触发。
+    private static func asciiContextAliases(
+        canonical: String,
+        contextBody: String,
+        source: String
+    ) -> [String] {
+        let anchors = contextualAnchorTokens(
+            excluding: canonical,
+            in: contextBody
+        ).filter { source.contains($0) }
+        var rankedAliases: [(surface: String, score: Double)] = []
+        for anchor in anchors {
+            let escaped = NSRegularExpression.escapedPattern(for: anchor)
+            let pattern = #"([\p{Han}]{2,12}?)(?:的)?\s*"# + escaped
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            for match in regex.matches(in: source, range: range) {
+                guard match.numberOfRanges > 1,
+                      let capture = Range(match.range(at: 1), in: source) else { continue }
+                var captured = String(source[capture])
+                for prefix in ["请把", "请用", "关于", "这个", "那个", "把", "用", "在", "将"]
+                    where captured.hasPrefix(prefix) && captured.count - prefix.count >= 2 {
+                    captured.removeFirst(prefix.count)
+                    break
+                }
+                let characters = Array(captured)
+                guard characters.count >= 2 else { continue }
+                for length in 2...min(12, characters.count) {
+                    let alias = String(characters.suffix(length))
+                    guard let score = crossScriptAliasScore(
+                        surface: alias,
+                        canonical: canonical
+                    ) else { continue }
+                    rankedAliases.append((alias, score))
+                }
+            }
+        }
+        guard let bestScore = rankedAliases.map(\.score).max() else { return [] }
+        // 同一名称若有两个互不包含且同分的中文候选，无法确定哪一个才是
+        // ASR 别名；留给模型处理，不做本地强制替换。
+        let best = rankedAliases.filter { bestScore - $0.score < 0.02 }
+        let distinct = Array(Set(best.map(\.surface)))
+        let minimal = distinct.filter { candidate in
+            !distinct.contains { other in
+                other != candidate && other.hasSuffix(candidate)
+                    && other.count > candidate.count
+            }
+        }
+        return minimal.count == 1 ? minimal : []
+    }
+
+    /// 只在“音译主体足够接近”时接受跨脚本别名。像 Claude Desktop 这类
+    /// 混合音译 + 通用产品形态允许有限的语义后缀；不会因为共享“配置/服务”
+    /// 就把大梁老师、Chrome 或任意中文名改成上下文里的英文产品名。
+    private static func crossScriptAliasScore(
+        surface: String,
+        canonical: String
+    ) -> Double? {
+        guard surface.allSatisfy(isHanCharacter), isASCIIWordLike(canonical) else {
+            return nil
+        }
+        let words = canonical.lowercased().split {
+            !$0.unicodeScalars.allSatisfy(\.isASCII) || !$0.isLetter
+        }.map(String.init)
+        guard !words.isEmpty else { return nil }
+
+        let semanticSuffixes: [String: [String]] = [
+            "desktop": ["桌面客户端", "桌面版", "桌面"],
+        ]
+        if words.count >= 2,
+           let suffixes = semanticSuffixes[words.last!],
+           let suffix = suffixes.first(where: surface.hasSuffix) {
+            let head = String(surface.dropLast(suffix.count))
+            guard head.count >= 2,
+                  let score = crossScriptConsonantSimilarity(
+                    surface: head,
+                    canonical: words.dropLast().joined(separator: " ")
+                  ),
+                  score >= 0.9 else { return nil }
+            return score
+        }
+
+        guard let score = crossScriptConsonantSimilarity(
+            surface: surface,
+            canonical: canonical
+        ), score >= 0.78 else { return nil }
+        return score
+    }
+
+    private static func crossScriptConsonantSimilarity(
+        surface: String,
+        canonical: String
+    ) -> Double? {
+        guard let syllables = tonelessPinyinSyllablesIfChinese(surface) else {
+            return nil
+        }
+        let left = String(syllables.compactMap(\.first).map(normalizedSoundConsonant))
+        let rightRaw = canonical.lowercased().filter {
+            $0.isLetter && !"aeiouy".contains($0)
+        }
+        let right = String(rightRaw.map(normalizedSoundConsonant))
+        guard left.count >= 3, right.count >= 3 else { return nil }
+        return editSimilarity(left, right)
+    }
+
+    private static func normalizedSoundConsonant(_ character: Character) -> Character {
+        switch character {
+        case "c", "k", "q", "s", "x", "z": return "k"
+        case "f", "v", "w": return "v"
+        case "r", "l": return "l"
+        default: return character
+        }
+    }
+
+    /// 中文上下文不能凭共同前缀和全文任意语义锚点建立确定性替换，否则
+    /// “登录失败仍在排查”会被“登录流程刚完成排查”误改。开放式中文纠错
+    /// 已由 resolveSurface 的唯一高置信音近通道负责；这里仅返回产品明确
+    /// 确认过的 alias，并仍受安全上下文 provenance 与冲突消解约束。
+    private static func hanContextAliases(
+        canonical: String,
+        contextBody: String,
+        source: String
+    ) -> [String] {
+        guard let aliases = productConfirmedHanContextAliases[canonical] else {
+            return []
+        }
+        return aliases.flatMap { rule -> [String] in
+            // 同一条已确认 alias 仍需落在相同的明确业务范围；范围词也来自
+            // 规则本身，而不是从上下文全文临时寻找任意重合词。
+            guard rule.sharedScopeCues.contains(where: {
+                contextBody.contains($0) && source.contains($0)
+            }) else { return [] }
+            return flexibleMatches(of: rule.alias, in: source).map {
+                String(source[$0.sourceRange])
+            }
+        }
+    }
+
+    private static func contextualAnchorTokens(
+        excluding canonical: String,
+        in body: String
+    ) -> [String] {
+        let remainder = body.replacingOccurrences(
+            of: canonical,
+            with: " ",
+            options: [.caseInsensitive, .diacriticInsensitive]
+        )
+        let ignored: Set<String> = [
+            "这个", "那个", "这次", "本次", "当前", "已经", "正在", "刚刚",
+            "完成", "以后", "时间", "记录", "说明", "检查", "测试", "确认",
+            "更新", "错误", "候选", "仅作", "上下", "文泄", "泄漏",
+        ]
+        var tokens: Set<String> = []
+        for run in hanRuns(in: remainder) {
+            let characters = Array(run)
+            guard characters.count >= 2 else { continue }
+            for length in 2...min(4, characters.count) {
+                for start in 0...(characters.count - length) {
+                    let token = String(characters[start..<(start + length)])
+                    guard !ignored.contains(token),
+                          !canonical.contains(token) else { continue }
+                    tokens.insert(token)
+                }
+            }
+        }
+        return tokens.sorted { left, right in
+            if left.count != right.count { return left.count > right.count }
+            return left < right
+        }
+    }
+
+    private static func hanRuns(in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"[\p{Han}]{2,64}"#) else {
+            return []
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            Range(match.range, in: text).map { String(text[$0]) }
+        }
+    }
+
+    private static func isHanCharacter(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { (0x3400...0x9FFF).contains($0.value) }
+    }
+
     private static func authorizedContextTerms(in text: String) -> [String] {
         let bounded = String(text.prefix(1_024))
         var terms: [String] = []
@@ -465,6 +747,7 @@ enum EntityResolver {
         let hypotheticalPrefixes = [
             "如果", "假如", "假设", "要是", "若定为", "若命名为", "若改名",
             "计划改名", "考虑改名", "以后改名", "未来改名", "暂定为",
+            "听说", "据说", "有人说", "传闻",
         ]
         let hypotheticalSuffixes = [
             "未确认", "还未确认", "尚未确认", "还没确认", "没有确认",
@@ -524,6 +807,7 @@ enum EntityResolver {
         ]
         let affirmedSuffixes = [
             "刚确认", "已确认", "已经确认", "已确认为", "正在使用", "当前使用",
+            "刚刚结束", "刚结束", "已经结束", "已结束", "刚刚完成", "刚完成",
             "构建正在", "构建已经", "构建已", "服务启动", "服务部署",
             "配置", "排期", "部署", "构建", "启动", "更新", "修复",
             "发布", "上线", "说明", "记录", "审查", "中的", "里面",
