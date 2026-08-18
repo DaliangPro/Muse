@@ -30,29 +30,19 @@ struct VoicePolishLedgerPipeline: Sendable {
         self.onStage = onStage
     }
 
-    /// 核心语义对照中，Flash 在保密边界和技术标识样本上出现安全退出，Pro
-    /// 均完成成稿。日常风险短文和约 1K 长文因此在官方 DeepSeek 端点内部
-    /// 自动使用 Pro；普通极短文本和 1,800 字以上压力路径仍尊重用户原模型。
-    /// 这属于单一“语音润色”模式下的内部策略，不向用户暴露强弱档位。
+    /// 模型影响一次成稿率和延迟，但不能由语音润色链路擅自替用户切换。
+    /// 真实生产跑测已经证明：把用户选择的 Flash 静默升级为 Pro，会让约 1K
+    /// 文本的 Planner 连续触发 60 秒超时。Ledger 因此始终尊重当前配置；
+    /// 模型能力差异由 Reviewer、确定性门禁和显式失败吸收。
     static func qualityConfig(for config: LLMConfig) -> LLMConfig {
-        guard config.model == "deepseek-v4-flash",
-              URLComponents(string: config.baseURL)?.host?.lowercased()
-                == "api.deepseek.com" else {
-            return config
-        }
-        return config.withModel("deepseek-v4-pro")
+        config
     }
 
-    /// 官方 DeepSeek 链路用 Pro 规划和写作、Flash 冷复核，避免同一个模型
-    /// 同时制造并认可自己的语义遗漏。其他 Provider 没有可证明的同源双模型时
-    /// 保持用户配置不变。
+    /// 冷 Reviewer 是隔离调用与独立 Prompt，不要求偷偷更换用户模型。
+    /// 若未来支持独立 Reviewer 模型，应成为明确、可审计的产品配置，而不是
+    /// 由某个 Provider 名称触发的隐藏策略。
     static func reviewConfig(for config: LLMConfig) -> LLMConfig {
-        guard ["deepseek-v4-flash", "deepseek-v4-pro"].contains(config.model),
-              URLComponents(string: config.baseURL)?.host?.lowercased()
-                == "api.deepseek.com" else {
-            return config
-        }
-        return config.withModel("deepseek-v4-flash")
+        config
     }
 
     static func shouldUse(

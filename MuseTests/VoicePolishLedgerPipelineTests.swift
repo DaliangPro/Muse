@@ -324,7 +324,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertEqual(spans.last?.end, request.input.fallbackText.count)
     }
 
-    func testOfficialDeepSeekFlashUsesProInsideLedgerOnly() {
+    func testLedgerRespectsSelectedModelForGenerationAndReview() {
         let flash = LLMConfig(
             apiKey: "test",
             model: "deepseek-v4-flash",
@@ -332,7 +332,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         )
         XCTAssertEqual(
             VoicePolishLedgerPipeline.qualityConfig(for: flash).model,
-            "deepseek-v4-pro"
+            "deepseek-v4-flash"
         )
         XCTAssertEqual(
             VoicePolishLedgerPipeline.reviewConfig(for: flash).model,
@@ -348,9 +348,13 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             VoicePolishLedgerPipeline.qualityConfig(for: custom).model,
             "deepseek-v4-flash"
         )
+        XCTAssertEqual(
+            VoicePolishLedgerPipeline.reviewConfig(for: custom).model,
+            "deepseek-v4-flash"
+        )
     }
 
-    func testOfficialDeepSeekUsesProForGenerationAndFlashForColdReview() async throws {
+    func testOfficialDeepSeekKeepsSelectedModelAcrossColdReview() async throws {
         let source = "不要承诺周五发布。"
         let request = makeRequest(source)
         let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
@@ -380,7 +384,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
 
         XCTAssertFalse(result.usedFallback)
         let models = await client.models()
-        XCTAssertEqual(models, ["deepseek-v4-pro", "deepseek-v4-pro", "deepseek-v4-flash"])
+        XCTAssertEqual(models, Array(repeating: "deepseek-v4-flash", count: 3))
     }
 
     func testPlannerCannotInventLowercaseTechnicalJoin() throws {
