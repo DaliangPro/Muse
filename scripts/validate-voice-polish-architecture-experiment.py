@@ -80,7 +80,7 @@ def main() -> None:
     audit = load_jsonl(run_dir / "provider-audit.jsonl")
 
     schema_version = run.get("schema_version")
-    if schema_version not in {1, 2, 3, 4, 5, 6, 7, 8} or run.get("status") != "complete":
+    if schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10} or run.get("status") != "complete":
         fail("实验报告未完整完成")
     if blind.get("schema_version") != schema_version or sealed.get("schema_version") != schema_version:
         fail("实验报告、盲评包与密封映射 schema 不一致")
@@ -218,6 +218,7 @@ def main() -> None:
                         "recipient_content",
                         "style_directive",
                         "editor_directive",
+                        "excluded_content",
                     }
                     if any(
                         not isinstance(unit, dict)
@@ -225,6 +226,24 @@ def main() -> None:
                         for unit in units
                     ):
                         fail(f"{key} typed ledger 缺少合法 delivery_role")
+                    if schema_version >= 9 and any(
+                        not isinstance(unit.get("surface_tokens"), list)
+                        or (
+                            unit.get("delivery_role") == "recipient_content"
+                            and bool(unit.get("surface_tokens"))
+                        )
+                        or (
+                            unit.get("delivery_role")
+                            in {
+                                "style_directive",
+                                "editor_directive",
+                                "excluded_content",
+                            }
+                            and not unit.get("surface_tokens")
+                        )
+                        for unit in units
+                    ):
+                        fail(f"{key} typed ledger 缺少合法 unit surface_tokens")
                 if schema_version >= 4:
                     corrections = ledger.get("corrections")
                     if not isinstance(corrections, list) or any(
@@ -243,6 +262,12 @@ def main() -> None:
                         for item in audience
                     ):
                         fail(f"{key} typed ledger 缺少合法 audience surface_tokens")
+                    if schema_version >= 10 and any(
+                        item.get("delivery_mode")
+                        not in {"explicit_reference", "direct_address"}
+                        for item in audience
+                    ):
+                        fail(f"{key} typed ledger 缺少合法 audience delivery_mode")
                 if schema_version >= 7 and not isinstance(
                     ledger.get("technical_token_mappings"), list
                 ):
@@ -289,6 +314,12 @@ def main() -> None:
                         for item in global_audience
                     ):
                         fail(f"{key} global_audience 缺少 surface_tokens")
+                    if schema_version >= 10 and any(
+                        item.get("delivery_mode")
+                        not in {"explicit_reference", "direct_address"}
+                        for item in global_audience
+                    ):
+                        fail(f"{key} global_audience 缺少合法 delivery_mode")
                 if schema_version >= 7 and not isinstance(
                     global_plan.get("global_technical_token_mappings"), list
                 ):
@@ -307,15 +338,26 @@ def main() -> None:
             fail("Provider 回执序号不连续")
         if receipt.get("configured_model") not in models or receipt.get("case_id") not in case_ids:
             fail("Provider 回执引用了未知模型或样本")
-        if (
-            receipt.get("http_status") != 200
-            or receipt.get("error") is not None
-            or receipt.get("finish_reason") == "length"
-            or not receipt.get("provider_response_id")
+        result = result_by_key.get(
+            (receipt.get("case_id"), receipt.get("configured_model"))
+        )
+        if receipt.get("http_status") == 200 and receipt.get("error") is None:
+            if (
+                receipt.get("finish_reason") == "length"
+                or not receipt.get("provider_response_id")
+                or not receipt.get("request_body_sha256")
+                or not receipt.get("response_text_sha256")
+            ):
+                fail(f"Provider 回执 {index} 不是可验证的完整成功响应")
+        elif (
+            result is None
+            or result.get("outcome") != "unavailable"
+            or not result.get("error")
+            or not receipt.get("error")
             or not receipt.get("request_body_sha256")
-            or not receipt.get("response_text_sha256")
+            or receipt.get("response_text_sha256") is not None
         ):
-            fail(f"Provider 回执 {index} 不是可验证的完整成功响应")
+            fail(f"Provider 回执 {index} 的失败证据与 unavailable 结果不一致")
 
     serialized_model_inputs = json.dumps(model_inputs, ensure_ascii=False, sort_keys=True)
     leaked_keys = sorted(

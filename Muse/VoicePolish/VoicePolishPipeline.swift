@@ -76,6 +76,7 @@ struct VoicePolishPipeline: Sendable {
     private let usesAdaptiveRenderTimeout: Bool
     private let usesAdaptiveRepairTimeout: Bool
     private let fastChunkTokenLimit: Int
+    private let ledgerRoutingEnabled: Bool
     private let onStage: (@Sendable (VoicePolishStage) -> Void)?
 
     init(
@@ -87,6 +88,7 @@ struct VoicePolishPipeline: Sendable {
         renderTimeout: Duration? = nil,
         repairTimeout: Duration? = nil,
         fastChunkSourceTokenLimit: Int = VoicePolishPipeline.fastChunkSourceTokenLimit,
+        ledgerRoutingEnabled: Bool = true,
         onStage: (@Sendable (VoicePolishStage) -> Void)? = nil
     ) {
         self.client = client
@@ -102,6 +104,10 @@ struct VoicePolishPipeline: Sendable {
         self.usesAdaptiveRenderTimeout = renderTimeout == nil
         self.usesAdaptiveRepairTimeout = repairTimeout == nil
         self.fastChunkTokenLimit = max(1, fastChunkSourceTokenLimit)
+        // 非默认切片阈值只由旧 Fast 分片专项测试注入；它必须继续验证原有
+        // 分片实现，不能被日常长文的新 Ledger 编排提前接管。
+        self.ledgerRoutingEnabled = ledgerRoutingEnabled
+            && fastChunkSourceTokenLimit == Self.fastChunkSourceTokenLimit
         self.onStage = onStage
     }
 
@@ -243,6 +249,44 @@ struct VoicePolishPipeline: Sendable {
         DebugFileLogger.log(
             "voice polish start route=\(decision.route.rawValue) executed=\(executedRoute.rawValue) quality=\(request.qualityMode.rawValue) input=\(request.fallbackText.count)chars facts=\(sourceFacts.count)"
         )
+
+        if ledgerRoutingEnabled, VoicePolishLedgerPipeline.shouldUse(for: request) {
+            DebugFileLogger.log(
+                "voice polish ledger route input=\(request.input.fallbackText.count)chars scene=\(request.context.scene.rawValue)"
+            )
+            let ledgerResult = await VoicePolishLedgerPipeline(
+                client: client,
+                config: config,
+                onStage: onStage
+            // Ledger 的 120 秒预算从实际进入规划时开始。录音停止后的 ASR
+            // teardown/词汇解析不应提前吃掉模型预算，否则长口述可能尚未发起
+            // Planner 就被判超时。
+            ).process(request, startedAt: .now)
+            if let text = ledgerResult.text {
+                return VoicePolishResult(
+                    text: text,
+                    detectedRoute: decision.route,
+                    executedRoute: .deep,
+                    llmAttemptCount: ledgerResult.attempts,
+                    validationCodes: ledgerResult.validationCodes,
+                    usedFallback: false,
+                    failureReason: nil
+                )
+            }
+            DebugFileLogger.log(
+                "voice polish ledger unavailable stage=\(ledgerResult.failureStage?.rawValue ?? "unknown") attempts=\(ledgerResult.attempts)"
+            )
+            return VoicePolishResult(
+                text: request.fallbackText,
+                detectedRoute: decision.route,
+                executedRoute: .deep,
+                llmAttemptCount: ledgerResult.attempts,
+                validationCodes: ledgerResult.validationCodes,
+                usedFallback: true,
+                failureReason: ledgerResult.failureReason,
+                rejectedDraft: ledgerResult.rejectedDraft
+            )
+        }
 
         do {
             if executedRoute == .fast {

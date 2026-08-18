@@ -11,6 +11,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json"
 OUTPUT = ROOT / "docs/2026-08-17-Muse-Voice-Polish-Core-Semantic-Test-Set.json"
+STRESS_BOUNDARY_IDS = {
+    "natural-long-09-asr-dirty-segments-1",
+    "natural-long-10-asr-dirty-segments-2",
+}
 
 
 def contract(
@@ -208,7 +212,7 @@ CONTRACTS = {
     "code-05": contract(
         "不确定版本和缺失错误码必须保持不确定",
         ["问题可能与Swift 6.1或6.2有关，具体版本未确认，错误码未保存"],
-        ["Swift 6.1", "Swift 6.2", "具体版本未确认", "错误码未保存", "后续确认"],
+        ["Swift 6.1", "Swift 6.2", "具体版本未确认", "错误码未保存"],
         ["把幕后不要猜落实为明确待确认状态"],
         ["确定具体版本", "虚构错误码或根因"],
         ["可概括为较新Swift编译器，但必须同时保留6.1/6.2候选或同等不确定范围"],
@@ -285,6 +289,11 @@ def main() -> None:
             "test_input_id": test_input_id,
             "source_case_id": base_case_id,
             "input_kind": "stress" if "base_case_id" in row else "base",
+            "acceptance_tier": (
+                "stress_boundary"
+                if test_input_id in STRESS_BOUNDARY_IDS
+                else "primary"
+            ),
             "title": row.get("title", base.get("title", test_input_id)),
             "writing_scene": row.get("writing_scene", base["writing_scene"]),
             "spoken_input": row["spoken_input"],
@@ -299,8 +308,8 @@ def main() -> None:
         })
 
     result = {
-        "schema_version": 1,
-        "name": "Muse 语音润色核心语义测试集 V1",
+        "schema_version": 2,
+        "name": "Muse 语音润色核心语义测试集 V2",
         "created_at": "2026-08-17",
         "language": "zh-CN",
         "source_dataset": SOURCE.name,
@@ -310,6 +319,9 @@ def main() -> None:
             "reference_output_is_not_a_unique_answer": True,
             "writer_must_not_receive_semantic_contract": True,
             "blind_review_hides_model_identity": True,
+            "primary_case_count": len(inputs) - len(STRESS_BOUNDARY_IDS),
+            "stress_boundary_case_count": len(STRESS_BOUNDARY_IDS),
+            "primary_long_text_target_chars": "700-1500",
             "critical_error_types": [
                 "fact",
                 "final_intent",

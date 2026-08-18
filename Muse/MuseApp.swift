@@ -149,6 +149,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return false }
             return await self.session.useCanonicalVoicePolishResult()
         }
+        appState.onRetryVoicePolish = { [weak self] in
+            guard let self else { return false }
+            return await self.session.retryVoicePolishResult()
+        }
         AppStartupCoordinator.scheduleDebugWindowsIfNeeded(
             hudDebugPresenter: hudDebugPresenter,
             appState: appState,
@@ -212,6 +216,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.hotkeyManager.isProcessing = true
                     case .voicePolishStage(let stage):
                         appState.showVoicePolishStage(stage)
+                        self.hotkeyManager.isProcessing = true
+                    case .voicePolishUnavailable(let reason):
+                        appState.showVoicePolishUnavailable(reason)
                         self.hotkeyManager.isProcessing = true
                     case .finalized(let text, let injection):
                         appState.finalize(text: text, outcome: injection)

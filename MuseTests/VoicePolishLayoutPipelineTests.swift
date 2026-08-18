@@ -942,7 +942,11 @@ final class VoicePolishLayoutPipelineTests: XCTestCase {
     }
 
     private func pipeline(_ client: LayoutPipelineScriptedLLM) -> VoicePolishPipeline {
-        VoicePolishPipeline(client: client, config: config)
+        VoicePolishPipeline(
+            client: client,
+            config: config,
+            ledgerRoutingEnabled: false
+        )
     }
 
     private func makeRequest(

@@ -29,7 +29,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPERIMENT_SCHEMA_VERSION = 8
+EXPERIMENT_SCHEMA_VERSION = 10
 DEFAULT_DATASET = ROOT / "docs/2026-08-17-Muse-Voice-Polish-Core-Semantic-Test-Set.json"
 DEFAULT_PILOT_IDS = [
     "micro-04",
@@ -86,16 +86,17 @@ PLANNER_SYSTEM = """你是 Muse 语音润色的局部意图规划器。输入是
 
 只返回一个 JSON 对象，schema 如下：
 {
-  "audience": [{"text": "收件人或受众", "source_span_ids": ["s001"], "surface_tokens": ["必须在成稿出现且逐字来自原文的称谓"]}],
+  "audience": [{"text": "收件人或受众", "source_span_ids": ["s001"], "surface_tokens": ["逐字来自原文的受众证据"], "delivery_mode": "explicit_reference|direct_address"}],
   "units": [{
     "id": "u1",
     "kind": "claim|action|advice|constraint|question|uncertainty|style",
-    "delivery_role": "recipient_content|style_directive|editor_directive",
+    "delivery_role": "recipient_content|style_directive|editor_directive|excluded_content",
     "final_meaning": "最终仍有效的含义",
     "source_span_ids": ["s001"],
     "status": "keep|replace|remove",
     "modality": "confirmed|possible|pending|prohibited|not_promised|promised|recommended",
-    "exact_tokens": ["必须精确保留的数字、日期、路径、命令、名称；没有则空数组"]
+    "exact_tokens": ["必须精确保留的数字、日期、路径、命令、名称；没有则空数组"],
+    "surface_tokens": ["style_directive/editor_directive/excluded_content 在原文中的幕后或排除措辞；recipient_content 必须为空数组"]
   }],
   "corrections": [{"subject": "被改口对象", "old_span_ids": ["s001"], "final_span_ids": ["s002"], "old_value": "旧值", "final_value": "最终值", "rendering_policy": "final_only|announce_change"}],
   "conditionals": [{
@@ -119,16 +120,23 @@ delivery_role 必须区分“要让收件人知道什么”和“只指导本次
 - recipient_content：含义必须进入成稿；
 - style_directive：只应用语气、风格或表达方式，绝不能把“语气不要催”“写得自然一些”等幕后要求照抄成正文；
 - editor_directive：只执行删除、归类、排序、格式或任务层处理，绝不能把编辑过程写给收件人。
+- excluded_content：原文中存在、但用户明确要求不得向当前收件人披露的内部判断或旁注；只能作为排除证据，绝不能进入成稿。
 判断依据必须来自 source spans；同一句同时含正文与风格要求时拆成两个 unit，不得把 style_directive 混进 recipient_content。
+
+每个 style_directive/editor_directive/excluded_content 必须在 surface_tokens 中列出至少一个逐字来自其 source spans 的幕后或排除措辞，供本地检查成稿是否照抄；recipient_content 的 surface_tokens 必须为空。excluded_content 应优先列出不得披露的核心内容，而不只是“不要告诉对方”这类控制句。surface_tokens 只证明原话不得泄漏，不能代替真正要保留的 recipient_content。
+
+如果原文明确说某个内部判断、猜测、旁注或原因“不要告诉/不要写给/不要披露给”当前收件人，该内容只能建成 excluded_content，不得同时建成 recipient_content。类似“不要说这是对方操作问题”“语气别催”“不要责怪对方”若只是控制成稿语气，应建成 style_directive；除非原文明说要向收件人传达“这不是你的责任”，否则不得照抄成正文。
 
 第一人称的真实状态、边界和立场——例如名称尚未确认、不要代用户作决定、当前不能承诺——通常是要让收件人知道的 recipient_content，不是 editor_directive。editor_directive 必须明确指向本次写作操作（删除哪句、保留哪个精确 token、如何归类或排版）。只要原文仍包含可发送的事实或立场，units 就不能全部标成 style_directive/editor_directive。
 
 每条 correction 还必须区分输出策略：
 - final_only：只是当前口述中的口误、起步错误或尚未对外生效的旧值，成稿只保留最终值；
 - announce_change：旧安排已经发布、已经生效或用户明确要求向收件人宣布取消/变更，成稿必须同时传达“旧安排取消/已改为新安排”，不能只写最终值。
-必须依据 source spans 中的传播状态判断，不能因为出现“原来”就自动推断已经通知过。
+版本号、数字、附件版本、专名等错误值即使已经出现在上一条消息里，只要“此前内容有误 + 最终正确值”已经足够让收件人采取行动，旧错误值仍使用 final_only；不得为了复述纠错过程保留它。只有旧安排、承诺、会议时间、执行状态等可能继续影响收件人行动的内容，才使用 announce_change。必须依据 source spans 中的传播状态和收件人是否仍需知道旧安排判断，不能因为出现“原来”“刚才发错”就自动选择 announce_change。
 
-audience 中的 surface_tokens 必须逐字来自所引用的 source spans，并且至少一个必须出现在成稿；它只用于防止丢失“团队、客户、小林”等接收对象，不得把上下文中的人名加入正文。若原文是“跟团队说/回复客户”，成稿应改成自然的直接消息或明确通知对象，不要机械照抄外层口述指令。
+“不要替我猜/确定具体版本、名称、错误码”若是在约束本次润色不得补造未知事实，应拆成两项：未确认状态是 recipient_content，禁止润色器猜测是 editor_directive；成稿只呈现未确认状态，不照抄幕后命令。若原文是在要求现实中的收件人不要替用户做决定或采取行动，则仍属于 recipient_content，不得误删。
+
+audience 中的 surface_tokens 必须逐字来自所引用的 source spans，只作为受众来源证据。delivery_mode=explicit_reference 时成稿必须明确出现受众称谓；delivery_mode=direct_address 时应改写成直接对收件人说的话，可以用“你/您/大家/各位”等直接称呼，不要求机械出现“客户”二字。若原文是“跟团队说/回复客户”，通常使用 direct_address，并删除“跟团队说/回复客户”这一外层口述指令；不得把上下文中的人名加入正文。
 
 故障现象与后续排查动作必须拆成独立 unit。原文只说“先做 X”时，X 是 advice/recommended，不代表“做完一定解决”；只有原文明确给出因果或保证，才能建立确定结果。
 
@@ -141,7 +149,7 @@ dictated_symbol_mappings 只用于 code/aiPrompt 中明确口述出的“斜杠�
 
 PLANNER_REPAIR_SYSTEM = """你是 Muse 意图清单的格式与角色修复器。上一版局部 Ledger 没有通过本地 schema/自洽性检查；你只修 Ledger，不写成稿。
 
-重新阅读 source spans，根据 validation_error 修复字段、证据或 delivery_role。不能把真实正文、第一人称未确认状态、承诺边界或给收件人的禁止事项全部标成幕后指令；editor_directive 只用于明确控制本次写作操作的要求。不得借修复新增原文没有的事实、上下文映射或条件关系。
+重新阅读 source spans，根据 validation_error 修复字段、证据或 delivery_role。delivery_role 只能是 recipient_content、style_directive、editor_directive、excluded_content；不能把真实正文、第一人称未确认状态、承诺边界或给收件人的禁止事项全部标成幕后指令。editor_directive 只用于明确控制本次写作操作的要求；excluded_content 只用于用户明确要求不得向当前收件人披露的内部内容。audience 每项必须带 delivery_mode：explicit_reference 要求成稿明确提到对象，direct_address 表示直接对对象说话。不得借修复新增原文没有的事实、上下文映射或条件关系。
 
 正常 ASCII 命令或路径不要写入 technical_token_mappings；只有技术标识内部被 ASR 插入空格时才使用 technical_token_mappings。中文口述的斜杠、短横线、双横线、下划线、点、冒号或反斜杠必须写入 dictated_symbol_mappings：路径/文件名使用 spoken_ascii_symbols，命令行参数使用 spoken_cli_symbols。映射不能取代正文 units。
 
@@ -152,7 +160,7 @@ GLOBAL_PLANNER_SYSTEM = """你是 Muse 语音润色的全文关系规划器。�
 
 只返回一个紧凑 JSON 对象：
 {
-  "global_audience": [{"text": "收件人或受众", "source_span_ids": ["s001"], "surface_tokens": ["团队"]}],
+  "global_audience": [{"text": "收件人或受众", "source_span_ids": ["s001"], "surface_tokens": ["团队"], "delivery_mode": "explicit_reference|direct_address"}],
   "global_corrections": [{"subject": "对象", "old_span_ids": ["s001"], "final_span_ids": ["s009"], "old_value": "旧值", "final_value": "最终值", "rendering_policy": "final_only|announce_change"}],
   "global_constraints": [{"meaning": "跨段仍需成立的约束", "source_span_ids": ["s002", "s008"], "modality": "confirmed|possible|pending|prohibited|not_promised|promised"}],
   "global_conditionals": [{
@@ -167,18 +175,18 @@ GLOBAL_PLANNER_SYSTEM = """你是 Muse 语音润色的全文关系规划器。�
   "structure": {"kind": "paragraphs|numbered_list|mixed|ai_prompt", "ordered_batch_ids": ["b01", "b02"]}
 }
 
-global_audience 必须合并局部 ledger 已识别的所有收件人及其 surface_tokens。global_corrections 必须包含局部 ledger 已识别的改口以及跨 batch 改口，并保留其 rendering_policy；跨 batch 新发现的改口也必须判断 final_only 或 announce_change。global_conditionals 必须保留所有局部条件及跨 batch 条件，并把同一条件控制的多个后果放在同一个对象中。global_technical_token_mappings 与 global_dictated_symbol_mappings 只能去重合并局部已验证映射，不得发明新映射。只能引用实际提供的 span ID 和 batch ID。不要复制局部 unit 列表，不要输出 Markdown 代码块，不要解释。"""
+global_audience 必须合并局部 ledger 已识别的所有收件人、surface_tokens 与 delivery_mode。global_corrections 必须包含局部 ledger 已识别的改口以及跨 batch 改口，并保留其 rendering_policy；跨 batch 新发现的改口也必须判断 final_only 或 announce_change。global_conditionals 必须保留所有局部条件及跨 batch 条件，并把同一条件控制的多个后果放在同一个对象中；style_directive、editor_directive、excluded_content 不得被当成需要写进正文的条件后果。global_technical_token_mappings 与 global_dictated_symbol_mappings 只能去重合并局部已验证映射，不得发明新映射。只能引用实际提供的 span ID 和 batch ID。不要复制局部 unit 列表，不要输出 Markdown 代码块，不要解释。"""
 
 
 WRITER_SYSTEM = """你是 Muse 语音润色的分段成稿 Writer。你的交付物是整篇成稿中的一个连续片段。
 
 严格依据语音转写和意图清单：保留最终事实、独立约束、收件人、语气、待确认与不承诺边界；删除口吃、机械重复、被撤回旧值、改口过程和幕后编辑说明；不得摘要长文，不得补写原因、承诺、人物、日期或结论。
 
-逐个执行 unit.delivery_role：recipient_content 才把含义写入正文；style_directive 只改变表达效果，不能复述成“语气不要催”“措辞自然”等编辑说明；editor_directive 只执行对应操作，不能出现在成稿。若同一 source span 同时有正文与风格要求，只输出 recipient_content，并让风格自然体现在措辞里。
+逐个执行 unit.delivery_role：recipient_content 才把含义写入正文；style_directive 只改变表达效果，不能复述成“语气不要催”“措辞自然”等编辑说明；editor_directive 只执行对应操作，不能出现在成稿；excluded_content 是明确禁止向当前收件人披露的内部信息，必须完整排除。若同一 source span 同时有正文与风格要求，只输出 recipient_content，并让风格自然体现在措辞里。
 
 逐条执行 correction.rendering_policy：final_only 删除旧值与改口过程，只写最终值；announce_change 必须让收件人明确知道旧安排已取消或发生变更，再写最终安排。不得把 announce_change 错当成普通口误静默删除。
 
-global_audience 中每个对象至少一个 surface_token 必须进入成稿；把“跟团队说/回复客户”等外层口述整理成自然的直接消息或明确通知对象，不要照抄口述动作。
+按 global_audience.delivery_mode 落实受众：explicit_reference 明确出现受众称谓；direct_address 直接对受众说话，可以用你、您、大家、各位等自然称呼，不要求出现抽象角色名。把“跟团队说/回复客户”等外层口述整理成直接消息，不能照抄口述动作。
 
 技术标识统一使用 global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical。advice/recommended 只能表达建议、下一步或排查动作，不得写成执行后必然解决；promised 只保留原文已经作出的承诺，不得擅自增强承诺范围。
 
@@ -190,12 +198,12 @@ conditionals/global_conditionals 是条件逻辑的唯一准绳：条件的 pola
 
 若最后一个 source span 带 high_confidence_abandoned_tail，只删除其中标出的残缺尾句；不得把它扩写成“待确认”“尚未明确”或任何新事项。global_context_mappings 是已通过来源校验的标准写法，成稿中同一实体必须统一采用 canonical。
 
-只输出本片段成稿，不要解释，不要加“润色结果”等前缀，不要自行添加全篇编号。"""
+自然语言短句必须使用合适的句末标点，问句使用问号。只输出本片段成稿，不要解释，不要加“润色结果”等前缀，不要自行添加全篇编号。"""
 
 
 REVIEWER_SYSTEM = """你是与 Writer 隔离的 Muse 语音润色复核器。你不负责改写全文，只负责根据语音转写、已授权上下文和意图清单检查候选成稿。
 
-逐项核对：最终事实、改口后的最终值、被撤回旧值、独立约束、收件人、主体-动作-时间关系、否定范围、不承诺/已承诺/未确认状态、上下文纠错与上下文泄漏、AI Prompt 的任务层级、长文是否摘要或遗漏。global_audience 的接收对象不得遗漏，外层“跟谁说/回复谁”应落实为自然成稿。advice/recommended 不得被写成确定因果或保证结果；global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical 必须精确出现，alias 不得残留。对 conditionals/global_conditionals 必须重新阅读对应 source spans，独立核对条件 polarity、每个后果 polarity 及共同作用范围；不得因为 Writer 与 Planner 表述一致就默认正确。逐个检查 delivery_role：recipient_content 不得遗漏；style_directive/editor_directive 的幕后措辞不得出现在候选成稿，只能看到其执行结果。逐条检查 correction.rendering_policy：final_only 不得残留旧值；announce_change 不得只剩最终值，必须保留旧安排取消/变更这一对收件人有用的信息。resolved_correction 的旧位置不得重复呈现 final_value；high_confidence_abandoned_tail 必须删除且不得被扩写成待确认事项；global_context_mappings 指定的同一实体不得混用 alias 与 canonical。没有来源证据的问题不得成立。
+逐项核对：最终事实、改口后的最终值、被撤回旧值、独立约束、收件人、主体-动作-时间关系、否定范围、不承诺/已承诺/未确认状态、上下文纠错与上下文泄漏、AI Prompt 的任务层级、长文是否摘要或遗漏。global_audience 的接收对象不得遗漏；direct_address 可以由自然的第二人称或直接称呼实现，不能硬性要求出现“客户”等抽象角色词，外层“跟谁说/回复谁”不得照抄。advice/recommended 不得被写成确定因果或保证结果；global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical 必须精确出现，alias 不得残留。对 conditionals/global_conditionals 必须重新阅读对应 source spans，独立核对条件 polarity、每个后果 polarity 及共同作用范围；不得因为 Writer 与 Planner 表述一致就默认正确。逐个检查 delivery_role：recipient_content 不得遗漏；style_directive/editor_directive 只能看到执行结果；excluded_content 及其同义改写都不得披露。不得把 style_directive、editor_directive 或 excluded_content 作为 missing 正文要求。逐条检查 correction.rendering_policy：final_only 不得残留旧值；announce_change 不得只剩最终值，必须保留旧安排取消/变更这一对收件人有用的信息。resolved_correction 的旧位置不得重复呈现 final_value；high_confidence_abandoned_tail 必须删除且不得被扩写成待确认事项；global_context_mappings 指定的同一实体不得混用 alias 与 canonical。没有来源证据的问题不得成立。
 
 只返回一个 JSON 对象：
 {
@@ -215,7 +223,7 @@ REVIEWER_SYSTEM = """你是与 Writer 隔离的 Muse 语音润色复核器。你
 
 REPAIR_SYSTEM = """你是 Muse 语音润色的定向片段修复器。根据当前 batch 原文、局部意图清单、全文关系、上一版片段和独立复核问题，只修改被指出的局部。
 
-不得把上一版成稿当作新事实来源，不得补写原文没有的事实，不得摘要。global_audience 缺失时只恢复对应接收对象，并把外层口述整理成自然的通知或直接消息。advice/recommended 不得升级成保证结果，promised 不得扩大原承诺；技术标识使用 global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical。修复条件关系时必须逐项遵守 global_conditionals，不能只改条件句而遗留后果的错误否定。recipient_content 必须保留；style_directive/editor_directive 只执行，不复述幕后措辞。correction 为 final_only 时只留最终值；为 announce_change 时必须保留旧安排取消/变更的收件人信息。resolved_correction 的旧位置只删除旧值，不重复写 final_value；high_confidence_abandoned_tail 只删除，不升级成待确认；global_context_mappings 必须统一应用。只输出修复后的当前 batch 完整片段，不要解释。"""
+不得把上一版成稿当作新事实来源，不得补写原文没有的事实，不得摘要。global_audience 缺失时按 delivery_mode 恢复受众：direct_address 使用自然的第二人称或直接称呼，不能机械补“客户”；并删除外层口述指令。advice/recommended 不得升级成保证结果，promised 不得扩大原承诺；技术标识使用 global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical。修复条件关系时必须逐项遵守 global_conditionals，不能只改条件句而遗留后果的错误否定。recipient_content 必须保留；style_directive/editor_directive 只执行，不复述幕后措辞；excluded_content 及其同义改写必须删除。correction 为 final_only 时只留最终值；为 announce_change 时必须保留旧安排取消/变更的收件人信息。resolved_correction 的旧位置只删除旧值，不重复写 final_value；high_confidence_abandoned_tail 只删除，不升级成待确认；global_context_mappings 必须统一应用。只输出修复后的当前 batch 完整片段，不要解释。"""
 
 
 @dataclass(frozen=True)
@@ -322,7 +330,7 @@ def load_dataset(path: Path) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         raise ExperimentError(f"数据集不存在、非普通文件或是符号链接：{path}")
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("schema_version") != 1 or value.get("case_count") != 25:
+    if value.get("schema_version") != 2 or value.get("case_count") != 25:
         raise ExperimentError("核心语义数据集身份不正确")
     return value
 
@@ -971,6 +979,11 @@ def sanitize_ledger_token_mappings(
         if isinstance(mapping, dict) and isinstance(mapping.get("alias"), str)
     }
     diagnostics: list[dict[str, Any]] = []
+    verified_context_aliases = {
+        mapping.get("alias")
+        for mapping in ledger.get("context_mappings", [])
+        if isinstance(mapping, dict)
+    }
     for mapping in technical:
         if not isinstance(mapping, dict):
             accepted_technical.append(mapping)
@@ -978,6 +991,14 @@ def sanitize_ledger_token_mappings(
         alias = mapping.get("alias")
         canonical = mapping.get("canonical")
         transform = mapping.get("transform")
+        if alias in verified_context_aliases:
+            diagnostics.append(
+                {
+                    "type": "discarded_duplicate_context_technical_mapping",
+                    "mapping": mapping,
+                }
+            )
+            continue
         if (
             transform == "remove_internal_ascii_whitespace"
             and isinstance(alias, str)
@@ -1033,6 +1054,56 @@ def sanitize_ledger_token_mappings(
         accepted_technical.append(mapping)
     ledger["technical_token_mappings"] = accepted_technical
     ledger["dictated_symbol_mappings"] = accepted_dictated
+    return diagnostics
+
+
+def sanitize_ledger_unit_shape(ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    """只修可由单元自身文字确定证明的 typed schema 错位。"""
+    units = ledger.get("units")
+    if not isinstance(units, list):
+        return []
+    diagnostics: list[dict[str, Any]] = []
+    replacement_kind = {
+        "style_directive": "style",
+        "editor_directive": "constraint",
+        "excluded_content": "constraint",
+    }
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        raw_kind = unit.get("kind")
+        role = unit.get("delivery_role")
+        if raw_kind != role or raw_kind not in replacement_kind:
+            continue
+        normalized_kind = replacement_kind[raw_kind]
+        unit["kind"] = normalized_kind
+        diagnostics.append(
+            {
+                "type": "normalized_delivery_role_misplaced_in_kind",
+                "unit_id": unit.get("id"),
+                "raw_kind": raw_kind,
+                "normalized_kind": normalized_kind,
+            }
+        )
+
+    for unit in units:
+        if not isinstance(unit, dict) or unit.get("delivery_role") != "recipient_content":
+            continue
+        meaning = str(unit.get("final_meaning", ""))
+        if not re.search(r"(?:不要|不得|不能|无法|不)承诺|(?:不要|不得|不能|无法|不)保证", meaning):
+            continue
+        if unit.get("modality") == "not_promised":
+            continue
+        previous = unit.get("modality")
+        unit["modality"] = "not_promised"
+        diagnostics.append(
+            {
+                "type": "normalized_explicit_non_commitment_modality",
+                "unit_id": unit.get("id"),
+                "raw_modality": previous,
+                "normalized_modality": "not_promised",
+            }
+        )
     return diagnostics
 
 
@@ -1183,6 +1254,82 @@ def apply_verified_mappings(text: str, global_plan: dict[str, Any]) -> str:
     )
 
 
+def normalize_writer_fragment(
+    text: str,
+    case: dict[str, Any],
+    ledger: dict[str, Any],
+    global_plan: dict[str, Any],
+) -> str:
+    """只补可确定的自然短句终止标点，不改变正文语义。"""
+    result = apply_verified_mappings(text, global_plan).rstrip()
+    if case.get("writing_scene") == "aiPrompt" and re.search(
+        r"(?:整理|改写|生成|写)[^\n。]{0,40}[Pp]rompt",
+        case.get("spoken_input", ""),
+    ):
+        task_layer_sentence = re.compile(
+            r"(?:整理|改写|生成|制作|输出|写)(?:为|成)?[^。！？\n]{0,30}"
+            r"(?:[Pp]rompt|任务|要求|说明)"
+            r"|不(?:要)?(?:现在|先|暂时|目前)?(?:开始|执行|进行)(?:研究|分析|任务)"
+            r"|只(?:整理|改写|生成|输出)(?:以下)?(?:任务|要求|说明|\s*[Pp]rompt)",
+            flags=re.IGNORECASE,
+        )
+        first_paragraph, separator, remainder = result.partition("\n\n")
+        first_sentences = re.findall(r"[^。！？\n]+[。！？]?", first_paragraph)
+        filtered_first = "".join(
+            sentence
+            for sentence in first_sentences
+            if not task_layer_sentence.search(sentence)
+        ).strip()
+        result = (
+            f"{filtered_first}{separator}{remainder}"
+            if filtered_first
+            else remainder.lstrip()
+        )
+        result = re.sub(
+            r"^\s*(?:请)?(?:将|把)?(?:以下|这些)?[^\n。！？：:]{0,30}"
+            r"(?:整理|改写|生成|制作|输出|写)(?:为|成)?[^\n。！？：:]{0,24}"
+            r"[Pp]rompt\s*(?:[。！？]\s*|[：:]\s*)",
+            "",
+            result,
+            count=1,
+        )
+        result = re.sub(
+            r"(?:^|(?<=[。！？\n]))\s*(?:本次|现在|当前|先|暂时|目前)?"
+            r"(?:只(?:整理|输出)(?:任务|要求|说明)|不(?:要)?(?:现在|先|暂时|目前)?(?:开始|执行|进行)(?:研究|分析|任务))"
+            r"(?:[，,]\s*(?:只(?:整理|输出)(?:任务|要求|说明)|不(?:要)?(?:现在|先|暂时|目前)?(?:开始|执行|进行)(?:研究|分析|任务)))?"
+            r"\s*[。！？]?\s*",
+            "",
+            result,
+        ).lstrip()
+    for audience in global_plan.get("global_audience", []):
+        if audience.get("delivery_mode") != "direct_address":
+            continue
+        for token in audience.get("surface_tokens", []):
+            outer_instruction = re.compile(
+                rf"^\s*(?:跟|给|回复)\s*{re.escape(token)}\s*(?:说|回(?:复)?(?:一下)?|写|发(?:一条)?(?:消息)?)?[：:,，\s]*"
+            )
+            match = outer_instruction.match(result)
+            if match is None or match.end() == 0:
+                continue
+            remainder = result[match.end():].lstrip()
+            if remainder:
+                result = f"{token}，{remainder}"
+            break
+    if (
+        not result
+        or case.get("writing_scene") in {"code", "aiPrompt"}
+        or ledger.get("structure", {}).get("kind") != "sentence"
+        or re.search(r"[。！？!?…]$", result)
+    ):
+        return result
+    has_question = any(
+        unit.get("delivery_role") == "recipient_content"
+        and unit.get("kind") == "question"
+        for unit in ledger.get("units", [])
+    )
+    return result + ("？" if has_question else "。")
+
+
 def validate_ledger(
     case: dict[str, Any], ledger: dict[str, Any], visible_spans: list[dict[str, Any]]
 ) -> None:
@@ -1197,6 +1344,7 @@ def validate_ledger(
         "recipient_content",
         "style_directive",
         "editor_directive",
+        "excluded_content",
     }
     allowed_kinds = {
         "claim",
@@ -1242,10 +1390,34 @@ def validate_ledger(
         if unit["modality"] == "recommended" and unit["kind"] not in {
             "action",
             "advice",
+            "constraint",
             "style",
         }:
             raise ExperimentError(
-                f"意图单元 {unit_id} recommended 只允许 action、advice 或 style"
+                f"意图单元 {unit_id} recommended 只允许 action、advice、constraint 或 style"
+            )
+        surface_tokens = unit.get("surface_tokens")
+        if not isinstance(surface_tokens, list) or any(
+            not isinstance(token, str) or not token for token in surface_tokens
+        ):
+            raise ExperimentError(
+                f"意图单元 {unit_id} surface_tokens 必须是字符串数组"
+            )
+        unit_evidence = "".join(
+            span["text"]
+            for span in visible_spans
+            if span["id"] in unit.get("source_span_ids", [])
+        )
+        if unit["delivery_role"] == "recipient_content":
+            if surface_tokens:
+                raise ExperimentError(
+                    f"意图单元 {unit_id} recipient_content 不得声明幕后 surface_tokens"
+                )
+        elif not surface_tokens or any(
+            token not in unit_evidence for token in surface_tokens
+        ):
+            raise ExperimentError(
+                f"意图单元 {unit_id} 幕后 surface_tokens 必须非空且逐字来自 source spans"
             )
         observed_delivery_roles.append(unit["delivery_role"])
     if "recipient_content" not in observed_delivery_roles:
@@ -1283,6 +1455,11 @@ def validate_ledger(
         )
         if any(token not in audience_evidence for token in surface_tokens):
             raise ExperimentError("收件人 surface_tokens 必须逐字来自引用的 source spans")
+        if item.get("delivery_mode") not in {
+            "explicit_reference",
+            "direct_address",
+        }:
+            raise ExperimentError("收件人 delivery_mode 缺失或不合法")
 
     corrections = ledger.get("corrections", [])
     if not isinstance(corrections, list):
@@ -1364,12 +1541,29 @@ def parse_and_validate_ledger(
     batch: dict[str, Any],
     response_text: str,
     label: str,
+    preflight_mappings: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ledger = parse_json_object(response_text, label)
-    diagnostics = sanitize_ledger_token_mappings(ledger)
-    diagnostics.extend(sanitize_ledger_context_mappings(
-        case, ledger, batch["source_spans"]
-    ))
+    diagnostics = sanitize_ledger_unit_shape(ledger)
+    ledger_context_mappings = ledger.get("context_mappings")
+    if not isinstance(ledger_context_mappings, list):
+        raise ExperimentError("意图清单 context_mappings 必须是数组")
+    batch_span_ids = {span["id"] for span in batch["source_spans"]}
+    for mapping in preflight_mappings or []:
+        if not set(mapping.get("source_span_ids", [])).issubset(batch_span_ids):
+            continue
+        if any(
+            existing.get("alias") == mapping.get("alias")
+            and existing.get("canonical") == mapping.get("canonical")
+            for existing in ledger_context_mappings
+            if isinstance(existing, dict)
+        ):
+            continue
+        ledger_context_mappings.append(copy.deepcopy(mapping))
+    diagnostics.extend(
+        sanitize_ledger_context_mappings(case, ledger, batch["source_spans"])
+    )
+    diagnostics.extend(sanitize_ledger_token_mappings(ledger))
     validate_ledger(case, ledger, batch["source_spans"])
     return ledger, diagnostics
 
@@ -1415,6 +1609,11 @@ def validate_global_plan(
         evidence = "".join(span_text_by_id[span_id] for span_id in span_ids)
         if any(token not in evidence for token in surface_tokens):
             raise ExperimentError("全文收件人 surface_tokens 无法回溯原文")
+        if item.get("delivery_mode") not in {
+            "explicit_reference",
+            "direct_address",
+        }:
+            raise ExperimentError("全文收件人 delivery_mode 缺失或不合法")
     for correction in corrections:
         if not isinstance(correction, dict):
             raise ExperimentError("全文改口关系必须是对象")
@@ -1561,12 +1760,16 @@ def sanitize_review_for_delivery_roles(
     for issue in review.get("issues", []):
         unit_ids = issue.get("unit_ids", [])
         cited_roles = [roles_by_unit_id.get(unit_id, set()) for unit_id in unit_ids]
-        provably_editor_only = bool(cited_roles) and all(
-            roles == {"editor_directive"} for roles in cited_roles
+        provably_non_recipient = bool(cited_roles) and all(
+            roles
+            and roles.issubset(
+                {"style_directive", "editor_directive", "excluded_content"}
+            )
+            for roles in cited_roles
         )
         empty_draft_span = not str(issue.get("draft_span", "")).strip()
         if (
-            provably_editor_only
+            provably_non_recipient
             and empty_draft_span
             and issue.get("type") in {"missing", "instruction_leak"}
         ):
@@ -1574,7 +1777,7 @@ def sanitize_review_for_delivery_roles(
                 {
                     "type": "discarded_contradictory_reviewer_issue",
                     "unit_ids": unit_ids,
-                    "reason": "editor_directive_without_draft_evidence_must_not_be_rendered",
+                    "reason": "non_recipient_unit_without_draft_evidence_must_not_be_rendered",
                 }
             )
             continue
@@ -1586,6 +1789,31 @@ def sanitize_review_for_delivery_roles(
     return sanitized, diagnostics
 
 
+NON_COMMITMENT_PATTERN = re.compile(
+    r"(?:不要|不得|不能|无法|不|未)(?:再|轻易|直接)?(?:承诺|保证)"
+)
+
+
+def output_preserves_non_commitment(
+    output: str, unit: dict[str, Any]
+) -> bool:
+    """在同一事实附近确认“不承诺”，避免偷换成“事情不会发生”。"""
+    anchors = [
+        str(token).strip()
+        for token in unit.get("exact_tokens", [])
+        if isinstance(token, str) and token.strip()
+    ]
+    if not anchors:
+        return bool(NON_COMMITMENT_PATTERN.search(output))
+    for anchor in anchors:
+        for match in re.finditer(re.escape(anchor), output):
+            start = max(0, match.start() - 120)
+            end = min(len(output), match.end() + 160)
+            if NON_COMMITMENT_PATTERN.search(output[start:end]):
+                return True
+    return False
+
+
 def deterministic_output_issues(
     case: dict[str, Any],
     spans: list[dict[str, Any]],
@@ -1594,28 +1822,55 @@ def deterministic_output_issues(
     global_plan: dict[str, Any] | None = None,
     batches: list[dict[str, Any]] | None = None,
     fragments: list[dict[str, str]] | None = None,
+    planned_batches: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """只检查能由产品任务层级确定证明的错误，不判断开放式自然度。"""
     issues: list[dict[str, Any]] = []
     if global_plan is not None:
         for audience in global_plan.get("global_audience", []):
             surface_tokens = audience.get("surface_tokens", [])
-            if any(token in output for token in surface_tokens):
-                continue
+            delivery_mode = audience.get("delivery_mode")
             audience_text = str(audience.get("text", "收件人")).strip()
-            issues.append(
-                {
-                    "type": "missing",
-                    "severity": "major",
-                    "unit_ids": [],
-                    "source_span_ids": audience.get("source_span_ids", []),
-                    "draft_span": "",
-                    "repair_instruction": (
-                        f"恢复接收对象“{audience_text}”，并用自然的直接消息或通知表达；"
-                        "不得只保留事件正文。"
-                    ),
-                }
-            )
+            direct_address_markers = ("你", "您", "大家", "各位")
+            realized = any(token in output for token in surface_tokens)
+            if delivery_mode == "direct_address":
+                realized = realized or any(
+                    marker in output for marker in direct_address_markers
+                )
+            if not realized:
+                issues.append(
+                    {
+                        "type": "missing",
+                        "severity": "major",
+                        "unit_ids": [],
+                        "source_span_ids": audience.get("source_span_ids", []),
+                        "draft_span": "",
+                        "repair_instruction": (
+                            f"恢复接收对象“{audience_text}”；direct_address 应直接对其说话，"
+                            "explicit_reference 应明确提到对象，不得只保留事件正文。"
+                        ),
+                    }
+                )
+            for token in surface_tokens:
+                outer_instruction = re.compile(
+                    rf"^\s*(?:跟|给|回复)\s*{re.escape(token)}\s*(?:说|回(?:复)?(?:一下)?|写|发(?:一条)?(?:消息)?|[：:,，])"
+                )
+                match = outer_instruction.search(output)
+                if match is None:
+                    continue
+                issues.append(
+                    {
+                        "type": "task_layer",
+                        "severity": "major",
+                        "unit_ids": [],
+                        "source_span_ids": audience.get("source_span_ids", []),
+                        "draft_span": match.group(0),
+                        "repair_instruction": (
+                            f"删除外层转述指令“{match.group(0).strip()}”，"
+                            f"改成直接面向“{audience_text}”的消息或自然通知。"
+                        ),
+                    }
+                )
         for mapping in global_plan.get("global_technical_token_mappings", []):
             alias = mapping.get("alias", "")
             canonical = mapping.get("canonical", "")
@@ -1652,11 +1907,153 @@ def deterministic_output_issues(
                     ),
                 }
             )
+        if planned_batches is not None:
+            recipient_units = [
+                unit
+                for planned in planned_batches
+                for unit in planned["local_ledger"].get("units", [])
+                if unit.get("delivery_role") == "recipient_content"
+            ]
+            for mapping in global_plan.get("global_context_mappings", []):
+                canonical = str(mapping.get("canonical", "")).strip()
+                mapping_spans = set(mapping.get("source_span_ids", []))
+                is_recipient_entity = any(
+                    mapping_spans & set(unit.get("source_span_ids", []))
+                    and (
+                        canonical in str(unit.get("final_meaning", ""))
+                        or canonical in unit.get("exact_tokens", [])
+                    )
+                    for unit in recipient_units
+                )
+                if not canonical or not is_recipient_entity or canonical in output:
+                    continue
+                issues.append(
+                    {
+                        "type": "missing",
+                        "severity": "major",
+                        "unit_ids": [],
+                        "source_span_ids": mapping.get("source_span_ids", []),
+                        "draft_span": "",
+                        "repair_instruction": (
+                            f"恢复已由安全上下文确认且属于收件人正文的标准实体“{canonical}”；"
+                            "不得把上下文中的其他事实带入成稿。"
+                        ),
+                    }
+                )
+    if planned_batches is not None:
+        recipient_searchable = "\n".join(
+            "\n".join(
+                [
+                    str(unit.get("final_meaning", "")),
+                    *[str(token) for token in unit.get("exact_tokens", [])],
+                ]
+            )
+            for planned in planned_batches
+            for unit in planned["local_ledger"].get("units", [])
+            if unit.get("delivery_role") == "recipient_content"
+        )
+        for planned in planned_batches:
+            for unit in planned["local_ledger"].get("units", []):
+                if unit.get("delivery_role") == "recipient_content":
+                    if (
+                        unit.get("modality") == "not_promised"
+                        and not output_preserves_non_commitment(output, unit)
+                    ):
+                        issues.append(
+                            {
+                                "type": "wrong_modality",
+                                "severity": "major",
+                                "unit_ids": [unit.get("id", "")],
+                                "source_span_ids": unit.get("source_span_ids", []),
+                                "draft_span": "",
+                                "repair_instruction": (
+                                    "恢复原文的“不承诺/不保证”边界；不得把它改成事件确定不会发生，"
+                                    "也不得扩大成新的承诺。"
+                                ),
+                            }
+                        )
+                    continue
+                for token in unit.get("surface_tokens", []):
+                    if token not in output or token in recipient_searchable:
+                        continue
+                    role = unit.get("delivery_role")
+                    issues.append(
+                        {
+                            "type": (
+                                "context_leak"
+                                if role == "excluded_content"
+                                else "instruction_leak"
+                            ),
+                            "severity": "major",
+                            "unit_ids": [unit.get("id", "")],
+                            "source_span_ids": unit.get("source_span_ids", []),
+                            "draft_span": token,
+                            "repair_instruction": (
+                                (
+                                    f"删除明确不得向当前收件人披露的内容“{token}”及其同义改写；"
+                                    if role == "excluded_content"
+                                    else f"删除照抄的幕后措辞“{token}”，只执行其风格或编辑作用；"
+                                )
+                                + "不得删除同一 source spans 中的收件人正文、事实或未确认状态。"
+                            ),
+                        }
+                    )
+        if global_plan is not None:
+            for correction in global_plan.get("global_corrections", []):
+                if correction.get("rendering_policy") != "final_only":
+                    continue
+                old_value = str(correction.get("old_value", "")).strip()
+                final_value = str(correction.get("final_value", "")).strip()
+                if (
+                    not old_value
+                    or old_value not in output
+                    or old_value in final_value
+                ):
+                    continue
+                matched_related = False
+                matched_unrelated = False
+                for planned in planned_batches:
+                    for unit in planned["local_ledger"].get("units", []):
+                        searchable = "\n".join(
+                            [
+                                str(unit.get("final_meaning", "")),
+                                *[
+                                    str(token)
+                                    for token in unit.get("exact_tokens", [])
+                                ],
+                            ]
+                        )
+                        if old_value not in searchable:
+                            continue
+                        resolved = unit.get("resolved_correction", {})
+                        is_related = (
+                            resolved.get("old_value") == old_value
+                            and resolved.get("final_value") == final_value
+                            and resolved.get("rendering_policy") == "final_only"
+                        )
+                        matched_related = matched_related or is_related
+                        matched_unrelated = matched_unrelated or not is_related
+                if not matched_related or matched_unrelated:
+                    continue
+                issues.append(
+                    {
+                        "type": "obsolete_retained",
+                        "severity": "major",
+                        "unit_ids": [],
+                        "source_span_ids": correction.get("old_span_ids", []),
+                        "draft_span": old_value,
+                        "repair_instruction": (
+                            f"该改口是 final_only：删除旧值“{old_value}”及其口述修改过程，"
+                            f"只保留最终值“{final_value}”；同时保留附件发错、致歉等独立事实。"
+                        ),
+                    }
+                )
     if case.get("writing_scene") == "aiPrompt":
         meta_prompt_patterns = [
             r"(?:整理|改写|生成|制作|输出|写)成一?份?(?:可直接[^\n，。]{0,24})?\s*[Pp]rompt",
             r"(?:整理|改写|生成|制作|输出|写)[^\n。]{0,30}\s*[Pp]rompt",
             r"以下[^\n。]{0,30}整理[^\n。]{0,20}\s*[Pp]rompt",
+            r"(?:整理|改写|生成|制作|输出|写)(?:为|成)?[^\n。]{0,30}(?:任务|要求|说明)",
         ]
         matches = [
             match
@@ -1668,8 +2065,9 @@ def deterministic_output_issues(
         )
         if source_has_prompt_authoring_layer:
             editor_deferral_patterns = [
+                r"不(?:要)?(?:现在|先|暂时|目前)?(?:开始|执行|进行)(?:研究|分析|任务)",
                 r"(?:现在|先|暂时|目前)?不(?:要)?(?:开始|执行|进行)(?:研究|分析|任务)",
-                r"只(?:整理|改写|生成)(?:以下)?(?:任务|要求|\s*[Pp]rompt)",
+                r"只(?:整理|改写|生成|输出)(?:以下)?(?:任务|要求|说明|\s*[Pp]rompt)",
             ]
             matches.extend(
                 match
@@ -1997,6 +2395,7 @@ def run_case(
                     batch,
                     response["text"],
                     f"Planner {batch['id']}",
+                    preflight_mappings,
                 )
             except ExperimentError as first_error:
                 repair_stage = f"planner_repair:{batch['id']}"
@@ -2033,6 +2432,7 @@ def run_case(
                     batch,
                     repaired_response["text"],
                     f"Planner Repair {batch['id']}",
+                    preflight_mappings,
                 )
             record["planner_diagnostics"].extend(
                 {"stage": diagnostic_stage, **diagnostic}
@@ -2158,8 +2558,11 @@ def run_case(
             fragments.append(
                 {
                     "batch_id": batch["id"],
-                    "text": apply_verified_mappings(
-                        response["text"], global_plan
+                    "text": normalize_writer_fragment(
+                        response["text"],
+                        case,
+                        planned["local_ledger"],
+                        global_plan,
                     ),
                 }
             )
@@ -2203,6 +2606,7 @@ def run_case(
             global_plan=global_plan,
             batches=batches,
             fragments=fragments,
+            planned_batches=resolved_planned_batches,
         )
         record["initial_deterministic_issues"] = deterministic_issues
         review = merge_deterministic_issues(review, deterministic_issues)
@@ -2269,8 +2673,11 @@ def run_case(
             )
             record["raw_responses"].append({"stage": stage, "text": response["text"]})
             require_complete_response(response)
-            fragment_by_id[batch_id]["text"] = apply_verified_mappings(
-                response["text"], global_plan
+            fragment_by_id[batch_id]["text"] = normalize_writer_fragment(
+                response["text"],
+                case,
+                planned_by_batch[batch_id]["local_ledger"],
+                global_plan,
             )
         repaired = "\n\n".join(
             fragment_by_id[batch["id"]]["text"] for batch in batches
@@ -2321,6 +2728,7 @@ def run_case(
             global_plan=global_plan,
             batches=batches,
             fragments=repaired_fragments,
+            planned_batches=resolved_planned_batches,
         )
         record["confirm_deterministic_issues"] = confirm_deterministic_issues
         confirm = merge_deterministic_issues(confirm, confirm_deterministic_issues)
@@ -2556,6 +2964,7 @@ def self_test(dataset: dict[str, Any]) -> None:
                     "status": "keep",
                     "modality": "confirmed",
                     "exact_tokens": [],
+                    "surface_tokens": [],
                 }
             ],
             "corrections": [],
@@ -2772,12 +3181,230 @@ def self_test(dataset: dict[str, Any]) -> None:
                     "text": "团队",
                     "source_span_ids": ["s001"],
                     "surface_tokens": ["团队"],
+                    "delivery_mode": "explicit_reference",
                 }
             ]
         },
     )
     if not any(issue.get("type") == "missing" for issue in audience_issues):
         raise ExperimentError("收件人缺失未被确定性门禁识别")
+    direct_audience_issues = deterministic_output_issues(
+        {"writing_scene": "customerSupport", "spoken_input": "回复客户说已经收到"},
+        [{"id": "s001", "text": "回复客户说已经收到"}],
+        "您好，我们已经收到您的反馈。",
+        global_plan={
+            "global_audience": [
+                {
+                    "text": "客户",
+                    "source_span_ids": ["s001"],
+                    "surface_tokens": ["客户"],
+                    "delivery_mode": "direct_address",
+                }
+            ]
+        },
+    )
+    if direct_audience_issues:
+        raise ExperimentError("自然第二人称被错误判为收件人缺失")
+    outer_instruction_issues = deterministic_output_issues(
+        {"writing_scene": "workChat", "spoken_input": "跟团队说会议改期"},
+        [{"id": "s001", "text": "跟团队说会议改期"}],
+        "跟团队说：会议已经改期。",
+        global_plan={
+            "global_audience": [
+                {
+                    "text": "团队",
+                    "source_span_ids": ["s001"],
+                    "surface_tokens": ["团队"],
+                    "delivery_mode": "direct_address",
+                }
+            ]
+        },
+    )
+    if not any(issue.get("type") == "task_layer" for issue in outer_instruction_issues):
+        raise ExperimentError("外层转述指令未被确定性门禁识别")
+    instruction_issues = deterministic_output_issues(
+        {"writing_scene": "code", "spoken_input": "版本未确认不要替我确定"},
+        [{"id": "s001", "text": "版本未确认不要替我确定"}],
+        "版本未确认，不要替我确定。",
+        planned_batches=[
+            {
+                "batch_id": "b01",
+                "local_ledger": {
+                    "units": [
+                        {
+                            "id": "u1",
+                            "delivery_role": "recipient_content",
+                            "final_meaning": "版本未确认",
+                            "source_span_ids": ["s001"],
+                            "exact_tokens": [],
+                            "surface_tokens": [],
+                        },
+                        {
+                            "id": "u2",
+                            "delivery_role": "editor_directive",
+                            "final_meaning": "禁止润色器猜测版本",
+                            "source_span_ids": ["s001"],
+                            "exact_tokens": [],
+                            "surface_tokens": ["不要替我确定"],
+                        },
+                    ]
+                },
+            }
+        ],
+    )
+    if not any(
+        issue.get("type") == "instruction_leak" for issue in instruction_issues
+    ):
+        raise ExperimentError("幕后 surface token 泄漏未被确定性门禁识别")
+    excluded_issues = deterministic_output_issues(
+        {
+            "writing_scene": "customerSupport",
+            "spoken_input": "内部怀疑第三方接口波动先不要告诉客户",
+        },
+        [{"id": "s001", "text": "内部怀疑第三方接口波动先不要告诉客户"}],
+        "目前可能与第三方接口波动有关。",
+        planned_batches=[
+            {
+                "batch_id": "b01",
+                "local_ledger": {
+                    "units": [
+                        {
+                            "id": "u1",
+                            "delivery_role": "excluded_content",
+                            "final_meaning": "未确认的内部判断不得披露",
+                            "source_span_ids": ["s001"],
+                            "exact_tokens": [],
+                            "surface_tokens": ["第三方接口波动"],
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    if not any(issue.get("type") == "context_leak" for issue in excluded_issues):
+        raise ExperimentError("明确排除内容泄漏未被确定性门禁识别")
+    non_commitment_batches = [
+        {
+            "batch_id": "b01",
+            "local_ledger": {
+                "units": [
+                    {
+                        "id": "u1",
+                        "delivery_role": "recipient_content",
+                        "final_meaning": "邮件里不要承诺周五对外发布",
+                        "source_span_ids": ["s001"],
+                        "exact_tokens": ["周五上午"],
+                        "surface_tokens": [],
+                        "modality": "not_promised",
+                    }
+                ]
+            },
+        }
+    ]
+    wrong_modality_issues = deterministic_output_issues(
+        {
+            "writing_scene": "email",
+            "spoken_input": "周五上午发内部试看邮件里不要承诺周五对外发布",
+        },
+        [{"id": "s001", "text": "周五上午发内部试看邮件里不要承诺周五对外发布"}],
+        "周五上午先发内部试看，我们不会在周五对外发布。",
+        planned_batches=non_commitment_batches,
+    )
+    if not any(issue.get("type") == "wrong_modality" for issue in wrong_modality_issues):
+        raise ExperimentError("不承诺被偷换成事件不会发生时未被确定性门禁识别")
+    preserved_modality_issues = deterministic_output_issues(
+        {
+            "writing_scene": "email",
+            "spoken_input": "周五上午发内部试看邮件里不要承诺周五对外发布",
+        },
+        [{"id": "s001", "text": "周五上午发内部试看邮件里不要承诺周五对外发布"}],
+        "周五上午先发内部试看，邮件里不要承诺周五对外发布。",
+        planned_batches=non_commitment_batches,
+    )
+    if any(issue.get("type") == "wrong_modality" for issue in preserved_modality_issues):
+        raise ExperimentError("正确保留的不承诺边界被误判")
+    missing_context_entity_issues = deterministic_output_issues(
+        {
+            "writing_scene": "aiPrompt",
+            "spoken_input": "项目名按北城研究写",
+        },
+        [{"id": "s001", "text": "项目名按北城研究写"}],
+        "比较五款语音输入工具。",
+        global_plan={
+            "global_context_mappings": [
+                {
+                    "alias": "北城研究",
+                    "canonical": "北辰研究",
+                    "source_span_ids": ["s001"],
+                    "context_field": "selected_text",
+                }
+            ]
+        },
+        planned_batches=[
+            {
+                "batch_id": "b01",
+                "local_ledger": {
+                    "units": [
+                        {
+                            "id": "u1",
+                            "delivery_role": "recipient_content",
+                            "final_meaning": "项目名使用北辰研究",
+                            "source_span_ids": ["s001"],
+                            "exact_tokens": ["北辰研究"],
+                            "surface_tokens": [],
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    if not any(issue.get("type") == "missing" for issue in missing_context_entity_issues):
+        raise ExperimentError("安全上下文确认的收件人正文实体缺失未被门禁识别")
+    final_only_plan = {
+        "global_corrections": [
+            {
+                "subject": "附件版本",
+                "old_span_ids": ["s001"],
+                "final_span_ids": ["s001"],
+                "old_value": "第二版",
+                "final_value": "第三版",
+                "rendering_policy": "final_only",
+            }
+        ]
+    }
+    final_only_batches = [
+        {
+            "batch_id": "b01",
+            "local_ledger": {
+                "units": [
+                    {
+                        "id": "u1",
+                        "delivery_role": "recipient_content",
+                        "final_meaning": "附件不是第二版，正确版本是第三版",
+                        "source_span_ids": ["s001"],
+                        "exact_tokens": ["第三版"],
+                        "surface_tokens": [],
+                        "resolved_correction": {
+                            "old_value": "第二版",
+                            "final_value": "第三版",
+                            "rendering_policy": "final_only",
+                        },
+                    }
+                ]
+            },
+        }
+    ]
+    final_only_issues = deterministic_output_issues(
+        {"writing_scene": "email", "spoken_input": "附件不是第二版是第三版"},
+        [{"id": "s001", "text": "附件不是第二版是第三版"}],
+        "附件不是第二版，正确版本是第三版。",
+        global_plan=final_only_plan,
+        planned_batches=final_only_batches,
+    )
+    if not any(
+        issue.get("type") == "obsolete_retained" for issue in final_only_issues
+    ):
+        raise ExperimentError("final_only 独占旧值残留未被确定性门禁识别")
     sanitized_review, review_diagnostics = sanitize_review_for_delivery_roles(
         {
             "verdict": "repair",
@@ -2805,6 +3432,55 @@ def self_test(dataset: dict[str, Any]) -> None:
     )
     if sanitized_review.get("verdict") != "pass" or not review_diagnostics:
         raise ExperimentError("Reviewer 恢复 editor_directive 的矛盾意见未被丢弃")
+    if normalize_writer_fragment(
+        "你到哪了",
+        {"writing_scene": "chat"},
+        {
+            "structure": {"kind": "sentence"},
+            "units": [
+                {"delivery_role": "recipient_content", "kind": "question"}
+            ],
+        },
+        {},
+    ) != "你到哪了？":
+        raise ExperimentError("自然短问句未补齐问号")
+    normalized_ai_prompt = normalize_writer_fragment(
+        (
+            "请将以下研究要求整理为可直接执行的 Prompt。"
+            "项目名使用北辰研究。"
+            "本次只整理任务，不开始研究。"
+            "比较五款语音输入工具。"
+        ),
+        {
+            "writing_scene": "aiPrompt",
+            "spoken_input": "先把以下研究要求整理成Prompt先别开始研究只整理任务",
+        },
+        {"structure": {"kind": "ai_prompt"}, "units": []},
+        {},
+    )
+    if normalized_ai_prompt != "项目名使用北辰研究。比较五款语音输入工具。":
+        raise ExperimentError("AI Prompt 外层任务未被确定性去除")
+    shape_ledger = {
+        "units": [
+            {
+                "id": "u1",
+                "kind": "editor_directive",
+                "delivery_role": "editor_directive",
+            },
+            {
+                "id": "u2",
+                "kind": "action",
+                "delivery_role": "recipient_content",
+                "modality": "confirmed",
+                "final_meaning": "不要承诺周五发布",
+            }
+        ]
+    }
+    shape_diagnostics = sanitize_ledger_unit_shape(shape_ledger)
+    if shape_ledger["units"][0]["kind"] != "constraint" or not shape_diagnostics:
+        raise ExperimentError("delivery role 误填 kind 未被确定性归一")
+    if shape_ledger["units"][1]["modality"] != "not_promised":
+        raise ExperimentError("明确不承诺单元未被归一为 not_promised")
     validate_conditionals(
         [
             {

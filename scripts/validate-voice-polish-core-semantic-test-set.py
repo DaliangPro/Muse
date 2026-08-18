@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json"
 CORE = ROOT / "docs/2026-08-17-Muse-Voice-Polish-Core-Semantic-Test-Set.json"
 
-EXPECTED_SCHEMA_VERSION = 1
-EXPECTED_NAME = "Muse 语音润色核心语义测试集 V1"
+EXPECTED_SCHEMA_VERSION = 2
+EXPECTED_NAME = "Muse 语音润色核心语义测试集 V2"
 EXPECTED_IDS = [
     "micro-02",
     "micro-04",
@@ -42,11 +42,16 @@ EXPECTED_IDS = [
     "natural-long-09-asr-dirty-segments-1",
     "natural-long-10-asr-dirty-segments-2",
 ]
+STRESS_BOUNDARY_IDS = {
+    "natural-long-09-asr-dirty-segments-1",
+    "natural-long-10-asr-dirty-segments-2",
+}
 
 INPUT_KEYS = {
     "test_input_id",
     "source_case_id",
     "input_kind",
+    "acceptance_tier",
     "title",
     "writing_scene",
     "spoken_input",
@@ -128,6 +133,12 @@ def main() -> None:
     ):
         if rules.get(key) is not True:
             fail(f"盲测规则 {key} 必须为 true")
+    if rules.get("primary_case_count") != 23:
+        fail("日常主验收样本必须固定为 23 条")
+    if rules.get("stress_boundary_case_count") != 2:
+        fail("压力边界样本必须固定为 2 条")
+    if rules.get("primary_long_text_target_chars") != "700-1500":
+        fail("日常长文本目标必须固定为 700-1500 字")
 
     inputs = core.get("inputs")
     if not isinstance(inputs, list):
@@ -165,6 +176,9 @@ def main() -> None:
         expected_values = {
             "source_case_id": base_case_id,
             "input_kind": "stress" if "base_case_id" in source_row else "base",
+            "acceptance_tier": (
+                "stress_boundary" if test_id in STRESS_BOUNDARY_IDS else "primary"
+            ),
             "writing_scene": source_row.get("writing_scene", base["writing_scene"]),
             "spoken_input": source_row["spoken_input"],
             "segment_texts": source_row.get("segment_texts", base["segment_texts"]),

@@ -74,6 +74,9 @@ final class AppState {
     var canUseVoicePolishCanonicalText = false
     var isRequestingVoicePolishCanonicalText = false
     var voicePolishCanonicalExitMessage: String?
+    var isVoicePolishUnavailable = false
+    var isRetryingVoicePolish = false
+    var voicePolishUnavailableMessage: String?
     var isQwen3OnlyMode: Bool {
         SenseVoiceServerManager.currentPort == nil && SenseVoiceServerManager.currentQwen3Port != nil
     }
@@ -84,6 +87,7 @@ final class AppState {
     @ObservationIgnored var onHidePanel: (() -> Void)?
     @ObservationIgnored var onCopyFallbackVisibilityChange: ((Bool) -> Void)?
     @ObservationIgnored var onUseVoicePolishCanonicalText: (() async -> Bool)?
+    @ObservationIgnored var onRetryVoicePolish: (() async -> Bool)?
     @ObservationIgnored private let voicePolishCanonicalExitDelay: Duration
     @ObservationIgnored private var voicePolishCanonicalExitGeneration = 0
     /// canonical 已接受或 pipeline 已提交结果后，在 finalized/completed 之前屏蔽重复 ESC。
@@ -217,6 +221,9 @@ final class AppState {
 
     func showVoicePolishStage(_ stage: VoicePolishStage) {
         guard barPhase == .processing, currentMode.kind == .voicePolish else { return }
+        isVoicePolishUnavailable = false
+        isRetryingVoicePolish = false
+        voicePolishUnavailableMessage = nil
         let shouldScheduleCanonicalExit = voicePolishStage == nil
             && !canUseVoicePolishCanonicalText
         voicePolishStage = stage
@@ -236,6 +243,60 @@ final class AppState {
                   self.currentMode.kind == .voicePolish,
                   self.voicePolishStage != nil else { return }
             self.canUseVoicePolishCanonicalText = true
+        }
+    }
+
+    func showVoicePolishUnavailable(_ reason: VoicePolishFailureReason?) {
+        guard barPhase == .processing, currentMode.kind == .voicePolish else { return }
+        voicePolishCanonicalExitGeneration &+= 1
+        voicePolishStage = nil
+        isVoicePolishUnavailable = true
+        isRetryingVoicePolish = false
+        isRequestingVoicePolishCanonicalText = false
+        canUseVoicePolishCanonicalText = true
+        voicePolishCanonicalExitMessage = nil
+        switch reason {
+        case .timeout:
+            voicePolishUnavailableMessage = L(
+                "润色超时，原转写已保留",
+                "Polishing timed out. The transcript was preserved."
+            )
+        case .requestFailed:
+            voicePolishUnavailableMessage = L(
+                "润色服务暂时不可用，原转写已保留",
+                "Polishing is temporarily unavailable. The transcript was preserved."
+            )
+        case .validationFailed:
+            voicePolishUnavailableMessage = L(
+                "这次润色未通过核对，原转写已保留",
+                "This draft did not pass review. The transcript was preserved."
+            )
+        case .setupFailed, .none:
+            voicePolishUnavailableMessage = L(
+                "这次没有完成润色，原转写已保留",
+                "Polishing did not finish. The transcript was preserved."
+            )
+        }
+        onShowPanel?()
+    }
+
+    func retryVoicePolish() {
+        guard isVoicePolishUnavailable, !isRetryingVoicePolish else { return }
+        isRetryingVoicePolish = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let accepted = await self.onRetryVoicePolish?() ?? false
+            guard self.barPhase == .processing,
+                  self.currentMode.kind == .voicePolish else { return }
+            if accepted {
+                self.isVoicePolishUnavailable = false
+                self.voicePolishUnavailableMessage = nil
+                self.voicePolishStage = .analyzing
+                self.canUseVoicePolishCanonicalText = true
+            } else {
+                self.isRetryingVoicePolish = false
+                self.isVoicePolishUnavailable = true
+            }
         }
     }
 
@@ -263,8 +324,10 @@ final class AppState {
               canUseVoicePolishCanonicalText else { return .rejected }
         voicePolishCanonicalExitGeneration &+= 1
         let generation = voicePolishCanonicalExitGeneration
+        let wasUnavailable = isVoicePolishUnavailable
         canUseVoicePolishCanonicalText = false
         isRequestingVoicePolishCanonicalText = true
+        isVoicePolishUnavailable = false
         voicePolishCanonicalExitMessage = L("正在切换…", "Switching…")
 
         let accepted = await onUseVoicePolishCanonicalText?() ?? false
@@ -286,8 +349,9 @@ final class AppState {
             return .accepted
         }
 
-        if restoreOnFailure, voicePolishStage != nil {
+        if restoreOnFailure, voicePolishStage != nil || wasUnavailable {
             canUseVoicePolishCanonicalText = true
+            isVoicePolishUnavailable = wasUnavailable
             voicePolishCanonicalExitMessage = L(
                 "切换失败，点击重试",
                 "Switch failed — retry"
@@ -396,6 +460,9 @@ final class AppState {
         voicePolishStage = nil
         canUseVoicePolishCanonicalText = false
         isRequestingVoicePolishCanonicalText = false
+        isVoicePolishUnavailable = false
+        isRetryingVoicePolish = false
+        voicePolishUnavailableMessage = nil
         if !preserveTerminalResult {
             hasCommittedVoicePolishTerminalResult = false
         }

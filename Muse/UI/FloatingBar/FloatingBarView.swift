@@ -19,15 +19,23 @@ protocol FloatingBarState: AnyObject, Observable {
     var canUseVoicePolishCanonicalText: Bool { get }
     var isRequestingVoicePolishCanonicalText: Bool { get }
     var voicePolishCanonicalExitMessage: String? { get }
+    var isVoicePolishUnavailable: Bool { get }
+    var isRetryingVoicePolish: Bool { get }
+    var voicePolishUnavailableMessage: String? { get }
     /// True when recording without SenseVoice streaming (Qwen3-only).
     var isQwen3OnlyMode: Bool { get }
     func copyFallbackToClipboard()
     func useVoicePolishCanonicalText()
+    func retryVoicePolish()
 }
 
 extension FloatingBarState {
     var isRequestingVoicePolishCanonicalText: Bool { false }
     var voicePolishCanonicalExitMessage: String? { nil }
+    var isVoicePolishUnavailable: Bool { false }
+    var isRetryingVoicePolish: Bool { false }
+    var voicePolishUnavailableMessage: String? { nil }
+    func retryVoicePolish() {}
 }
 
 /// Dark-themed floating transcription bar with smooth morphing between states.
@@ -406,7 +414,10 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 timeline.date.timeIntervalSince(processingStartDate ?? timeline.date)
             )
             let showsLiveElapsed = state.currentMode.kind != .voicePolish
-            HStack(spacing: 5) {
+            if state.isVoicePolishUnavailable {
+                voicePolishUnavailableContent
+            } else {
+                HStack(spacing: 5) {
                 HStack(spacing: 5) {
                     Text(processingLabel)
                     if showsLiveElapsed {
@@ -462,11 +473,51 @@ struct FloatingBarView<S: FloatingBarState>: View {
                         .font(.system(size: 11, weight: .semibold))
                         .opacity(0.82)
                 }
+                }
+                .font(TF.hudFontTitle)
+                .floatingBarReadableText(color: barTextColor)
             }
-            .font(TF.hudFontTitle)
-            .floatingBarReadableText(color: barTextColor)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var voicePolishUnavailableContent: some View {
+        HStack(spacing: 7) {
+            Text(state.voicePolishUnavailableMessage ?? L(
+                "这次没有完成润色，原转写已保留",
+                "Polishing did not finish. The transcript was preserved."
+            ))
+            .font(.system(size: 11, weight: .semibold))
+            .lineLimit(1)
+
+            Button {
+                state.retryVoicePolish()
+            } label: {
+                Text(state.isRetryingVoicePolish ? L("正在重试…", "Retrying…") : L("重试润色", "Retry"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background { Capsule().fill(Color.white.opacity(0.14)) }
+            }
+            .buttonStyle(.plain)
+            .disabled(state.isRetryingVoicePolish)
+
+            Button {
+                state.useVoicePolishCanonicalText()
+            } label: {
+                Text(L("使用原转写", "Use transcript"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background { Capsule().fill(Color.white.opacity(0.14)) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(L(
+                "使用已完成术语纠正的原转写并继续输入",
+                "Use the terminology-corrected transcript and continue"
+            ))
+        }
+        .floatingBarReadableText(color: barTextColor)
     }
 
     private var doneContent: some View {
@@ -748,6 +799,12 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private func processingWidth() -> CGFloat {
         // 普通模式给持续更新的“· 0.0s”留固定宽度；Voice Polish 使用稳定的
         // “正在润色”文案，不把累计时间误呈现成多个阶段耗时。
+        if state.isVoicePolishUnavailable {
+            return min(
+                TF.barFallbackWidth,
+                max(520, measureText(state.voicePolishUnavailableMessage ?? "") + 250)
+            )
+        }
         let showsCanonicalExitStatus = state.canUseVoicePolishCanonicalText
             || state.isRequestingVoicePolishCanonicalText
             || state.voicePolishCanonicalExitMessage != nil

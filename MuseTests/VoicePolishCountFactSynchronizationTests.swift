@@ -738,7 +738,11 @@ final class VoicePolishCountFactSynchronizationTests: XCTestCase {
     private func pipeline(
         _ client: CountSynchronizationScriptedLLM
     ) -> VoicePolishPipeline {
-        VoicePolishPipeline(client: client, config: config)
+        VoicePolishPipeline(
+            client: client,
+            config: config,
+            ledgerRoutingEnabled: false
+        )
     }
 
     private func makeRequest(_ text: String) -> VoicePolishRequest {

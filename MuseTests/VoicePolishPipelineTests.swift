@@ -2862,7 +2862,11 @@ final class VoicePolishPipelineTests: XCTestCase {
     }
 
     private func pipeline(_ client: ScriptedVoicePolishLLM) -> VoicePolishPipeline {
-        VoicePolishPipeline(client: client, config: config)
+        VoicePolishPipeline(
+            client: client,
+            config: config,
+            ledgerRoutingEnabled: false
+        )
     }
 
     private func makeChunkedDeclaredListFixture(count: Int) -> (

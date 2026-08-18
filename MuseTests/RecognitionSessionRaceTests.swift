@@ -804,6 +804,8 @@ private final class RaceRecognitionEventRecorder: @unchecked Sendable {
                 storage.append("processing:\(text)")
             case .voicePolishStage(let stage):
                 storage.append("voicePolishStage:\(stage.rawValue)")
+            case .voicePolishUnavailable(let reason):
+                storage.append("voicePolishUnavailable:\(reason?.rawValue ?? "unknown")")
             case .finalized(let text, let injection):
                 storage.append("finalized:\(text):\(injection)")
             case .streamingInterrupted:

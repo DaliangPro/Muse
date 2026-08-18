@@ -242,6 +242,38 @@ final class AppStateTests: XCTestCase {
         XCTAssertNil(appState.voicePolishCanonicalExitMessage)
     }
 
+    func testVoicePolishUnavailableRequiresExplicitRetryOrCanonicalChoice() async {
+        let appState = AppState(
+            initialModes: ProcessingMode.defaults,
+            voicePolishCanonicalExitDelay: .zero
+        )
+        appState.currentMode = .formalWriting
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.stopRecording()
+
+        appState.showVoicePolishUnavailable(.validationFailed)
+
+        XCTAssertEqual(appState.barPhase, .processing)
+        XCTAssertTrue(appState.isVoicePolishUnavailable)
+        XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
+        XCTAssertTrue(appState.voicePolishUnavailableMessage?.contains("原转写已保留") == true)
+
+        var retryCount = 0
+        appState.onRetryVoicePolish = {
+            retryCount += 1
+            return true
+        }
+        appState.retryVoicePolish()
+        for _ in 0..<20 where retryCount == 0 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(retryCount, 1)
+        XCTAssertFalse(appState.isVoicePolishUnavailable)
+        XCTAssertEqual(appState.voicePolishStage, .analyzing)
+    }
+
     func testReconcileCurrentModeKeepsSupportedCustomModeForQuickOnlyProvider() {
         let appState = AppState(initialModes: ProcessingMode.defaults)
         let customMode = ProcessingMode(
