@@ -80,7 +80,7 @@ def main() -> None:
     audit = load_jsonl(run_dir / "provider-audit.jsonl")
 
     schema_version = run.get("schema_version")
-    if schema_version not in {1, 2, 3, 4, 5, 6, 7} or run.get("status") != "complete":
+    if schema_version not in {1, 2, 3, 4, 5, 6, 7, 8} or run.get("status") != "complete":
         fail("实验报告未完整完成")
     if blind.get("schema_version") != schema_version or sealed.get("schema_version") != schema_version:
         fail("实验报告、盲评包与密封映射 schema 不一致")
@@ -247,6 +247,10 @@ def main() -> None:
                     ledger.get("technical_token_mappings"), list
                 ):
                     fail(f"{key} typed ledger 缺少 technical_token_mappings")
+                if schema_version >= 8 and not isinstance(
+                    ledger.get("dictated_symbol_mappings"), list
+                ):
+                    fail(f"{key} typed ledger 缺少 dictated_symbol_mappings")
             global_plan = result.get("global_plan")
             if global_plan is not None and (
                 not isinstance(global_plan, dict)
@@ -289,6 +293,10 @@ def main() -> None:
                     global_plan.get("global_technical_token_mappings"), list
                 ):
                     fail(f"{key} global plan 缺少技术标识映射")
+                if schema_version >= 8 and not isinstance(
+                    global_plan.get("global_dictated_symbol_mappings"), list
+                ):
+                    fail(f"{key} global plan 缺少口述符号映射")
 
     if len(audit) != total_calls or len(model_inputs) != total_calls:
         fail(

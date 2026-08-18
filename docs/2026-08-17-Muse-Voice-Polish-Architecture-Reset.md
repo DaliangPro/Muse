@@ -64,7 +64,7 @@
       "final_meaning": "会议改到周四下午",
       "source_spans": ["会议改到周四下午"],
       "status": "keep|replace|remove",
-      "modality": "confirmed|possible|pending|prohibited|not_promised|recommended",
+      "modality": "confirmed|possible|pending|prohibited|not_promised|promised|recommended",
       "exact_tokens": ["周四下午"]
     }
   ],
@@ -106,6 +106,20 @@
       "source_spans": ["s003"]
     }
   ],
+  "dictated_symbol_mappings": [
+    {
+      "alias": "swift build短横线c release",
+      "canonical": "swift build -c release",
+      "transform": "spoken_cli_symbols",
+      "source_spans": ["s003"]
+    },
+    {
+      "alias": "scripts斜杠package短横线app点sh",
+      "canonical": "scripts/package-app.sh",
+      "transform": "spoken_ascii_symbols",
+      "source_spans": ["s003"]
+    }
+  ],
   "structure": {
     "kind": "sentence|paragraphs|numbered_list|mixed|ai_prompt",
     "ordered_unit_ids": ["u1"]
@@ -122,7 +136,9 @@
 - `delivery_role` 必须区分收件人正文、只需应用的风格要求、只需执行的编辑要求；后两者不得被照抄进成稿；
 - `context_mappings` 只能改变写法，不能把上下文事实变成正文事实；
 - `technical_token_mappings` 只允许在代码/AI Prompt 场景删除单个 ASCII 技术标识内部的 ASR 空格，多个断词必须拆成多条映射，不能用整句映射猜测普通词边界，也不能猜新字符；
-- `modality` 必须区分“不会发生”“不要承诺发生”“尚未确认”“可能发生”；
+- `dictated_symbol_mappings` 只处理原文明确口述的固定 ASCII 符号；路径/文件名做符号直换，命令参数可额外恢复参数前的必要空格，非符号字符必须逐字不变；
+- 映射字段不能代替正文 unit；错误放入技术映射的恒等项或可确定的口述符号项由本地清洗器删除或迁移，不为此再调用模型；
+- `modality` 必须区分“不会发生”“不要承诺发生”“已经承诺”“尚未确认”“可能发生”和“建议执行”；
 - 故障现象与后续建议必须拆开；`advice/recommended` 不能被 Writer 升级为确定因果或保证结果；
 - 收件人和转达动作必须成为一等信息，不能依赖普通名词保留检查。
 - Planner 已从原文提取出的收件人必须带可回溯 `surface_tokens`；最终成稿至少命中一个，缺失时只修收件人，不重写全文。
@@ -417,6 +433,29 @@ Reviewer 必须对照原始 source spans 独立重建这类高风险条件，不
 - Flash 的首稿与修复稿仍残留“整理为 Prompt”的外层任务。Confirm Reviewer 拒绝后返回 `unavailable`，没有把错误候选或原转写冒充成功。独立 Agent 对空候选判为 `unusable`，与系统显式失败状态一致。
 
 结合 1,028 字普通交接邮件中两个模型均可直接发送，当前最小产品结论是：普通约 1K 消息不必统一使用更贵模型；任务层级复杂的 1K AI Prompt 对 Pro 明显更稳。正式实现可以内部升级已验证模型或协议，但 UI 仍只有一个“语音润色”模式。若用户只配置了未达到该场景能力门槛的模型，应明确提示本次未完成，而不是静默回原文。
+
+### 10.9 第二批核心关系回归
+
+第二批先用 `chat-03`、`work-02`、`work-03`、`code-03`、`code-05` 检查承诺、负责人关系、延期状态、口述技术符号和不确定版本。首轮没有出现危险成稿，但暴露出三项 schema 缺口：已经作出的联系承诺没有 `promised`，建议动作可能自然建模为 `action/recommended`，中文口述的斜杠和短横线被错误塞进普通技术断词字段。
+
+本轮没有为具体句子增加答案特判，而是做了三项通用改动：
+
+1. `promised` 只保留原文已经作出的承诺，Writer 不得扩大承诺范围；
+2. `recommended` 可以修饰 action、advice 或 style，但 advice 必须使用 recommended；
+3. 口述符号使用独立 `dictated_symbol_mappings`。路径和文件名只做固定符号替换，命令行选项使用 `spoken_cli_symbols` 恢复参数前的必要空格，非符号字符必须逐字不变。
+
+Planner 偶尔会把恒等命令或口述符号映射重复写进 `technical_token_mappings`。这类字段分类错误不需要再次调用模型：本地清洗器删除恒等项，把能够由固定变换确定证明的条目迁回口述符号字段；无法确定的映射仍然失败，不能猜测。
+
+定向回归证据：
+
+- `build/voice-polish-architecture-core-corrections-v20/`
+- `build/voice-polish-architecture-core-relations-v21/`
+- `build/voice-polish-architecture-schema-relations-v22/`
+- `build/voice-polish-architecture-dictated-symbols-v24/`
+
+独立 Agent 在看不到模型映射的情况下，对更新后的 10 条核心样本、每条两个候选给出：`direct_send = 16`、`minor_edit = 4`、`major_error = 0`、`unusable = 0`。其中 `code-03` 的两个候选都精确保留四步、`swift test`、`swift build -c release`、`scripts/package-app.sh`、codesign 检查和最后启动顺序。
+
+4 个轻微问题集中在两个通用边界：公开改口成稿仍会残留已作废的“第二版”，未确认版本成稿仍会照抄“不要替我确定”这类幕后措辞且缺少自然的后续确认表达。下一批只处理 correction rendering 与 editor directive 的语义边界，不扩大到完整 130 条，也不据此接入生产。
 
 ## 11. 当前停止线
 

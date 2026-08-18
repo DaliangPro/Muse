@@ -29,7 +29,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPERIMENT_SCHEMA_VERSION = 7
+EXPERIMENT_SCHEMA_VERSION = 8
 DEFAULT_DATASET = ROOT / "docs/2026-08-17-Muse-Voice-Polish-Core-Semantic-Test-Set.json"
 DEFAULT_PILOT_IDS = [
     "micro-04",
@@ -57,6 +57,15 @@ SAFE_CONTEXT_TYPES = {
     "recent_safe",
     "conflicting_safe",
 }
+DICTATED_ASCII_SYMBOLS = (
+    ("反斜杠", "\\"),
+    ("双横线", "--"),
+    ("短横线", "-"),
+    ("下划线", "_"),
+    ("斜杠", "/"),
+    ("冒号", ":"),
+    ("点", "."),
+)
 
 
 CONTEXT_RESOLVER_SYSTEM = """你是 Muse 语音润色的上下文术语解析器。你只识别“正文中的非标准写法 → 已授权上下文中明确确认的标准写法”，不写成稿。
@@ -85,7 +94,7 @@ PLANNER_SYSTEM = """你是 Muse 语音润色的局部意图规划器。输入是
     "final_meaning": "最终仍有效的含义",
     "source_span_ids": ["s001"],
     "status": "keep|replace|remove",
-    "modality": "confirmed|possible|pending|prohibited|not_promised|recommended",
+    "modality": "confirmed|possible|pending|prohibited|not_promised|promised|recommended",
     "exact_tokens": ["必须精确保留的数字、日期、路径、命令、名称；没有则空数组"]
   }],
   "corrections": [{"subject": "被改口对象", "old_span_ids": ["s001"], "final_span_ids": ["s002"], "old_value": "旧值", "final_value": "最终值", "rendering_policy": "final_only|announce_change"}],
@@ -96,6 +105,10 @@ PLANNER_SYSTEM = """你是 Muse 语音润色的局部意图规划器。输入是
     "consequences": [{"action": "条件成立或不成立时的后果", "polarity": false, "source_span_ids": ["s001"]}]
   }],
   "technical_token_mappings": [{"alias": "Main Actor", "canonical": "MainActor", "source_span_ids": ["s001"], "transform": "remove_internal_ascii_whitespace"}],
+  "dictated_symbol_mappings": [
+    {"alias": "swift build短横线c release", "canonical": "swift build -c release", "source_span_ids": ["s001"], "transform": "spoken_cli_symbols"},
+    {"alias": "scripts斜杠package短横线app点sh", "canonical": "scripts/package-app.sh", "source_span_ids": ["s001"], "transform": "spoken_ascii_symbols"}
+  ],
   "context_mappings": [{"alias": "正文写法", "canonical": "已确认标准写法", "source_span_ids": ["s001"], "context_field": "selected_text|text_before_cursor|text_after_cursor|recent_muse_inputs"}],
   "structure": {"kind": "sentence|paragraphs|numbered_list|mixed|ai_prompt", "ordered_unit_ids": ["u1"]}
 }
@@ -121,6 +134,8 @@ audience 中的 surface_tokens 必须逐字来自所引用的 source spans，并
 
 technical_token_mappings 只用于 code/aiPrompt 场景中高置信的 ASCII 技术标识断词：alias 必须逐字来自 source spans，canonical 只能删除 alias 内部多余空白，不能改字母、大小写或标点。每条 mapping 只能覆盖一个技术标识；同一句有多个断词时分别输出多条，不得把整句或同时含普通英文词边界的长短语作为一个 alias。普通英文短语不得强行合并；不确定时返回空数组。
 
+dictated_symbol_mappings 只用于 code/aiPrompt 中明确口述出的“斜杠、反斜杠、短横线、双横线、下划线、点、冒号”。alias 必须逐字来自 source spans。路径、文件名和普通技术标识使用 spoken_ascii_symbols，只做符号直换；命令行选项使用 spoken_cli_symbols，除符号直换外，只允许在 `-c`、`--filter` 这类参数前恢复一个必要空格。canonical 必须是该固定变换的精确结果，不能增删或改写其他字符。映射只补充 units，不能取代正文 unit；已经是正常 ASCII 的命令/路径不要放入该数组，也不要使用 transform=none；没有口述符号时返回空数组。
+
 只能引用本次输入实际提供的 source span ID。不要复述长段原文，不要输出 Markdown 代码块，不要解释。"""
 
 
@@ -128,7 +143,9 @@ PLANNER_REPAIR_SYSTEM = """你是 Muse 意图清单的格式与角色修复器�
 
 重新阅读 source spans，根据 validation_error 修复字段、证据或 delivery_role。不能把真实正文、第一人称未确认状态、承诺边界或给收件人的禁止事项全部标成幕后指令；editor_directive 只用于明确控制本次写作操作的要求。不得借修复新增原文没有的事实、上下文映射或条件关系。
 
-返回与局部 Planner 完全相同 schema 的单个 JSON 对象，不要输出 Markdown 或解释。"""
+正常 ASCII 命令或路径不要写入 technical_token_mappings；只有技术标识内部被 ASR 插入空格时才使用 technical_token_mappings。中文口述的斜杠、短横线、双横线、下划线、点、冒号或反斜杠必须写入 dictated_symbol_mappings：路径/文件名使用 spoken_ascii_symbols，命令行参数使用 spoken_cli_symbols。映射不能取代正文 units。
+
+只返回修复后的 Ledger 本身，顶层必须仍是 audience、units、corrections、conditionals、technical_token_mappings、dictated_symbol_mappings、context_mappings、structure；不要回显 input、invalid_ledger_response、validation_error，不要输出 Markdown 或解释。"""
 
 
 GLOBAL_PLANNER_SYSTEM = """你是 Muse 语音润色的全文关系规划器。局部规划器已经处理每个 batch；你只负责合并跨 batch 的改口、收件人、否定/待确认/不承诺边界和全文结构，不得重写所有局部 units。
@@ -137,7 +154,7 @@ GLOBAL_PLANNER_SYSTEM = """你是 Muse 语音润色的全文关系规划器。�
 {
   "global_audience": [{"text": "收件人或受众", "source_span_ids": ["s001"], "surface_tokens": ["团队"]}],
   "global_corrections": [{"subject": "对象", "old_span_ids": ["s001"], "final_span_ids": ["s009"], "old_value": "旧值", "final_value": "最终值", "rendering_policy": "final_only|announce_change"}],
-  "global_constraints": [{"meaning": "跨段仍需成立的约束", "source_span_ids": ["s002", "s008"], "modality": "confirmed|possible|pending|prohibited|not_promised"}],
+  "global_constraints": [{"meaning": "跨段仍需成立的约束", "source_span_ids": ["s002", "s008"], "modality": "confirmed|possible|pending|prohibited|not_promised|promised"}],
   "global_conditionals": [{
     "id": "gc1",
     "cue_ids": ["lc001"],
@@ -145,11 +162,12 @@ GLOBAL_PLANNER_SYSTEM = """你是 Muse 语音润色的全文关系规划器。�
     "consequences": [{"action": "共同受该条件控制的动作", "polarity": false, "source_span_ids": ["s006"]}]
   }],
   "global_technical_token_mappings": [{"alias": "Main Actor", "canonical": "MainActor", "source_span_ids": ["s001"], "transform": "remove_internal_ascii_whitespace"}],
+  "global_dictated_symbol_mappings": [{"alias": "scripts斜杠package短横线app点sh", "canonical": "scripts/package-app.sh", "source_span_ids": ["s001"], "transform": "spoken_ascii_symbols"}],
   "global_context_mappings": [{"alias": "正文中的非标准写法", "canonical": "安全上下文确认的标准写法", "source_span_ids": ["s001"], "context_field": "selected_text|text_before_cursor|text_after_cursor|recent_muse_inputs"}],
   "structure": {"kind": "paragraphs|numbered_list|mixed|ai_prompt", "ordered_batch_ids": ["b01", "b02"]}
 }
 
-global_audience 必须合并局部 ledger 已识别的所有收件人及其 surface_tokens。global_corrections 必须包含局部 ledger 已识别的改口以及跨 batch 改口，并保留其 rendering_policy；跨 batch 新发现的改口也必须判断 final_only 或 announce_change。global_conditionals 必须保留所有局部条件及跨 batch 条件，并把同一条件控制的多个后果放在同一个对象中。global_technical_token_mappings 只能去重合并局部已验证映射，不得发明新映射。只能引用实际提供的 span ID 和 batch ID。不要复制局部 unit 列表，不要输出 Markdown 代码块，不要解释。"""
+global_audience 必须合并局部 ledger 已识别的所有收件人及其 surface_tokens。global_corrections 必须包含局部 ledger 已识别的改口以及跨 batch 改口，并保留其 rendering_policy；跨 batch 新发现的改口也必须判断 final_only 或 announce_change。global_conditionals 必须保留所有局部条件及跨 batch 条件，并把同一条件控制的多个后果放在同一个对象中。global_technical_token_mappings 与 global_dictated_symbol_mappings 只能去重合并局部已验证映射，不得发明新映射。只能引用实际提供的 span ID 和 batch ID。不要复制局部 unit 列表，不要输出 Markdown 代码块，不要解释。"""
 
 
 WRITER_SYSTEM = """你是 Muse 语音润色的分段成稿 Writer。你的交付物是整篇成稿中的一个连续片段。
@@ -162,7 +180,7 @@ WRITER_SYSTEM = """你是 Muse 语音润色的分段成稿 Writer。你的交付
 
 global_audience 中每个对象至少一个 surface_token 必须进入成稿；把“跟团队说/回复客户”等外层口述整理成自然的直接消息或明确通知对象，不要照抄口述动作。
 
-技术标识统一使用 global_technical_token_mappings 的 canonical。advice/recommended 只能表达建议、下一步或排查动作，不得写成执行后必然解决。
+技术标识统一使用 global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical。advice/recommended 只能表达建议、下一步或排查动作，不得写成执行后必然解决；promised 只保留原文已经作出的承诺，不得擅自增强承诺范围。
 
 若场景是 aiPrompt，交付可直接交给 AI 执行的 Prompt 本身，不回答任务，也不要再写“请把下面内容整理成 Prompt”。用户对当前润色步骤说的“先不执行、只整理任务”也是编辑层指令，不得写入未来 AI 的 Prompt。
 
@@ -177,7 +195,7 @@ conditionals/global_conditionals 是条件逻辑的唯一准绳：条件的 pola
 
 REVIEWER_SYSTEM = """你是与 Writer 隔离的 Muse 语音润色复核器。你不负责改写全文，只负责根据语音转写、已授权上下文和意图清单检查候选成稿。
 
-逐项核对：最终事实、改口后的最终值、被撤回旧值、独立约束、收件人、主体-动作-时间关系、否定范围、不承诺/未确认状态、上下文纠错与上下文泄漏、AI Prompt 的任务层级、长文是否摘要或遗漏。global_audience 的接收对象不得遗漏，外层“跟谁说/回复谁”应落实为自然成稿。advice/recommended 不得被写成确定因果或保证结果；global_technical_token_mappings 的 canonical 必须精确出现，alias 不得残留。对 conditionals/global_conditionals 必须重新阅读对应 source spans，独立核对条件 polarity、每个后果 polarity 及共同作用范围；不得因为 Writer 与 Planner 表述一致就默认正确。逐个检查 delivery_role：recipient_content 不得遗漏；style_directive/editor_directive 的幕后措辞不得出现在候选成稿，只能看到其执行结果。逐条检查 correction.rendering_policy：final_only 不得残留旧值；announce_change 不得只剩最终值，必须保留旧安排取消/变更这一对收件人有用的信息。resolved_correction 的旧位置不得重复呈现 final_value；high_confidence_abandoned_tail 必须删除且不得被扩写成待确认事项；global_context_mappings 指定的同一实体不得混用 alias 与 canonical。没有来源证据的问题不得成立。
+逐项核对：最终事实、改口后的最终值、被撤回旧值、独立约束、收件人、主体-动作-时间关系、否定范围、不承诺/已承诺/未确认状态、上下文纠错与上下文泄漏、AI Prompt 的任务层级、长文是否摘要或遗漏。global_audience 的接收对象不得遗漏，外层“跟谁说/回复谁”应落实为自然成稿。advice/recommended 不得被写成确定因果或保证结果；global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical 必须精确出现，alias 不得残留。对 conditionals/global_conditionals 必须重新阅读对应 source spans，独立核对条件 polarity、每个后果 polarity 及共同作用范围；不得因为 Writer 与 Planner 表述一致就默认正确。逐个检查 delivery_role：recipient_content 不得遗漏；style_directive/editor_directive 的幕后措辞不得出现在候选成稿，只能看到其执行结果。逐条检查 correction.rendering_policy：final_only 不得残留旧值；announce_change 不得只剩最终值，必须保留旧安排取消/变更这一对收件人有用的信息。resolved_correction 的旧位置不得重复呈现 final_value；high_confidence_abandoned_tail 必须删除且不得被扩写成待确认事项；global_context_mappings 指定的同一实体不得混用 alias 与 canonical。没有来源证据的问题不得成立。
 
 只返回一个 JSON 对象：
 {
@@ -197,7 +215,7 @@ REVIEWER_SYSTEM = """你是与 Writer 隔离的 Muse 语音润色复核器。你
 
 REPAIR_SYSTEM = """你是 Muse 语音润色的定向片段修复器。根据当前 batch 原文、局部意图清单、全文关系、上一版片段和独立复核问题，只修改被指出的局部。
 
-不得把上一版成稿当作新事实来源，不得补写原文没有的事实，不得摘要。global_audience 缺失时只恢复对应接收对象，并把外层口述整理成自然的通知或直接消息。advice/recommended 不得升级成保证结果，技术标识使用 global_technical_token_mappings 的 canonical。修复条件关系时必须逐项遵守 global_conditionals，不能只改条件句而遗留后果的错误否定。recipient_content 必须保留；style_directive/editor_directive 只执行，不复述幕后措辞。correction 为 final_only 时只留最终值；为 announce_change 时必须保留旧安排取消/变更的收件人信息。resolved_correction 的旧位置只删除旧值，不重复写 final_value；high_confidence_abandoned_tail 只删除，不升级成待确认；global_context_mappings 必须统一应用。只输出修复后的当前 batch 完整片段，不要解释。"""
+不得把上一版成稿当作新事实来源，不得补写原文没有的事实，不得摘要。global_audience 缺失时只恢复对应接收对象，并把外层口述整理成自然的通知或直接消息。advice/recommended 不得升级成保证结果，promised 不得扩大原承诺；技术标识使用 global_technical_token_mappings 与 global_dictated_symbol_mappings 的 canonical。修复条件关系时必须逐项遵守 global_conditionals，不能只改条件句而遗留后果的错误否定。recipient_content 必须保留；style_directive/editor_directive 只执行，不复述幕后措辞。correction 为 final_only 时只留最终值；为 announce_change 时必须保留旧安排取消/变更的收件人信息。resolved_correction 的旧位置只删除旧值，不重复写 final_value；high_confidence_abandoned_tail 只删除，不升级成待确认；global_context_mappings 必须统一应用。只输出修复后的当前 batch 完整片段，不要解释。"""
 
 
 @dataclass(frozen=True)
@@ -819,6 +837,65 @@ def validate_technical_token_mappings(
             raise ExperimentError(f"{label} canonical 只能删除该技术标识内部的 ASCII 空白")
 
 
+def canonicalized_dictated_symbol_sequence(
+    value: str, transform: str
+) -> tuple[str, bool]:
+    result = value
+    replaced = False
+    for spoken, symbol in DICTATED_ASCII_SYMBOLS:
+        if spoken in result:
+            result = result.replace(spoken, symbol)
+            replaced = True
+    if transform == "spoken_cli_symbols":
+        result = re.sub(r"(?<=[A-Za-z0-9])(?=--[A-Za-z])", " ", result)
+        result = re.sub(
+            r"(?<=[A-Za-z0-9])-(?=[A-Za-z](?:\s|$))",
+            " -",
+            result,
+        )
+    return re.sub(r"\s+", " ", result).strip(), replaced
+
+
+def validate_dictated_symbol_mappings(
+    value: Any,
+    visible_spans: list[dict[str, Any]],
+    label: str,
+) -> None:
+    if not isinstance(value, list):
+        raise ExperimentError(f"{label} 必须是数组")
+    allowed_span_ids = {span["id"] for span in visible_spans}
+    span_text_by_id = {span["id"]: span["text"] for span in visible_spans}
+    seen_aliases: set[str] = set()
+    for mapping in value:
+        if not isinstance(mapping, dict):
+            raise ExperimentError(f"{label} 条目必须是对象")
+        alias = mapping.get("alias")
+        canonical = mapping.get("canonical")
+        span_ids = mapping.get("source_span_ids")
+        transform = mapping.get("transform")
+        if (
+            not isinstance(alias, str)
+            or not alias
+            or not isinstance(canonical, str)
+            or not canonical
+            or alias in seen_aliases
+            or transform not in {"spoken_ascii_symbols", "spoken_cli_symbols"}
+            or canonical != canonical.strip()
+            or re.search(r"[^\x20-\x7E]", canonical)
+        ):
+            raise ExperimentError(f"{label} alias、canonical、transform 或格式不合法")
+        seen_aliases.add(alias)
+        validate_span_ids(span_ids, allowed_span_ids, label)
+        evidence = "".join(span_text_by_id[span_id] for span_id in span_ids)
+        if alias not in evidence:
+            raise ExperimentError(f"{label} alias 必须逐字来自引用的 source spans")
+        expected, replaced = canonicalized_dictated_symbol_sequence(alias, transform)
+        if not replaced or canonical != expected or canonical == alias:
+            raise ExperimentError(
+                f"{label} canonical 必须等于固定口述符号变换结果：{expected!r}"
+            )
+
+
 def sanitize_ledger_context_mappings(
     case: dict[str, Any],
     ledger: dict[str, Any],
@@ -875,6 +952,87 @@ def sanitize_ledger_context_mappings(
                 }
             )
     ledger["context_mappings"] = accepted
+    return diagnostics
+
+
+def sanitize_ledger_token_mappings(
+    ledger: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """丢弃恒等映射，并把被放错字段的可证明口述符号映射迁回专用字段。"""
+    technical = ledger.get("technical_token_mappings")
+    dictated = ledger.get("dictated_symbol_mappings")
+    if not isinstance(technical, list) or not isinstance(dictated, list):
+        return []
+    accepted_technical: list[Any] = []
+    accepted_dictated = copy.deepcopy(dictated)
+    dictated_by_alias = {
+        mapping.get("alias"): mapping
+        for mapping in accepted_dictated
+        if isinstance(mapping, dict) and isinstance(mapping.get("alias"), str)
+    }
+    diagnostics: list[dict[str, Any]] = []
+    for mapping in technical:
+        if not isinstance(mapping, dict):
+            accepted_technical.append(mapping)
+            continue
+        alias = mapping.get("alias")
+        canonical = mapping.get("canonical")
+        transform = mapping.get("transform")
+        if (
+            transform == "remove_internal_ascii_whitespace"
+            and isinstance(alias, str)
+            and alias == canonical
+        ):
+            diagnostics.append(
+                {
+                    "type": "discarded_identity_technical_mapping",
+                    "mapping": mapping,
+                }
+            )
+            continue
+        has_spoken_symbol = isinstance(alias, str) and any(
+            spoken in alias for spoken, _ in DICTATED_ASCII_SYMBOLS
+        )
+        if has_spoken_symbol and isinstance(canonical, str):
+            proven_transform = next(
+                (
+                    candidate
+                    for candidate in ("spoken_ascii_symbols", "spoken_cli_symbols")
+                    if canonicalized_dictated_symbol_sequence(alias, candidate)[0]
+                    == canonical
+                ),
+                None,
+            )
+            if proven_transform is not None:
+                migrated = {
+                    "alias": alias,
+                    "canonical": canonical,
+                    "source_span_ids": copy.deepcopy(
+                        mapping.get("source_span_ids")
+                    ),
+                    "transform": proven_transform,
+                }
+                existing = dictated_by_alias.get(alias)
+                if existing is None:
+                    accepted_dictated.append(migrated)
+                    dictated_by_alias[alias] = migrated
+                elif (
+                    existing.get("canonical") != canonical
+                    or existing.get("transform") != proven_transform
+                ):
+                    accepted_technical.append(mapping)
+                    continue
+                diagnostics.append(
+                    {
+                        "type": "migrated_misclassified_dictated_symbol_mapping",
+                        "mapping": mapping,
+                        "normalized_transform": proven_transform,
+                    }
+                )
+                continue
+        accepted_technical.append(mapping)
+    ledger["technical_token_mappings"] = accepted_technical
+    ledger["dictated_symbol_mappings"] = accepted_dictated
     return diagnostics
 
 
@@ -958,6 +1116,29 @@ def merged_local_technical_token_mappings(
     return merged
 
 
+def merged_local_dictated_symbol_mappings(
+    planned_batches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    canonical_by_alias: dict[str, str] = {}
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for planned in planned_batches:
+        for mapping in planned["local_ledger"].get(
+            "dictated_symbol_mappings", []
+        ):
+            alias = mapping["alias"]
+            canonical = mapping["canonical"]
+            previous = canonical_by_alias.get(alias)
+            if previous is not None and previous != canonical:
+                raise ExperimentError("局部口述符号映射存在冲突 canonical")
+            canonical_by_alias[alias] = canonical
+            key = (alias, canonical, tuple(mapping["source_span_ids"]))
+            if key not in seen:
+                merged.append(copy.deepcopy(mapping))
+                seen.add(key)
+    return merged
+
+
 def apply_verified_technical_token_mappings(
     text: str, global_plan: dict[str, Any]
 ) -> str:
@@ -975,9 +1156,29 @@ def apply_verified_technical_token_mappings(
     return result
 
 
+def apply_verified_dictated_symbol_mappings(
+    text: str, global_plan: dict[str, Any]
+) -> str:
+    result = text
+    mappings = sorted(
+        global_plan.get("global_dictated_symbol_mappings", []),
+        key=lambda item: len(item.get("alias", "")),
+        reverse=True,
+    )
+    for mapping in mappings:
+        alias = mapping.get("alias", "")
+        canonical = mapping.get("canonical", "")
+        if alias and canonical and alias != canonical:
+            result = result.replace(alias, canonical)
+    return result
+
+
 def apply_verified_mappings(text: str, global_plan: dict[str, Any]) -> str:
     return apply_verified_technical_token_mappings(
-        apply_verified_context_mappings(text, global_plan),
+        apply_verified_dictated_symbol_mappings(
+            apply_verified_context_mappings(text, global_plan),
+            global_plan,
+        ),
         global_plan,
     )
 
@@ -1012,6 +1213,7 @@ def validate_ledger(
         "pending",
         "prohibited",
         "not_promised",
+        "promised",
         "recommended",
     }
     observed_delivery_roles: list[str] = []
@@ -1033,9 +1235,17 @@ def validate_ledger(
             raise ExperimentError(f"意图单元 {unit_id} kind 缺失或不合法")
         if unit.get("modality") not in allowed_modalities:
             raise ExperimentError(f"意图单元 {unit_id} modality 缺失或不合法")
-        if (unit["kind"] == "advice") != (unit["modality"] == "recommended"):
+        if unit["kind"] == "advice" and unit["modality"] != "recommended":
             raise ExperimentError(
-                f"意图单元 {unit_id} advice 必须与 recommended 成对"
+                f"意图单元 {unit_id} advice 必须使用 recommended"
+            )
+        if unit["modality"] == "recommended" and unit["kind"] not in {
+            "action",
+            "advice",
+            "style",
+        }:
+            raise ExperimentError(
+                f"意图单元 {unit_id} recommended 只允许 action、advice 或 style"
             )
         observed_delivery_roles.append(unit["delivery_role"])
     if "recipient_content" not in observed_delivery_roles:
@@ -1116,6 +1326,15 @@ def validate_ledger(
         "局部技术标识映射",
     )
 
+    dictated_mappings = ledger.get("dictated_symbol_mappings")
+    if dictated_mappings and case.get("writing_scene") not in {"code", "aiPrompt"}:
+        raise ExperimentError("口述 ASCII 符号映射只允许用于 code/aiPrompt 场景")
+    validate_dictated_symbol_mappings(
+        dictated_mappings,
+        visible_spans,
+        "局部口述符号映射",
+    )
+
     mappings = ledger.get("context_mappings", [])
     if not isinstance(mappings, list):
         raise ExperimentError("意图清单 context_mappings 必须是数组")
@@ -1147,9 +1366,10 @@ def parse_and_validate_ledger(
     label: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ledger = parse_json_object(response_text, label)
-    diagnostics = sanitize_ledger_context_mappings(
+    diagnostics = sanitize_ledger_token_mappings(ledger)
+    diagnostics.extend(sanitize_ledger_context_mappings(
         case, ledger, batch["source_spans"]
-    )
+    ))
     validate_ledger(case, ledger, batch["source_spans"])
     return ledger, diagnostics
 
@@ -1164,6 +1384,7 @@ def validate_global_plan(
     constraints = plan.get("global_constraints")
     conditionals = plan.get("global_conditionals")
     technical_mappings = plan.get("global_technical_token_mappings")
+    dictated_mappings = plan.get("global_dictated_symbol_mappings")
     mappings = plan.get("global_context_mappings", [])
     structure = plan.get("structure")
     if (
@@ -1171,9 +1392,10 @@ def validate_global_plan(
         or not isinstance(corrections, list)
         or not isinstance(constraints, list)
         or not isinstance(technical_mappings, list)
+        or not isinstance(dictated_mappings, list)
     ):
         raise ExperimentError(
-            "全文计划缺少 audience、corrections、constraints 或技术映射数组"
+            "全文计划缺少 audience、corrections、constraints、技术或口述符号映射数组"
         )
     span_text_by_id = {span["id"]: span["text"] for span in spans}
     for item in audience:
@@ -1230,6 +1452,11 @@ def validate_global_plan(
         technical_mappings,
         spans,
         "全文技术标识映射",
+    )
+    validate_dictated_symbol_mappings(
+        dictated_mappings,
+        spans,
+        "全文口述符号映射",
     )
     if not isinstance(mappings, list):
         raise ExperimentError("全文计划 global_context_mappings 必须是数组")
@@ -1404,6 +1631,24 @@ def deterministic_output_issues(
                     "repair_instruction": (
                         f"将 ASR 断开的技术标识“{alias}”统一恢复为“{canonical}”；"
                         "不得改变其他字符。"
+                    ),
+                }
+            )
+        for mapping in global_plan.get("global_dictated_symbol_mappings", []):
+            alias = mapping.get("alias", "")
+            canonical = mapping.get("canonical", "")
+            if canonical in output and alias not in output:
+                continue
+            issues.append(
+                {
+                    "type": "wrong_relation",
+                    "severity": "major",
+                    "unit_ids": [],
+                    "source_span_ids": mapping.get("source_span_ids", []),
+                    "draft_span": alias if alias in output else "",
+                    "repair_instruction": (
+                        f"将口述符号技术片段“{alias}”精确恢复为“{canonical}”；"
+                        "不得改变非符号字符。"
                     ),
                 }
             )
@@ -1815,6 +2060,9 @@ def run_case(
                 "global_technical_token_mappings": copy.deepcopy(
                     local.get("technical_token_mappings", [])
                 ),
+                "global_dictated_symbol_mappings": copy.deepcopy(
+                    local.get("dictated_symbol_mappings", [])
+                ),
                 "global_context_mappings": copy.deepcopy(
                     local.get("context_mappings", [])
                 ),
@@ -1849,6 +2097,9 @@ def run_case(
             global_plan = parse_json_object(response["text"], "Global Planner")
         global_plan["global_technical_token_mappings"] = (
             merged_local_technical_token_mappings(planned_batches)
+        )
+        global_plan["global_dictated_symbol_mappings"] = (
+            merged_local_dictated_symbol_mappings(planned_batches)
         )
         record["planner_diagnostics"].extend(
             {"stage": "global_context_mapping", **diagnostic}
@@ -2211,6 +2462,78 @@ def self_test(dataset: dict[str, Any]) -> None:
     else:
         raise ExperimentError("跨普通词边界的技术标识映射未被 schema 拒绝")
 
+    dictated_source = [
+        {
+            "id": "s001",
+            "text": (
+                "先运行 swift build短横线c release，再执行 "
+                "scripts斜杠package短横线app点sh"
+            ),
+        }
+    ]
+    dictated_mappings = [
+        {
+            "alias": "swift build短横线c release",
+            "canonical": "swift build -c release",
+            "source_span_ids": ["s001"],
+            "transform": "spoken_cli_symbols",
+        },
+        {
+            "alias": "scripts斜杠package短横线app点sh",
+            "canonical": "scripts/package-app.sh",
+            "source_span_ids": ["s001"],
+            "transform": "spoken_ascii_symbols",
+        },
+    ]
+    validate_dictated_symbol_mappings(
+        dictated_mappings,
+        dictated_source,
+        "口述符号映射自检",
+    )
+    if apply_verified_dictated_symbol_mappings(
+        dictated_source[0]["text"],
+        {"global_dictated_symbol_mappings": dictated_mappings},
+    ) != "先运行 swift build -c release，再执行 scripts/package-app.sh":
+        raise ExperimentError("已验证的口述符号映射未精确应用")
+    try:
+        validate_dictated_symbol_mappings(
+            [
+                {
+                    "alias": "scripts斜杠package短横线app点sh",
+                    "canonical": "scripts/package-app.py",
+                    "source_span_ids": ["s001"],
+                    "transform": "spoken_ascii_symbols",
+                }
+            ],
+            dictated_source,
+            "错误口述符号映射自检",
+        )
+    except ExperimentError:
+        pass
+    else:
+        raise ExperimentError("改变非符号字符的口述符号映射未被拒绝")
+    misplaced_ledger = {
+        "technical_token_mappings": [
+            {
+                "alias": "swift test",
+                "canonical": "swift test",
+                "source_span_ids": ["s001"],
+                "transform": "remove_internal_ascii_whitespace",
+            },
+            copy.deepcopy(dictated_mappings[0]),
+        ],
+        "dictated_symbol_mappings": [copy.deepcopy(dictated_mappings[1])],
+    }
+    token_diagnostics = sanitize_ledger_token_mappings(misplaced_ledger)
+    if misplaced_ledger["technical_token_mappings"]:
+        raise ExperimentError("恒等或错字段的技术映射未被确定性清理")
+    if {item["alias"] for item in misplaced_ledger["dictated_symbol_mappings"]} != {
+        item["alias"] for item in dictated_mappings
+    }:
+        raise ExperimentError("错字段的口述符号映射未迁回专用字段")
+    if len(token_diagnostics) != 2:
+        raise ExperimentError("技术映射清理诊断数量不正确")
+
     cases = dataset["inputs"]
     for case in cases:
         spans = source_spans(case)
@@ -2257,6 +2580,7 @@ def self_test(dataset: dict[str, Any]) -> None:
                 for index, cue in enumerate(first_batch_cues, start=1)
             ],
             "technical_token_mappings": [],
+            "dictated_symbol_mappings": [],
             "context_mappings": [],
             "structure": {"kind": "sentence", "ordered_unit_ids": ["u1"]},
         }
@@ -2297,6 +2621,7 @@ def self_test(dataset: dict[str, Any]) -> None:
                 )
             ],
             "global_technical_token_mappings": [],
+            "global_dictated_symbol_mappings": [],
             "global_context_mappings": [],
             "structure": {
                 "kind": "paragraphs",
