@@ -19,6 +19,7 @@ enum VoicePolishLedgerPrompts {
 
     规则：
     - 每个 recipient_content 都必须引用真实 source span；没有证据不得新增事实。
+    - recipient_content.surface_tokens 固定返回空数组；只有 style_directive、editor_directive 和 excluded_content 才填写逐字来自自身 source span 的 surface_tokens，用于检查幕后说明或排除内容是否泄漏。
     - 每个 source span 都必须由至少一个 unit 处置；纯口吃或废弃片段也要建立 status=remove 的 editor_directive，不能静默漏段。structure.ordered_unit_ids 必须恰好列出全部需要进入成稿的 recipient_content unit。
     - 口吃、重复起步、被撤回旧值和写作幕后说明不是正文；有意强调、最终事实、收件人、待确认、不承诺和禁止事项必须保留。
     - “不要承诺/不能保证”必须使用 modality=not_promised，不能写成 confirmed 的“不会发生”。已经作出的承诺才用 promised。

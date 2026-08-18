@@ -57,6 +57,35 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy { $0.options.reasoningPolicy == .disabled })
     }
 
+    func testRecipientSurfaceTokensAreLocallyIgnoredInsteadOfTriggeringPlanRepair() async throws {
+        let source = "明天开会，请团队准时参加，不要迟到。"
+        let finalText = source
+        let request = makeRequest(source, scene: .workChat)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: finalText,
+            sourceSpanIds: evidenceSpanIDs(for: request),
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: ["请团队准时参加"]
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(finalText)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        XCTAssertNil(result.plannerValidationTrace)
+    }
+
     func testWriterCannotOmitAnyDailyLongTextUnit() async throws {
         let request = makeRequest(dailySource("漏项检查"))
         let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)

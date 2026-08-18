@@ -27,7 +27,7 @@ struct VoicePolishLedgerUnit: Codable, Sendable, Equatable {
     var status: String
     var modality: String
     var exactTokens: [String]
-    let surfaceTokens: [String]
+    var surfaceTokens: [String]
 }
 
 struct VoicePolishLedgerCorrection: Codable, Sendable, Equatable {

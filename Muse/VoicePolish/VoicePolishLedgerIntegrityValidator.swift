@@ -223,11 +223,10 @@ enum VoicePolishLedgerIntegrityValidator {
             }
             let evidence = unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
             if unit.deliveryRole == "recipient_content" {
-                guard unit.surfaceTokens.isEmpty else {
-                    throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                        "recipient_unit_surface_tokens_must_be_empty:\(unit.id)"
-                    )
-                }
+                // surface_tokens 只用于证明幕后说明或排除内容是否泄漏；正文 unit
+                // 不消费这个字段。模型即使冗余填写，也在本地清空，不能让一个
+                // 无语义作用的协议细节导致整段口述回退。
+                unit.surfaceTokens = []
             } else {
                 guard !unit.surfaceTokens.isEmpty,
                       unit.surfaceTokens.allSatisfy({ !$0.isEmpty && evidence.contains($0) }) else {
