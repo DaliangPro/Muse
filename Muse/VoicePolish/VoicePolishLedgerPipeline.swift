@@ -433,7 +433,10 @@ struct VoicePolishLedgerPipeline: Sendable {
                     options: LLMGenerationOptions(
                         temperature: 0,
                         maxOutputTokens: maxOutputTokens,
-                        reasoningPolicy: .low,
+                        // Planner、Writer 与 Reviewer 都只需按来源证据输出可验证
+                        // JSON。启用 thinking 会让 DeepSeek Flash/Pro 在真实链路中
+                        // 连续耗尽 60 秒阶段预算；架构实验也一直显式关闭 thinking。
+                        reasoningPolicy: .disabled,
                         responseFormat: responseFormat
                     )
                 ),

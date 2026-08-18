@@ -54,6 +54,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         )
         XCTAssertEqual(requests[0].options.responseFormat, .jsonObject)
         XCTAssertEqual(requests[1].options.responseFormat, .jsonObject)
+        XCTAssertTrue(requests.allSatisfy { $0.options.reasoningPolicy == .disabled })
     }
 
     func testWriterCannotOmitAnyDailyLongTextUnit() async throws {
