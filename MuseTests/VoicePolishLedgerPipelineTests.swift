@@ -269,6 +269,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             [.voicePolishAnalyze, .voicePolishAnalyze, .voicePolishRender, .voicePolishAnalyze]
         )
         XCTAssertTrue(requests[1].user.contains("invalid_ledger_response"))
+        XCTAssertTrue(requests[1].user.contains("conditionals_invalid"))
     }
 
     func testDictatedSymbolMappingIsAppliedBeforeReview() async throws {

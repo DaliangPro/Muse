@@ -481,7 +481,7 @@ Pro 的一次成稿率为 92%，`direct_send + minor_edit` 为 96%；Flash 分�
 3. 单次运行共享 120 秒总预算，自动调用最多 6 次，Repair 只改 Reviewer 指向的 fragment；
 4. Ledger 不读取原始安全上下文，只接收由本地 `EntityResolver` 证明的 canonical mapping；excluded/style/editor 内容不会反向强制写回正文；
 5. 失败不再静默注入原文。Session 保留 canonical，并显示“重新润色 / 使用原转写”；只有用户明确选择后才走原转写出口；
-6. Prompt v21 已把条件方向固化为本地 `operator_kind`（区分 `only_if` 与 `if_then`），拒绝模型自行把 `Swift 6`、`Node 20` 等版本名并写，并对仍残留口述脚手架的近原样长稿触发局部修复；三组正反回归与只读审计均通过；
+6. Prompt v22 已把条件方向固化为本地 `operator_kind`（区分 `only_if` 与 `if_then`），拒绝模型自行把 `Swift 6`、`Node 20` 等版本名并写，对仍残留口述脚手架的近原样长稿触发局部修复，并把具体 Ledger 证据错误反馈给唯一一次 Planner Repair；
 7. 质量 Runner 已把“预算调用尝试”与“成功 Provider 调用”分开记录：超时或本地失败仍计入尝试次数，但只有完成 HTTP 200 解析并落盘审计回执的请求才计入成功调用，避免把正常超时误报为审计链路丢失；
 8. 全量 1,240 项 Swift 测试（6 项条件跳过）、Release、健康检查、25 条核心集、130 条压力集结构校验和 25×2 实验报告校验均通过。
 

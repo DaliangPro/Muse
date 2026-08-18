@@ -1,7 +1,17 @@
 import Foundation
 
-enum VoicePolishLedgerIntegrityError: Error, Equatable {
+enum VoicePolishLedgerIntegrityError: Error, Equatable, CustomStringConvertible {
     case invalidLedger
+    case invalidLedgerReason(String)
+
+    var description: String {
+        switch self {
+        case .invalidLedger:
+            return "invalid_ledger"
+        case .invalidLedgerReason(let reason):
+            return reason
+        }
+    }
 }
 
 enum VoicePolishLedgerIntegrityValidator {
@@ -181,7 +191,9 @@ enum VoicePolishLedgerIntegrityValidator {
                 partial[spanID, default: []].insert(mapping.canonical)
             }
         }
-        guard !ledger.units.isEmpty else { throw VoicePolishLedgerIntegrityError.invalidLedger }
+        guard !ledger.units.isEmpty else {
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason("units_empty")
+        }
 
         var unitIds: Set<String> = []
         for index in ledger.units.indices {
@@ -195,23 +207,33 @@ enum VoicePolishLedgerIntegrityValidator {
                   !unit.finalMeaning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !unit.sourceSpanIds.isEmpty,
                   unit.sourceSpanIds.allSatisfy(validSpanIDs.contains) else {
-                throw VoicePolishLedgerIntegrityError.invalidLedger
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "unit_identity_enum_or_source_span_invalid:\(unit.id)"
+                )
             }
             if spans.count >= 3, unit.sourceSpanIds.count > 2 {
-                throw VoicePolishLedgerIntegrityError.invalidLedger
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "unit_references_more_than_two_source_spans:\(unit.id)"
+                )
             }
             if unit.kind == "advice" && unit.modality != "recommended" {
-                throw VoicePolishLedgerIntegrityError.invalidLedger
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "advice_unit_requires_recommended_modality:\(unit.id)"
+                )
             }
             let evidence = unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
             if unit.deliveryRole == "recipient_content" {
                 guard unit.surfaceTokens.isEmpty else {
-                    throw VoicePolishLedgerIntegrityError.invalidLedger
+                    throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                        "recipient_unit_surface_tokens_must_be_empty:\(unit.id)"
+                    )
                 }
             } else {
                 guard !unit.surfaceTokens.isEmpty,
                       unit.surfaceTokens.allSatisfy({ !$0.isEmpty && evidence.contains($0) }) else {
-                    throw VoicePolishLedgerIntegrityError.invalidLedger
+                    throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                        "non_recipient_unit_requires_source_backed_surface_tokens:\(unit.id)"
+                    )
                 }
             }
             let allowedCanonical = Set(unit.sourceSpanIds.flatMap {
@@ -222,7 +244,9 @@ enum VoicePolishLedgerIntegrityValidator {
             }), facts(in: unit.finalMeaning).isSubset(of: facts(in: evidence).union(
                 allowedCanonical.flatMap { facts(in: $0) }
             )) else {
-                throw VoicePolishLedgerIntegrityError.invalidLedger
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "unit_contains_unbacked_exact_token_or_fact:\(unit.id)"
+                )
             }
             if explicitNonCommitment(in: unit.finalMeaning) {
                 unit.modality = "not_promised"
@@ -259,12 +283,17 @@ enum VoicePolishLedgerIntegrityValidator {
               ledger.structure.orderedUnitIds.count == recipientUnitIDs.count,
               ["sentence", "paragraphs", "numbered_list", "mixed", "ai_prompt"]
                 .contains(ledger.structure.kind) else {
-            throw VoicePolishLedgerIntegrityError.invalidLedger
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                "structure_must_exactly_order_active_recipient_units"
+            )
         }
 
         let referencedSpanIDs = Set(ledger.units.flatMap(\.sourceSpanIds))
         guard validSpanIDs.isSubset(of: referencedSpanIDs) else {
-            throw VoicePolishLedgerIntegrityError.invalidLedger
+            let missing = validSpanIDs.subtracting(referencedSpanIDs).sorted().joined(separator: ",")
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                "source_spans_without_unit:\(missing)"
+            )
         }
 
         for audience in ledger.audience {
@@ -273,17 +302,24 @@ enum VoicePolishLedgerIntegrityValidator {
                   audience.sourceSpanIds.allSatisfy(validSpanIDs.contains),
                   !audience.surfaceTokens.isEmpty,
                   ["direct_address", "explicit_reference"].contains(audience.deliveryMode)
-            else { throw VoicePolishLedgerIntegrityError.invalidLedger }
+            else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason("audience_invalid")
+            }
             let evidence = audience.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
             guard audience.surfaceTokens.allSatisfy({ evidence.contains($0) }) else {
-                throw VoicePolishLedgerIntegrityError.invalidLedger
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "audience_surface_token_not_in_source"
+                )
             }
         }
         let source = spans.map(\.text).joined()
         let requiredAudience = requiredAudienceTokens(in: source)
         let plannedAudience = Set(ledger.audience.flatMap(\.surfaceTokens))
         guard requiredAudience.isSubset(of: plannedAudience) else {
-            throw VoicePolishLedgerIntegrityError.invalidLedger
+            let missing = requiredAudience.subtracting(plannedAudience).sorted().joined(separator: ",")
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                "required_audience_missing:\(missing)"
+            )
         }
         for correction in ledger.corrections {
             guard !correction.subject.isEmpty,
@@ -295,32 +331,52 @@ enum VoicePolishLedgerIntegrityValidator {
                   correction.oldSpanIds.allSatisfy(validSpanIDs.contains),
                   correction.finalSpanIds.allSatisfy(validSpanIDs.contains),
                   ["final_only", "announce_change"].contains(correction.renderingPolicy)
-            else { throw VoicePolishLedgerIntegrityError.invalidLedger }
+            else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason("correction_schema_invalid")
+            }
             let oldEvidence = correction.oldSpanIds.compactMap { spanByID[$0]?.text }.joined()
             let finalEvidence = correction.finalSpanIds.compactMap { spanByID[$0]?.text }.joined()
             guard oldEvidence.contains(correction.oldValue),
                   finalEvidence.contains(correction.finalValue) else {
-                throw VoicePolishLedgerIntegrityError.invalidLedger
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "correction_value_not_found_in_its_source_span"
+                )
             }
         }
 
-        try validateConditionals(
-            ledger.conditionals,
-            requiredLogicCues: requiredLogicCues,
-            spans: spanByID
-        )
-        try validateTokenMappings(
-            ledger.technicalTokenMappings,
-            transform: "remove_internal_ascii_whitespace",
-            spans: spanByID,
-            sceneAllowsMappings: scene == .code || scene == .aiPrompt
-        )
-        try validateTokenMappings(
-            ledger.dictatedSymbolMappings,
-            transform: nil,
-            spans: spanByID,
-            sceneAllowsMappings: scene == .code || scene == .aiPrompt
-        )
+        do {
+            try validateConditionals(
+                ledger.conditionals,
+                requiredLogicCues: requiredLogicCues,
+                spans: spanByID
+            )
+        } catch {
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason("conditionals_invalid")
+        }
+        do {
+            try validateTokenMappings(
+                ledger.technicalTokenMappings,
+                transform: "remove_internal_ascii_whitespace",
+                spans: spanByID,
+                sceneAllowsMappings: scene == .code || scene == .aiPrompt
+            )
+        } catch {
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                "technical_token_mappings_invalid"
+            )
+        }
+        do {
+            try validateTokenMappings(
+                ledger.dictatedSymbolMappings,
+                transform: nil,
+                spans: spanByID,
+                sceneAllowsMappings: scene == .code || scene == .aiPrompt
+            )
+        } catch {
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                "dictated_symbol_mappings_invalid"
+            )
+        }
         ledger.contextMappings = verifiedMappings.filter { mapping in
             ledger.units.contains { unit in
                 unit.deliveryRole == "recipient_content"

@@ -34,7 +34,7 @@ enum VoicePolishLedgerPrompts {
     static let plannerRepair = """
     你是 Muse 意图清单的格式与证据修复器。上一版 Ledger 没有通过本地 schema 或来源完整性检查；你只修 Ledger，不写成稿。
 
-    重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES 和 VERIFIED_ENTITY_MAPPINGS。确保每个 source span 都由 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；每个 logic cue 恰好由一条 conditional 覆盖；correction 的旧值和最终值逐字来自各自证据；技术映射只做固定的空白或口述符号变换；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。
+    重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES、VERIFIED_ENTITY_MAPPINGS 和 VALIDATION_ERROR，针对错误原因修正。确保每个 source span 都由 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；source span 达到 3 个时，每个 unit 最多引用 2 个 source span；recipient_content 的 surface_tokens 必须为空，其他 role 必须填写逐字来自证据的 surface_tokens；每个 logic cue 恰好由一条 conditional 覆盖；correction 的旧值和最终值逐字来自各自证据；技术映射只做固定的空白或口述符号变换；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。
     不得借修复新增原文没有的事实、受众、条件或映射。只返回完整修复后的 Ledger JSON，不要回显错误、解释或 Markdown。
     """
 

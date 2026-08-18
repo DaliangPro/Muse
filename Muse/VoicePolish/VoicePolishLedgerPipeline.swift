@@ -1,7 +1,11 @@
 import Foundation
 
 private struct VoicePolishLedgerTimeoutError: Error {}
-private struct VoicePolishLedgerPlanValidationError: Error {}
+private struct VoicePolishLedgerPlanValidationError: Error, CustomStringConvertible {
+    let detail: String
+
+    var description: String { detail }
+}
 
 /// 面向日常复杂短文与约 1K 长文的新流水线。它不调用旧语义 Validator，
 /// 只使用带来源证据的 Ledger、隔离 Reviewer 和可确定证明的本地安全门。
@@ -111,7 +115,7 @@ struct VoicePolishLedgerPipeline: Sendable {
                 mappings: mappings,
                 requiredLogicCues: requiredLogicCues
             )
-        } catch is VoicePolishLedgerPlanValidationError {
+        } catch let validationError as VoicePolishLedgerPlanValidationError {
             do {
                 try reserveAttempt(&attempts)
                 let repairedPlan = try await generate(
@@ -124,7 +128,7 @@ struct VoicePolishLedgerPipeline: Sendable {
                         mappings: mappings,
                         requiredLogicCues: requiredLogicCues,
                         invalidResponse: rawPlanResponse,
-                        error: VoicePolishLedgerPlanValidationError()
+                        error: validationError
                     ),
                     responseFormat: .jsonObject,
                     maxOutputTokens: outputBudget(source: request.input.fallbackText, baseline: 4_096),
@@ -466,7 +470,7 @@ struct VoicePolishLedgerPipeline: Sendable {
                 scene: request.context.scene
             )
         } catch {
-            throw VoicePolishLedgerPlanValidationError()
+            throw VoicePolishLedgerPlanValidationError(detail: String(describing: error))
         }
     }
 
