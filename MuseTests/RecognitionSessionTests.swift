@@ -325,12 +325,10 @@ final class RecognitionSessionTests: XCTestCase {
         let requests = await client.recordedRequests()
         let request = try XCTUnwrap(requests.first)
         let payload = try Self.voicePolishPayload(from: request)
-        let sourceSpans = try XCTUnwrap(payload["source_spans"] as? [[String: Any]])
-        XCTAssertEqual(sourceSpans.compactMap { $0["text"] as? String }.joined(), canonical)
-        XCTAssertFalse(request.user.contains(raw))
+        XCTAssertEqual(payload["canonical_text"] as? String, canonical)
         XCTAssertFalse(request.user.contains("内置整句"))
         let models = await client.recordedModels()
-        XCTAssertEqual(models, Array(repeating: "voice-polish-fast-model", count: 3))
+        XCTAssertEqual(models, ["voice-polish-fast-model"])
     }
 
     func testDirectAndVoicePolishShareGlobalCanonicalAndFixedSnippetBehavior() async throws {
@@ -696,9 +694,7 @@ final class RecognitionSessionTests: XCTestCase {
         let targetRequests = await client.recordedRequests()
         let request = try XCTUnwrap(targetRequests.first)
         let payload = try Self.voicePolishPayload(from: request)
-        let sourceSpans = try XCTUnwrap(payload["source_spans"] as? [[String: Any]])
-        XCTAssertEqual(sourceSpans.compactMap { $0["text"] as? String }.joined(), canonical)
-        XCTAssertFalse(request.user.contains(raw))
+        XCTAssertEqual(payload["canonical_text"] as? String, canonical)
     }
 
     func testVoicePolishDoesNotBypassRepositorySuppressionThroughLegacySnippets() async throws {
@@ -845,7 +841,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertNil(result?.processedText)
         XCTAssertFalse(result?.llmFailed ?? true)
         XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
-        XCTAssertTrue(recorder.values.contains("voicePolishStage:analyzing"))
+        XCTAssertTrue(recorder.values.contains("voicePolishStage:polishing"))
         XCTAssertTrue(recorder.values.contains("processing:\(canonical)"))
     }
 
@@ -922,7 +918,7 @@ final class RecognitionSessionTests: XCTestCase {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
-        let source = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
         let wrong = source.replacingOccurrences(
             of: "邮件里不要承诺周五对外发布",
             with: "邮件里说明周五一定不会对外发布"
@@ -1027,7 +1023,7 @@ final class RecognitionSessionTests: XCTestCase {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
-        let source = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
         let wrong = source.replacingOccurrences(
             of: "邮件里不要承诺周五对外发布",
             with: "邮件里说明周五一定不会对外发布"

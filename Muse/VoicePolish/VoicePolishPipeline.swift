@@ -77,6 +77,7 @@ struct VoicePolishPipeline: Sendable {
     private let usesAdaptiveRepairTimeout: Bool
     private let fastChunkTokenLimit: Int
     private let ledgerRoutingEnabled: Bool
+    private let ledgerMinimumCharacterCount: Int
     private let onStage: (@Sendable (VoicePolishStage) -> Void)?
 
     init(
@@ -89,6 +90,7 @@ struct VoicePolishPipeline: Sendable {
         repairTimeout: Duration? = nil,
         fastChunkSourceTokenLimit: Int = VoicePolishPipeline.fastChunkSourceTokenLimit,
         ledgerRoutingEnabled: Bool = true,
+        ledgerMinimumCharacterCount: Int = 80,
         onStage: (@Sendable (VoicePolishStage) -> Void)? = nil
     ) {
         self.client = client
@@ -108,6 +110,7 @@ struct VoicePolishPipeline: Sendable {
         // 分片实现，不能被日常长文的新 Ledger 编排提前接管。
         self.ledgerRoutingEnabled = ledgerRoutingEnabled
             && fastChunkSourceTokenLimit == Self.fastChunkSourceTokenLimit
+        self.ledgerMinimumCharacterCount = max(0, ledgerMinimumCharacterCount)
         self.onStage = onStage
     }
 
@@ -250,7 +253,11 @@ struct VoicePolishPipeline: Sendable {
             "voice polish start route=\(decision.route.rawValue) executed=\(executedRoute.rawValue) quality=\(request.qualityMode.rawValue) input=\(request.fallbackText.count)chars facts=\(sourceFacts.count)"
         )
 
-        if ledgerRoutingEnabled, VoicePolishLedgerPipeline.shouldUse(for: request) {
+        if ledgerRoutingEnabled,
+           VoicePolishLedgerPipeline.shouldUse(
+               for: request,
+               minimumCharacterCount: ledgerMinimumCharacterCount
+           ) {
             DebugFileLogger.log(
                 "voice polish ledger route input=\(request.input.fallbackText.count)chars scene=\(request.context.scene.rawValue)"
             )

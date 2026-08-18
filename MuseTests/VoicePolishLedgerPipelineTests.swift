@@ -8,6 +8,17 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         baseURL: "https://example.com/v1"
     )
 
+    private func productionLedgerPipeline(
+        _ client: any LLMClient,
+        config: LLMConfig? = nil
+    ) -> VoicePolishPipeline {
+        VoicePolishPipeline(
+            client: client,
+            config: config ?? self.config,
+            ledgerMinimumCharacterCount: 0
+        )
+    }
+
     func testDailyLongTextUsesPlannerWriterAndColdReviewer() async throws {
         let source = dailySource("本周课程交接")
         let request = makeRequest(source)
@@ -30,10 +41,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(
-            client: client,
-            config: config
-        ).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, finalText)
@@ -60,7 +68,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(incomplete),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 2)
@@ -93,10 +101,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(
-            client: client,
-            config: config
-        ).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, repaired)
@@ -125,10 +130,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(
-            client: client,
-            config: config
-        ).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, repaired)
@@ -162,10 +164,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(
-            client: client,
-            config: config
-        ).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 5)
@@ -175,26 +174,37 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertEqual(requestCount, 5)
     }
 
-    func testRiskShortTextUsesLedgerWhileSimpleShortQuestionKeepsLightPath() {
-        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+    func testVeryShortTextKeepsLightPathWhileRiskyMediumTextUsesLedger() {
+        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "如果还是不行，让他把系统版本和错误截图发过来。",
             scene: .customerSupport
         )))
-        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "跟团队说会议改到周四下午。",
             scene: .workChat
         )))
-        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "只有客户确认，才能对外发布。",
             scene: .workChat
         )))
-        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "不要覆盖安装，建议先跑测试。",
             scene: .workChat
         )))
         XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "你到哪了",
             scene: .chat
+        )))
+        let riskyMedium = "如果还是不行，让他把系统版本、错误截图、复现步骤和最近一次操作时间发过来，"
+            + "同时说明不要承诺当天一定解决，只需确认我们已经收到并会继续排查，明天下午前再同步一次进展。"
+        XCTAssertGreaterThanOrEqual(riskyMedium.count, 80)
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            riskyMedium,
+            scene: .customerSupport
+        )))
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            dailySource("日常长文路由"),
+            scene: .document
         )))
     }
 
@@ -247,7 +257,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, finalText)
@@ -296,7 +306,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, "执行scripts/package-app.sh，然后检查codesign。")
@@ -366,7 +376,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             baseURL: "https://api.deepseek.com"
         )
 
-        let result = await VoicePolishPipeline(client: client, config: official).process(request)
+        let result = await productionLedgerPipeline(client, config: official).process(request)
 
         XCTAssertFalse(result.usedFallback)
         let models = await client.models()
@@ -684,7 +694,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(repaired), try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 5)
@@ -719,7 +729,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(repaired), try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 5)
@@ -783,7 +793,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, repaired)
@@ -821,7 +831,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(passReview()),
         ])
 
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await productionLedgerPipeline(client).process(request)
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, source)

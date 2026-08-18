@@ -55,12 +55,18 @@ struct VoicePolishLedgerPipeline: Sendable {
         return config.withModel("deepseek-v4-flash")
     }
 
-    static func shouldUse(for request: VoicePolishRequest) -> Bool {
+    static func shouldUse(
+        for request: VoicePolishRequest,
+        minimumCharacterCount: Int = 80
+    ) -> Bool {
         let text = request.input.fallbackText
-        // 日常 700～1,500 字是本轮主场景；280 字作为保守升级起点，避免
-        // 已经稳定的一句话/极短消息承担三次模型调用。超过 1,800 字仍留给
-        // 既有有界分片链路，作为压力边界单独演进。
-        guard !text.isEmpty, text.count <= 1_800 else { return false }
+        // Ledger 的主场景是日常中长口述。80 字以下继续使用成熟的一次 Fast
+        // 成稿与本地硬门禁，避免一句改口承担 Planner JSON 修复和冷复核的
+        // 延迟；80～279 字只有出现明确风险才升级，280～1,800 字统一使用。
+        // 更长文本仍留给既有有界分片链路，作为压力边界单独演进。
+        guard text.count >= max(0, minimumCharacterCount), text.count <= 1_800 else {
+            return false
+        }
         if text.count >= 280 { return true }
         if !request.resolvedEntities.isEmpty || !request.input.requiredEntityEdits.isEmpty {
             return true
