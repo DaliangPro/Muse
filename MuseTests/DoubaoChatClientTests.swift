@@ -58,6 +58,23 @@ private final class VoicePolishProviderAuditMissingIDURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private struct VoicePolishProviderAuditFailureClient: LLMClient {
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        throw LLMError.timedOut
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
+        throw LLMError.timedOut
+    }
+
+    func warmUp(baseURL: String) async {}
+}
+
 final class DoubaoChatClientTests: XCTestCase {
 
     private func withChineseAppLanguage(_ action: () -> Void) {
@@ -232,11 +249,13 @@ final class DoubaoChatClientTests: XCTestCase {
             session: URLSession(configuration: configuration)
         )
         let nonce = String(repeating: "d", count: 64)
+        let successCounter = VoicePolishProviderAuditSuccessCounter()
         let auditedClient = VoicePolishProviderAuditedLLMClient(
             base: providerClient,
             runNonce: nonce,
             testInputID: "VP-L15-AUDIT-DETACHED",
-            receiptPath: receiptURL.path
+            receiptPath: receiptURL.path,
+            successCounter: successCounter
         )
 
         let response = try await AsyncTimeout.throwingValue(
@@ -274,6 +293,49 @@ final class DoubaoChatClientTests: XCTestCase {
         XCTAssertEqual(receipt.runNonce, nonce)
         XCTAssertEqual(receipt.testInputID, "VP-L15-AUDIT-DETACHED")
         XCTAssertEqual(receipt.requestOrdinal, 1)
+        let successfulCallCount = await successCounter.currentCount()
+        XCTAssertEqual(successfulCallCount, 1)
+    }
+
+    func test质量Runner不会把超时尝试计为成功Provider调用() async {
+        let successCounter = VoicePolishProviderAuditSuccessCounter()
+        let auditedClient = VoicePolishProviderAuditedLLMClient(
+            base: VoicePolishProviderAuditFailureClient(),
+            runNonce: String(repeating: "e", count: 64),
+            testInputID: "VP-L15-AUDIT-TIMEOUT",
+            receiptPath: "/tmp/voice-polish-audit-timeout-unused.jsonl",
+            successCounter: successCounter
+        )
+
+        do {
+            _ = try await auditedClient.generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishAnalyze,
+                    system: nil,
+                    user: "测试超时",
+                    options: LLMGenerationOptions(reasoningPolicy: .disabled)
+                ),
+                config: LLMConfig(
+                    apiKey: "test-only-key",
+                    model: "deepseek-chat",
+                    baseURL: "https://api.deepseek.com"
+                )
+            )
+            XCTFail("超时调用不应成功")
+        } catch {
+            guard let llmError = error as? LLMError else {
+                XCTFail("收到非预期错误：\(error)")
+                return
+            }
+            guard case .timedOut = llmError else {
+                XCTFail("收到非预期 LLM 错误：\(llmError)")
+                return
+            }
+        }
+
+        let successfulCallCount = await successCounter.currentCount()
+        XCTAssertEqual(successfulCallCount, 0)
     }
 
     func testProvider没有ResponseID时不得产生可冒充的成功回执() async throws {

@@ -2,20 +2,35 @@ import AppKit
 import CommonCrypto
 import Foundation
 
+actor VoicePolishProviderAuditSuccessCounter {
+    private var count = 0
+
+    func recordSuccess() {
+        count += 1
+    }
+
+    func currentCount() -> Int {
+        count
+    }
+}
+
 /// `AsyncTimeout` 会在 detached task 内执行模型调用，外层 TaskLocal 不会自动继承。
 /// 质量 Runner 因此用每条样本独立的客户端包装器，在真正进入 `generate` 时重新
 /// 绑定审计上下文，避免请求成功但网络层看不到 nonce、样本 ID 或回执路径。
 struct VoicePolishProviderAuditedLLMClient: LLMClient {
     let base: any LLMClient
     let context: VoicePolishProviderAudit.Context
+    let successCounter: VoicePolishProviderAuditSuccessCounter
 
     init(
         base: any LLMClient,
         runNonce: String,
         testInputID: String,
-        receiptPath: String
+        receiptPath: String,
+        successCounter: VoicePolishProviderAuditSuccessCounter = .init()
     ) {
         self.base = base
+        self.successCounter = successCounter
         context = VoicePolishProviderAudit.Context(
             runNonce: runNonce,
             testInputID: testInputID,
@@ -24,13 +39,17 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
     }
 
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
-        try await VoicePolishProviderAudit.withContext(
+        let response = try await VoicePolishProviderAudit.withContext(
             runNonce: context.runNonce,
             testInputID: context.testInputID,
             receiptPath: context.receiptPath
         ) {
             try await base.generate(request, config: config)
         }
+        // 网络层只有在 HTTP 200 响应完成解析且回执已经 fsync 后才会返回。
+        // 预算尝试可能在超时、本地校验或非 200 响应处结束，不能冒充成功调用数。
+        await successCounter.recordSuccess()
+        return response
     }
 
     func process(
@@ -161,6 +180,7 @@ enum VoicePolishQualityRunner {
         let executedRoute: String
         let internalChunkCount: Int
         let llmCallCount: Int
+        let llmAttemptCount: Int
         let latencyMilliseconds: Int64
         let fallbackUsed: Bool
         let hardValidationCodes: [String]
@@ -417,18 +437,21 @@ enum VoicePolishQualityRunner {
                     resolvedEntities: resolvedEntities
                 )
                 let startedAt = ContinuousClock.now
+                let successCounter = VoicePolishProviderAuditSuccessCounter()
                 let auditedClient = VoicePolishProviderAuditedLLMClient(
                     base: providerClient,
                     runNonce: invocation.runNonce,
                     testInputID: input.testInputId,
-                    receiptPath: providerAuditURL.path
+                    receiptPath: providerAuditURL.path,
+                    successCounter: successCounter
                 )
                 let result = await VoicePolishPipeline(
                     client: auditedClient,
                     config: config
                 ).process(request)
                 let elapsed = ContinuousClock.now - startedAt
-                expectedProviderReceiptCount += result.llmAttemptCount
+                let successfulProviderCallCount = await successCounter.currentCount()
+                expectedProviderReceiptCount += successfulProviderCallCount
                 let actualProviderReceiptCount = try providerAuditReceiptCount(
                     at: providerAuditURL
                 )
@@ -458,7 +481,8 @@ enum VoicePolishQualityRunner {
                         for: request.fallbackText,
                         executedRoute: result.executedRoute
                     ),
-                    llmCallCount: result.llmAttemptCount,
+                    llmCallCount: successfulProviderCallCount,
+                    llmAttemptCount: result.llmAttemptCount,
                     latencyMilliseconds: milliseconds(elapsed),
                     fallbackUsed: result.usedFallback,
                     hardValidationCodes: validationEvidence.hardValidationCodes,

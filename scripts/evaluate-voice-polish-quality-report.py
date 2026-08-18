@@ -476,6 +476,19 @@ def runtime_evidence_failures(result: dict) -> list[str]:
                 f"LLM 调用数 {llm_call_count} 少于内部切片数 {internal_chunk_count}"
             )
 
+    llm_attempt_count = result.get("llm_attempt_count")
+    if (
+        not isinstance(llm_attempt_count, int)
+        or isinstance(llm_attempt_count, bool)
+        or llm_attempt_count < 1
+    ):
+        failures.append(f"没有有效 LLM 预算尝试计数：{llm_attempt_count!r}")
+    elif isinstance(llm_call_count, int) and not isinstance(llm_call_count, bool):
+        if llm_attempt_count < llm_call_count:
+            failures.append(
+                f"LLM 预算尝试数 {llm_attempt_count} 少于成功调用数 {llm_call_count}"
+            )
+
     latency = result.get("latency_milliseconds")
     if not isinstance(latency, int) or isinstance(latency, bool) or latency < 1:
         failures.append(f"没有有效模型耗时：{latency!r}")

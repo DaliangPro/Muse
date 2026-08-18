@@ -358,12 +358,14 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             base = {
                 "internal_chunk_count": 2,
                 "llm_call_count": 2,
+                "llm_attempt_count": 2,
                 "latency_milliseconds": 1,
                 "hard_validation_codes": [],
                 "diagnostic_codes": ["sceneStyleMismatch"],
             }
             diagnostic_only = module.runtime_evidence_failures(base)
             too_few_calls = module.runtime_evidence_failures({**base, "llm_call_count": 1})
+            impossible_attempts = module.runtime_evidence_failures({**base, "llm_attempt_count": 1})
             hard_failure = module.runtime_evidence_failures({
                 **base,
                 "hard_validation_codes": ["missingProtectedFact"],
@@ -371,6 +373,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             print(json.dumps({
                 "diagnostic_only": diagnostic_only,
                 "too_few_calls": too_few_calls,
+                "impossible_attempts": impossible_attempts,
                 "hard_failure": hard_failure,
             }, ensure_ascii=False))
             """,
@@ -383,6 +386,9 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
 
         XCTAssertEqual(result["diagnostic_only"], [])
         XCTAssertTrue(result["too_few_calls", default: []].contains { $0.contains("少于内部切片数") })
+        XCTAssertTrue(result["impossible_attempts", default: []].contains {
+            $0.contains("预算尝试数") && $0.contains("少于成功调用数")
+        })
         XCTAssertTrue(result["hard_failure", default: []].contains { $0.contains("硬校验错误") })
     }
 
