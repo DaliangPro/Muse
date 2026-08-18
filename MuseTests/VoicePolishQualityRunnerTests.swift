@@ -306,6 +306,22 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         )
     }
 
+    func testPlanner修复轨迹只编码稳定错误代码() throws {
+        let trace = VoicePolishPlannerValidationTrace(
+            initialCode: "units_empty",
+            repairedCode: "source_spans_without_unit"
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(trace)) as? [String: String]
+        )
+
+        XCTAssertEqual(object["initial_code"], "units_empty")
+        XCTAssertEqual(object["repaired_code"], "source_spans_without_unit")
+        XCTAssertFalse(object.values.contains { $0.contains(":") })
+    }
+
     func test内部切片数按Fast实际分片计算() {
         let source = "第一句内容。第二句内容。第三句内容。第四句内容。"
 

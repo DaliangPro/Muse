@@ -314,6 +314,22 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 2)
     }
 
+    func testPlannerInvalidJSONReportsStableDecodeTrace() async throws {
+        let request = makeRequest(dailySource("JSON 诊断"))
+        let client = LedgerScriptedLLM(responses: ["{}", "{}"])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(
+            result.plannerValidationTrace,
+            VoicePolishPlannerValidationTrace(
+                initialCode: "ledger_json_decode_failed",
+                repairedCode: "ledger_json_decode_failed"
+            )
+        )
+    }
+
     func testDictatedSymbolMappingIsAppliedBeforeReview() async throws {
         let source = "执行scripts斜杠package短横线app点sh，然后检查codesign。"
         let request = makeRequest(source, scene: .code)

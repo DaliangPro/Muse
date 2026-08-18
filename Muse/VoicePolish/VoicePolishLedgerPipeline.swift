@@ -7,8 +7,13 @@ private struct VoicePolishLedgerPlanValidationError: Error, CustomStringConverti
     var description: String { detail }
 
     var stableDiagnostic: String {
-        detail.split(separator: ":", maxSplits: 1).first.map(String.init)
-            ?? "ledger_validation_failed"
+        let candidate = detail.split(separator: ":", maxSplits: 1).first.map(String.init) ?? ""
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_")
+        guard !candidate.isEmpty,
+              candidate.unicodeScalars.allSatisfy(allowed.contains) else {
+            return "ledger_validation_failed"
+        }
+        return candidate
     }
 }
 
@@ -485,7 +490,7 @@ struct VoicePolishLedgerPipeline: Sendable {
             )
         } catch let error as VoicePolishLedgerIntegrityError {
             throw VoicePolishLedgerPlanValidationError(detail: error.description)
-        } catch is DecodingError {
+        } catch is StructuredLLMDecoderError {
             throw VoicePolishLedgerPlanValidationError(detail: "ledger_json_decode_failed")
         } catch {
             throw VoicePolishLedgerPlanValidationError(detail: "ledger_validation_failed")
