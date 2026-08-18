@@ -20,6 +20,13 @@ from urllib.parse import urlsplit
 from voice_polish_quality_checks import fact_group_is_preserved, relation_blocks
 
 
+QUALITY_DATASET_SCHEMA_VERSION = 7
+QUALITY_DATASET_NAME = "Muse 语音润色多维产品质量测试集 V3.2"
+QUALITY_DATASET_CASE_COUNT = 89
+QUALITY_DATASET_STRESS_VARIANT_COUNT = 41
+QUALITY_DATASET_TOTAL_INPUT_COUNT = 130
+
+
 def normalized(text: str) -> str:
     normalized_text = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n")
     return re.sub(r"[\t\f\v ]+", " ", normalized_text).strip()
@@ -62,6 +69,75 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def validated_quality_dataset(path: Path, expected_dataset_sha256: str) -> tuple[bytes, dict, str]:
+    """把评分母集绑定到独立冻结值，并拒绝缩减或替换 130 条结构。"""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"质量母测试集不存在、不是常规文件或是符号链接：{path}")
+    expected_dataset_sha256 = validate_hex(
+        expected_dataset_sha256, 64, "expected dataset SHA-256"
+    )
+    try:
+        dataset_bytes = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"质量母测试集无法读取：{error}") from error
+    actual_dataset_sha256 = hashlib.sha256(dataset_bytes).hexdigest()
+    if actual_dataset_sha256 != expected_dataset_sha256:
+        raise ValueError("质量母测试集 SHA-256 与外部冻结值不一致")
+    try:
+        document = json.loads(dataset_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"质量母测试集无法解析：{error}") from error
+    if not isinstance(document, dict):
+        raise ValueError("质量母测试集必须是 JSON 对象")
+    if document.get("schema_version") != QUALITY_DATASET_SCHEMA_VERSION:
+        raise ValueError(
+            "质量母测试集 schema_version 不一致："
+            f"{document.get('schema_version')!r}"
+        )
+    if document.get("name") != QUALITY_DATASET_NAME:
+        raise ValueError(f"质量母测试集名称不一致：{document.get('name')!r}")
+    cases = document.get("cases")
+    variants = document.get("stress_variants")
+    if not isinstance(cases, list) or not isinstance(variants, list):
+        raise ValueError("质量母测试集缺少 cases 或 stress_variants 数组")
+    actual_counts = (len(cases), len(variants), len(cases) + len(variants))
+    expected_counts = (
+        QUALITY_DATASET_CASE_COUNT,
+        QUALITY_DATASET_STRESS_VARIANT_COUNT,
+        QUALITY_DATASET_TOTAL_INPUT_COUNT,
+    )
+    declared_counts = (
+        document.get("case_count"),
+        document.get("stress_variant_count"),
+        document.get("total_input_count"),
+    )
+    if actual_counts != expected_counts or declared_counts != expected_counts:
+        raise ValueError(
+            "质量母测试集必须固定为 89 条基准 + 41 条变体 = 130 次输入；"
+            f"声明={declared_counts!r}，实际={actual_counts!r}"
+        )
+    return dataset_bytes, document, actual_dataset_sha256
+
+
+def provider_request_binding_sha256(
+    run_nonce: str,
+    test_input_id: str,
+    request_ordinal: int,
+    request_body_sha256: str,
+) -> str:
+    """与网络层相同的无歧义字段绑定，独立验证每条请求属于本次样本。"""
+    components = [
+        run_nonce,
+        test_input_id,
+        str(request_ordinal),
+        request_body_sha256,
+    ]
+    encoded = "|".join(
+        f"{len(value.encode('utf-8'))}:{value}" for value in components
+    )
+    return sha256_text(f"muse-provider-audit-v2|{encoded}")
+
+
 def validated_provider_endpoint(value: str) -> str:
     parsed = urlsplit(value)
     if (
@@ -94,6 +170,7 @@ def validated_build_manifest(
     expected_source_commit: str,
     expected_source_tree: str,
     expected_executable_sha256: str,
+    expected_dataset_sha256: str,
     expected_designated_requirement_sha256: str,
 ) -> dict:
     """只在 manifest 及其关键字段同时命中外部 expected 值时建立信任。"""
@@ -106,6 +183,9 @@ def validated_build_manifest(
     expected_source_tree = validate_hex(expected_source_tree, 40, "expected source tree")
     expected_executable_sha256 = validate_hex(
         expected_executable_sha256, 64, "expected executable SHA-256"
+    )
+    expected_dataset_sha256 = validate_hex(
+        expected_dataset_sha256, 64, "expected dataset SHA-256"
     )
     expected_designated_requirement_sha256 = validate_hex(
         expected_designated_requirement_sha256,
@@ -133,6 +213,7 @@ def validated_build_manifest(
         "source_commit": expected_source_commit,
         "source_tree": expected_source_tree,
         "executable_sha256": expected_executable_sha256,
+        "dataset_sha256": expected_dataset_sha256,
         "designated_requirement_sha256": expected_designated_requirement_sha256,
     }
     for field, expected_value in expected_pairs.items():
@@ -210,6 +291,8 @@ def launch_candidate_run(
     with provider_audit_path.open("xb"):
         pass
     provider_audit_path.chmod(0o600)
+    audit_stat = provider_audit_path.stat()
+    audit_identity = (audit_stat.st_dev, audit_stat.st_ino)
     run_nonce = secrets.token_hex(32)
     started_at = datetime.now(timezone.utc)
     process = subprocess.Popen([
@@ -233,6 +316,11 @@ def launch_candidate_run(
     finished_at = datetime.now(timezone.utc)
     if return_code != 0:
         raise ValueError(f"候选质量进程退出码为 {return_code}")
+    if provider_audit_path.is_symlink() or not provider_audit_path.is_file():
+        raise ValueError("候选进程替换或移除了 Evaluator 预建的 Provider 审计文件")
+    final_audit_stat = provider_audit_path.stat()
+    if (final_audit_stat.st_dev, final_audit_stat.st_ino) != audit_identity:
+        raise ValueError("候选进程替换了 Evaluator 预建的 Provider 审计文件")
     if not report_path.is_file() or report_path.is_symlink():
         raise ValueError("候选进程没有生成常规报告文件")
     report_mtime = datetime.fromtimestamp(report_path.stat().st_mtime, timezone.utc)
@@ -463,8 +551,8 @@ def provider_audit_failures(
             failures.append(f"{prefix}的 test_input_id 不属于本次冻结输入：{test_id!r}")
         else:
             receipts_by_test_id.setdefault(test_id, []).append(receipt)
-        if receipt.get("schema_version") != 1:
-            failures.append(f"{prefix}的 schema_version 不是 1")
+        if receipt.get("schema_version") != 2:
+            failures.append(f"{prefix}的 schema_version 不是 2")
         if receipt.get("run_nonce") != expected_run_nonce:
             failures.append(f"{prefix}的 run_nonce 与 Evaluator 本次启动值不一致")
         if receipt.get("provider") != expected_provider:
@@ -486,6 +574,36 @@ def provider_audit_failures(
                 r"[0-9a-f]{64}", receipt[field]
             ):
                 failures.append(f"{prefix}的 {field} 不是 64 位 SHA-256")
+        request_ordinal = receipt.get("request_ordinal")
+        if (
+            not isinstance(request_ordinal, int)
+            or isinstance(request_ordinal, bool)
+            or request_ordinal < 1
+        ):
+            failures.append(f"{prefix}的 request_ordinal 不是正整数")
+        request_binding = receipt.get("request_binding_sha256")
+        if not isinstance(request_binding, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", request_binding
+        ):
+            failures.append(f"{prefix}的 request_binding_sha256 不是 64 位 SHA-256")
+        elif (
+            isinstance(test_id, str)
+            and isinstance(request_ordinal, int)
+            and not isinstance(request_ordinal, bool)
+            and request_ordinal >= 1
+            and isinstance(receipt.get("request_body_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", receipt["request_body_sha256"])
+            and request_binding
+            != provider_request_binding_sha256(
+                expected_run_nonce,
+                test_id,
+                request_ordinal,
+                receipt["request_body_sha256"],
+            )
+        ):
+            failures.append(
+                f"{prefix}的 request_binding_sha256 未绑定本次 nonce、样本、序号和请求体"
+            )
         response_id = receipt.get("provider_response_id")
         if not isinstance(response_id, str) or not (1 <= len(response_id.encode("utf-8")) <= 512):
             failures.append(f"{prefix}缺少有效 Provider response ID")
@@ -553,6 +671,7 @@ def main() -> None:
     parser.add_argument("--expected-source-commit", required=True)
     parser.add_argument("--expected-source-tree", required=True)
     parser.add_argument("--expected-executable-sha256", required=True)
+    parser.add_argument("--expected-dataset-sha256", required=True)
     parser.add_argument("--expected-designated-requirement-sha256", required=True)
     parser.add_argument("--expected-prompt-version", required=True, type=int)
     parser.add_argument("--run-timeout-seconds", type=int, default=21_600)
@@ -565,18 +684,21 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(f"FAIL：{error}") from error
 
-    dataset_bytes = args.dataset.read_bytes()
-    dataset = json.loads(dataset_bytes.decode("utf-8"))
-    expected = flatten_dataset(dataset)
     failures: list[str] = []
 
     try:
+        dataset_bytes, dataset, expected_dataset_sha256 = validated_quality_dataset(
+            args.dataset,
+            args.expected_dataset_sha256,
+        )
+        expected = flatten_dataset(dataset)
         build_manifest = validated_build_manifest(
             args.build_manifest,
             expected_manifest_sha256=args.expected_build_manifest_sha256,
             expected_source_commit=args.expected_source_commit,
             expected_source_tree=args.expected_source_tree,
             expected_executable_sha256=args.expected_executable_sha256,
+            expected_dataset_sha256=expected_dataset_sha256,
             expected_designated_requirement_sha256=(
                 args.expected_designated_requirement_sha256
             ),
@@ -630,6 +752,10 @@ def main() -> None:
             args.expected_build_manifest_sha256, 64, "expected manifest SHA-256"
         ):
             raise ValueError("外部构建 manifest 在跑测期间发生变化")
+        if args.dataset.is_symlink() or not args.dataset.is_file():
+            raise ValueError("质量母测试集在跑测期间被替换或移除")
+        if sha256_file(args.dataset) != expected_dataset_sha256:
+            raise ValueError("质量母测试集在跑测期间发生变化")
         provider_receipts = read_provider_audit(provider_audit_path)
     except (OSError, ValueError, plistlib.InvalidFileException) as error:
         raise SystemExit(f"FAIL：候选应用真实跑测未完成：{error}") from error
@@ -897,7 +1023,7 @@ def main() -> None:
     print(f"PASS：{len(expected)} 次输入全部通过硬性检查，未发生回退、空输出或必要改写缺失。")
     print(f"长度覆盖：{dict(sorted(buckets.items()))}")
     print(f"上下文覆盖：{dict(sorted(contexts.items()))}")
-    print(f"母集 SHA-256：{hashlib.sha256(dataset_bytes).hexdigest()}")
+    print(f"母集 SHA-256：{expected_dataset_sha256}")
     print(f"无答案运行输入：{runner_input_path}（SHA-256 {expected_run_input_sha256}）")
     print(f"外部构建 manifest：{args.build_manifest}（SHA-256 {sha256_file(args.build_manifest)}）")
     print(f"Provider 网络回执：{provider_audit_path}（{len(provider_receipts)} 条，SHA-256 {sha256_file(provider_audit_path)}）")

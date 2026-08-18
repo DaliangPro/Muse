@@ -47,6 +47,31 @@ def append_safe_context_trap(fixture: dict, case_id: str) -> list[str]:
     return list(forbidden)
 
 
+def conflicting_context_candidates(fixture: dict) -> list[str]:
+    """从冲突上下文自身提取候选，确保任一候选都不能泄漏进成稿。"""
+    if not str(fixture.get("type", "")).startswith("conflicting_"):
+        return []
+
+    context_texts = [
+        fixture.get("selected_text"),
+        fixture.get("text_before_cursor"),
+        fixture.get("text_after_cursor"),
+        *(fixture.get("recent_muse_inputs") or []),
+    ]
+    candidates: list[str] = []
+    quoted_candidate_pattern = re.compile(
+        r"“([^”\n]+)”|‘([^’\n]+)’|\"([^\"\n]+)\"|`([^`\n]+)`"
+    )
+    for text in context_texts:
+        if not isinstance(text, str):
+            continue
+        for match in quoted_candidate_pattern.finditer(text):
+            candidate = next(group.strip() for group in match.groups() if group)
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
 def shared_claim_check(
     segment: str,
     reference: str,
@@ -178,6 +203,15 @@ LEGACY_REQUIRED_GROUP_OVERRIDES = {
     ],
 }
 
+CODE_01_CRITICAL_REQUIRED_TOKENS = [
+    "Muse/VoicePolish/VoicePolishPipeline.swift",
+    "swift test --filter VoicePolishPipelineTests",
+]
+
+VARIANT_REQUIRED_OVERRIDES = {
+    "code-01-noise-01": CODE_01_CRITICAL_REQUIRED_TOKENS,
+}
+
 VARIANT_FACTOR_OVERRIDES = {
     # 该输入只有错误断句，没有真实填充词，不能为了覆盖数字而错标维度。
     "email-01-noise-01": ["wrong_punctuation", "wrong_sentence_boundary"],
@@ -210,7 +244,7 @@ VARIANT_FORBIDDEN_OVERRIDES = {
     "code-01-noise-01": ["斜杠", "双横线", "Pol ish"],
     "code-03-noise-01": ["三步", "等一下", "还有一步", "短横线", "斜杠"],
     "support-02-noise-01": ["整单退款", "不对", "那就"],
-    "support-04-noise-01": ["可能是第三方接口波动", "别说一定能修好"],
+    "support-04-noise-01": ["第三方接口波动", "别说一定能修好"],
     "support-05-noise-01": ["目前不是坏了", "坏了。是需要"],
     "chat-01-stutter-01": ["我我我", "大大概", "不不用"],
     "chat-04-stutter-01": ["你明天你明天", "还是还是"],
@@ -307,7 +341,7 @@ VARIANT_FACTOR_FORBIDDEN_OVERRIDES = {
         "false_start": ["那就"],
     },
     "support-04-noise-01": {
-        "explicit_aside": ["可能是第三方接口波动"],
+        "explicit_aside": ["第三方接口波动"],
         "meta_instruction": ["别说一定能修好"],
         "wrong_punctuation": ["这个原因。先不要"],
         "wrong_sentence_boundary": ["技术正在查预计明天"],
@@ -385,6 +419,26 @@ VARIANT_FACTOR_FORBIDDEN_OVERRIDES = {
 }
 
 VARIANT_FACTOR_ASSERTION_OVERRIDES = {
+    "code-01-noise-01": {
+        "mixed_language_tokenization": {
+            "required_substrings": [
+                "回退原文",
+                *CODE_01_CRITICAL_REQUIRED_TOKENS,
+            ],
+        },
+        "accidental_space": {
+            "required_substrings": [
+                "回退原文",
+                *CODE_01_CRITICAL_REQUIRED_TOKENS,
+            ],
+        },
+        "dictated_symbols": {
+            "required_substrings": [
+                "回退原文",
+                *CODE_01_CRITICAL_REQUIRED_TOKENS,
+            ],
+        },
+    },
     "chat-03-noise-01": {
         "lexical_repetition": {
             "maximum_occurrences": {"排不开": 1},
@@ -778,6 +832,7 @@ def context_cases() -> list[dict]:
             recent=row.get("recent"),
         )
         context_forbidden = list(row.get("context_forbidden", []))
+        context_forbidden.extend(conflicting_context_candidates(fixture))
         if fixture["safety"] == "safe":
             context_forbidden.extend(append_safe_context_trap(fixture, row["id"]))
         if fixture["safety"] == "safe" and not any(
@@ -786,6 +841,7 @@ def context_cases() -> list[dict]:
             sentinel = f"CTX-ONLY-{row['id'].upper()}"
             context_forbidden.append(sentinel)
             append_context_text(fixture, f"仅作上下文泄漏测试：{sentinel}。")
+        context_forbidden = list(dict.fromkeys(context_forbidden))
         item = new_case(
             case_id=row["id"],
             group="context_correction",
@@ -1597,7 +1653,7 @@ def natural_ultra_long_cases() -> list[dict]:
     product_segments[23] = (
         "前面质量修复的重试次数我说错了，最终最多两次。" + product_segments[23]
     )
-    course_segments[23] += "课程资料复核先安排三轮。"
+    course_segments[14] += "另外，课程资料复核先安排三轮。"
     course_segments[30] = (
         "前面的课程资料复核轮次不对，课程资料复核最终安排两轮。" + course_segments[30]
     )
@@ -1615,8 +1671,8 @@ def natural_ultra_long_cases() -> list[dict]:
         "前面质量修复的重试次数我说错了，最终最多两次。",
         "质量修复重试次数最终最多两次。",
     )
-    course_full_reference[23] = course_full_reference[23].replace(
-        "课程资料复核先安排三轮。", ""
+    course_full_reference[14] = course_full_reference[14].replace(
+        "另外，课程资料复核先安排三轮。", ""
     )
     course_full_reference[30] = course_full_reference[30].replace(
         "前面的课程资料复核轮次不对，课程资料复核最终安排两轮。",
@@ -1729,6 +1785,7 @@ def legacy_automatic_checks(
         if canonical and canonical in reference:
             required.append(canonical)
     required.extend(LEGACY_REQUIRED_OVERRIDES.get(case_id, []))
+    required.extend(VARIANT_REQUIRED_OVERRIDES.get(test_input_id, []))
     forbidden = [
         claim for claim in remove
         if claim in spoken and claim not in reference

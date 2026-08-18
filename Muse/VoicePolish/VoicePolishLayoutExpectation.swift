@@ -880,7 +880,11 @@ private extension VoicePolishLayoutExpectation {
                 Self.continuousSequenceCount(englishOrdinalValues),
                 Self.rhetoricalOrderedItemCount(in: text),
             ].compactMap { $0 }.max()
-            implicitStepCount = Self.implicitStepCount(in: text, hasCJK: hasCJK)
+            let sequentialStepCount = Self.implicitStepCount(in: text, hasCJK: hasCJK)
+            let promptDirectiveCount = scene == .aiPrompt
+                ? Self.aiPromptDirectiveCount(in: text)
+                : 0
+            implicitStepCount = max(sequentialStepCount, promptDirectiveCount)
             parallelItemCount = parallelItems
             topicSwitchCount = VoicePolishLayoutExpectation
                 .topicSwitchEvidenceCount(in: text)
@@ -1310,6 +1314,56 @@ private extension VoicePolishLayoutExpectation {
                 #"(?i)\b(?:start\s+by|begin\s+by|first|then|next|after\s+that|finally|lastly)\b"#,
                 in: text
             )
+        }
+
+        /// AI Prompt 里的多个动作经常没有序号，甚至没有完整标点。这里抽取
+        /// 非重叠的动作 span：同一句“不要输出测试方案”只算一个动作，同类但
+        /// 分开的“说明依据、说明影响”则算两项。它只决定最低列表项数，不
+        /// 执行 Prompt，也不把下游输出数量（例如“三条建议”）当作列表数。
+        private static func aiPromptDirectiveCount(in text: String) -> Int {
+            let scrubbed = text
+                .replacingOccurrences(
+                    of: #"“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|`[^`\n]*`|\"[^\"\n]*\""#,
+                    with: " ",
+                    options: .regularExpression
+                )
+            let actionPatterns = [
+                // 禁止或暂缓一个动作。
+                #"(?:不要|别|不得|禁止|不可|无需)\s*(?:直接|马上|立刻|现在|擅自|自行)?\s*(?:改|修改|执行|删除|添加|输出|回答|预测|假设|编造|省略|合并|运行|调用|发送|发布)"#,
+                // 解释或说明原因、机制、依据。
+                #"(?:解释|说明)(?:一下)?(?:[^，。；;！？!?\n]{0,12}?)(?:原因|原理|机制|依据|为什么|问题|影响|范围)"#,
+                // 列出、梳理或追踪结构与链路。
+                #"(?:列出|列明|梳理|整理)(?:[^，。；;！？!?\n]{0,20}?)(?:调用链|链路|步骤|流程|清单|结构|路径|关系)"#,
+                // 给出可执行方案、建议、结论或结果。
+                #"(?:给|给出|提供|输出)(?:[^，。；;！？!?\n]{0,20}?)(?:方案|建议|结论|结果|步骤|清单|计划)"#,
+                // 单独要求补充、设计或说明测试/验证。
+                #"(?:(?:需要|要|请)\s*(?:补|补充|设计|说明|列出|给出)?|(?:补|补充|设计|说明|列出|给出))(?:[^，。；;！？!?\n]{0,12}?)(?:测试|验证用例|验收用例)"#,
+                // 比较、查找、定位、评估等独立分析动作。
+                #"(?:比较|对比|查找|找出|定位|评估|分析|检查|核对)(?:[^，。；;！？!?\n]{1,24})"#,
+                // 明确交付格式或禁止执行 Prompt 本身。
+                #"(?:输出格式|交付格式|返回格式|不要执行|只输出|仅输出)"#,
+            ]
+
+            var ranges: [NSRange] = []
+            let fullRange = NSRange(scrubbed.startIndex..<scrubbed.endIndex, in: scrubbed)
+            for pattern in actionPatterns {
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                ranges.append(contentsOf: regex.matches(in: scrubbed, range: fullRange).map(\.range))
+            }
+            let ordered = ranges.sorted { left, right in
+                if left.location != right.location { return left.location < right.location }
+                return left.length > right.length
+            }
+            var accepted: [NSRange] = []
+            for range in ordered where range.location != NSNotFound && range.length > 0 {
+                if accepted.contains(where: {
+                    NSIntersectionRange($0, range).length > 0
+                }) {
+                    continue
+                }
+                accepted.append(range)
+            }
+            return accepted.count
         }
 
         private static func parallelItemCount(in text: String) -> Int {

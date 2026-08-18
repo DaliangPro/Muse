@@ -42,6 +42,26 @@ enum VoicePolishProviderAudit {
         CC_SHA256_Final(&digest, &context)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
+
+    /// 用长度前缀把 Evaluator nonce、样本 ID、样本内请求序号和实际请求体摘要
+    /// 绑定成一个不可歧义的摘要。Evaluator 会独立重算，避免字段被拆开替换。
+    static func requestBindingSHA256(
+        runNonce: String,
+        testInputID: String,
+        requestOrdinal: Int,
+        requestBodySHA256: String
+    ) -> String {
+        let components = [
+            runNonce,
+            testInputID,
+            String(requestOrdinal),
+            requestBodySHA256,
+        ]
+        let encoded = components.map { value in
+            "\(value.utf8.count):\(value)"
+        }.joined(separator: "|")
+        return sha256Hex(Data("muse-provider-audit-v2|\(encoded)".utf8))
+    }
 }
 
 struct VoicePolishProviderAuditReceipt: Codable, Sendable, Equatable {
@@ -57,6 +77,7 @@ struct VoicePolishProviderAuditReceipt: Codable, Sendable, Equatable {
     let transport: String
     let httpStatus: Int
     let requestBodySHA256: String
+    let requestBindingSHA256: String
     let responseTextSHA256: String
     let providerResponseID: String
     let recordedAt: Date
@@ -74,6 +95,7 @@ struct VoicePolishProviderAuditReceipt: Codable, Sendable, Equatable {
         case transport
         case httpStatus = "http_status"
         case requestBodySHA256 = "request_body_sha256"
+        case requestBindingSHA256 = "request_binding_sha256"
         case responseTextSHA256 = "response_text_sha256"
         case providerResponseID = "provider_response_id"
         case recordedAt = "recorded_at"
@@ -427,8 +449,9 @@ actor DoubaoChatClient: LLMClient {
 
         let ordinalKey = "\(audit.runNonce)\u{0}\(audit.testInputID)"
         let nextOrdinal = (auditOrdinals[ordinalKey] ?? 0) + 1
+        let requestBodySHA256 = VoicePolishProviderAudit.sha256Hex(requestBody)
         let receipt = VoicePolishProviderAuditReceipt(
-            schemaVersion: 1,
+            schemaVersion: 2,
             runNonce: audit.runNonce,
             testInputID: audit.testInputID,
             requestOrdinal: nextOrdinal,
@@ -439,7 +462,13 @@ actor DoubaoChatClient: LLMClient {
             responseModel: result.responseModel,
             transport: transport,
             httpStatus: 200,
-            requestBodySHA256: VoicePolishProviderAudit.sha256Hex(requestBody),
+            requestBodySHA256: requestBodySHA256,
+            requestBindingSHA256: VoicePolishProviderAudit.requestBindingSHA256(
+                runNonce: audit.runNonce,
+                testInputID: audit.testInputID,
+                requestOrdinal: nextOrdinal,
+                requestBodySHA256: requestBodySHA256
+            ),
             responseTextSHA256: VoicePolishProviderAudit.sha256Hex(Data(result.text.utf8)),
             providerResponseID: rawResponseID,
             recordedAt: Date()
@@ -474,10 +503,16 @@ actor DoubaoChatClient: LLMClient {
         line.append(0x0A)
 
         let handle = try FileHandle(forWritingTo: url)
-        defer { try? handle.close() }
-        _ = try handle.seekToEnd()
-        try handle.write(contentsOf: line)
-        try handle.synchronize()
+        do {
+            _ = try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+            // 每条 HTTP 200 成功响应在返回上层前立即落盘；不能依赖进程退出时刷新。
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
     }
 
     static func makeChatRequest(

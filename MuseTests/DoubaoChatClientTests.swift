@@ -73,6 +73,18 @@ final class DoubaoChatClientTests: XCTestCase {
         action()
     }
 
+    func test请求绑定摘要使用UTF8长度前缀且可由Evaluator独立重算() {
+        XCTAssertEqual(
+            VoicePolishProviderAudit.requestBindingSHA256(
+                runNonce: String(repeating: "a", count: 64),
+                testInputID: "样本-01",
+                requestOrdinal: 2,
+                requestBodySHA256: String(repeating: "b", count: 64)
+            ),
+            "ab82d49a29f6f0541f3af63569db7b372e22b6026a43f7903e22f1e6f68bc4f2"
+        )
+    }
+
     func testPromptAndUserInputAreSeparatedForLLMRequest() {
         let prompt = "请修正以下文本：{text}\n只返回正文。"
         let parts = prompt.separatedLLMMessages(with: "200毫秒")
@@ -177,6 +189,7 @@ final class DoubaoChatClientTests: XCTestCase {
             VoicePolishProviderAuditReceipt.self,
             from: Data(lines[0].utf8)
         )
+        XCTAssertEqual(receipt.schemaVersion, 2)
         XCTAssertEqual(receipt.runNonce, nonce)
         XCTAssertEqual(receipt.testInputID, "VP-L15-AUDIT-001")
         XCTAssertEqual(receipt.requestOrdinal, 1)
@@ -190,9 +203,77 @@ final class DoubaoChatClientTests: XCTestCase {
         XCTAssertEqual(receipt.providerResponseID, "chatcmpl-provider-123")
         XCTAssertTrue(receipt.requestBodySHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil)
         XCTAssertEqual(
+            receipt.requestBindingSHA256,
+            VoicePolishProviderAudit.requestBindingSHA256(
+                runNonce: nonce,
+                testInputID: "VP-L15-AUDIT-001",
+                requestOrdinal: 1,
+                requestBodySHA256: receipt.requestBodySHA256
+            )
+        )
+        XCTAssertEqual(
             receipt.responseTextSHA256,
             VoicePolishProviderAudit.sha256Hex(Data("润色完成。".utf8))
         )
+    }
+
+    func test质量Runner在Detached超时任务内重新绑定并立即落盘审计上下文() async throws {
+        let fixtureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseProviderAuditDetachedTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fixtureDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.trashItem(at: fixtureDirectory, resultingItemURL: nil) }
+        let receiptURL = fixtureDirectory.appendingPathComponent("provider-audit.jsonl")
+        XCTAssertTrue(FileManager.default.createFile(atPath: receiptURL.path, contents: Data()))
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [VoicePolishProviderAuditURLProtocol.self]
+        let providerClient = DoubaoChatClient(
+            provider: .deepseek,
+            session: URLSession(configuration: configuration)
+        )
+        let nonce = String(repeating: "d", count: 64)
+        let auditedClient = VoicePolishProviderAuditedLLMClient(
+            base: providerClient,
+            runNonce: nonce,
+            testInputID: "VP-L15-AUDIT-DETACHED",
+            receiptPath: receiptURL.path
+        )
+
+        let response = try await AsyncTimeout.throwingValue(
+            .seconds(2),
+            timeoutError: LLMError.timedOut
+        ) {
+            try await auditedClient.generate(
+                LLMRequest(
+                    context: .processingMode,
+                    task: .voicePolishFast,
+                    system: "只返回润色后文本。",
+                    user: "嗯润色一下",
+                    options: LLMGenerationOptions(reasoningPolicy: .disabled)
+                ),
+                config: LLMConfig(
+                    apiKey: "test-only-key",
+                    model: "deepseek-chat",
+                    baseURL: "https://api.deepseek.com"
+                )
+            )
+        }
+
+        XCTAssertEqual(response.text, "润色完成。")
+        let data = try Data(contentsOf: receiptURL)
+        XCTAssertGreaterThan(data.count, 0)
+        XCTAssertEqual(data.last, 0x0A)
+        let lines = data.split(separator: 0x0A)
+        XCTAssertEqual(lines.count, 1)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let receipt = try decoder.decode(
+            VoicePolishProviderAuditReceipt.self,
+            from: Data(lines[0])
+        )
+        XCTAssertEqual(receipt.runNonce, nonce)
+        XCTAssertEqual(receipt.testInputID, "VP-L15-AUDIT-DETACHED")
+        XCTAssertEqual(receipt.requestOrdinal, 1)
     }
 
     func testProvider没有ResponseID时不得产生可冒充的成功回执() async throws {

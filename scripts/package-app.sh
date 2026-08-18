@@ -43,6 +43,7 @@ if [ "${MUSE_PACKAGE_TEST_MODE:-0}" != "1" ]; then
 fi
 APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/Muse.app}"
 QUALITY_BUILD_MANIFEST_PATH="${MUSE_QUALITY_BUILD_MANIFEST_PATH:-}"
+QUALITY_DATASET_PATH=""
 if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
     case "$QUALITY_BUILD_MANIFEST_PATH" in
         /*) ;;
@@ -59,6 +60,28 @@ if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
             ;;
     esac
     /bin/mkdir -p "$(/usr/bin/dirname "$QUALITY_BUILD_MANIFEST_PATH")"
+
+    if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+        QUALITY_DATASET_PATH="${MUSE_QUALITY_DATASET_PATH:-}"
+        [ -n "$QUALITY_DATASET_PATH" ] || {
+            echo "MUSE_QUALITY_DATASET_PATH is required for a quality manifest in package test mode" >&2
+            exit 1
+        }
+    else
+        if [ -n "${MUSE_QUALITY_DATASET_PATH:-}" ]; then
+            echo "MUSE_QUALITY_DATASET_PATH cannot override the frozen production dataset" >&2
+            exit 1
+        fi
+        QUALITY_DATASET_PATH="$PROJECT_DIR/docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json"
+    fi
+    case "$QUALITY_DATASET_PATH" in
+        /*) ;;
+        *) echo "Quality dataset path must be absolute" >&2; exit 1 ;;
+    esac
+    if [ ! -f "$QUALITY_DATASET_PATH" ] || [ -L "$QUALITY_DATASET_PATH" ]; then
+        echo "Quality dataset must be an existing regular non-symlink file: $QUALITY_DATASET_PATH" >&2
+        exit 1
+    fi
 fi
 APP_NAME="${APP_NAME:-Muse}"
 APP_EXECUTABLE="Muse"
@@ -410,6 +433,7 @@ MIN_SYSTEM_VERSION="$MIN_SYSTEM_VERSION" \
 if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
     PACKAGED_EXECUTABLE="$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
     PACKAGED_EXECUTABLE_SHA256="$(/usr/bin/shasum -a 256 "$PACKAGED_EXECUTABLE" | /usr/bin/awk '{print $1}')"
+    QUALITY_DATASET_SHA256="$(/usr/bin/shasum -a 256 "$QUALITY_DATASET_PATH" | /usr/bin/awk '{print $1}')"
     DESIGNATED_REQUIREMENT_OUTPUT="$(/usr/bin/codesign -dr - "$APP_PATH" 2>&1)"
     DESIGNATED_REQUIREMENT="$(printf '%s\n' "$DESIGNATED_REQUIREMENT_OUTPUT" | /usr/bin/awk '
         /^(# )?designated => / {
@@ -434,6 +458,7 @@ if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
     MUSE_MANIFEST_SOURCE_COMMIT="$MUSE_SOURCE_COMMIT_VALUE" \
     MUSE_MANIFEST_SOURCE_TREE="$MUSE_SOURCE_TREE_VALUE" \
     MUSE_MANIFEST_EXECUTABLE_SHA256="$PACKAGED_EXECUTABLE_SHA256" \
+    MUSE_MANIFEST_DATASET_SHA256="$QUALITY_DATASET_SHA256" \
     MUSE_MANIFEST_DESIGNATED_REQUIREMENT="$DESIGNATED_REQUIREMENT" \
     MUSE_MANIFEST_DESIGNATED_REQUIREMENT_SHA256="$DESIGNATED_REQUIREMENT_SHA256" \
         /usr/bin/python3 - "$QUALITY_BUILD_MANIFEST_PATH" <<'PY'
@@ -451,6 +476,7 @@ document = {
     "source_commit": os.environ["MUSE_MANIFEST_SOURCE_COMMIT"],
     "source_tree": os.environ["MUSE_MANIFEST_SOURCE_TREE"],
     "executable_sha256": os.environ["MUSE_MANIFEST_EXECUTABLE_SHA256"],
+    "dataset_sha256": os.environ["MUSE_MANIFEST_DATASET_SHA256"],
     "designated_requirement": os.environ["MUSE_MANIFEST_DESIGNATED_REQUIREMENT"],
     "designated_requirement_sha256": os.environ[
         "MUSE_MANIFEST_DESIGNATED_REQUIREMENT_SHA256"
@@ -479,6 +505,7 @@ PY
     echo "MUSE_QUALITY_EXPECTED_SOURCE_COMMIT=$MUSE_SOURCE_COMMIT_VALUE"
     echo "MUSE_QUALITY_EXPECTED_SOURCE_TREE=$MUSE_SOURCE_TREE_VALUE"
     echo "MUSE_QUALITY_EXPECTED_EXECUTABLE_SHA256=$PACKAGED_EXECUTABLE_SHA256"
+    echo "MUSE_QUALITY_EXPECTED_DATASET_SHA256=$QUALITY_DATASET_SHA256"
     echo "MUSE_QUALITY_EXPECTED_DESIGNATED_REQUIREMENT_SHA256=$DESIGNATED_REQUIREMENT_SHA256"
 fi
 

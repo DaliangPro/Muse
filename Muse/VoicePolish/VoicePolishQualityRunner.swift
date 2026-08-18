@@ -2,6 +2,55 @@ import AppKit
 import CommonCrypto
 import Foundation
 
+/// `AsyncTimeout` 会在 detached task 内执行模型调用，外层 TaskLocal 不会自动继承。
+/// 质量 Runner 因此用每条样本独立的客户端包装器，在真正进入 `generate` 时重新
+/// 绑定审计上下文，避免请求成功但网络层看不到 nonce、样本 ID 或回执路径。
+struct VoicePolishProviderAuditedLLMClient: LLMClient {
+    let base: any LLMClient
+    let context: VoicePolishProviderAudit.Context
+
+    init(
+        base: any LLMClient,
+        runNonce: String,
+        testInputID: String,
+        receiptPath: String
+    ) {
+        self.base = base
+        context = VoicePolishProviderAudit.Context(
+            runNonce: runNonce,
+            testInputID: testInputID,
+            receiptPath: receiptPath
+        )
+    }
+
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        try await VoicePolishProviderAudit.withContext(
+            runNonce: context.runNonce,
+            testInputID: context.testInputID,
+            receiptPath: context.receiptPath
+        ) {
+            try await base.generate(request, config: config)
+        }
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
+        try await base.process(text: text, prompt: prompt, context: context, config: config)
+    }
+
+    func probeThinkingMode(config: LLMConfig) async throws -> LLMThinkingProbeEvidence {
+        try await base.probeThinkingMode(config: config)
+    }
+
+    func warmUp(baseURL: String) async {
+        await base.warmUp(baseURL: baseURL)
+    }
+}
+
 /// 由签名后的 Muse.app 显式执行的语音润色质量跑测入口。
 ///
 /// XCTest 必须继续使用隔离凭据；该入口只在传入专用参数时运行，复用正式应用
@@ -153,6 +202,10 @@ enum VoicePolishQualityRunner {
         case missingSourceCommit
         case invalidSourceCommit(String)
         case evidenceFileReadFailed(String)
+        case invalidProviderAuditPath(String)
+        case providerAuditWasNotEmpty(String)
+        case providerAuditUnreadable(String)
+        case providerAuditCountMismatch(testID: String, expected: Int, actual: Int)
 
         var errorDescription: String? {
             switch self {
@@ -178,6 +231,14 @@ enum VoicePolishQualityRunner {
                 return "候选应用的 MuseSourceCommit 无效：\(value)"
             case .evidenceFileReadFailed(let path):
                 return "无法读取质量验收证据文件：\(path)"
+            case .invalidProviderAuditPath(let path):
+                return "Provider 审计路径必须是 Evaluator 预建的绝对常规文件：\(path)"
+            case .providerAuditWasNotEmpty(let path):
+                return "Provider 审计文件在 Runner 启动前不是空文件：\(path)"
+            case .providerAuditUnreadable(let path):
+                return "Provider 审计文件无法完整读取：\(path)"
+            case .providerAuditCountMismatch(let testID, let expected, let actual):
+                return "\(testID) 完成后 Provider 回执累计 \(actual) 条，应为 \(expected) 条"
             }
         }
     }
@@ -283,6 +344,9 @@ enum VoicePolishQualityRunner {
         )
 
         do {
+            let providerAuditURL = try validatedEmptyProviderAuditURL(
+                at: invocation.providerAuditPath
+            )
             let artifactEvidence = try runtimeArtifactEvidence(
                 runInputPath: invocation.runInputPath
             )
@@ -295,7 +359,7 @@ enum VoicePolishQualityRunner {
                 throw RunnerError.missingLLMConfig
             }
             let config = VoicePolishSettings.modelOverride().map(loadedConfig.withModel) ?? loadedConfig
-            let client = LLMProviderRegistry.makeClient(for: provider)
+            let providerClient = LLMProviderRegistry.makeClient(for: provider)
             report = QualityRunReport(
                 schemaVersion: report.schemaVersion,
                 status: report.status,
@@ -323,6 +387,7 @@ enum VoicePolishQualityRunner {
             try write(report, to: invocation.reportPath)
 
             var caseReports: [QualityCaseReport] = []
+            var expectedProviderReceiptCount = 0
             for (index, input) in inputs.enumerated() {
                 let terminology = terminologyRules(from: input.preconditions)
                 let envelope = makeEnvelope(for: input, terminology: terminology)
@@ -352,14 +417,28 @@ enum VoicePolishQualityRunner {
                     resolvedEntities: resolvedEntities
                 )
                 let startedAt = ContinuousClock.now
-                let result = await VoicePolishProviderAudit.withContext(
+                let auditedClient = VoicePolishProviderAuditedLLMClient(
+                    base: providerClient,
                     runNonce: invocation.runNonce,
                     testInputID: input.testInputId,
-                    receiptPath: invocation.providerAuditPath
-                ) {
-                    await VoicePolishPipeline(client: client, config: config).process(request)
-                }
+                    receiptPath: providerAuditURL.path
+                )
+                let result = await VoicePolishPipeline(
+                    client: auditedClient,
+                    config: config
+                ).process(request)
                 let elapsed = ContinuousClock.now - startedAt
+                expectedProviderReceiptCount += result.llmAttemptCount
+                let actualProviderReceiptCount = try providerAuditReceiptCount(
+                    at: providerAuditURL
+                )
+                guard actualProviderReceiptCount == expectedProviderReceiptCount else {
+                    throw RunnerError.providerAuditCountMismatch(
+                        testID: input.testInputId,
+                        expected: expectedProviderReceiptCount,
+                        actual: actualProviderReceiptCount
+                    )
+                }
                 let validationEvidence = validationEvidence(for: result.validationCodes)
                 caseReports.append(QualityCaseReport(
                     testInputID: input.testInputId,
@@ -707,6 +786,45 @@ enum VoicePolishQualityRunner {
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
         CC_SHA256_Final(&digest, &context)
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func validatedEmptyProviderAuditURL(at path: String) throws -> URL {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        guard path.hasPrefix("/"), url.path == path,
+              let values = try? url.resourceValues(
+                  forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            throw RunnerError.invalidProviderAuditPath(path)
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        guard (attributes[.size] as? NSNumber)?.intValue == 0 else {
+            throw RunnerError.providerAuditWasNotEmpty(path)
+        }
+        return url
+    }
+
+    private static func providerAuditReceiptCount(at url: URL) throws -> Int {
+        let data = try Data(contentsOf: url)
+        guard !data.isEmpty else { return 0 }
+        guard data.last == 0x0A else {
+            throw RunnerError.providerAuditUnreadable(url.path)
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        do {
+            for line in lines {
+                _ = try decoder.decode(
+                    VoicePolishProviderAuditReceipt.self,
+                    from: Data(line)
+                )
+            }
+        } catch {
+            throw RunnerError.providerAuditUnreadable(url.path)
+        }
+        return lines.count
     }
 
     private static func milliseconds(_ duration: Duration) -> Int64 {

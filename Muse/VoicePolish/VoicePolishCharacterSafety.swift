@@ -46,6 +46,71 @@ enum VoicePolishOutputNormalizer {
             normalized = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
             break
         }
+        return collapsingExactWholeDraftRepetitions(
+            in: normalized,
+            sourceText: sourceText
+        )
+    }
+
+    /// Provider 的安全修复偶尔会把同一份完整成稿原样重复两到三遍。只有在
+    /// 空行分隔出的若干 block 能组成至少两份逐字相同的完整文本，且原口述
+    /// 本身没有同样重复时才折叠；近似段落或任一事实不同都保持原样，继续交
+    /// 给 Validator 判断，避免误删用户有意重复的内容。
+    static func collapsingExactWholeDraftRepetitions(
+        in text: String,
+        sourceText: String
+    ) -> String {
+        let normalized = VoicePolishCharacterSafety.normalizedLineEndings(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let blocks = normalized
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard blocks.count >= 2 else { return normalized }
+
+        for unitBlockCount in 1...(blocks.count / 2) {
+            guard blocks.count.isMultiple(of: unitBlockCount) else { continue }
+            let repetitionCount = blocks.count / unitBlockCount
+            guard repetitionCount >= 2 else { continue }
+            let unit = Array(blocks[..<unitBlockCount])
+            let isExactRepetition = stride(
+                from: unitBlockCount,
+                to: blocks.count,
+                by: unitBlockCount
+            ).allSatisfy { start in
+                Array(blocks[start..<(start + unitBlockCount)]) == unit
+            }
+            guard isExactRepetition else { continue }
+
+            let collapsed = unit.joined(separator: "\n\n")
+            // 极短的重复可能就是聊天中的语气强调；只有完整成稿级文本才在本地
+            // 确定性折叠。原口述已包含两份相同文本时也不替用户做删除决定。
+            guard collapsed.count >= 40,
+                  !sourceContainsRepeatedWholeDraft(
+                    collapsed,
+                    repetitionCount: repetitionCount,
+                    sourceText: sourceText
+                  ) else {
+                continue
+            }
+            return collapsed
+        }
         return normalized
+    }
+
+    private static func sourceContainsRepeatedWholeDraft(
+        _ draft: String,
+        repetitionCount: Int,
+        sourceText: String
+    ) -> Bool {
+        let comparableDraft = draft
+            .filter { !$0.isWhitespace && !$0.isPunctuation }
+            .lowercased()
+        let comparableSource = sourceText
+            .filter { !$0.isWhitespace && !$0.isPunctuation }
+            .lowercased()
+        guard !comparableDraft.isEmpty else { return true }
+        return comparableSource.components(separatedBy: comparableDraft).count - 1
+            >= repetitionCount
     }
 }

@@ -67,6 +67,39 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertTrue(requests[1].user.contains(#""required_facts""#))
     }
 
+    func testFastRepairCollapsesThreeExactCopiesOfTheWholeDraft() async {
+        let source = "项目周期是九个月，今天同步当前进度，说明下一步回归安排，并列出负责人和验收方式。"
+        let incomplete = "今天同步当前进度，说明下一步回归安排，并列出负责人和验收方式。"
+        let repaired = "项目周期是 9 个月。今天同步当前进度，说明下一步回归安排，并列出负责人和验收方式。"
+        let repeatedRepair = [repaired, repaired, repaired].joined(separator: "\n\n")
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(incomplete),
+            .response(repeatedRepair),
+        ])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .workChat)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
+    func testWholeDraftCollapseKeepsNearDuplicateBlocksWithDifferentFacts() {
+        let first = "项目周期是 9 个月。今天同步当前进度，并说明下一步回归安排。"
+        let second = "项目周期是 10 个月。今天同步当前进度，并说明下一步回归安排。"
+        let response = first + "\n\n" + second
+
+        XCTAssertEqual(
+            VoicePolishOutputNormalizer.collapsingExactWholeDraftRepetitions(
+                in: response,
+                sourceText: "项目周期先按九个月，另一个方案是十个月。"
+            ),
+            response
+        )
+    }
+
     func testAutomaticRepairsAccidentallyCompressedDeliberateEmphasis() async {
         let source = "真的真的很好"
         let compressed = "真的很好。"
@@ -175,6 +208,109 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, repaired)
         XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertFalse(result.validationCodes.contains(.promptLeakage))
+    }
+
+    func testFastRepairReceivesPendingItemWithoutRepeatingItsEditorInstruction() async {
+        let source = "今天会议定了三件事。第一，首页不改结构；第二，小陈补齐数据；第三，我整理测试清单。另外还有一个没定的是发布日期，要等客户回复，这个别放在已确定事项里。"
+        let leaked = """
+        已确定事项（共三件）：
+        1. 首页不改结构。
+        2. 小陈补齐数据。
+        3. 我整理测试清单。
+
+        发布日期要等客户回复，这个别放在已确定事项里。
+        """
+        let repaired = """
+        已确定事项（共三件）：
+        1. 首页不改结构。
+        2. 小陈补齐数据。
+        3. 我整理测试清单。
+
+        待确认事项：发布日期需等客户回复。
+        """
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(leaked),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .note)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertTrue(result.text.contains("待确认事项：发布日期需等客户回复"))
+        XCTAssertFalse(result.text.contains("别放在已确定事项"))
+        let requests = await client.recordedRequests()
+        XCTAssertTrue(requests[1].user.contains(#""excluded_editor_spans""#))
+        XCTAssertTrue(requests[1].user.contains("发布日期要等客户回复"))
+    }
+
+    func testWorkChatKeepsRecipientFacingRequestNotToGuessAnUnconfirmedName() async {
+        let source = "灵建这个名字我还没确认先保留别替我猜"
+        let output = "灵建这个名字我还没确认，先保留，别替我猜。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .workChat)
+        )
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, output)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.validationCodes.contains(.promptLeakage))
+    }
+
+    func testWorkChatStillRepairsAnExplicitEditorOnlyGuessingReminder() async {
+        let source = "客户名称待确认。别替我猜是给润色器的幕后提醒，正文只写名称待确认。"
+        let leaked = "客户名称待确认，别替我猜。"
+        let repaired = "客户名称待确认。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(leaked),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .workChat)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
+    func testDocumentKeepsARecipientFacingRequestNotToGuess() async {
+        let source = "请在发给供应商的说明里写：版本尚未确认，别替我猜，等研发回复后再更新。"
+        let output = "版本尚未确认，别替我猜，等研发回复后再更新。"
+        let client = ScriptedVoicePolishLLM(steps: [.response(output)])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .document)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, output)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertFalse(result.validationCodes.contains(.promptLeakage))
+    }
+
+    func testCustomerSupportRepairsAnExcludedInternalDisclosureClaim() async {
+        let source = "回复客户我们已经收到问题。技术正在查，预计明天下午前给一次进展。内部看可能是第三方接口波动这个原因，先不要告诉客户，没有确认。"
+        let leaked = "我们已收到问题，技术团队正在排查，预计明天下午前同步一次进展。内部初步判断可能与第三方接口波动有关。"
+        let repaired = "我们已收到问题，技术团队正在排查，预计明天下午前同步一次进展。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(leaked),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .customerSupport)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requests = await client.recordedRequests()
+        XCTAssertTrue(requests[1].user.contains(#""excluded_disclosure_claims":["第三方接口波动"]"#))
     }
 
     func testFastRepairRestoresRecipientFacingNegativeIntent() async {
@@ -644,7 +780,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertEqual(result.detectedRoute, .structured)
         XCTAssertEqual(result.executedRoute, .fast)
         XCTAssertEqual(result.llmAttemptCount, 1)
-        XCTAssertFalse(result.usedFallback)
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
         XCTAssertEqual(result.text, output)
         XCTAssertFalse(result.text.contains("食奇家"))
         XCTAssertFalse(result.text.contains("说错"))
@@ -721,13 +857,22 @@ final class VoicePolishPipelineTests: XCTestCase {
     func testBalancedCodeAllowsOnlyProvenDictatedSymbolRestoration() async {
         let source = "文件在Muse斜杠VoicePolish斜杠VoicePolishPipeline点swift，复现命令是swift test双横线filter VoicePolishPipelineTests。"
         let output = "文件：`Muse/VoicePolish/VoicePolishPipeline.swift`\n\n复现命令：`swift test --filter VoicePolishPipelineTests`"
-        let accepted = await pipeline(ScriptedVoicePolishLLM(steps: [
+        let acceptedClient = ScriptedVoicePolishLLM(steps: [
             .response(output),
-        ])).process(makeRequest(source, scene: .code))
+        ])
+        let accepted = await pipeline(acceptedClient).process(
+            makeRequest(source, scene: .code)
+        )
 
         XCTAssertFalse(accepted.usedFallback)
         XCTAssertEqual(accepted.text, output)
         XCTAssertFalse(accepted.validationCodes.contains(.planIntegrityFailure))
+        let acceptedRequests = await acceptedClient.recordedRequests()
+        XCTAssertTrue(
+            acceptedRequests[0].user.contains("Muse\\/VoicePolish\\/VoicePolishPipeline.swift")
+                && acceptedRequests[0].user.contains("swift test --filter VoicePolishPipelineTests"),
+            acceptedRequests[0].user
+        )
 
         let invented = await pipeline(ScriptedVoicePolishLLM(steps: [
             .response("复现命令：`swift test --filter SecretTests`"),
@@ -735,6 +880,33 @@ final class VoicePolishPipelineTests: XCTestCase {
 
         XCTAssertTrue(invented.usedFallback)
         XCTAssertTrue(invented.validationCodes.contains(.planIntegrityFailure))
+    }
+
+    func testCodeRepairRestoresARepeatedPathComponentInsteadOfDeduplicatingIt() async {
+        let source = "记录 bug 在 Muse 斜杠 Voice Polish 斜杠 Voice Pol ish Pipeline 点 swift，复现命令 swift test 双横线 filter Voice Polish Pipeline Tests。"
+        let incomplete = "记录 bug：`Muse/VoicePolishPipeline.swift`。复现命令：`swift test --filter VoicePolishPipelineTests`。"
+        let repaired = "记录 bug：`Muse/VoicePolish/VoicePolishPipeline.swift`。复现命令：`swift test --filter VoicePolishPipelineTests`。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(incomplete),
+            .response(repaired),
+        ])
+
+        let result = await pipeline(client).process(
+            makeRequest(source, scene: .code)
+        )
+
+        XCTAssertFalse(
+            result.usedFallback,
+            "\(result.validationCodes) rejected=\(String(describing: result.rejectedDraft))"
+        )
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requests = await client.recordedRequests()
+        XCTAssertTrue(
+            requests[1].user.contains("Muse\\/VoicePolish\\/VoicePolishPipeline.swift"),
+            requests[1].user
+        )
+        XCTAssertTrue(requests[1].user.contains("swift test --filter VoicePolishPipelineTests"))
     }
 
     func testBalancedAcceptsLabeledChineseAmountRenderedAsPlainDigits() async {
@@ -754,12 +926,13 @@ final class VoicePolishPipelineTests: XCTestCase {
     func testBalancedAcceptsSourceBackedSwiftDiagnosticInBackticksAfterStutterCleanup() async {
         let source = "让让AI帮我查这个这个Swift并并发问题现象是偶发出现 MainActor isolated property cannot be referenced 然后不要直接改代码先解释原因列出可能的调用链最后给最小修改方案和需要补的测试"
         let output = """
-        请帮我排查一个 Swift 并发问题。现象是偶发出现 `MainActor isolated property cannot be referenced` 错误。请先不要直接修改代码，按以下步骤处理：
+        请帮我排查一个 Swift 并发问题。现象是偶发出现 `MainActor isolated property cannot be referenced` 错误。请按以下要求处理：
 
-        1. 解释该错误出现的原因；
-        2. 列出可能导致问题的调用链；
-        3. 给出最小修改方案；
-        4. 列出需要补充的测试。
+        1. 暂时不要直接修改代码；
+        2. 解释该错误出现的原因；
+        3. 列出可能导致问题的调用链；
+        4. 给出最小修改方案；
+        5. 列出需要补充的测试。
         """
         let result = await pipeline(ScriptedVoicePolishLLM(steps: [
             .response(output),
@@ -850,10 +1023,23 @@ final class VoicePolishPipelineTests: XCTestCase {
     }
 
     func testLongFastDraftExpandsBoundedOutputAndTimeoutBudgets() async {
-        let unit = "这是一段需要完整保留并认真整理的长内容。"
-        let paragraph = String(repeating: unit, count: 32)
-        let source = String(repeating: paragraph, count: 4)
-        let output = [paragraph, paragraph, paragraph, paragraph].joined(separator: "\n\n")
+        let subjects = [
+            "产品目标", "用户反馈", "录音体验", "识别结果",
+            "润色成稿", "发送流程", "设置界面", "安全上下文",
+            "长文处理", "短文处理", "事实保护", "结构判断",
+            "异常恢复", "版本升级", "权限提示", "客户沟通",
+        ]
+        let aspects = ["背景", "范围", "现状", "问题", "原因", "边界", "顺序", "语气"]
+        let cleanSentences = subjects.flatMap { subject in
+            aspects.map { aspect in
+                "\(subject)的\(aspect)需要完整保留并认真整理，不能压缩成空泛摘要。"
+            }
+        }
+        let sourceSentences = cleanSentences.map { "嗯，" + $0 }
+        let source = sourceSentences.joined()
+        let output = stride(from: 0, to: cleanSentences.count, by: 8).map { start in
+            cleanSentences[start..<min(start + 8, cleanSentences.count)].joined()
+        }.joined(separator: "\n\n")
         let request = makeRequest(source)
         let client = ScriptedVoicePolishLLM(steps: [.response(output)])
 
@@ -878,7 +1064,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertGreaterThan(VoicePolishPipeline.defaultRenderTimeout(for: request), .seconds(20))
         XCTAssertGreaterThan(VoicePolishPipeline.defaultRepairTimeout(for: request), .seconds(10))
         XCTAssertGreaterThan(VoicePolishPipeline.defaultTotalTimeout(for: request), .seconds(45))
-        let oversizedRequest = makeRequest(String(repeating: unit, count: 600))
+        let oversizedRequest = makeRequest(String(repeating: sourceSentences[0], count: 600))
         XCTAssertEqual(
             VoicePolishPipeline.outputTokenBudget(
                 for: oversizedRequest,
@@ -891,10 +1077,18 @@ final class VoicePolishPipelineTests: XCTestCase {
             .seconds(120)
         )
 
-        let result = await pipeline(client).process(request)
+        let result = await VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: Int.max
+        ).process(request)
 
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, output)
+        XCTAssertFalse(result.text.contains("嗯，"))
+        XCTAssertEqual(
+            result.text.replacingOccurrences(of: "\n", with: ""),
+            output.replacingOccurrences(of: "\n", with: "")
+        )
         let requests = await client.recordedRequests()
         XCTAssertEqual(
             requests.first?.options.maxOutputTokens,
@@ -929,7 +1123,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             "测试部分必须记录每条真实输出以及具体失败原因",
             "交付部分只有独立验收通过后才允许覆盖安装",
         ]
-        let source = constraints.joined(separator: "。") + "。"
+        let source = constraints.map { "嗯，" + $0 }.joined(separator: "。") + "。"
         let summary = Array(
             repeating: "团队已讨论项目背景并整理相关材料。",
             count: 6
@@ -947,7 +1141,10 @@ final class VoicePolishPipelineTests: XCTestCase {
             makeRequest(source, quality: .automatic, scene: .document)
         )
 
-        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertFalse(
+            result.usedFallback,
+            "\(result.validationCodes) rejected=\(String(describing: result.rejectedDraft))"
+        )
         XCTAssertFalse(result.text.contains("团队已讨论项目背景并整理相关材料"))
         XCTAssertTrue(result.text.contains(constraints.first!))
         XCTAssertTrue(result.text.contains(constraints.last!))
@@ -999,7 +1196,10 @@ final class VoicePolishPipelineTests: XCTestCase {
             makeRequest(source, quality: .automatic, scene: .document)
         )
 
-        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertFalse(
+            result.usedFallback,
+            "\(result.validationCodes) rejected=\(String(describing: result.rejectedDraft))"
+        )
         XCTAssertEqual(result.text, repaired)
         XCTAssertEqual(result.llmAttemptCount, 2)
     }
@@ -1090,22 +1290,158 @@ final class VoicePolishPipelineTests: XCTestCase {
         })
     }
 
+    func testInitialAndRecoveryChunkersDoNotSplitChineseNumericFactAtHardBoundary() throws {
+        let source = String(repeating: "前", count: 48)
+            + "一百二十三人"
+            + String(repeating: "后", count: 46)
+
+        let initialChunks = VoicePolishPipeline.fastChunkTexts(
+            from: source,
+            maximumSourceTokens: 50
+        )
+        let recoveryChunks = try XCTUnwrap(
+            VoicePolishPipeline.fastChunkRecoveryTexts(from: source)
+        )
+
+        for chunks in [initialChunks, recoveryChunks] {
+            XCTAssertEqual(chunks.joined(), source)
+            XCTAssertEqual(chunks.filter { $0.contains("一百二十三") }.count, 1)
+            XCTAssertFalse(chunks.contains { $0.hasSuffix("一百") })
+            XCTAssertFalse(chunks.contains { $0.hasPrefix("二十三人") })
+        }
+    }
+
+    func testInitialHardChunksPreserveChineseNumberAndDoNotInventParagraphBreaks() async {
+        let prefix = String(repeating: "前文甲乙丙丁", count: 8)
+        let fact = "一百二十三人"
+        let suffix = String(repeating: "后文戊己庚辛", count: 7) + "后文壬癸"
+        let source = prefix + fact + suffix
+        let chunks = VoicePolishPipeline.fastChunkTexts(
+            from: source,
+            maximumSourceTokens: 52
+        )
+        let outputs = chunks.map { chunk in
+            chunk
+                .replacingOccurrences(of: "前文", with: "前述")
+                .replacingOccurrences(of: "后文", with: "后续")
+        }
+        let client = ScriptedVoicePolishLLM(steps: outputs.map { .response($0) })
+        let pipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: 52
+        )
+
+        let result = await pipeline.process(
+            makeRequest(source, quality: .automatic, scene: .code)
+        )
+
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, outputs.joined())
+        XCTAssertTrue(result.text.contains(fact))
+        XCTAssertFalse(result.text.contains("\n\n"))
+        XCTAssertEqual(result.llmAttemptCount, chunks.count)
+    }
+
+    func testRecoveryHardChunksPreserveChineseNumberAndJoinContiguously() async throws {
+        let opening = "前置说明需要保留。"
+        let failedChunk = String(repeating: "前文甲乙丙丁", count: 8)
+            + "一百二十三人"
+            + String(repeating: "后文戊己庚辛", count: 7)
+            + "后文壬癸"
+        let source = opening + failedChunk
+        let chunks = VoicePolishPipeline.fastChunkTexts(
+            from: source,
+            maximumSourceTokens: 100
+        )
+        let failedIndex = try XCTUnwrap(chunks.firstIndex { $0.contains("一百二十三") })
+        let recoveryChunks = try XCTUnwrap(
+            VoicePolishPipeline.fastChunkRecoveryTexts(from: chunks[failedIndex])
+        )
+        func polished(_ chunk: String) -> String {
+            chunk
+                .replacingOccurrences(of: "前置说明需要保留", with: "前置说明已保留")
+                .replacingOccurrences(of: "前文", with: "前述")
+                .replacingOccurrences(of: "后文", with: "后续")
+        }
+        let incomplete = polished(chunks[failedIndex])
+            .replacingOccurrences(of: "一百二十三", with: "")
+        var steps: [ScriptedVoicePolishLLM.Step] = []
+        for (index, chunk) in chunks.enumerated() {
+            if index == failedIndex {
+                steps.append(.response(incomplete))
+                steps.append(.response(incomplete))
+                steps.append(contentsOf: recoveryChunks.map { .response(polished($0)) })
+            } else {
+                steps.append(.response(polished(chunk)))
+            }
+        }
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let pipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: 100
+        )
+
+        let result = await pipeline.process(
+            makeRequest(source, quality: .automatic, scene: .code)
+        )
+
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertEqual(recoveryChunks.filter { $0.contains("一百二十三") }.count, 1)
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertTrue(result.text.contains("一百二十三人"))
+        XCTAssertFalse(result.text.contains("一百\n\n二十三人"))
+        XCTAssertEqual(
+            result.text,
+            polished(chunks[0]) + "\n\n" + recoveryChunks.map(polished).joined()
+        )
+        XCTAssertEqual(result.llmAttemptCount, 5)
+    }
+
     func testNearEightThousandTokenAutomaticInputRunsAsValidatedFastChunks() async {
-        let unit = "嗯，这一段项目说明需要完整保留并整理清楚。"
-        let source = String(repeating: unit, count: 390)
+        let subjects = [
+            "产品目标", "用户反馈", "录音体验", "识别结果", "润色成稿",
+            "发送流程", "设置界面", "安全上下文", "长文处理", "短文处理",
+            "事实保护", "结构判断", "异常恢复", "版本升级", "权限提示",
+            "客户沟通", "课程资料", "发布准备", "回归检查", "质量验收",
+        ]
+        let aspects = [
+            "背景", "范围", "现状", "问题", "原因",
+            "边界", "顺序", "语气", "标点", "段落",
+            "术语", "日期", "负责人", "截止时间", "风险",
+            "方案", "状态", "证据", "限制", "结论",
+        ]
+        let units = subjects.flatMap { subject in
+            aspects.map { aspect in
+                "嗯，\(subject)相关的\(aspect)说明需要完整保留并整理清楚。"
+            }
+        }
+        let source = units.prefix(320).joined()
         let chunks = VoicePolishPipeline.fastChunkTexts(from: source)
-        let outputs = chunks.map {
-            $0.replacingOccurrences(of: "嗯，", with: "")
-                .replacingOccurrences(of: "。", with: "。\n\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        let outputs = chunks.map { chunk in
+            let sentences = chunk
+                .split(separator: "。", omittingEmptySubsequences: true)
+                .map { $0.replacingOccurrences(of: "嗯，", with: "") + "。" }
+            let groupSize = max(1, (sentences.count + 3) / 4)
+            return stride(from: 0, to: sentences.count, by: groupSize)
+                .map { start in
+                    sentences[start..<min(start + groupSize, sentences.count)].joined()
+                }
+                .joined(separator: "\n\n")
         }
         let client = ScriptedVoicePolishLLM(steps: outputs.map { .response($0) })
 
         let result = await pipeline(client).process(
             makeRequest(source, quality: .automatic, scene: .document)
         )
+        XCTAssertGreaterThan(EstimatedTokenCounter.count(in: source), 7_000)
         XCTAssertGreaterThanOrEqual(chunks.count, 3)
-        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertFalse(
+            result.usedFallback,
+            "\(result.validationCodes) rejected=\(String(describing: result.rejectedDraft))"
+        )
         XCTAssertFalse(result.text.contains("嗯"))
         XCTAssertEqual(result.llmAttemptCount, chunks.count)
         let requests = await client.recordedRequests()
@@ -1118,17 +1454,17 @@ final class VoicePolishPipelineTests: XCTestCase {
 
     func testChunkedFastUsesDocumentEvidenceForDistantCrossChunkCorrection() async {
         let opening = String(
-            repeating: "这部分背景需要完整保留，不能被压缩成摘要。\n\n",
+            repeating: "嗯，这部分背景需要完整保留，不能被压缩成摘要。",
             count: 95
         )
-        let oldFact = "项目预算先按 3 万元。\n\n"
+        let oldFact = "项目预算先按 3 万元。"
         let middle = String(
-            repeating: "中间的独立约束也要逐项保留并维持原有顺序。\n\n",
+            repeating: "嗯，中间的独立约束也要逐项保留并维持原有顺序。",
             count: 170
         )
-        let correction = "前面那句改成 4 万元。\n\n"
+        let correction = "前面那句改成 4 万元。"
         let ending = String(
-            repeating: "结尾的交付要求同样需要完整整理。\n\n",
+            repeating: "嗯，结尾的交付要求同样需要完整整理。",
             count: 70
         )
         let source = opening + oldFact + middle + correction + ending
@@ -1138,9 +1474,10 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertNotEqual(oldIndex, finalIndex)
 
         let outputs = chunks.map {
-            $0.replacingOccurrences(of: oldFact.trimmingCharacters(in: .newlines), with: "")
+            $0.replacingOccurrences(of: "嗯，", with: "")
+                .replacingOccurrences(of: oldFact, with: "")
                 .replacingOccurrences(
-                    of: correction.trimmingCharacters(in: .newlines),
+                    of: correction,
                     with: "项目预算最终为 4 万元。"
                 )
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1160,6 +1497,247 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy {
             $0.user.contains(#""forbidden_superseded_facts""#)
                 && $0.user.contains(#""canonical_value":"30000""#)
+        })
+    }
+
+    func testChunkedFastBisectsOnlyTheFailedCanonicalChunkAfterRepairStillMissesFacts() async throws {
+        let fixture = try makeFastChunkRecoveryFixture()
+        let failedChunk = fixture.chunks[fixture.failedIndex]
+        let failedOutput = polishedChunkOutput(failedChunk)
+            .replacingOccurrences(of: "2026-08-20", with: "")
+        var steps: [ScriptedVoicePolishLLM.Step] = []
+        for (index, chunk) in fixture.chunks.enumerated() {
+            if index == fixture.failedIndex {
+                steps.append(.response(failedOutput))
+                steps.append(.response(failedOutput))
+                steps.append(contentsOf: fixture.recoveryChunks.map {
+                    .response(polishedChunkOutput($0))
+                })
+            } else {
+                steps.append(.response(polishedChunkOutput(chunk)))
+            }
+        }
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let chunkedPipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: fixture.chunkLimit
+        )
+
+        let result = await chunkedPipeline.process(
+            makeRequest(fixture.source, quality: .automatic, scene: .document)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertTrue(result.text.contains("9 个月"))
+        XCTAssertTrue(result.text.contains("48 万元"))
+        XCTAssertTrue(result.text.contains("2026-08-20"))
+        XCTAssertFalse(result.text.contains("嗯，"))
+        XCTAssertEqual(result.llmAttemptCount, fixture.chunks.count + 3)
+
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.count, fixture.chunks.count + 3)
+        for (index, chunk) in fixture.chunks.enumerated() where index != fixture.failedIndex {
+            XCTAssertEqual(
+                requests.filter { canonicalChunkText(in: $0) == chunk }.count,
+                1,
+                "已成功片不应重跑：\(chunk)"
+            )
+        }
+        XCTAssertEqual(
+            requests.filter { canonicalChunkText(in: $0) == failedChunk }.count,
+            2
+        )
+        for recoveryChunk in fixture.recoveryChunks {
+            let childRequests = requests.filter {
+                $0.task == .voicePolishFast
+                    && canonicalChunkText(in: $0) == recoveryChunk
+            }
+            XCTAssertEqual(childRequests.count, 1)
+            XCTAssertEqual(
+                chunkDocumentText(in: try XCTUnwrap(childRequests.first)),
+                fixture.source
+            )
+        }
+    }
+
+    func testChunkedFastBisectsAfterLongChunkRemainsUnchangedTwice() async throws {
+        let fixture = try makeFastChunkRecoveryFixture()
+        let failedChunk = fixture.chunks[fixture.failedIndex]
+        var steps: [ScriptedVoicePolishLLM.Step] = []
+        for (index, chunk) in fixture.chunks.enumerated() {
+            if index == fixture.failedIndex {
+                steps.append(.response(failedChunk))
+                steps.append(.response(failedChunk))
+                steps.append(contentsOf: fixture.recoveryChunks.map {
+                    .response(polishedChunkOutput($0))
+                })
+            } else {
+                steps.append(.response(polishedChunkOutput(chunk)))
+            }
+        }
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let chunkedPipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: fixture.chunkLimit
+        )
+
+        let result = await chunkedPipeline.process(
+            makeRequest(fixture.source, quality: .automatic, scene: .document)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertFalse(result.text.contains("嗯，"))
+        XCTAssertEqual(result.llmAttemptCount, fixture.chunks.count + 3)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(
+            requests.filter { canonicalChunkText(in: $0) == failedChunk }.count,
+            2
+        )
+        XCTAssertEqual(
+            requests.filter {
+                fixture.recoveryChunks.contains(canonicalChunkText(in: $0) ?? "")
+            }.count,
+            2
+        )
+    }
+
+    func testChunkedFastBisectsExplicitlyTruncatedInitialChunk() async throws {
+        let fixture = try makeFastChunkRecoveryFixture()
+        var steps = fixture.chunks[..<fixture.failedIndex].map {
+            ScriptedVoicePolishLLM.Step.response(polishedChunkOutput($0))
+        }
+        steps.append(.truncated)
+        steps.append(contentsOf: fixture.recoveryChunks.map {
+            .response(polishedChunkOutput($0))
+        })
+        steps.append(contentsOf: fixture.chunks[(fixture.failedIndex + 1)...].map {
+            .response(polishedChunkOutput($0))
+        })
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let chunkedPipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: fixture.chunkLimit
+        )
+
+        let result = await chunkedPipeline.process(
+            makeRequest(fixture.source, quality: .automatic, scene: .document)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.llmAttemptCount, fixture.chunks.count + 2)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(
+            requests.filter {
+                fixture.recoveryChunks.contains(canonicalChunkText(in: $0) ?? "")
+            }.count,
+            2
+        )
+    }
+
+    func testChunkedFastStopsAfterOneRecoveredChildStillFailsValidation() async throws {
+        let fixture = try makeFastChunkRecoveryFixture()
+        let failedChunk = fixture.chunks[fixture.failedIndex]
+        let failedOutput = polishedChunkOutput(failedChunk)
+            .replacingOccurrences(of: "2026-08-20", with: "")
+        let firstChild = fixture.recoveryChunks[0]
+        let factToOmit = try XCTUnwrap(
+            ["9", "48", "2026-08-20"].first(where: firstChild.contains)
+        )
+        let failedChildOutput = polishedChunkOutput(firstChild)
+            .replacingOccurrences(of: factToOmit, with: "")
+        var steps = fixture.chunks[..<fixture.failedIndex].map {
+            ScriptedVoicePolishLLM.Step.response(polishedChunkOutput($0))
+        }
+        steps.append(.response(failedOutput))
+        steps.append(.response(failedOutput))
+        steps.append(.response(failedChildOutput))
+        steps.append(.response(failedChildOutput))
+        steps.append(.response("不应继续请求第二个子片或递归二分"))
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let chunkedPipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: fixture.chunkLimit
+        )
+
+        let result = await chunkedPipeline.process(
+            makeRequest(fixture.source, quality: .automatic, scene: .document)
+        )
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .validationFailed)
+        XCTAssertEqual(result.llmAttemptCount, fixture.failedIndex + 4)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.count, fixture.failedIndex + 4)
+        XCTAssertEqual(
+            requests.filter { canonicalChunkText(in: $0) == firstChild }.count,
+            2
+        )
+        XCTAssertFalse(requests.contains {
+            canonicalChunkText(in: $0) == fixture.recoveryChunks[1]
+        })
+    }
+
+    func testChunkedFastDoesNotBisectRequestFailure() async throws {
+        let fixture = try makeFastChunkRecoveryFixture()
+        var steps = fixture.chunks[..<fixture.failedIndex].map {
+            ScriptedVoicePolishLLM.Step.response(polishedChunkOutput($0))
+        }
+        steps.append(.failure)
+        steps.append(.response("网络失败后不应盲目二分"))
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let chunkedPipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: fixture.chunkLimit
+        )
+
+        let result = await chunkedPipeline.process(
+            makeRequest(fixture.source, quality: .automatic, scene: .document)
+        )
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .requestFailed)
+        XCTAssertEqual(result.llmAttemptCount, fixture.failedIndex + 1)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.count, fixture.failedIndex + 1)
+        XCTAssertFalse(requests.contains { request in
+            fixture.recoveryChunks.contains(canonicalChunkText(in: request) ?? "")
+        })
+    }
+
+    func testChunkedFastDoesNotBisectPromptLeakageSafetyFailure() async throws {
+        let fixture = try makeFastChunkRecoveryFixture()
+        let failedChunk = fixture.chunks[fixture.failedIndex]
+        let leaked = "MUSE_INPUT_PAYLOAD\n" + polishedChunkOutput(failedChunk)
+        var steps = fixture.chunks[..<fixture.failedIndex].map {
+            ScriptedVoicePolishLLM.Step.response(polishedChunkOutput($0))
+        }
+        steps.append(.response(leaked))
+        steps.append(.response(leaked))
+        steps.append(.response("安全错误后不应盲目二分"))
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let chunkedPipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: fixture.chunkLimit
+        )
+
+        let result = await chunkedPipeline.process(
+            makeRequest(fixture.source, quality: .automatic, scene: .document)
+        )
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .validationFailed)
+        XCTAssertTrue(result.validationCodes.contains(.promptLeakage))
+        XCTAssertEqual(result.llmAttemptCount, fixture.failedIndex + 2)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.count, fixture.failedIndex + 2)
+        XCTAssertFalse(requests.contains { request in
+            fixture.recoveryChunks.contains(canonicalChunkText(in: request) ?? "")
         })
     }
 
@@ -1202,7 +1780,8 @@ final class VoicePolishPipelineTests: XCTestCase {
         let chunkLimit = 18
         let chunks = VoicePolishPipeline.fastChunkTexts(
             from: canonicalSource,
-            maximumSourceTokens: chunkLimit
+            maximumSourceTokens: chunkLimit,
+            protectedTerms: request.resolvedEntities.map(\.canonical)
         )
         XCTAssertGreaterThan(chunks.count, 1)
         guard let oldChunkIndex = chunks.firstIndex(where: { $0.contains("上海先按 3 人") }),
@@ -1212,6 +1791,9 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertNotEqual(oldChunkIndex, finalChunkIndex)
         let outputs = chunks.map { chunk in
             chunk
+                .replacingOccurrences(of: "项目中", with: "项目里")
+                .replacingOccurrences(of: "这个安排继续保留", with: "这个安排保持不变")
+                .replacingOccurrences(of: "需要", with: "需")
                 .replacingOccurrences(of: "上海先按 3 人。", with: "")
                 .replacingOccurrences(of: "不对，上海最终改成 4 人。", with: "上海最终为 4 人。")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1252,6 +1834,85 @@ final class VoicePolishPipelineTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy {
             $0.user.contains(#""forbidden_superseded_facts":[]"#)
         })
+    }
+
+    func testRecoveredChildrenRecalculateSameValueFactDispositionAcrossCorrection() async throws {
+        let activePart = "嗯，北京 3 人，这个安排继续保留。嗯，甲项背景需要整理。嗯，乙项范围需要说明。嗯，丙项限制需要保留。嗯，丁项风险需要交代。嗯，戊项动作需要记录。嗯，己项交付需要核对。"
+        let correctedPart = "嗯，上海先按 3 人。嗯，庚项背景需要整理。嗯，辛项范围需要说明。嗯，壬项限制需要保留。嗯，癸项结果需要复盘。嗯，交付日期是 2026-08-20。嗯，不对，上海最终改成 4 人。"
+        let source = activePart + correctedPart
+        let chunkLimit = max(
+            EstimatedTokenCounter.count(in: activePart),
+            EstimatedTokenCounter.count(in: correctedPart)
+        )
+        let chunks = VoicePolishPipeline.fastChunkTexts(
+            from: source,
+            maximumSourceTokens: chunkLimit
+        )
+        let correctedIndex = try XCTUnwrap(chunks.firstIndex {
+            $0.contains("上海先按 3 人")
+                && $0.contains("上海最终改成 4 人")
+                && $0.contains("2026-08-20")
+        }, "改口应完整位于一个初始片：\(chunks)")
+        let recoveryChunks = try XCTUnwrap(
+            VoicePolishPipeline.fastChunkRecoveryTexts(from: chunks[correctedIndex])
+        )
+        let oldChildIndex = try XCTUnwrap(
+            recoveryChunks.firstIndex { $0.contains("上海先按 3 人") }
+        )
+        let finalChildIndex = try XCTUnwrap(
+            recoveryChunks.firstIndex { $0.contains("上海最终改成 4 人") }
+        )
+        XCTAssertNotEqual(oldChildIndex, finalChildIndex)
+
+        func correctedOutput(_ chunk: String) -> String {
+            polishedChunkOutput(chunk)
+                .replacingOccurrences(of: "上海先按 3 人。", with: "")
+                .replacingOccurrences(
+                    of: "不对，上海最终改成 4 人。",
+                    with: "上海最终为 4 人。"
+                )
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let failedOutput = correctedOutput(chunks[correctedIndex])
+            .replacingOccurrences(of: "2026-08-20", with: "")
+        var steps: [ScriptedVoicePolishLLM.Step] = []
+        for (index, chunk) in chunks.enumerated() {
+            if index == correctedIndex {
+                steps.append(.response(failedOutput))
+                steps.append(.response(failedOutput))
+                steps.append(contentsOf: recoveryChunks.map {
+                    .response(correctedOutput($0))
+                })
+            } else {
+                steps.append(.response(correctedOutput(chunk)))
+            }
+        }
+        let client = ScriptedVoicePolishLLM(steps: steps)
+        let pipeline = VoicePolishPipeline(
+            client: client,
+            config: config,
+            fastChunkSourceTokenLimit: chunkLimit
+        )
+
+        let result = await pipeline.process(
+            makeRequest(source, quality: .automatic, scene: .workChat)
+        )
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertTrue(result.text.contains("北京 3 人"))
+        XCTAssertFalse(result.text.contains("上海先按 3 人"))
+        XCTAssertTrue(result.text.contains("上海最终为 4 人"))
+        XCTAssertTrue(result.text.contains("2026-08-20"))
+
+        let requests = await client.recordedRequests()
+        let oldChild = recoveryChunks[oldChildIndex]
+        let oldChildRequest = try XCTUnwrap(requests.first {
+            $0.task == .voicePolishFast && canonicalChunkText(in: $0) == oldChild
+        })
+        XCTAssertFalse(sourceFactCanonicalValues(in: oldChildRequest).contains("3"))
+        XCTAssertEqual(chunkDocumentText(in: oldChildRequest), source)
+        XCTAssertTrue(chunkForbiddenFacts(in: oldChildRequest).isEmpty)
     }
 
     func testPunctuationOnlyChangeCannotHideRetainedShortStutter() async {
@@ -1392,6 +2053,95 @@ final class VoicePolishPipelineTests: XCTestCase {
 
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, polished)
+        XCTAssertFalse(result.validationCodes.contains(.unchangedDraft))
+    }
+
+    func testLongPunctuatedDraftWithOralScaffoldingStillRequiresPolish() async {
+        let source = """
+        今天先和团队确认了登录流程，目前页面和接口都已经对齐。就是说，第一轮检查没有发现阻断问题。
+
+        然后的话，明天还要核对支付页面和退款入口，重点看看异常状态下的提示是否清楚。
+
+        怎么说呢，退出流程也需要补一轮测试，确认完成后再把完整结果发到工作群。
+        """
+        let polished = """
+        今天先和团队确认了登录流程，目前页面和接口都已经对齐。
+
+        第一轮检查没有发现阻断问题。
+
+        明天还要核对支付页面和退款入口，重点检查异常状态下的提示是否清楚。
+
+        退出流程也需要补一轮测试，确认完成后再把完整结果发到工作群。
+        """
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(source),
+            .response(polished),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .document))
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, polished)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishFast, .voicePolishRepair])
+    }
+
+    func testLongOralDraftCannotPassByReturningTheSameFormattedText() async {
+        let source = """
+        这次复盘呢，主要还是想跟大家说一下目前的情况。第一部分吧，我们这边其实已经把页面大概看了一遍，整体上感觉还行。
+
+        后面呢，我觉得可能还是要再跟研发沟通一下，因为有些地方怎么讲，就是大家理解得不太一样。然后呢，测试这边也需要再看一看，暂时先这样。
+        """
+        let polished = """
+        这次复盘主要同步目前的情况。第一部分，我们已经初步检查了页面，整体表现正常。
+
+        后续还需要和研发进一步沟通，因为部分内容的理解尚未统一。测试侧也要继续核对，完成后再同步结论。
+        """
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(source),
+            .response(polished),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .document))
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertTrue(result.text.contains("这次复盘主要同步目前的情况"))
+        XCTAssertTrue(result.text.contains("测试侧也要继续核对"))
+        for filler in ["复盘呢", "第一部分吧", "怎么讲", "然后呢"] {
+            XCTAssertFalse(result.text.contains(filler), result.text)
+        }
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
+    func testShortSentenceMissingTerminalPunctuationRequiresRepair() async {
+        let source = "明天上午十点开会麻烦大家准时到"
+        let polished = "明天上午十点开会，麻烦大家准时到。"
+        let client = ScriptedVoicePolishLLM(steps: [
+            .response(source),
+            .response(polished),
+        ])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .workChat))
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, polished)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
+    func testAlreadyStructuredLongListMayRemainUnchanged() async {
+        let source = """
+        1. 登录流程：页面、接口和异常提示已经完成核对，当前没有阻断问题。
+        2. 支付流程：明天继续检查退款入口，并确认失败状态下的用户提示。
+        3. 退出流程：补一轮完整回归测试，完成后把结果统一发到工作群。
+        """
+        let client = ScriptedVoicePolishLLM(steps: [.response(source)])
+
+        let result = await pipeline(client).process(makeRequest(source, scene: .document))
+
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
+        XCTAssertEqual(result.text, source)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertFalse(result.validationCodes.contains(.unchangedDraft))
     }
 
@@ -1821,6 +2571,82 @@ final class VoicePolishPipelineTests: XCTestCase {
         VoicePolishPipeline(client: client, config: config)
     }
 
+    private func makeFastChunkRecoveryFixture() throws -> (
+        source: String,
+        chunks: [String],
+        failedIndex: Int,
+        recoveryChunks: [String],
+        chunkLimit: Int
+    ) {
+        let first = "嗯，前段背景需要完整保留，负责人是小陈，截止日期是 2026-08-18。"
+        let failed = "嗯，项目周期是 9 个月。嗯，预算是 48 万元。嗯，发布时间是 2026-08-20，验收人是小林。"
+        let last = "嗯，结尾交付安排需要完整保留，负责人是小周，复核日期是 2026-08-21。"
+        let source = first + failed + last
+        let chunkLimit = max(
+            EstimatedTokenCounter.count(in: first),
+            max(
+                EstimatedTokenCounter.count(in: failed),
+                EstimatedTokenCounter.count(in: last)
+            )
+        )
+        let chunks = VoicePolishPipeline.fastChunkTexts(
+            from: source,
+            maximumSourceTokens: chunkLimit
+        )
+        let failedIndex = try XCTUnwrap(chunks.firstIndex {
+            $0.contains("9 个月")
+                && $0.contains("48 万元")
+                && $0.contains("2026-08-20")
+        }, "测试夹具应把三个事实保留在同一初始片")
+        let recoveryChunks = try XCTUnwrap(
+            VoicePolishPipeline.fastChunkRecoveryTexts(from: chunks[failedIndex])
+        )
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertEqual(recoveryChunks.count, 2)
+        return (source, chunks, failedIndex, recoveryChunks, chunkLimit)
+    }
+
+    private func polishedChunkOutput(_ text: String) -> String {
+        text.replacingOccurrences(of: "嗯，", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func canonicalChunkText(in request: LLMRequest) -> String? {
+        voicePolishPayload(in: request)["canonical_text"] as? String
+    }
+
+    private func chunkDocumentText(in request: LLMRequest) -> String? {
+        let payload = voicePolishPayload(in: request)
+        let chunkContext = payload["chunk_context"] as? [String: Any]
+        return chunkContext?["document_canonical_text"] as? String
+    }
+
+    private func sourceFactCanonicalValues(in request: LLMRequest) -> [String] {
+        let sourceFacts = voicePolishPayload(in: request)["source_facts"]
+            as? [[String: Any]]
+        return sourceFacts?.compactMap { $0["canonical_value"] as? String } ?? []
+    }
+
+    private func chunkForbiddenFacts(in request: LLMRequest) -> [[String: Any]] {
+        let payload = voicePolishPayload(in: request)
+        let chunkContext = payload["chunk_context"] as? [String: Any]
+        return chunkContext?["forbidden_superseded_facts"] as? [[String: Any]] ?? []
+    }
+
+    private func voicePolishPayload(in request: LLMRequest) -> [String: Any] {
+        guard let data = request.user.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        guard let originalPayload = root["original_payload"] as? String,
+              let originalData = originalPayload.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: originalData)
+                as? [String: Any] else {
+            return root
+        }
+        return decoded
+    }
+
     private func makeRequest(
         _ text: String,
         quality: VoicePolishQualityMode = .balanced,
@@ -1938,6 +2764,7 @@ private actor ScriptedVoicePolishLLM: LLMClient {
         case response(String)
         case delayedResponse(String, Duration)
         case failure
+        case truncated
     }
 
     private var steps: [Step]
@@ -1959,6 +2786,8 @@ private actor ScriptedVoicePolishLLM: LLMClient {
             return LLMResponse(text: text, model: config.model)
         case .failure:
             throw MockVoicePolishError.failed
+        case .truncated:
+            throw LLMError.truncatedResponse(256)
         }
     }
 

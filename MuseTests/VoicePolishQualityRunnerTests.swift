@@ -402,6 +402,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             commit = "1" * 40
             tree = "2" * 40
             executable = "3" * 64
+            dataset = "4" * 64
             requirement = 'identifier "pro.daliang.muse" and certificate leaf = H"abc"'
             requirement_hash = hashlib.sha256(requirement.encode("utf-8")).hexdigest()
             document = {
@@ -412,6 +413,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
                 "source_commit": commit,
                 "source_tree": tree,
                 "executable_sha256": executable,
+                "dataset_sha256": dataset,
                 "designated_requirement": requirement,
                 "designated_requirement_sha256": requirement_hash,
                 "created_at": "2026-08-17T00:00:00Z",
@@ -424,9 +426,10 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
                 expected_source_commit=commit,
                 expected_source_tree=tree,
                 expected_executable_sha256=executable,
+                expected_dataset_sha256=dataset,
                 expected_designated_requirement_sha256=requirement_hash,
             )
-            rejected = False
+            rejected_executable = False
             try:
                 module.validated_build_manifest(
                     path,
@@ -434,18 +437,100 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
                     expected_source_commit=commit,
                     expected_source_tree=tree,
                     expected_executable_sha256="4" * 64,
+                    expected_dataset_sha256=dataset,
                     expected_designated_requirement_sha256=requirement_hash,
                 )
             except ValueError:
-                rejected = True
-            print(json.dumps({"commit": valid["source_commit"], "rejected": rejected}))
+                rejected_executable = True
+            rejected_dataset_manifest = False
+            try:
+                module.validated_build_manifest(
+                    path,
+                    expected_manifest_sha256=manifest_hash,
+                    expected_source_commit=commit,
+                    expected_source_tree=tree,
+                    expected_executable_sha256=executable,
+                    expected_dataset_sha256="5" * 64,
+                    expected_designated_requirement_sha256=requirement_hash,
+                )
+            except ValueError:
+                rejected_dataset_manifest = True
+            print(json.dumps({
+                "commit": valid["source_commit"],
+                "rejected_executable": rejected_executable,
+                "rejected_dataset_manifest": rejected_dataset_manifest,
+            }))
             """,
             arguments: [scriptPath.path]
         )
         let data = try XCTUnwrap(output.data(using: .utf8))
         let result = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(result["commit"] as? String, String(repeating: "1", count: 40))
-        XCTAssertEqual(result["rejected"] as? Bool, true)
+        XCTAssertEqual(result["rejected_executable"] as? Bool, true)
+        XCTAssertEqual(result["rejected_dataset_manifest"] as? Bool, true)
+    }
+
+    func testEvaluator拒绝错误母集SHA并锁定89加41等于130() throws {
+        let scriptPath = repositoryRoot
+            .appendingPathComponent("scripts/evaluate-voice-polish-quality-report.py")
+        let datasetPath = repositoryRoot
+            .appendingPathComponent("docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json")
+        let output = try runPython(
+            """
+            import copy, hashlib, importlib.util, json, pathlib, sys, tempfile
+            script = pathlib.Path(sys.argv[1])
+            dataset_path = pathlib.Path(sys.argv[2])
+            sys.path.insert(0, str(script.parent))
+            spec = importlib.util.spec_from_file_location("voice_polish_evaluator", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            expected_sha = module.sha256_file(dataset_path)
+            _, valid, actual_sha = module.validated_quality_dataset(
+                dataset_path,
+                expected_sha,
+            )
+            rejected_wrong_sha = False
+            try:
+                module.validated_quality_dataset(dataset_path, "0" * 64)
+            except ValueError:
+                rejected_wrong_sha = True
+
+            reduced = copy.deepcopy(valid)
+            reduced["cases"] = reduced["cases"][:-1]
+            reduced["case_count"] = 88
+            reduced["total_input_count"] = 129
+            directory = pathlib.Path(tempfile.mkdtemp(prefix="MuseDatasetFreezeTests-"))
+            reduced_path = directory / "reduced-dataset.json"
+            reduced_path.write_text(
+                json.dumps(reduced, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rejected_reduced = False
+            try:
+                module.validated_quality_dataset(
+                    reduced_path,
+                    module.sha256_file(reduced_path),
+                )
+            except ValueError:
+                rejected_reduced = True
+            print(json.dumps({
+                "actual_sha": actual_sha,
+                "expected_sha": expected_sha,
+                "case_count": len(valid["cases"]),
+                "variant_count": len(valid["stress_variants"]),
+                "rejected_wrong_sha": rejected_wrong_sha,
+                "rejected_reduced": rejected_reduced,
+            }))
+            """,
+            arguments: [scriptPath.path, datasetPath.path]
+        )
+        let data = try XCTUnwrap(output.data(using: .utf8))
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(result["actual_sha"] as? String, result["expected_sha"] as? String)
+        XCTAssertEqual(result["case_count"] as? Int, 89)
+        XCTAssertEqual(result["variant_count"] as? Int, 41)
+        XCTAssertEqual(result["rejected_wrong_sha"] as? Bool, true)
+        XCTAssertEqual(result["rejected_reduced"] as? Bool, true)
     }
 
     func testEvaluator要求网络回执与每条LLM调用一一对应() throws {
@@ -462,7 +547,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             now = datetime.datetime.now(datetime.timezone.utc)
             nonce = "a" * 64
             receipt = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "run_nonce": nonce,
                 "test_input_id": "VP-001",
                 "request_ordinal": 1,
@@ -478,6 +563,18 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
                 "provider_response_id": "chatcmpl-real-1",
                 "recorded_at": now.isoformat(),
             }
+            receipt["request_binding_sha256"] = module.provider_request_binding_sha256(
+                receipt["run_nonce"],
+                receipt["test_input_id"],
+                receipt["request_ordinal"],
+                receipt["request_body_sha256"],
+            )
+            cross_implementation_binding = module.provider_request_binding_sha256(
+                "a" * 64,
+                "样本-01",
+                2,
+                "b" * 64,
+            )
             kwargs = {
                 "expected_run_nonce": nonce,
                 "expected_provider": "deepseek",
@@ -494,17 +591,32 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
                 "missing_response_id": module.provider_audit_failures([
                     {**receipt, "provider_response_id": ""}
                 ], **kwargs),
+                "tampered_binding": module.provider_audit_failures([
+                    {**receipt, "request_ordinal": 2}
+                ], **kwargs),
+                "cross_implementation_binding": cross_implementation_binding,
             }, ensure_ascii=False))
             """,
             arguments: [scriptPath.path]
         )
         let data = try XCTUnwrap(output.data(using: .utf8))
         let result = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: data) as? [String: [String]]
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
-        XCTAssertEqual(result["valid"], [])
-        XCTAssertTrue(result["zero_receipt", default: []].contains { $0.contains("Provider 回执 0 条") })
-        XCTAssertTrue(result["missing_response_id", default: []].contains { $0.contains("response ID") })
+        XCTAssertEqual(result["valid"] as? [String], [])
+        XCTAssertTrue((result["zero_receipt"] as? [String] ?? []).contains {
+            $0.contains("Provider 回执 0 条")
+        })
+        XCTAssertTrue((result["missing_response_id"] as? [String] ?? []).contains {
+            $0.contains("response ID")
+        })
+        XCTAssertTrue((result["tampered_binding"] as? [String] ?? []).contains {
+            $0.contains("未绑定本次 nonce、样本、序号和请求体")
+        })
+        XCTAssertEqual(
+            result["cross_implementation_binding"] as? String,
+            "ab82d49a29f6f0541f3af63569db7b372e22b6026a43f7903e22f1e6f68bc4f2"
+        )
     }
 
     private var repositoryRoot: URL {

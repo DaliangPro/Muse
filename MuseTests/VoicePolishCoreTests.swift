@@ -810,7 +810,7 @@ final class VoicePolishCoreTests: XCTestCase {
                 request: request,
                 sourceFacts: ProtectedFactExtractor.extract(from: request.input.segments)
             )
-            XCTAssertTrue(result.codes.contains(.unchangedDraft), "\(pair): \(result.codes)")
+            XCTAssertTrue(result.hasHardFailure, "\(pair): \(result.codes)")
         }
     }
 

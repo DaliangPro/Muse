@@ -52,6 +52,11 @@ enum VoicePolishValidator {
     ) -> VoicePolishValidationResult {
         var codes = commonCodes(output: output, sourceText: request.fallbackText)
         let outputFacts = protectedFactsFromOutput(output, request: request)
+        let preservedDeclaredCount = VoicePolishListCountConsistency
+            .preservedDeclaredCountEvidence(
+                in: output,
+                canonicalSource: request.fallbackText
+            )
         let supersededOccurrences = locallySupersededFactOccurrences(
             request: request,
             sourceFacts: sourceFacts
@@ -64,6 +69,7 @@ enum VoicePolishValidator {
         if sourceFacts.enumerated().contains(where: { index, fact in
             !supersededFactIndices.contains(index)
                 && !containsEquivalent(fact, in: outputFacts, output: output)
+                && preservedDeclaredCount?.satisfiesSourceFact(fact) != true
         }) {
             append(.missingProtectedFact, to: &codes)
         }
@@ -73,6 +79,7 @@ enum VoicePolishValidator {
                     outputFact,
                     request: request
                 )
+                && preservedDeclaredCount?.backsCandidateFact(outputFact) != true
         }) {
             append(.planIntegrityFailure, to: &codes)
         }
@@ -313,7 +320,7 @@ enum VoicePolishValidator {
 
     /// 代码口述中的“斜杠 / 点 / 双横线”可以确定性还原为符号。这里只生成
     /// 本地校验投影，不改用户原文，也不允许补出来源中没有口述的命令内容。
-    private static func dictatedSymbolProjection(_ source: String) -> String {
+    static func dictatedSymbolProjection(_ source: String) -> String {
         [
             ("双横线", "--"),
             ("短横线", "-"),
@@ -323,6 +330,60 @@ enum VoicePolishValidator {
             ("点", "."),
         ].reduce(source) { text, replacement in
             text.replacingOccurrences(of: replacement.0, with: replacement.1)
+        }
+    }
+
+    /// 把代码口述里可以确定性恢复的完整路径与命令作为显式证据交给模型。
+    /// 路径每一层都按口述顺序保留，不能因为目录名与文件名前缀相同而去重；
+    /// 命令只在已口述的 flag 后合并明显的 CamelCase 测试标识符。
+    static func dictatedCodeArtifacts(in request: VoicePolishRequest) -> [String] {
+        guard request.context.scene == .code else { return [] }
+        let projected = dictatedSymbolProjection(request.fallbackText)
+            .replacingOccurrences(
+                of: #"\s*/\s*"#,
+                with: "/",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"\s*\.\s*(?=[A-Za-z])"#,
+                with: ".",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"\s*--\s*([A-Za-z])"#,
+                with: " --$1",
+                options: .regularExpression
+            )
+        var artifacts: [String] = []
+
+        let pathPattern = #"(?i)(?:[A-Za-z][A-Za-z0-9_ ]*/)+[A-Za-z][A-Za-z0-9_ ]*\.[A-Za-z][A-Za-z0-9_]*"#
+        for match in regexMatches(pathPattern, in: projected) {
+            let path = match.split(separator: "/", omittingEmptySubsequences: false)
+                .map { component in component.filter { !$0.isWhitespace } }
+                .joined(separator: "/")
+            if path.contains("/"), path.contains(".") { artifacts.append(path) }
+        }
+
+        let commandPattern = #"(?i)(?<![A-Za-z0-9_])(?:swift|git|xcodebuild|python3?|bash|sh|npm|pnpm|yarn)\s+[^，。！？!?\n]+"#
+        for rawCommand in regexMatches(commandPattern, in: projected) {
+            var tokens = rawCommand.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            if let filterIndex = tokens.firstIndex(of: "--filter"),
+               tokens.indices.contains(filterIndex + 2) {
+                let identifier = tokens[(filterIndex + 1)...].joined()
+                tokens.replaceSubrange((filterIndex + 1)..., with: [identifier])
+            }
+            let command = tokens.joined(separator: " ")
+            if tokens.count >= 2 { artifacts.append(command) }
+        }
+        return Array(Set(artifacts)).sorted()
+    }
+
+    private static func regexMatches(_ pattern: String, in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let matchRange = Range(match.range, in: text) else { return nil }
+            return String(text[matchRange]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
 
@@ -391,24 +452,7 @@ enum VoicePolishValidator {
         // 只把明确指向“如何写成稿”的话当幕后指令；“给开发说先别改路径”
         // 是收件人要执行的正文，不能因含“别”字就删除。若输出仍逐字保留这类
         // 写作指令，或只是换一种幕后措辞复述，则触发修复。
-        let metaPatterns = [
-            #"(?:这个|这句|这段|这部分|上面这(?:句|段)|以下内容).{0,14}(?:别写|不要写|不用展开|别展开|不要展开|别放|不要放)"#,
-            #"(?:不要|别)(?:替我|帮我).{0,14}(?:确定|猜|补写|编)"#,
-            #"(?:不要|别)(?:对客户)?(?:说|写|告诉).{0,18}(?:操作问题|内部原因|猜测)"#,
-        ]
-        let sourceMetaSpans = metaPatterns.flatMap { pattern -> [String] in
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
-            let range = NSRange(
-                request.fallbackText.startIndex..<request.fallbackText.endIndex,
-                in: request.fallbackText
-            )
-            return regex.matches(in: request.fallbackText, range: range).compactMap { match in
-                guard let matchRange = Range(match.range, in: request.fallbackText) else {
-                    return nil
-                }
-                return normalizedNaturalText(String(request.fallbackText[matchRange]))
-            }
-        }
+        let sourceMetaSpans = editorInstructionSpans(in: request)
         let repeatsMetaSpan = sourceMetaSpans.contains { !$0.isEmpty && draft.contains($0) }
         let paraphrasesMetaInstruction = !sourceMetaSpans.isEmpty && [
             #"(?:语气|措辞).{0,8}(?:不用|不要|别).{0,4}(?:重|强)"#,
@@ -419,11 +463,158 @@ enum VoicePolishValidator {
             append(.promptLeakage, to: &codes)
         }
 
+        let excludedClaims = excludedDisclosureClaims(in: request)
+        if excludedClaims.contains(where: { claim in
+            let normalizedClaim = normalizedNaturalText(claim)
+            return normalizedClaim.count >= 3 && draft.contains(normalizedClaim)
+        }) {
+            append(.excludedSideNoteLeaked, to: &codes)
+        }
+
         appendProtectedNegativeIntentCodes(
             output: output,
             request: request,
             to: &codes
         )
+    }
+
+    /// 返回明确只用于指导成稿、不能逐字进入正文的本地片段。判断以语用证据
+    /// 为主：明确指向“这句/正文/已确定事项”的编辑要求始终属于幕后；“别替
+    /// 我猜”只有在没有收件人指向、也不是“名称未确认，先保留”这类完整对外
+    /// 意图时才按幕后处理，避免再按场景一刀切。
+    static func editorInstructionSpans(in request: VoicePolishRequest) -> [String] {
+        let source = request.fallbackText
+        let explicitPatterns = [
+            #"(?:这个|这句|这段|这部分|上面这(?:句|段)|以下内容).{0,14}(?:别写|不要写|不用展开|别展开|不要展开|别放|不要放)"#,
+            #"(?:不要|别)(?:对客户)?(?:说|写|告诉).{0,18}(?:操作问题|内部原因|猜测)"#,
+        ]
+        var spans = explicitPatterns.flatMap { matchedNormalizedSpans($0, in: source) }
+
+        let ambiguousPattern = #"(?:不要|别)(?:替我|帮我).{0,14}(?:确定|猜|补写|编)"#
+        guard let regex = try? NSRegularExpression(pattern: ambiguousPattern) else {
+            return Array(Set(spans)).sorted()
+        }
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        for match in regex.matches(in: source, range: fullRange) {
+            guard let matchRange = Range(match.range, in: source) else { continue }
+            let clauseRange = localSentenceRange(containing: matchRange, in: source)
+            let clause = normalizedNaturalText(String(source[clauseRange]))
+            let recipientFacingIntent = containsRecipientCue(clause)
+            let explicitEditorCue = [
+                "润色器", "模型", "成稿", "正文", "编辑要求", "幕后提醒", "只写",
+                "不要放入", "别放入", "不要写进", "别写进",
+            ].contains(where: clause.contains)
+            guard explicitEditorCue, !recipientFacingIntent else { continue }
+            spans.append(normalizedNaturalText(String(source[matchRange])))
+        }
+        return Array(Set(spans.filter { !$0.isEmpty })).sorted()
+    }
+
+    /// 给 Fast repair 的待确认内容。这里只返回带有明确未决状态或外部确认条件
+    /// 的完整局部小句，并先移除已识别的幕后编辑片段；模型必须保留事项与状态，
+    /// 但不能把“别放进已确定事项”继续写给读者。
+    static func pendingEditorialItems(in request: VoicePolishRequest) -> [String] {
+        let editorSpans = editorInstructionSpans(in: request)
+        return semanticClauses(in: request.fallbackText).compactMap { rawClause in
+            var clause = normalizedNaturalText(rawClause)
+            guard ["未确认", "没确认", "尚未确认", "未定", "没定", "待定", "要等", "等待"].contains(
+                where: clause.contains
+            ) else { return nil }
+            for span in editorSpans where !span.isEmpty {
+                clause = clause.replacingOccurrences(of: span, with: "")
+            }
+            clause = clause.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard clause.count >= 4,
+                  !["另外还有一个没定的是", "还有一个没定的是", "另有一项待定"].contains(clause) else {
+                return nil
+            }
+            return clause
+        }
+    }
+
+    /// 从“明确禁止向客户披露”的内部判断中提取核心 claim。只有客服场景、
+    /// 内部不确定判断与相邻披露禁令同时存在时才启用；普通的“原因尚未确认”
+    /// 不会被当作秘密，用户主动要求告知客户某个未确认可能性时也不会触发。
+    static func excludedDisclosureClaims(in request: VoicePolishRequest) -> [String] {
+        guard request.context.scene == .customerSupport else { return [] }
+        let clauses = semanticClauses(in: request.fallbackText)
+        let disclosureVetoes = [
+            "不要告诉客户", "别告诉客户", "先不要告诉客户", "暂时不要告诉客户",
+            "不要对客户说", "别对客户说", "不要写给客户", "别写给客户",
+        ]
+        let internalSignals = [
+            "内部看", "内部判断", "内部初步判断", "内部猜测", "内部推测",
+            "我们内部看", "我们内部判断", "我们内部猜测", "我们内部推测",
+        ]
+        var claims: [String] = []
+        for (index, rawClause) in clauses.enumerated() {
+            let clause = normalizedNaturalText(rawClause)
+            guard internalSignals.contains(where: clause.contains),
+                  ["可能", "初步", "猜测", "推测", "怀疑"].contains(where: clause.contains) else {
+                continue
+            }
+            let nearby = clauses[max(0, index - 1)...min(clauses.count - 1, index + 1)]
+                .map(normalizedNaturalText)
+                .joined()
+            guard disclosureVetoes.contains(where: nearby.contains) else { continue }
+
+            var claim = clause
+            for signal in internalSignals.sorted(by: { $0.count > $1.count }) {
+                if let range = claim.range(of: signal) {
+                    claim = String(claim[range.upperBound...])
+                    break
+                }
+            }
+            for prefix in ["初步判断", "初步认为", "可能是", "可能与", "可能跟", "可能和", "怀疑是", "推测是", "是"] {
+                if claim.hasPrefix(prefix) {
+                    claim.removeFirst(prefix.count)
+                    break
+                }
+            }
+            for suffix in ["这个原因", "该原因", "这个判断", "该判断", "目前没有确认", "目前未确认", "尚未确认", "没有确认", "未确认"] {
+                if let range = claim.range(of: suffix) {
+                    claim = String(claim[..<range.lowerBound])
+                    break
+                }
+            }
+            if claim.count >= 3 { claims.append(claim) }
+        }
+        return Array(Set(claims)).sorted()
+    }
+
+    private static func matchedNormalizedSpans(
+        _ pattern: String,
+        in source: String
+    ) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(source.startIndex..<source.endIndex, in: source)
+        return regex.matches(in: source, range: range).compactMap { match in
+            guard let matchRange = Range(match.range, in: source) else { return nil }
+            return normalizedNaturalText(String(source[matchRange]))
+        }
+    }
+
+    private static func localSentenceRange(
+        containing target: Range<String.Index>,
+        in source: String
+    ) -> Range<String.Index> {
+        let boundaries = CharacterSet(charactersIn: "。！？!?；;\n")
+        var lower = target.lowerBound
+        while lower > source.startIndex {
+            let previous = source.index(before: lower)
+            guard source[previous].unicodeScalars.allSatisfy({ !boundaries.contains($0) }) else {
+                break
+            }
+            lower = previous
+        }
+        var upper = target.upperBound
+        while upper < source.endIndex {
+            guard source[upper].unicodeScalars.allSatisfy({ !boundaries.contains($0) }) else {
+                break
+            }
+            upper = source.index(after: upper)
+        }
+        return lower..<upper
     }
 
     /// 保护用户真正要传达给收件人的否定要求与否定事实。这里只覆盖本地可以
@@ -793,6 +984,10 @@ enum VoicePolishValidator {
             "给客户说", "告诉客户", "通知客户", "请客户", "让客户",
             "给团队说", "告诉团队", "通知团队", "请团队", "让团队",
             "给他说", "告诉他", "通知他", "请他", "让他",
+            "发给开发", "发给客户", "发给团队", "发给供应商", "发给负责人",
+            "发给收件人", "写给开发", "写给客户", "写给团队", "写给供应商",
+            "告诉供应商", "通知供应商", "请供应商", "让供应商",
+            "给读者", "写给读者", "告诉读者", "收件人看到",
         ].contains(where: text.contains)
     }
 
@@ -2063,12 +2258,18 @@ enum VoicePolishValidator {
         }
 
         let outputFacts = protectedFactsFromOutput(output, request: request)
+        let preservedDeclaredCount = VoicePolishListCountConsistency
+            .preservedDeclaredCountEvidence(
+                in: output,
+                canonicalSource: request.fallbackText
+            )
         if outputFacts.contains(where: { outputFact in
             !sourceFacts.contains(where: { equivalent($0, outputFact) })
                 && !isSourceBackedFormattingFact(
                     outputFact,
                     request: request
                 )
+                && preservedDeclaredCount?.backsCandidateFact(outputFact) != true
         }) {
             append(.planIntegrityFailure, to: &codes)
         }
@@ -2079,6 +2280,7 @@ enum VoicePolishValidator {
 
         for fact in planFacts {
             let isPresent = containsEquivalent(fact, in: outputFacts, output: output)
+                || preservedDeclaredCount?.satisfiesSourceFact(fact) == true
             switch fact.disposition {
             case .mustPreserve, .uncertain:
                 if !isPresent { append(.missingProtectedFact, to: &codes) }
@@ -2203,6 +2405,8 @@ enum VoicePolishValidator {
     ) {
         let comparableSource = comparableDraft(request.fallbackText)
         let comparableOutput = comparableDraft(output)
+        let layoutInsensitiveSource = layoutInsensitiveDraft(request.fallbackText)
+        let layoutInsensitiveOutput = layoutInsensitiveDraft(output)
         let normalizedOutput = normalizedNaturalText(output)
         // 只加标点或换行、却完整保留“嗯/我我/这个这个”等口述残片，仍然
         // 不是成稿。长文只检查未处于引号/示例语境的高置信残片，避免文档在
@@ -2213,11 +2417,69 @@ enum VoicePolishValidator {
         let retainsSourceDisfluency = sourceDisfluencies.contains {
             normalizedOutput.contains(normalizedNaturalText($0))
         }
-        guard requiresTransformation(request),
-              comparableSource == comparableOutput || retainsSourceDisfluency else {
+        let repairedMissingTerminalPunctuation = needsTerminalPunctuationRepair(request)
+            && hasTerminalPunctuation(output)
+        let sourcePunctuationIssues = VoicePolishPunctuationRepair.issues(
+            in: request.fallbackText
+        )
+        let repairedLocalPunctuationIssues = !sourcePunctuationIssues.isEmpty
+            && VoicePolishPunctuationRepair.issues(in: output).isEmpty
+        let completedLocalOnlyRepair = repairedMissingTerminalPunctuation
+            || repairedLocalPunctuationIssues
+        let exactLongDraftNeedsAnotherPass = request.fallbackText.count > 80
+            && request.context.scene != .code
+            && !isClearlyStructuredSendReadySource(request)
+            && layoutInsensitiveSource == layoutInsensitiveOutput
+        let transformationStillMissing = (
+            (comparableSource == comparableOutput || exactLongDraftNeedsAnotherPass)
+                && !completedLocalOnlyRepair
+        ) || retainsSourceDisfluency
+        guard (requiresTransformation(request) || exactLongDraftNeedsAnotherPass),
+              transformationStillMissing else {
             return
         }
         append(.unchangedDraft, to: &codes)
+    }
+
+    private static func needsTerminalPunctuationRepair(
+        _ request: VoicePolishRequest
+    ) -> Bool {
+        guard request.context.scene != .code else { return false }
+        let source = request.fallbackText.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let semanticCharacters = source.filter {
+            !$0.isWhitespace && !$0.isPunctuation && !$0.isSymbol
+        }
+        guard semanticCharacters.count >= 6 else { return false }
+        return !hasTerminalPunctuation(source)
+    }
+
+    private static func hasTerminalPunctuation(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).range(
+            of: #"[。！？!?…](?:[”’\"』」）)】])?$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func isClearlyStructuredSendReadySource(
+        _ request: VoicePolishRequest
+    ) -> Bool {
+        let expectation = VoicePolishLayoutExpectation.infer(from: request)
+        guard expectation.kind == .numberedList || expectation.kind == .bulletList else {
+            return false
+        }
+        let itemCount = VoicePolishNumbering.recognizedListItemCount(
+            in: request.fallbackText
+        )
+        guard itemCount >= 2 else { return false }
+        if let expected = expectation.expectedListItemCount {
+            return itemCount == expected
+        }
+        if let minimum = expectation.minimumListItemCount {
+            return itemCount >= minimum
+        }
+        return true
     }
 
     private static func highConfidenceLongDraftDisfluencies(in text: String) -> [String] {
@@ -2281,6 +2543,26 @@ enum VoicePolishValidator {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !value.isEmpty { results.append(value) }
             }
+        }
+
+        // 长语音即使已经有句号和分段，仍可能只是 ASR 原稿。
+        // “然后的话/怎么说呢”位于小句起点时是高置信口语支架；“就是说”
+        // 单独也可能承担解释功能，只在全文同时存在其他口语支架时才拦截。
+        var discourseFillers: [String] = []
+        for clause in semanticClauses(in: text) {
+            let normalizedClause = normalizedNaturalText(clause)
+            for phrase in ["然后的话", "怎么说呢", "就是说"]
+                where normalizedClause.hasPrefix(phrase) {
+                guard let range = clause.range(of: phrase),
+                      !isInsideQuotedOrLocalExample(range, in: clause) else { continue }
+                discourseFillers.append(phrase)
+            }
+        }
+        let hasStrongDiscourseFiller = discourseFillers.contains {
+            $0 == "然后的话" || $0 == "怎么说呢"
+        }
+        if hasStrongDiscourseFiller || discourseFillers.count >= 2 {
+            results.append(contentsOf: discourseFillers)
         }
         return Array(Set(results)).sorted()
     }
@@ -2509,8 +2791,7 @@ enum VoicePolishValidator {
             return false
         }
 
-        if source.count >= 80,
-           source.range(of: #"[。！？!?]"#, options: .regularExpression) == nil {
+        if needsTerminalPunctuationRepair(request) {
             return true
         }
         if source.count >= 80,
@@ -2533,6 +2814,11 @@ enum VoicePolishValidator {
             .filter { !$0.isPunctuation }
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    }
+
+    private static func layoutInsensitiveDraft(_ text: String) -> String {
+        VoicePolishCharacterSafety.normalizedLineEndings(text)
+            .filter { !$0.isPunctuation && !$0.isWhitespace }
     }
 
     private static func commonCodes(

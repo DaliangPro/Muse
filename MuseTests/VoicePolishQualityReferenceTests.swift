@@ -131,12 +131,14 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
             (
                 id: "natural-long-09",
                 old: "质量修复重试次数先按三次",
-                final: "质量修复的重试次数我说错了"
+                final: "质量修复的重试次数我说错了",
+                minimumChunkCount: 4
             ),
             (
                 id: "natural-long-10",
                 old: "课程资料复核先安排三轮",
-                final: "课程资料复核轮次不对"
+                final: "课程资料复核轮次不对",
+                minimumChunkCount: 5
             ),
         ]
 
@@ -152,7 +154,11 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                 $0.contains(expectation.final)
             })
 
-            XCTAssertGreaterThanOrEqual(chunks.count, 2, expectation.id)
+            XCTAssertGreaterThanOrEqual(
+                chunks.count,
+                expectation.minimumChunkCount,
+                expectation.id
+            )
             XCTAssertNotEqual(oldIndex, finalIndex, "\(expectation.id) 未真实跨内部切片")
         }
 

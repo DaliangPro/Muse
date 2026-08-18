@@ -152,6 +152,58 @@ final class VoicePolishLayoutExpectationTests: XCTestCase {
         XCTAssertEqual(expectation.numberingPreference, .chinese)
     }
 
+    func testAIPromptKeepsFiveIndependentDirectivesAsFiveListItems() {
+        let sources = [
+            "让AI帮我查这个Swift并发问题现象是偶发出现 MainActor isolated property cannot be referenced 然后不要直接改代码先解释原因列出可能的调用链最后给最小修改方案和需要补的测试",
+            "让AI查这个 Swift 并发问题现象是 Main Actor isolated property cannot be refer enced。然后不要直接改代码先解释原因。列出调用链最后给最小修改方案和需要补的测试？",
+        ]
+
+        for source in sources {
+            let expectation = infer(source, scene: .aiPrompt)
+            XCTAssertEqual(expectation.kind, .numberedList, source)
+            XCTAssertEqual(expectation.minimumListItemCount, 5, source)
+        }
+    }
+
+    func testAIPromptDoesNotCountQuotedExampleAsIndependentDirectives() {
+        let expectation = infer(
+            "解释这段提示词为什么容易误导。原句是“不要修改代码，解释原因，列出调用链并给出方案和测试”。最后只给一段改写建议。",
+            scene: .aiPrompt
+        )
+
+        XCTAssertNotEqual(expectation.minimumListItemCount, 5)
+    }
+
+    func testAIPromptOverlappingWordsDoNotBecomeThreeFakeDirectives() {
+        let expectation = infer(
+            "请不要直接输出测试方案，只需帮我把这句话润色顺。",
+            scene: .aiPrompt
+        )
+
+        XCTAssertNotEqual(expectation.kind, .numberedList)
+        XCTAssertNil(expectation.minimumListItemCount)
+    }
+
+    func testAIPromptCountsRepeatedDirectiveKindsAtDifferentSpans() {
+        let expectation = infer(
+            "请解释原因，说明判断依据，说明影响范围，给出修复方案，给出回归计划。",
+            scene: .aiPrompt
+        )
+
+        XCTAssertEqual(expectation.kind, .numberedList)
+        XCTAssertEqual(expectation.minimumListItemCount, 5)
+    }
+
+    func testAIPromptCountsRepeatedDirectiveKindsWithoutASRPunctuation() {
+        let expectation = infer(
+            "请解释原因说明判断依据说明影响范围给出修复方案给出回归计划",
+            scene: .aiPrompt
+        )
+
+        XCTAssertEqual(expectation.kind, .numberedList)
+        XCTAssertEqual(expectation.minimumListItemCount, 5)
+    }
+
     func testSingleOrdinalMentionDoesNotBecomeCompactEnumeration() {
         let expectation = infer(
             "现在除了第二项，其他内容都测试成功了。第二项在文字试跑中显示原文回退，但正式润色已经成功。",

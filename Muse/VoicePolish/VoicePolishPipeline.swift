@@ -14,10 +14,24 @@ struct VoicePolishPipeline: Sendable {
     private static let maximumRepairTimeout: Int64 = 90
     private static let maximumTotalTimeout: Int64 = 240
     private static let maximumOutputTokens = 8_192
-    /// 单片正文控制在约 2,800 tokens。这样即使成稿接近原文长度，Fast 的
-    /// 输出预算和生成时长仍保有足够余量，不会让 6k～8k 中文一次撞上 8,192
-    /// tokens 与 120 秒硬上限。分片属于内部可靠性策略，不暴露为用户模式。
-    static let fastChunkSourceTokenLimit = 2_800
+    /// 每篇长文只允许对一个失败初始片执行一次二分；每个子片仍沿用 Fast 的
+    /// “初稿 + 一次修复”上限，因此额外最多四次 LLM 调用，且不会递归二分。
+    private static let fastChunkRecoveryMaximumDepth = 1
+    private static let fastChunkRecoveryMaximumAdditionalAttempts = 4
+    private static let fastChunkMaximumAttemptsPerRun = 2
+    private static let recoverableFastChunkCodes: Set<VoicePolishValidationCode> = [
+        .explanationOnly,
+        .missingProtectedFact,
+        .abnormalLength,
+        .planIntegrityFailure,
+        .layoutRequirementUnmet,
+        .unchangedDraft,
+    ]
+    /// 单片正文控制在约 1,800 tokens。真实质量跑测证明 2,600 tokens 左右的
+    /// 单片仍可能被模型压缩，随后因事实缺失让整篇长文退回原稿。更小的片段
+    /// 给逐项保全和一次局部修复留出余量；它只是内部可靠性策略，不暴露为
+    /// 用户模式。
+    static let fastChunkSourceTokenLimit = 1_800
 
     private let client: any LLMClient
     private let config: LLMConfig
@@ -204,7 +218,8 @@ struct VoicePolishPipeline: Sendable {
             if executedRoute == .fast {
                 let chunks = Self.fastChunkTexts(
                     from: request.fallbackText,
-                    maximumSourceTokens: fastChunkTokenLimit
+                    maximumSourceTokens: fastChunkTokenLimit,
+                    protectedTerms: request.resolvedEntities.map(\.canonical)
                 )
                 if chunks.count > 1 {
                     return await runChunkedFast(
@@ -264,7 +279,8 @@ struct VoicePolishPipeline: Sendable {
     /// 分片不会把紧随其后的显式改口与前文拆开，避免旧事实被局部校验误保留。
     static func fastChunkTexts(
         from source: String,
-        maximumSourceTokens: Int = fastChunkSourceTokenLimit
+        maximumSourceTokens: Int = fastChunkSourceTokenLimit,
+        protectedTerms: [String] = []
     ) -> [String] {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -287,7 +303,8 @@ struct VoicePolishPipeline: Sendable {
             let boundary = preferredChunkBoundary(
                 in: remaining,
                 idealTokens: idealTokens,
-                maximumTokens: maximumSourceTokens
+                maximumTokens: maximumSourceTokens,
+                protectedTerms: protectedTerms
             )
             guard boundary > remaining.startIndex, boundary < remaining.endIndex else {
                 return [trimmed]
@@ -306,7 +323,8 @@ struct VoicePolishPipeline: Sendable {
     private static func preferredChunkBoundary(
         in text: String,
         idealTokens: Int,
-        maximumTokens: Int
+        maximumTokens: Int,
+        protectedTerms: [String]
     ) -> String.Index {
         struct Candidate {
             let index: String.Index
@@ -319,6 +337,10 @@ struct VoicePolishPipeline: Sendable {
         var safeCandidates: [Candidate] = []
         var hardBoundary: String.Index?
         var index = text.startIndex
+        let protectedRanges = protectedChunkRanges(
+            in: text,
+            additionalTerms: protectedTerms
+        )
 
         while index < text.endIndex {
             let character = text[index]
@@ -326,13 +348,17 @@ struct VoicePolishPipeline: Sendable {
             let prefix = String(text[..<next])
             let tokens = EstimatedTokenCounter.count(in: prefix)
             if tokens <= maximumTokens {
-                hardBoundary = next
+                if !isUnsafeProtectedBoundary(next, ranges: protectedRanges),
+                   !isUnsafeCorrectionBoundary(in: text, at: next) {
+                    hardBoundary = next
+                }
             } else {
                 break
             }
 
             guard let strength = chunkBoundaryStrength(after: character),
-                  !isUnsafeCorrectionBoundary(in: text, at: next) else {
+                  !isUnsafeCorrectionBoundary(in: text, at: next),
+                  !isUnsafeProtectedBoundary(next, ranges: protectedRanges) else {
                 index = next
                 continue
             }
@@ -376,7 +402,8 @@ struct VoicePolishPipeline: Sendable {
             if tokens > extensionLimit { break }
             if let strength = chunkBoundaryStrength(after: character),
                strength >= 1,
-               !isUnsafeCorrectionBoundary(in: text, at: next) {
+               !isUnsafeCorrectionBoundary(in: text, at: next),
+               !isUnsafeProtectedBoundary(next, ranges: protectedRanges) {
                 return next
             }
             extendedIndex = next
@@ -390,7 +417,71 @@ struct VoicePolishPipeline: Sendable {
             guard isASCIIWordCharacter(previous), isASCIIWordCharacter(next) else { break }
             boundary = text.index(before: boundary)
         }
+        while let protectedRange = protectedRanges.first(where: {
+            $0.lowerBound < boundary && boundary < $0.upperBound
+        }) {
+            boundary = protectedRange.lowerBound
+        }
         return boundary == text.startIndex ? (hardBoundary ?? text.endIndex) : boundary
+    }
+
+    private static func protectedChunkRanges(
+        in text: String,
+        additionalTerms: [String]
+    ) -> [Range<String.Index>] {
+        let segment = RecognitionSegment(
+            id: "voice-polish-chunk-boundary",
+            text: text,
+            startTimeMs: nil,
+            endTimeMs: nil,
+            confidence: nil,
+            isFinal: true
+        )
+        let facts = ProtectedFactExtractor.extract(from: [segment])
+        var ranges = ProtectedFactExtractor.locations(
+            of: facts,
+            in: [segment]
+        ).compactMap { location -> Range<String.Index>? in
+            guard location.segmentIndex == 0,
+                  location.offset >= 0,
+                  location.length > 0,
+                  let lower = text.index(
+                      text.startIndex,
+                      offsetBy: location.offset,
+                      limitedBy: text.endIndex
+                  ),
+                  let upper = text.index(
+                      lower,
+                      offsetBy: location.length,
+                      limitedBy: text.endIndex
+                  ) else {
+                return nil
+            }
+            return lower..<upper
+        }
+
+        for term in Set(additionalTerms) {
+            guard !term.isEmpty else { continue }
+            var searchStart = text.startIndex
+            while searchStart < text.endIndex,
+                  let range = text.range(
+                      of: term,
+                      range: searchStart..<text.endIndex
+                  ) {
+                ranges.append(range)
+                searchStart = range.upperBound
+            }
+        }
+        return ranges
+    }
+
+    private static func isUnsafeProtectedBoundary(
+        _ boundary: String.Index,
+        ranges: [Range<String.Index>]
+    ) -> Bool {
+        ranges.contains {
+            $0.lowerBound < boundary && boundary < $0.upperBound
+        }
     }
 
     private static func chunkBoundaryStrength(after character: Character) -> Int? {
@@ -428,6 +519,83 @@ struct VoicePolishPipeline: Sendable {
             || "_./:-".unicodeScalars.contains(scalar)
     }
 
+    /// 失败片的唯一恢复切分。它只产生两个 canonical 子片，不对任一子片继续
+    /// 递归；沿用常规分片的纠错短语和 ASCII 标识符边界保护。
+    static func fastChunkRecoveryTexts(
+        from source: String,
+        protectedTerms: [String] = []
+    ) -> [String]? {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let totalTokens = EstimatedTokenCounter.count(in: trimmed)
+        guard !trimmed.isEmpty, totalTokens >= 2 else { return nil }
+
+        let halfTokens = max(1, Int(ceil(Double(totalTokens) / 2)))
+        let boundary = preferredChunkBoundary(
+            in: trimmed,
+            idealTokens: halfTokens,
+            maximumTokens: halfTokens,
+            protectedTerms: protectedTerms
+        )
+        guard boundary > trimmed.startIndex, boundary < trimmed.endIndex else {
+            return nil
+        }
+        let first = String(trimmed[..<boundary])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let second = String(trimmed[boundary...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !first.isEmpty, !second.isEmpty else { return nil }
+        return [first, second]
+    }
+
+    private static func combinedChunkOutput(
+        _ outputs: [String],
+        sourceChunks: [String],
+        canonicalSource: String
+    ) -> String {
+        guard outputs.count == sourceChunks.count,
+              let firstOutput = outputs.first else {
+            return outputs.joined(separator: "\n\n")
+        }
+
+        var sourceRanges: [Range<String.Index>] = []
+        var searchStart = canonicalSource.startIndex
+        for chunk in sourceChunks {
+            guard let range = canonicalSource.range(
+                of: chunk,
+                range: searchStart..<canonicalSource.endIndex
+            ) else {
+                return outputs.joined(separator: "\n\n")
+            }
+            sourceRanges.append(range)
+            searchStart = range.upperBound
+        }
+
+        var combined = firstOutput
+        for index in 0..<(outputs.count - 1) {
+            let currentRange = sourceRanges[index]
+            let nextRange = sourceRanges[index + 1]
+            let sourceGap = String(
+                canonicalSource[currentRange.upperBound..<nextRange.lowerBound]
+            )
+            let separator: String
+            if sourceGap.contains("\n") {
+                separator = "\n\n"
+            } else if !sourceGap.isEmpty {
+                separator = sourceGap
+            } else if currentRange.upperBound > canonicalSource.startIndex,
+                      let lastCharacter = canonicalSource[..<currentRange.upperBound].last,
+                      chunkBoundaryStrength(after: lastCharacter) != nil {
+                separator = "\n\n"
+            } else {
+                // 无标点硬切只是请求边界，不是正文段落边界。连续拼回可避免
+                // “一百 | 二十三人”一类事实被凭空插入空行后改变含义。
+                separator = ""
+            }
+            combined += separator + outputs[index + 1]
+        }
+        return combined
+    }
+
     private func runChunkedFast(
         request: VoicePolishRequest,
         chunks: [String],
@@ -439,8 +607,11 @@ struct VoicePolishPipeline: Sendable {
             "voice polish chunked start chunks=\(chunks.count) input=\(request.fallbackText.count)chars"
         )
         var outputs: [String] = []
+        var outputSourceChunks: [String] = []
         var attempts = 0
         var accumulatedCodes: [VoicePolishValidationCode] = []
+        var recoveryDepth = 0
+        var recoveryAttempts = 0
         let supersededOccurrences = VoicePolishValidator.locallySupersededFactOccurrences(
             request: request,
             sourceFacts: sourceFacts
@@ -458,64 +629,37 @@ struct VoicePolishPipeline: Sendable {
         )
 
         for (index, chunk) in chunks.enumerated() {
-            let chunkRequest = fastChunkRequest(
-                from: request,
-                text: chunk,
-                index: index,
-                count: chunks.count
-            )
-            let factSegments = chunkRequest.context.scene == .code
-                ? chunkRequest.input.segments
-                : VoicePolishNumbering.removingContinuousNumberedLineMarkers(
-                    from: chunkRequest.input.segments
-                )
-            let supersededKeysInChunk = factDispositionsByChunk[index].superseded
-            let chunkFacts = (ProtectedFactExtractor.extract(from: factSegments)
-                + chunkRequest.resolvedEntities.map {
-                    SourceFactCandidate(
-                        sourceText: $0.surfaceText,
-                        canonicalValue: $0.canonical,
-                        kind: .lexiconEntity,
-                        sourceSegmentIDs: $0.sourceSegmentIDs
-                    )
-                }).filter {
-                    !supersededKeysInChunk.contains(Self.semanticFactIdentity($0))
-                }
-            let payload: String
-            do {
-                payload = try VoicePolishPrompts.chunkPayload(
-                    for: chunkRequest,
-                    sourceFacts: chunkFacts,
-                    documentText: request.fallbackText,
-                    documentSourceFacts: sourceFacts,
-                    supersededFactIndices: globallyForbiddenSuperseded,
-                    chunkIndex: index + 1,
-                    chunkCount: chunks.count
-                )
-            } catch {
-                return fallback(
-                    request: request,
-                    detectedRoute: detectedRoute,
-                    executedRoute: .fast,
-                    attempts: attempts,
-                    codes: [.emptyOutput],
-                    reason: .setupFailed
-                )
-            }
-
+            let executionIndex = index + recoveryDepth
+            let executionCount = chunks.count + recoveryDepth
             // 第一片继续尊重从停止录音起算的既有时限；后续每片获得独立生成
             // 窗口，避免把多次受控请求重新挤回单次 240 秒的总上限。
             let chunkStartedAt = index == 0 ? startedAt : ContinuousClock.now
-            let result = await runFast(
-                request: chunkRequest,
-                payload: payload,
-                sourceFacts: chunkFacts,
+            let result = await runFastChunk(
+                documentRequest: request,
+                text: chunk,
+                index: executionIndex,
+                count: executionCount,
+                sourceFacts: sourceFacts,
+                supersededKeys: factDispositionsByChunk[index].superseded,
+                globallyForbiddenSuperseded: globallyForbiddenSuperseded,
                 detectedRoute: detectedRoute,
                 startedAt: chunkStartedAt
             )
             attempts += result.llmAttemptCount
-            appendUnique(result.validationCodes, to: &accumulatedCodes)
-            guard !result.usedFallback else {
+            if !result.usedFallback {
+                appendUnique(result.validationCodes, to: &accumulatedCodes)
+                outputs.append(result.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                outputSourceChunks.append(chunk)
+                continue
+            }
+
+            guard recoveryDepth < Self.fastChunkRecoveryMaximumDepth,
+                  Self.shouldRecoverFastChunk(result),
+                  let recoveryChunks = Self.fastChunkRecoveryTexts(
+                      from: chunk,
+                      protectedTerms: request.resolvedEntities.map(\.canonical)
+                  ) else {
+                appendUnique(result.validationCodes, to: &accumulatedCodes)
                 return fallback(
                     request: request,
                     detectedRoute: detectedRoute,
@@ -526,10 +670,86 @@ struct VoicePolishPipeline: Sendable {
                     rejectedDraft: result.rejectedDraft
                 )
             }
-            outputs.append(result.text.trimmingCharacters(in: .whitespacesAndNewlines))
+
+            recoveryDepth += 1
+            let expandedChunks = Array(chunks[..<index])
+                + recoveryChunks
+                + Array(chunks[(index + 1)...])
+            let recoveryDispositions = Self.factDispositionsByChunk(
+                request: request,
+                chunks: expandedChunks,
+                sourceFacts: sourceFacts,
+                supersededOccurrences: supersededOccurrences
+            )
+            var recoveredOutputs: [String] = []
+            var recoveryFailedResult: VoicePolishResult?
+
+            for (childOffset, recoveryChunk) in recoveryChunks.enumerated() {
+                // 为即将运行的子片预留完整的“初稿 + 修复”预算。不能在只剩一次
+                // 调用时启动一个可能需要修复的子片，从而突破总调用上限。
+                guard recoveryAttempts + Self.fastChunkMaximumAttemptsPerRun
+                        <= Self.fastChunkRecoveryMaximumAdditionalAttempts else {
+                    recoveryFailedResult = result
+                    break
+                }
+                let expandedIndex = index + childOffset
+                let childResult = await runFastChunk(
+                    documentRequest: request,
+                    text: recoveryChunk,
+                    index: expandedIndex,
+                    count: expandedChunks.count,
+                    sourceFacts: sourceFacts,
+                    supersededKeys: recoveryDispositions[expandedIndex].superseded,
+                    globallyForbiddenSuperseded: globallyForbiddenSuperseded,
+                    detectedRoute: detectedRoute,
+                    startedAt: ContinuousClock.now
+                )
+                attempts += childResult.llmAttemptCount
+                recoveryAttempts += childResult.llmAttemptCount
+                guard !childResult.usedFallback else {
+                    recoveryFailedResult = childResult
+                    break
+                }
+                appendUnique(childResult.validationCodes, to: &accumulatedCodes)
+                recoveredOutputs.append(
+                    childResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+
+            if let recoveryFailedResult {
+                appendUnique(result.validationCodes, to: &accumulatedCodes)
+                appendUnique(recoveryFailedResult.validationCodes, to: &accumulatedCodes)
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .fast,
+                    attempts: attempts,
+                    codes: accumulatedCodes,
+                    reason: recoveryFailedResult.failureReason ?? .validationFailed,
+                    rejectedDraft: recoveryFailedResult.rejectedDraft ?? result.rejectedDraft
+                )
+            }
+            guard recoveredOutputs.count == recoveryChunks.count else {
+                appendUnique(result.validationCodes, to: &accumulatedCodes)
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .fast,
+                    attempts: attempts,
+                    codes: accumulatedCodes,
+                    reason: .validationFailed,
+                    rejectedDraft: result.rejectedDraft
+                )
+            }
+            outputs.append(contentsOf: recoveredOutputs)
+            outputSourceChunks.append(contentsOf: recoveryChunks)
         }
 
-        let combinedDraft = outputs.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let combinedDraft = Self.combinedChunkOutput(
+            outputs,
+            sourceChunks: outputSourceChunks,
+            canonicalSource: request.fallbackText
+        )
         let normalized = normalizedLayoutText(combinedDraft, request: request)
         let finalOutput = VoicePolishValidator.removingDeterministicDraftArtifacts(
             from: normalized,
@@ -560,6 +780,88 @@ struct VoicePolishPipeline: Sendable {
             executedRoute: .fast,
             attempts: attempts,
             codes: accumulatedCodes
+        )
+    }
+
+    private static func shouldRecoverFastChunk(_ result: VoicePolishResult) -> Bool {
+        guard result.usedFallback,
+              result.failureReason == .validationFailed else {
+            return false
+        }
+        let hardCodes = result.validationCodes.filter(\.isHardFailure)
+        guard !hardCodes.isEmpty,
+              hardCodes.allSatisfy(recoverableFastChunkCodes.contains) else {
+            return false
+        }
+        if result.llmAttemptCount == fastChunkMaximumAttemptsPerRun { return true }
+        // 初次响应已被 Provider 明确截断、超过安全上限，或无法通过长度归一化
+        // 时，不存在可供内容 Repair 的完整草稿；直接缩小该片比重复同尺寸请求
+        // 更可靠。普通网络/超时仍不会映射为 abnormalLength。
+        return result.llmAttemptCount == 1
+            && hardCodes.count == 1
+            && hardCodes[0] == .abnormalLength
+    }
+
+    private func runFastChunk(
+        documentRequest: VoicePolishRequest,
+        text: String,
+        index: Int,
+        count: Int,
+        sourceFacts: [SourceFactCandidate],
+        supersededKeys: Set<String>,
+        globallyForbiddenSuperseded: Set<Int>,
+        detectedRoute: VoicePolishRoute,
+        startedAt: ContinuousClock.Instant
+    ) async -> VoicePolishResult {
+        let chunkRequest = fastChunkRequest(
+            from: documentRequest,
+            text: text,
+            index: index,
+            count: count
+        )
+        let factSegments = chunkRequest.context.scene == .code
+            ? chunkRequest.input.segments
+            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(
+                from: chunkRequest.input.segments
+            )
+        let chunkFacts = (ProtectedFactExtractor.extract(from: factSegments)
+            + chunkRequest.resolvedEntities.map {
+                SourceFactCandidate(
+                    sourceText: $0.surfaceText,
+                    canonicalValue: $0.canonical,
+                    kind: .lexiconEntity,
+                    sourceSegmentIDs: $0.sourceSegmentIDs
+                )
+            }).filter {
+                !supersededKeys.contains(Self.semanticFactIdentity($0))
+            }
+        let payload: String
+        do {
+            payload = try VoicePolishPrompts.chunkPayload(
+                for: chunkRequest,
+                sourceFacts: chunkFacts,
+                documentText: documentRequest.fallbackText,
+                documentSourceFacts: sourceFacts,
+                supersededFactIndices: globallyForbiddenSuperseded,
+                chunkIndex: index + 1,
+                chunkCount: count
+            )
+        } catch {
+            return fallback(
+                request: chunkRequest,
+                detectedRoute: detectedRoute,
+                executedRoute: .fast,
+                attempts: 0,
+                codes: [.emptyOutput],
+                reason: .setupFailed
+            )
+        }
+        return await runFast(
+            request: chunkRequest,
+            payload: payload,
+            sourceFacts: chunkFacts,
+            detectedRoute: detectedRoute,
+            startedAt: startedAt
         )
     }
 
@@ -1178,6 +1480,19 @@ struct VoicePolishPipeline: Sendable {
                         codes: repairedValidation.codes
                     )
                 } catch {
+                    if isSizeRelatedGenerationFailure(error) {
+                        var codes = validation.codes
+                        appendUnique([.abnormalLength], to: &codes)
+                        return fallback(
+                            request: request,
+                            detectedRoute: detectedRoute,
+                            executedRoute: .fast,
+                            attempts: attempts,
+                            codes: codes,
+                            reason: .validationFailed,
+                            rejectedDraft: finalOutput
+                        )
+                    }
                     return fallback(
                         request: request,
                         detectedRoute: detectedRoute,
@@ -1207,6 +1522,16 @@ struct VoicePolishPipeline: Sendable {
                 codes: validation.codes
             )
         } catch {
+            if isSizeRelatedGenerationFailure(error) {
+                return fallback(
+                    request: request,
+                    detectedRoute: detectedRoute,
+                    executedRoute: .fast,
+                    attempts: attempts,
+                    codes: [.abnormalLength],
+                    reason: .validationFailed
+                )
+            }
             return fallback(
                 request: request,
                 detectedRoute: detectedRoute,
@@ -1644,6 +1969,16 @@ struct VoicePolishPipeline: Sendable {
             return .validationFailed
         }
         return .requestFailed
+    }
+
+    private func isSizeRelatedGenerationFailure(_ error: Error) -> Bool {
+        guard let llmError = error as? LLMError else { return false }
+        switch llmError {
+        case .truncatedResponse, .responseTooLarge:
+            return true
+        default:
+            return false
+        }
     }
 
     private func success(
