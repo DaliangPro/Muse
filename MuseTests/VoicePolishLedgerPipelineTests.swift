@@ -140,6 +140,24 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertTrue(requests[3].user.contains("不得改成事情确定不会发生"))
     }
 
+    func testPlannerKeepsNonCommitmentOutOfCorrectionRelations() {
+        XCTAssertTrue(
+            VoicePolishLedgerPrompts.planner.contains(
+                "不要承诺/不能保证/不要假设/禁止"
+            )
+        )
+        XCTAssertTrue(
+            VoicePolishLedgerPrompts.plannerRepair.contains(
+                "correction_subject_not_bound_to_old_value"
+            )
+        )
+        XCTAssertTrue(
+            VoicePolishLedgerPrompts.plannerRepair.contains(
+                "必须删除对应伪 correction"
+            )
+        )
+    }
+
     func testVerifiedContextEntityMissingTriggersTargetedRepair() async throws {
         let source = "项目名按北城研究写。"
         let repaired = "项目名统一使用北辰研究。"
