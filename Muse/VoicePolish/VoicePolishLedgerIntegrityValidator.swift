@@ -1270,6 +1270,30 @@ enum VoicePolishLedgerIntegrityValidator {
         unitSourceSpanIDs: Set<String>,
         corrections: [VoicePolishLedgerCorrection]
     ) -> String? {
+        for correction in corrections
+        where correction.renderingPolicy == "final_only"
+            && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
+            && evidence.contains(correction.oldValue)
+            && unitMeaning.contains(correction.oldValue) {
+            for oldRange in ranges(of: correction.oldValue, in: evidence) {
+                let oldSentence = sentence(in: evidence, containing: oldRange)
+                let hasHistoricalCue = oldSentence.range(
+                    of: #"(?:原来|原定|原先|之前|先前|本来)"#,
+                    options: .regularExpression
+                ) != nil
+                let hasCancellationCue = oldSentence.range(
+                    of: #"(?:取消|作废|不再采用|不算|不要了)"#,
+                    options: .regularExpression
+                ) != nil
+                // `final_only` 已由前面的来源关系门禁证明。旧句若明确只是
+                // “原来……这个取消”的历史说明，应整体执行并移出正文；
+                // 绝不能把其中旧值机械替换成最终值，制造“最终安排也取消”。
+                if hasHistoricalCue && hasCancellationCue {
+                    return oldSentence
+                }
+            }
+        }
+
         let instructionPattern = #"(?:旧(?:数字|值|版本|日期|安排)?|原(?:数字|值|版本|日期|安排)?)[^。！？\n]{0,24}(?:不要|不再|无需)(?:写|保留|放|出现|记录)[^。！？\n]{0,16}"#
         guard unitMeaning.range(of: instructionPattern, options: .regularExpression) != nil,
               let sourceRange = evidence.range(of: instructionPattern, options: .regularExpression)
@@ -2388,6 +2412,17 @@ enum VoicePolishLedgerIntegrityValidator {
     private static func clause(in text: String, containing range: NSRange) -> String {
         guard let stringRange = Range(range, in: text) else { return "" }
         let delimiters: Set<Character> = ["，", "。", "！", "？", "；", ",", "!", "?", ";", "\n"]
+        let before = text[..<stringRange.lowerBound]
+        let start = before.lastIndex(where: delimiters.contains)
+            .map { text.index(after: $0) } ?? text.startIndex
+        let after = text[stringRange.upperBound...]
+        let end = after.firstIndex(where: delimiters.contains) ?? text.endIndex
+        return String(text[start..<end])
+    }
+
+    private static func sentence(in text: String, containing range: NSRange) -> String {
+        guard let stringRange = Range(range, in: text) else { return "" }
+        let delimiters: Set<Character> = ["。", "！", "？", "!", "?", "\n"]
         let before = text[..<stringRange.lowerBound]
         let start = before.lastIndex(where: delimiters.contains)
             .map { text.index(after: $0) } ?? text.startIndex

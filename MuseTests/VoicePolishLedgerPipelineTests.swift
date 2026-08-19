@@ -1301,24 +1301,34 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             subject: "录制安排", oldValue: "周二", finalValue: "周三下午",
             oldSpanIds: ["old"], finalSpanIds: ["final"], renderingPolicy: "final_only"
         )
-        let unit = VoicePolishLedgerUnit(
+        let finalUnit = VoicePolishLedgerUnit(
             id: "u1", kind: "claim", deliveryRole: "recipient_content",
-            finalMeaning: "录制安排在周三下午。", sourceSpanIds: ["final", "old"],
+            finalMeaning: "录制安排在周三下午。", sourceSpanIds: ["final"],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        let oldUnit = VoicePolishLedgerUnit(
+            id: "u2", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "原来说周二录，这个取消。", sourceSpanIds: ["old"],
             status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
         )
         let plan = VoicePolishIntentLedger(
-            audience: [], units: [unit], corrections: [correction], conditionals: [],
+            audience: [], units: [finalUnit, oldUnit], corrections: [correction], conditionals: [],
             technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
-            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1", "u2"])
         )
 
-        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
             plan,
             spans: spans,
             verifiedMappings: [],
             requiredLogicCues: [],
             scene: .email
-        ))
+        )
+        XCTAssertEqual(validated.structure.orderedUnitIds, ["u1"])
+        XCTAssertEqual(
+            validated.units.first(where: { $0.id == "u2" })?.deliveryRole,
+            "editor_directive"
+        )
 
         let crossSegment = [
             spans[0],
