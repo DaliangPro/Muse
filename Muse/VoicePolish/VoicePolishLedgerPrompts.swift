@@ -27,15 +27,15 @@ enum VoicePolishLedgerPrompts {
     - style_directive/editor_directive 只执行不照抄；明确不允许告诉当前收件人的内部内容使用 excluded_content。
     - context_mappings 只能使用输入中 VERIFIED_ENTITY_MAPPINGS 已确认的条目，不能从普通上下文猜新映射。
     - REQUIRED_LOGIC_CUES 中每个 cue_id 必须且只能在 conditionals 中出现一次，operator_kind 必须逐字复制该 cue 的 operator_kind。condition.subject、condition.predicate 和 consequence.action 必须分别复制对应 source span 中最短、逐字存在的语义短语，不得同义改写或概括；条件极性和每个共同后果必须分字段表达。only_if 是必要条件，不得升级成“条件满足就一定执行”的 if_then；没有 cue 时 conditionals 必须为空。
-    - technical_token_mappings 只用于 code/aiPrompt 中同一个 ASCII 技术标识被 ASR 拆成至少三个片段、且其中至少两个是 1～3 个字母的明确断词；canonical 只能删除内部空白。`Swift 6`、`Node 20`、`Claude Code` 等合法名称、版本或普通英文短语不得合并。不确定时返回空数组。dictated_symbol_mappings 只用于明确口述的斜杠、反斜杠、短横线、双横线、下划线、点和冒号，canonical 只能按字面还原符号。
-    - AI Prompt 场景的成稿应是未来 AI 可直接执行的 Prompt 本身，不得再次要求未来 AI “整理成 Prompt”，也不得开始执行研究。
+    - technical_token_mappings 与 dictated_symbol_mappings 统一返回空数组；技术断词及斜杠、短横线、点、双横线等口述符号由程序从来源 span 机械验证和恢复，Planner 不得自报或猜测映射。`Swift 6`、`Node 20`、`Claude Code` 等合法名称、版本或普通英文短语不得合并。
+    - AI Prompt 场景的成稿应是未来 AI 可直接执行的 Prompt 本身，不得再次要求未来 AI“整理成 Prompt”，也不得开始执行研究。若来源是“帮我整理成 Prompt，先别开始研究，只整理任务/要求”，后半句是给 Muse 的当前 editor_directive，必须 status=remove，不得建成 recipient_content。
     - exact_tokens 只写拼写不可变化的项目名、术语、路径、命令和版本等；允许自然格式变化的普通日期、数字与措辞不要放入。普通数值可以转换中文/阿拉伯数字写法，但不得补原文没有的量词、单位或币种，例如原文只说“预算一万六”时不能擅自写成“16000 元”。
     """
 
     static let plannerRepair = """
     你是 Muse 意图清单的格式与证据修复器。上一版 Ledger 没有通过本地 schema 或来源完整性检查；你只修 Ledger，不写成稿。
 
-    重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES、VERIFIED_ENTITY_MAPPINGS 和 VALIDATION_ERROR，针对错误原因修正。若错误是 source_spans_without_unit，逐个核对遗漏 span 并新增或调整有来源的 unit，不得用删除要求来追求通过；若错误是 unit_contains_unbacked_exact_token，移除普通日期/数字的逐字格式要求；若错误是 unit_contains_unbacked_fact 或 ledger_measurement_coverage_invalid，保留每个仍有效的来源事实及其对象关系，但删除擅自补入的单位、币种、人物或数值。确保每个 source span 都由至少一个 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；source span 达到 3 个时，每个 unit 最多引用 2 个 source span；recipient_content 的 surface_tokens 必须为空，其他 role 必须填写逐字来自证据的 surface_tokens，excluded_content 的 token 还必须覆盖被排除内容本身而非只覆盖旁边指令；每个 logic cue 恰好由一条 conditional 覆盖；普通改口的 subject 必须与旧值属于同一对象关系，旧值和最终值逐字来自各自证据，VERIFIED_ENTITY_MAPPINGS 已确认的别名→标准名不要再重复声明为 correction；技术映射只做固定的空白或口述符号变换；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。
+    重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES、VERIFIED_ENTITY_MAPPINGS 和 VALIDATION_ERROR，针对错误原因修正。若错误是 source_spans_without_unit，逐个核对遗漏 span 并新增或调整有来源的 unit，不得用删除要求来追求通过；若错误是 unit_contains_unbacked_exact_token，移除普通日期/数字的逐字格式要求；若错误是 unit_contains_unbacked_fact 或 ledger_measurement_coverage_invalid，保留每个仍有效的来源事实及其对象关系，但删除擅自补入的单位、币种、人物或数值。确保每个 source span 都由至少一个 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；source span 达到 3 个时，每个 unit 最多引用 2 个 source span；recipient_content 的 surface_tokens 必须为空，其他 role 必须填写逐字来自证据的 surface_tokens，excluded_content 的 token 还必须覆盖被排除内容本身而非只覆盖旁边指令；每个 logic cue 恰好由一条 conditional 覆盖；普通改口的 subject 必须与旧值属于同一对象关系，旧值和最终值逐字来自各自证据，VERIFIED_ENTITY_MAPPINGS 已确认的别名→标准名不要再重复声明为 correction；technical_token_mappings 与 dictated_symbol_mappings 必须为空，程序会自行恢复可证明的断词和口述符号；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。AI Prompt 中“先别开始研究，只整理任务/要求”这类针对当前润色的说明必须标 editor_directive/remove，不能进入 recipient_content。
     不得借修复新增原文没有的事实、受众、条件或映射。只返回完整修复后的 Ledger JSON，不要回显错误、解释或 Markdown。
     """
 

@@ -911,6 +911,53 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertTrue(wrongRelation.codes.contains(.supersededFactRetained))
     }
 
+    func testDistantCorrectionBindsCourseReviewRoundsDespiteDiscoursePrefix() {
+        let middle = "只保留最终决定及必要理由。" + String(
+            repeating: "中间还有需要保留的课程边界和制作要求。",
+            count: 30
+        )
+        let source = "示例文件要能打开 链接要能访问 普通浏览器路径要能完成 另外 课程资料复核先安排三轮。"
+            + middle
+            + "前面的课程资料复核轮次不对，课程资料复核最终安排两轮。"
+            + "其他培训仍安排三次复核。"
+        let request = makeRequest(source, scene: .document)
+        let facts = ProtectedFactExtractor.extract(from: request.input.segments)
+        let occurrences = VoicePolishValidator.locallySupersededFactOccurrences(
+            request: request,
+            sourceFacts: facts
+        )
+
+        guard let correction = occurrences.first else {
+            return XCTFail("没有识别课程资料复核三轮到两轮的远距离改口")
+        }
+        XCTAssertEqual(occurrences.count, 1)
+        XCTAssertEqual(correction.relationAnchor, "课程资料复核")
+        XCTAssertEqual(correction.factDescriptor, "轮")
+        XCTAssertEqual(correction.replacementDescriptor, "轮")
+        XCTAssertTrue(
+            VoicePolishValidator.locallySupersededFactIndices(
+                request: request,
+                sourceFacts: facts
+            ).isEmpty,
+            "另一个仍有效的三次复核不能被全局禁用"
+        )
+
+        let good = VoicePolishValidator.validateFast(
+            output: "课程资料复核最终安排两轮。其他培训仍安排三次复核。",
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertFalse(good.codes.contains(.missingProtectedFact), "\(good.codes)")
+        XCTAssertFalse(good.codes.contains(.supersededFactRetained), "\(good.codes)")
+
+        let wrong = VoicePolishValidator.validateFast(
+            output: "课程资料复核仍安排三轮，最终安排两轮；其他培训仍安排三次复核。",
+            request: request,
+            sourceFacts: facts
+        )
+        XCTAssertTrue(wrong.codes.contains(.supersededFactRetained))
+    }
+
     func testRelationGateAcceptsNaturalPeopleUnitsAndRejectsBorrowedOrNonCurrentFacts() {
         let request = makeRequest(
             "北京 3 人。上海先按 3 人。不对，上海改成 4 人。",

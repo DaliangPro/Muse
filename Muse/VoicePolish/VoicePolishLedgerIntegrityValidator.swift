@@ -194,6 +194,16 @@ enum VoicePolishLedgerIntegrityValidator {
         guard !ledger.units.isEmpty else {
             throw VoicePolishLedgerIntegrityError.invalidLedgerReason("units_empty")
         }
+        // 技术断词和口述符号都属于可机械证明的字符变换，不再信任 Planner
+        // 自报 mapping。程序直接从每个来源 span 识别最小 alias 并生成 canonical；
+        // 这样错误数组不会让整份 Ledger 回退，也不能借冗余 span 把 canonical
+        // 扇出到无证据的 unit。
+        let localTokenMappings = locallyVerifiedTokenMappings(
+            spans: spans,
+            sceneAllowsMappings: scene == .code || scene == .aiPrompt
+        )
+        ledger.technicalTokenMappings = localTokenMappings.technical
+        ledger.dictatedSymbolMappings = localTokenMappings.dictated
         do {
             try validateTokenMappings(
                 ledger.technicalTokenMappings,
@@ -225,6 +235,8 @@ enum VoicePolishLedgerIntegrityValidator {
             spans: spanByID,
             validSpanIDs: validSpanIDs
         )
+        let fullSource = spans.map(\.text).joined()
+        var locallyRemovedEditorUnitIDs: Set<String> = []
         var unitIds: Set<String> = []
         for index in ledger.units.indices {
             var unit = ledger.units[index]
@@ -252,6 +264,20 @@ enum VoicePolishLedgerIntegrityValidator {
                 )
             }
             let evidence = unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
+            if scene == .aiPrompt,
+               unit.deliveryRole == "recipient_content",
+               unit.status != "remove",
+               let editorToken = currentAIPromptEditorInstruction(
+                    in: evidence,
+                    unitMeaning: unit.finalMeaning,
+                    fullSource: fullSource
+               ) {
+                unit.deliveryRole = "editor_directive"
+                unit.status = "remove"
+                unit.exactTokens = []
+                unit.surfaceTokens = [editorToken]
+                locallyRemovedEditorUnitIDs.insert(unit.id)
+            }
             if unit.deliveryRole == "recipient_content" {
                 // surface_tokens 只用于证明幕后说明或排除内容是否泄漏；正文 unit
                 // 不消费这个字段。模型即使冗余填写，也在本地清空，不能让一个
@@ -281,6 +307,10 @@ enum VoicePolishLedgerIntegrityValidator {
             )
             let evidenceFacts = facts(in: evidence).union(
                 allowedCanonical.flatMap { facts(in: $0) }
+            )
+            unit.finalMeaning = normalizingUnsupportedMeasurementFamilies(
+                in: unit.finalMeaning,
+                against: evidence
             )
             var normalizedExactTokens: [String] = []
             for token in unit.exactTokens {
@@ -350,6 +380,14 @@ enum VoicePolishLedgerIntegrityValidator {
                 }
             }
             ledger.units[index] = unit
+        }
+        if !locallyRemovedEditorUnitIDs.isEmpty {
+            ledger.structure = VoicePolishLedgerStructure(
+                kind: ledger.structure.kind,
+                orderedUnitIds: ledger.structure.orderedUnitIds.filter {
+                    !locallyRemovedEditorUnitIDs.contains($0)
+                }
+            )
         }
         let activeRecipientUnits = ledger.units.filter {
             $0.deliveryRole == "recipient_content" && $0.status != "remove"
@@ -839,6 +877,91 @@ enum VoicePolishLedgerIntegrityValidator {
         }
     }
 
+    /// AI Prompt 场景里“帮我整理成 Prompt，先别开始研究，只整理任务”是
+    /// 给 Muse 的当前编辑指令，不是要传给未来 AI 的任务正文。Planner 若把
+    /// 这一句误标为正文，Writer/Repair 会反复照抄。只在同一来源同时出现
+    /// 明确的 Prompt 整理请求、unit 自己也表达该指令时，程序把逐字命中的
+    /// 局部句子改回 editor/remove；不会对普通研究 Prompt 做开放式推断。
+    private static func currentAIPromptEditorInstruction(
+        in evidence: String,
+        unitMeaning: String,
+        fullSource: String
+    ) -> String? {
+        let outerRequest = #"(?:帮我|请|把).{0,80}(?:整理|改写|生成).{0,24}(?:Prompt|提示词|任务)"#
+        let editorInstruction = #"(?:先|暂时|目前)?(?:别|不要|不用)(?:现在|先|暂时|目前)?(?:开始|执行|进行)(?:研究|分析|任务)[，,、\s]*(?:只)?(?:整理|改写)(?:任务|要求|Prompt|提示词)"#
+        guard fullSource.range(of: outerRequest, options: .regularExpression) != nil,
+              unitMeaning.range(of: editorInstruction, options: .regularExpression) != nil,
+              let range = evidence.range(of: editorInstruction, options: .regularExpression) else {
+            return nil
+        }
+        return String(evidence[range])
+    }
+
+    private static func locallyVerifiedTokenMappings(
+        spans: [VoicePolishEvidenceSpan],
+        sceneAllowsMappings: Bool
+    ) -> (
+        technical: [VoicePolishLedgerTokenMapping],
+        dictated: [VoicePolishLedgerTokenMapping]
+    ) {
+        guard sceneAllowsMappings else { return ([], []) }
+        let technicalPattern = #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]{1,32}\s+){2,}[A-Za-z0-9]{1,32}(?![A-Za-z0-9])"#
+        let symbolPattern = dictatedSymbols
+            .map { NSRegularExpression.escapedPattern(for: $0.0) }
+            .joined(separator: "|")
+        let dictatedPattern = #"(?<![A-Za-z0-9])(?:[A-Za-z0-9._]+(?:\s+[A-Za-z0-9._]+)*)(?:(?:"#
+            + symbolPattern
+            + #")[A-Za-z0-9._]+(?:\s+[A-Za-z0-9._]+)*)+(?![A-Za-z0-9])"#
+        guard let technicalRegex = try? NSRegularExpression(pattern: technicalPattern),
+              let dictatedRegex = try? NSRegularExpression(pattern: dictatedPattern) else {
+            return ([], [])
+        }
+
+        var technical: [VoicePolishLedgerTokenMapping] = []
+        var dictated: [VoicePolishLedgerTokenMapping] = []
+        var technicalKeys: Set<String> = []
+        var dictatedKeys: Set<String> = []
+        for span in spans {
+            let fullRange = NSRange(span.text.startIndex..<span.text.endIndex, in: span.text)
+            for match in technicalRegex.matches(in: span.text, range: fullRange) {
+                guard let range = Range(match.range, in: span.text) else { continue }
+                let alias = String(span.text[range])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let canonical = alias.replacingOccurrences(
+                    of: #"(?<=[A-Za-z0-9])\s+(?=[A-Za-z0-9])"#,
+                    with: "",
+                    options: .regularExpression
+                )
+                let mapping = VoicePolishLedgerTokenMapping(
+                    alias: alias,
+                    canonical: canonical,
+                    sourceSpanIds: [span.id],
+                    transform: "remove_internal_ascii_whitespace"
+                )
+                guard isHighConfidenceJoinedTechnicalToken(mapping),
+                      technicalKeys.insert("\(span.id)|\(alias)").inserted else { continue }
+                technical.append(mapping)
+            }
+            for match in dictatedRegex.matches(in: span.text, range: fullRange) {
+                guard let range = Range(match.range, in: span.text) else { continue }
+                let alias = String(span.text[range])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let transform = alias.contains(where: \.isWhitespace)
+                    ? "spoken_cli_symbols"
+                    : "spoken_ascii_symbols"
+                guard let canonical = dictatedCanonical(alias, transform: transform),
+                      dictatedKeys.insert("\(span.id)|\(alias)").inserted else { continue }
+                dictated.append(VoicePolishLedgerTokenMapping(
+                    alias: alias,
+                    canonical: canonical,
+                    sourceSpanIds: [span.id],
+                    transform: transform
+                ))
+            }
+        }
+        return (technical, dictated)
+    }
+
     /// 条件字段属于安全关键契约，不能只靠“引用了某个 span ID”自证。
     /// Planner 必须复制来源中的最短语义短语；这里只忽略空白和标点，不做
     /// 同义推断，避免把“客户确认后发布”伪造成“老板批准后删除数据库”。
@@ -959,8 +1082,14 @@ enum VoicePolishLedgerIntegrityValidator {
                 spans: spans
             )
             let hasLocalOmittedSubjectPair = !localOmittedSubjectRanges.isEmpty
+            let hasSameSegmentBackwardCancellation = finalValueIsSubjectBacked
+                && explicitlyCancelsOldValueInSameSegment(
+                    correction,
+                    spans: spans
+                )
             guard (oldValueIsSubjectBacked && finalValueIsSubjectBacked)
-                    || hasLocalOmittedSubjectPair else {
+                    || hasLocalOmittedSubjectPair
+                    || hasSameSegmentBackwardCancellation else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                     oldValueIsSubjectBacked
                         ? "correction_subject_not_bound_to_final_value"
@@ -968,6 +1097,50 @@ enum VoicePolishLedgerIntegrityValidator {
                 )
             }
         }
+    }
+
+    /// 自然交接里常先给最终安排，再补一句“原来说周二录，这个取消”。旧句
+    /// 会省略“录制安排”全称，但同一个 ASR segment 已明确包含最终对象、旧值
+    /// 与取消证据。这里只接受非 measurement、同 segment、旧/新值各自唯一且
+    /// 旧句同时带历史状态与取消词的反向改口，不能跨 segment 借另一个对象。
+    private static func explicitlyCancelsOldValueInSameSegment(
+        _ correction: VoicePolishLedgerCorrection,
+        spans: [String: VoicePolishEvidenceSpan]
+    ) -> Bool {
+        guard measurementScan(in: correction.oldValue).occurrences.isEmpty,
+              measurementScan(in: correction.finalValue).occurrences.isEmpty else {
+            return false
+        }
+        for oldID in correction.oldSpanIds {
+            guard let oldSpan = spans[oldID] else { continue }
+            for finalID in correction.finalSpanIds {
+                guard let finalSpan = spans[finalID],
+                      oldSpan.segmentID == finalSpan.segmentID else { continue }
+                let segmentSpans = spans.values
+                    .filter { $0.segmentID == oldSpan.segmentID }
+                    .sorted { $0.start < $1.start }
+                let segmentText = segmentSpans.map(\.text).joined()
+                guard ranges(of: correction.oldValue, in: segmentText).count == 1,
+                      ranges(of: correction.finalValue, in: segmentText).count == 1 else {
+                    continue
+                }
+                let oldClause = clause(
+                    in: oldSpan.text,
+                    containing: ranges(of: correction.oldValue, in: oldSpan.text).first
+                        ?? NSRange(location: 0, length: 0)
+                )
+                let hasHistoricalCue = oldClause.range(
+                    of: #"(?:原来|原定|原先|之前|先前|本来)"#,
+                    options: .regularExpression
+                ) != nil
+                let hasCancellationCue = oldSpan.text.range(
+                    of: #"(?:取消|作废|不再采用|不算|不要了)"#,
+                    options: .regularExpression
+                ) != nil
+                if hasHistoricalCue && hasCancellationCue { return true }
+            }
+        }
+        return false
     }
 
     private static func facts(in text: String) -> Set<String> {
@@ -1058,6 +1231,32 @@ enum VoicePolishLedgerIntegrityValidator {
             }
         }
         return MeasurementScan(occurrences: occurrences, bareValueCounts: bareValueCounts)
+    }
+
+    /// Planner 偶尔会把“预算一万六”自行补成“预算 16000 元”。来源没有
+    /// 单位或币种时，程序不能把该推断交给 Writer；但也无需让整段 1K 文本
+    /// 因一个可机械撤销的后缀回退。仅当同一 unit 中该裸值和新增 measurement
+    /// 都各自唯一时，把整段 measurement 收口为原值 canonical，随后仍走事实、
+    /// 对象关系与 Reviewer 门禁。已有单位的删除、替换或跨对象借值不会进入此路。
+    private static func normalizingUnsupportedMeasurementFamilies(
+        in finalMeaning: String,
+        against evidence: String
+    ) -> String {
+        let source = measurementScan(in: evidence)
+        let final = measurementScan(in: finalMeaning)
+        let candidates = final.occurrences.filter { occurrence in
+            source.bareValueCounts[occurrence.value, default: 0] == 1
+                && final.occurrences.filter({ $0.value == occurrence.value }).count == 1
+                && !source.occurrences.contains(where: {
+                    $0.value == occurrence.value && $0.family == occurrence.family
+                })
+        }
+        guard !candidates.isEmpty else { return finalMeaning }
+        let mutable = NSMutableString(string: finalMeaning)
+        for occurrence in candidates.sorted(by: { $0.range.location > $1.range.location }) {
+            mutable.replaceCharacters(in: occurrence.range, with: occurrence.value)
+        }
+        return mutable as String
     }
 
     private static func activeMeasurementScan(

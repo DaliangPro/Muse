@@ -169,6 +169,40 @@ final class VoicePolishQualityReferenceTests: XCTestCase {
                 || contextRequest.fallbackText.contains("Muse 进程")
         )
         XCTAssertFalse(contextRequest.fallbackText.contains("缪斯进程"))
+
+        let dirtyNearEightThousand = try XCTUnwrap(
+            fixtures["natural-long-10-asr-dirty-segments-2"]
+        )
+        let dirtyRequest = makeRequest(for: dirtyNearEightThousand)
+        let dirtyFacts = ProtectedFactExtractor.extract(from: dirtyRequest.input.segments)
+        let dirtyOccurrences = VoicePolishValidator.locallySupersededFactOccurrences(
+            request: dirtyRequest,
+            sourceFacts: dirtyFacts
+        )
+        XCTAssertTrue(dirtyOccurrences.contains { occurrence in
+            occurrence.relationAnchor == "课程资料复核"
+                && dirtyFacts[occurrence.factIndex].canonicalValue == "3"
+                && occurrence.replacementFactIndex.map {
+                    dirtyFacts[$0].canonicalValue == "2"
+                } == true
+        })
+        let initialChunks = VoicePolishPipeline.fastChunkTexts(
+            from: dirtyRequest.fallbackText
+        )
+        let recoveryChunks = try XCTUnwrap(
+            VoicePolishPipeline.fastChunkRecoveryTexts(from: initialChunks[0])
+        )
+        let expandedChunks = recoveryChunks + Array(initialChunks.dropFirst())
+        let dispositions = VoicePolishPipeline.factDispositionsByChunk(
+            request: dirtyRequest,
+            chunks: expandedChunks,
+            sourceFacts: dirtyFacts,
+            supersededOccurrences: dirtyOccurrences
+        )
+        XCTAssertTrue(
+            dispositions[1].superseded.contains("number|3"),
+            "失败片二分后仍错误要求恢复已作废的课程资料复核三轮"
+        )
     }
 }
 

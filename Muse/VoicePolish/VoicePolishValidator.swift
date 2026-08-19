@@ -1299,7 +1299,7 @@ enum VoicePolishValidator {
                 "分钟", "小时", "个月", "工作日", "公里", "万元",
                 "个", "条", "张", "份", "项", "人", "位", "名", "台",
                 "款", "套", "本", "页", "章", "段", "次", "遍", "场",
-                "组", "种", "件", "家", "只", "天", "周", "月", "年",
+                "轮", "组", "种", "件", "家", "只", "天", "周", "月", "年",
             ]
             guard let classifier = classifiers
                 .sorted(by: { $0.count > $1.count })
@@ -1319,7 +1319,7 @@ enum VoicePolishValidator {
             let classifiers = [
                 "分钟", "小时", "个月", "工作日", "公里", "万元",
                 "个", "条", "张", "份", "项", "台", "款", "套", "本",
-                "页", "章", "段", "次", "遍", "场", "组", "种", "件",
+                "页", "章", "段", "次", "遍", "轮", "场", "组", "种", "件",
                 "家", "只", "天", "周", "月", "年",
             ]
             guard let classifier = classifiers
@@ -1388,6 +1388,7 @@ enum VoicePolishValidator {
                 }
             }
             let removablePrefixes = [
+                "另外", "此外", "还有",
                 "不对", "我改一下", "我说错了", "说错了", "我的意思是",
                 "应该是", "刚确认", "确认", "先说", "正确", "最终", "最后", "原来",
                 "原定", "先按", "先记", "预计", "大约", "最多", "最少", "上限",
@@ -1461,6 +1462,19 @@ enum VoicePolishValidator {
             return genericSubjectSuffixes.contains { suffix in
                 left == right + suffix || right == left + suffix
             }
+        }
+
+        func explicitRetractionMatchesCandidateAnchor(
+            _ candidate: String,
+            explicit: String
+        ) -> Bool {
+            if relationAnchorsAreCompatible(candidate, explicit) { return true }
+            // 无标点 ASR 会让旧值前的 28 字窗口连带上一条动作，例如
+            // “链接要能访问普通浏览器路径要能完成另外课程资料复核先安排三轮”。
+            // 明确撤回对象已经由“前面的 X 轮次不对”独立提取；旧值候选只在
+            // 其标签以完整、多字撤回对象结尾时匹配，多个候选同时命中仍会在
+            // 下游按歧义拒绝，不能靠最近数字猜测。
+            return explicit.count >= 4 && candidate.hasSuffix(explicit)
         }
 
         /// “前面上海团队参会人数说错了”把撤回对象放在 marker 前，而旧值和
@@ -1617,17 +1631,21 @@ enum VoicePolishValidator {
                 }
                 let previousCandidates = locatedFacts.filter { candidate in
                     let precedesMarker = candidate.globalEndOffset <= marker.globalStartOffset
-                    let followsPreviousCorrection = allowsDistantPrevious
-                        || markerIndex == 0
-                        || candidate.globalOffset >= locatedMarkers[markerIndex - 1].globalEndOffset
                     let gap = textBetween(candidate.globalEndOffset, marker.globalStartOffset)
                     let boundaryCount = hardBoundaryCount(in: gap)
                     let distance = marker.globalStartOffset - candidate.globalEndOffset
                     let candidateLabel = relationLabel(before: candidate)
                     let matchesExplicitAnchor = explicitRetractionAnchor != nil
                         && minimalRelationAnchor(candidateLabel).map {
-                            relationAnchorsAreCompatible(explicitRetractionAnchor!, $0)
+                            explicitRetractionMatchesCandidateAnchor(
+                                $0,
+                                explicit: explicitRetractionAnchor!
+                            )
                         } == true
+                    let followsPreviousCorrection = allowsDistantPrevious
+                        || markerIndex == 0
+                        || candidate.globalOffset >= locatedMarkers[markerIndex - 1].globalEndOffset
+                        || matchesExplicitAnchor
                     let exactAnchoredRetraction = hasExplicitRetraction
                         && (
                             (finalLabel != nil
@@ -1684,7 +1702,10 @@ enum VoicePolishValidator {
                           let candidateAnchor = minimalRelationAnchor(
                             relationLabel(before: candidate)
                           ) else { return false }
-                    return relationAnchorsAreCompatible(explicitRetractionAnchor, candidateAnchor)
+                    return explicitRetractionMatchesCandidateAnchor(
+                        candidateAnchor,
+                        explicit: explicitRetractionAnchor
+                    )
                 }
                 // 同类事实之间优先按“预算/附件/发布日期”等局部对象标签配对；
                 // 完全相同的对象标签优先。若最终只说“预算”，同时可匹配“项目
@@ -2090,7 +2111,7 @@ enum VoicePolishValidator {
             let classifiers = [
                 "分钟", "小时", "个月", "工作日", "公里", "万元",
                 "个", "条", "张", "份", "项", "台", "款", "套", "本",
-                "页", "章", "段", "次", "遍", "场", "组", "种", "件",
+                "页", "章", "段", "次", "遍", "轮", "场", "组", "种", "件",
                 "家", "只", "天", "周", "月", "年",
             ]
             guard let classifier = classifiers
@@ -2137,7 +2158,7 @@ enum VoicePolishValidator {
                 "分钟", "小时", "个月", "工作日", "公里", "万元",
                 "个", "条", "张", "份", "项", "人", "位", "名", "台",
                 "款", "套", "本", "页", "章", "段", "次", "遍", "场",
-                "组", "种", "件", "家", "只", "天", "周", "月", "年",
+                "轮", "组", "种", "件", "家", "只", "天", "周", "月", "年",
             ]
             guard let classifier = classifiers.sorted(by: { $0.count > $1.count })
                 .first(where: { compact.hasPrefix($0) }) else { return nil }

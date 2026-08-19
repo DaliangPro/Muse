@@ -95,10 +95,10 @@ struct VoicePolishIntentLedger: Codable, Sendable, Equatable {
     var units: [VoicePolishLedgerUnit]
     let corrections: [VoicePolishLedgerCorrection]
     let conditionals: [VoicePolishLedgerConditional]
-    let technicalTokenMappings: [VoicePolishLedgerTokenMapping]
-    let dictatedSymbolMappings: [VoicePolishLedgerTokenMapping]
+    var technicalTokenMappings: [VoicePolishLedgerTokenMapping]
+    var dictatedSymbolMappings: [VoicePolishLedgerTokenMapping]
     var contextMappings: [VoicePolishLedgerContextMapping]
-    let structure: VoicePolishLedgerStructure
+    var structure: VoicePolishLedgerStructure
 }
 
 /// Writer 不再返回无法核对覆盖范围的一整段自由文本。每个需要交付的 unit
