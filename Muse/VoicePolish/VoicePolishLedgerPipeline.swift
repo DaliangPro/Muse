@@ -99,91 +99,130 @@ struct VoicePolishLedgerPipeline: Sendable {
         let deadline = startedAt.advanced(by: totalTimeout)
 
         var rawPlanResponse = ""
-        let ledger: VoicePolishIntentLedger
-        do {
-            try reserveAttempt(&attempts)
-            rawPlanResponse = try await generate(
-                task: .voicePolishAnalyze,
-                stage: .analyzing,
-                system: VoicePolishLedgerPrompts.planner,
-                user: try plannerPayload(
-                    request: request,
-                    spans: spans,
-                    mappings: mappings,
-                    requiredLogicCues: requiredLogicCues
-                ),
-                responseFormat: .jsonObject,
-                maxOutputTokens: outputBudget(source: request.input.fallbackText, baseline: 4_096),
-                timeout: .seconds(60),
-                deadline: deadline,
-                config: generationConfig
-            )
-            ledger = try decodedAndValidatedLedger(
-                rawPlanResponse,
-                request: request,
-                spans: spans,
-                mappings: mappings,
-                requiredLogicCues: requiredLogicCues
-            )
-        } catch let validationError as VoicePolishLedgerPlanValidationError {
+        var plannedLedger: VoicePolishIntentLedger?
+        var retriedInitialRequest = false
+        planning: while plannedLedger == nil {
             do {
                 try reserveAttempt(&attempts)
-                let repairedPlan = try await generate(
+                rawPlanResponse = try await generate(
                     task: .voicePolishAnalyze,
                     stage: .analyzing,
-                    system: VoicePolishLedgerPrompts.plannerRepair,
-                    user: try plannerRepairPayload(
+                    system: VoicePolishLedgerPrompts.planner,
+                    user: try plannerPayload(
                         request: request,
                         spans: spans,
                         mappings: mappings,
-                        requiredLogicCues: requiredLogicCues,
-                        invalidResponse: rawPlanResponse,
-                        error: validationError
+                        requiredLogicCues: requiredLogicCues
                     ),
                     responseFormat: .jsonObject,
-                    maxOutputTokens: outputBudget(source: request.input.fallbackText, baseline: 4_096),
+                    // 约 1K、多约束文本的 Ledger 通常显著长于最终成稿。
+                    // 规划阶段直接给满受控上限，避免 4096 token 在完整覆盖
+                    // source spans 前被截断；总时限与总尝试数仍保持不变。
+                    maxOutputTokens: outputBudget(
+                        source: request.input.fallbackText,
+                        baseline: 8_192
+                    ),
                     timeout: .seconds(60),
                     deadline: deadline,
                     config: generationConfig
                 )
-                ledger = try decodedAndValidatedLedger(
-                    repairedPlan,
+                plannedLedger = try decodedAndValidatedLedger(
+                    rawPlanResponse,
                     request: request,
                     spans: spans,
                     mappings: mappings,
                     requiredLogicCues: requiredLogicCues
                 )
-            } catch let finalError {
-                let reason: VoicePolishFailureReason
-                let repairedCode: String?
-                if finalError is VoicePolishLedgerTimeoutError {
-                    reason = .timeout
-                    repairedCode = nil
-                } else if finalError is VoicePolishLedgerPlanValidationError {
-                    reason = .validationFailed
-                    repairedCode = (finalError as? VoicePolishLedgerPlanValidationError)?
-                        .stableDiagnostic
-                } else {
-                    reason = .requestFailed
-                    repairedCode = nil
+            } catch let validationError as VoicePolishLedgerPlanValidationError {
+                // 规划阶段总共只有一个恢复槽：首次若已因瞬时网络错误重试，
+                // 第二次再产出无效 Ledger 就显式失败，不能继续叠加 schema
+                // repair，确保最坏仍不超过 6 次总调用。
+                if retriedInitialRequest {
+                    return .unavailable(
+                        stage: .planning,
+                        attempts: attempts,
+                        codes: [.planIntegrityFailure],
+                        reason: .validationFailed,
+                        plannerValidationTrace: VoicePolishPlannerValidationTrace(
+                            initialCode: validationError.stableDiagnostic,
+                            repairedCode: nil
+                        )
+                    )
                 }
-                return .unavailable(
+                do {
+                    try reserveAttempt(&attempts)
+                    let repairedPlan = try await generate(
+                        task: .voicePolishAnalyze,
+                        stage: .analyzing,
+                        system: VoicePolishLedgerPrompts.plannerRepair,
+                        user: try plannerRepairPayload(
+                            request: request,
+                            spans: spans,
+                            mappings: mappings,
+                            requiredLogicCues: requiredLogicCues,
+                            invalidResponse: rawPlanResponse,
+                            error: validationError
+                        ),
+                        responseFormat: .jsonObject,
+                        maxOutputTokens: outputBudget(
+                            source: request.input.fallbackText,
+                            baseline: 8_192
+                        ),
+                        timeout: .seconds(60),
+                        deadline: deadline,
+                        config: generationConfig
+                    )
+                    plannedLedger = try decodedAndValidatedLedger(
+                        repairedPlan,
+                        request: request,
+                        spans: spans,
+                        mappings: mappings,
+                        requiredLogicCues: requiredLogicCues
+                    )
+                } catch let finalError {
+                    let reason: VoicePolishFailureReason
+                    let repairedCode: String?
+                    if finalError is VoicePolishLedgerTimeoutError {
+                        reason = .timeout
+                        repairedCode = nil
+                    } else if finalError is VoicePolishLedgerPlanValidationError {
+                        reason = .validationFailed
+                        repairedCode = (finalError as? VoicePolishLedgerPlanValidationError)?
+                            .stableDiagnostic
+                    } else {
+                        reason = .requestFailed
+                        repairedCode = nil
+                    }
+                    return .unavailable(
+                        stage: .planning,
+                        attempts: attempts,
+                        codes: [.planIntegrityFailure],
+                        reason: reason,
+                        plannerValidationTrace: VoicePolishPlannerValidationTrace(
+                            initialCode: validationError.stableDiagnostic,
+                            repairedCode: repairedCode
+                        )
+                    )
+                }
+            } catch let error {
+                if !retriedInitialRequest, shouldRetryInitialPlannerRequest(error) {
+                    retriedInitialRequest = true
+                    continue planning
+                }
+                return unavailable(
                     stage: .planning,
                     attempts: attempts,
-                    codes: [.planIntegrityFailure],
-                    reason: reason,
-                    plannerValidationTrace: VoicePolishPlannerValidationTrace(
-                        initialCode: validationError.stableDiagnostic,
-                        repairedCode: repairedCode
-                    )
+                    code: .invalidStructuredResponse,
+                    error: error
                 )
             }
-        } catch let error {
-            return unavailable(
+        }
+        guard let ledger = plannedLedger else {
+            return .unavailable(
                 stage: .planning,
                 attempts: attempts,
-                code: .invalidStructuredResponse,
-                error: error
+                codes: [.planIntegrityFailure],
+                reason: .validationFailed
             )
         }
 
@@ -261,6 +300,19 @@ struct VoicePolishLedgerPipeline: Sendable {
             return .polished(initialDraft, attempts: attempts)
         }
         guard initialReview.verdict != "unsafe" else {
+            return .unavailable(
+                stage: .reviewing,
+                attempts: attempts,
+                codes: [.semanticDecisionUnverified],
+                reason: .validationFailed,
+                rejectedDraft: initialDraft
+            )
+        }
+        // wrong_role 说明 Planner 把真实正文误标成 editor/remove/excluded。
+        // Draft Repair 只能改成稿 fragment，不能纠正 Ledger 的角色与结构；
+        // 继续修稿会让同一错误 Ledger 在确认阶段被误放行，因此必须显式
+        // 停止并让用户重试一次完整规划。
+        if initialIssues.contains(where: { $0.type == "wrong_role" }) {
             return .unavailable(
                 stage: .reviewing,
                 attempts: attempts,
@@ -395,7 +447,7 @@ struct VoicePolishLedgerPipeline: Sendable {
         let allowedTypes = Set([
             "missing", "wrong_relation", "wrong_condition", "wrong_modality",
             "obsolete_retained", "invented", "context_leak", "task_layer",
-            "instruction_leak", "style_shift",
+            "instruction_leak", "style_shift", "wrong_role",
         ])
         let validSpanIDs = Set(spans.map(\.id))
         let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
@@ -760,6 +812,37 @@ struct VoicePolishLedgerPipeline: Sendable {
             throw VoicePolishLedgerIntegrityError.invalidLedger
         }
         attempts += 1
+    }
+
+    /// 只对首次 Planner 的瞬时 Provider 失败做一次同模型重试；鉴权、地址、
+    /// 响应过大和本地总超时都不会重试。总调用上限仍由 maximumAttempts 统一
+    /// 约束，因此不会形成循环，也不会偷偷切换用户选择的模型。
+    private func shouldRetryInitialPlannerRequest(_ error: Error) -> Bool {
+        guard !(error is VoicePolishLedgerTimeoutError),
+              !(error is CancellationError) else { return false }
+        if let urlError = error as? URLError {
+            return [
+                .timedOut, .cannotFindHost, .cannotConnectToHost,
+                .networkConnectionLost, .dnsLookupFailed, .notConnectedToInternet,
+                .resourceUnavailable,
+            ].contains(urlError.code)
+        }
+        guard let llmError = error as? LLMError else { return false }
+        switch llmError {
+        case .requestFailed(let statusCode):
+            return statusCode == 0
+                || statusCode == 408
+                || statusCode == 425
+                || (500...599).contains(statusCode)
+        case .emptyResponse, .truncatedResponse:
+            return true
+        case .requestRejected(let statusCode, _):
+            return statusCode == 408
+                || statusCode == 425
+                || (500...599).contains(statusCode)
+        case .invalidURL, .responseTooLarge, .timedOut:
+            return false
+        }
     }
 
     private func blockingIssues(

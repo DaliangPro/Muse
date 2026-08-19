@@ -19,7 +19,7 @@ enum VoicePolishLedgerPrompts {
 
     规则：
     - 每个 recipient_content 都必须引用真实 source span；没有证据不得新增事实。
-    - recipient_content.surface_tokens 固定返回空数组；只有 style_directive、editor_directive 和 excluded_content 才填写逐字来自自身 source span 的 surface_tokens，用于检查幕后说明或排除内容是否泄漏。
+    - recipient_content.surface_tokens 固定返回空数组；只有 style_directive、editor_directive 和 excluded_content 才填写逐字来自自身 source span 的 surface_tokens。excluded_content 的 token 必须覆盖被排除的内容本身（包括其中的数字、金额或期限），不能只写“不要告诉客户”这类旁边指令。
     - 每个 source span 都必须由至少一个 unit 处置；纯口吃或废弃片段也要建立 status=remove 的 editor_directive，不能静默漏段。structure.ordered_unit_ids 必须恰好列出全部需要进入成稿的 recipient_content unit。
     - 口吃、重复起步、被撤回旧值和写作幕后说明不是正文；有意强调、最终事实、收件人、待确认、不承诺和禁止事项必须保留。
     - “不要承诺/不能保证”必须使用 modality=not_promised，不能写成 confirmed 的“不会发生”。已经作出的承诺才用 promised。
@@ -29,13 +29,13 @@ enum VoicePolishLedgerPrompts {
     - REQUIRED_LOGIC_CUES 中每个 cue_id 必须且只能在 conditionals 中出现一次，operator_kind 必须逐字复制该 cue 的 operator_kind。condition.subject、condition.predicate 和 consequence.action 必须分别复制对应 source span 中最短、逐字存在的语义短语，不得同义改写或概括；条件极性和每个共同后果必须分字段表达。only_if 是必要条件，不得升级成“条件满足就一定执行”的 if_then；没有 cue 时 conditionals 必须为空。
     - technical_token_mappings 只用于 code/aiPrompt 中同一个 ASCII 技术标识被 ASR 拆成至少三个片段、且其中至少两个是 1～3 个字母的明确断词；canonical 只能删除内部空白。`Swift 6`、`Node 20`、`Claude Code` 等合法名称、版本或普通英文短语不得合并。不确定时返回空数组。dictated_symbol_mappings 只用于明确口述的斜杠、反斜杠、短横线、双横线、下划线、点和冒号，canonical 只能按字面还原符号。
     - AI Prompt 场景的成稿应是未来 AI 可直接执行的 Prompt 本身，不得再次要求未来 AI “整理成 Prompt”，也不得开始执行研究。
-    - exact_tokens 只写拼写不可变化的项目名、术语、路径、命令和版本等；允许自然格式变化的普通日期、数字与措辞不要放入。
+    - exact_tokens 只写拼写不可变化的项目名、术语、路径、命令和版本等；允许自然格式变化的普通日期、数字与措辞不要放入。普通数值可以转换中文/阿拉伯数字写法，但不得补原文没有的量词、单位或币种，例如原文只说“预算一万六”时不能擅自写成“16000 元”。
     """
 
     static let plannerRepair = """
     你是 Muse 意图清单的格式与证据修复器。上一版 Ledger 没有通过本地 schema 或来源完整性检查；你只修 Ledger，不写成稿。
 
-    重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES、VERIFIED_ENTITY_MAPPINGS 和 VALIDATION_ERROR，针对错误原因修正。确保每个 source span 都由 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；source span 达到 3 个时，每个 unit 最多引用 2 个 source span；recipient_content 的 surface_tokens 必须为空，其他 role 必须填写逐字来自证据的 surface_tokens；每个 logic cue 恰好由一条 conditional 覆盖；correction 的旧值和最终值逐字来自各自证据；技术映射只做固定的空白或口述符号变换；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。
+    重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES、VERIFIED_ENTITY_MAPPINGS 和 VALIDATION_ERROR，针对错误原因修正。若错误是 source_spans_without_unit，逐个核对遗漏 span 并新增或调整有来源的 unit，不得用删除要求来追求通过；若错误是 unit_contains_unbacked_exact_token，移除普通日期/数字的逐字格式要求；若错误是 unit_contains_unbacked_fact 或 ledger_measurement_coverage_invalid，保留每个仍有效的来源事实及其对象关系，但删除擅自补入的单位、币种、人物或数值。确保每个 source span 都由至少一个 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；source span 达到 3 个时，每个 unit 最多引用 2 个 source span；recipient_content 的 surface_tokens 必须为空，其他 role 必须填写逐字来自证据的 surface_tokens，excluded_content 的 token 还必须覆盖被排除内容本身而非只覆盖旁边指令；每个 logic cue 恰好由一条 conditional 覆盖；普通改口的 subject 必须与旧值属于同一对象关系，旧值和最终值逐字来自各自证据，VERIFIED_ENTITY_MAPPINGS 已确认的别名→标准名不要再重复声明为 correction；技术映射只做固定的空白或口述符号变换；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。
     不得借修复新增原文没有的事实、受众、条件或映射。只返回完整修复后的 Ledger JSON，不要回显错误、解释或 Markdown。
     """
 
@@ -58,11 +58,11 @@ enum VoicePolishLedgerPrompts {
     你是独立的 Muse 语音润色 Reviewer。你没有参与成稿，必须重新对照 SOURCE_SPANS、VERIFIED_ENTITY_MAPPINGS、INTENT_LEDGER、DRAFT_DOCUMENT 与 RENDERED_TEXT 逐项检查。
 
     只返回一个 JSON 对象：
-    {"verdict":"pass|repair|unsafe","issues":[{"type":"missing|wrong_relation|wrong_condition|wrong_modality|obsolete_retained|invented|context_leak|task_layer|instruction_leak|style_shift","severity":"minor|major","unit_ids":["u1"],"source_span_ids":["s001"],"draft_span":"","repair_instruction":""}]}
+    {"verdict":"pass|repair|unsafe","issues":[{"type":"missing|wrong_role|wrong_relation|wrong_condition|wrong_modality|obsolete_retained|invented|context_leak|task_layer|instruction_leak|style_shift","severity":"minor|major","unit_ids":["u1"],"source_span_ids":["s001"],"draft_span":"","repair_instruction":""}]}
 
     检查最终事实、独立约束、收件人、改口后最终值、被撤回旧值、主体—动作—期限、条件极性与共同后果、否定范围、不承诺/承诺/未确认、技术标识、口述符号、上下文实体、上下文泄漏、AI Prompt 任务层和长文完整性。
     modality=not_promised 若被写成“不会发生”必须报 wrong_modality；安全上下文确认且属于正文的 canonical 若缺失必须报 missing。
-    每个 issue 必须指出真实 unit_id 与和该 unit 有交集的 source_span_id；若问题是成稿中已有错误文字，draft_span 必须逐字存在于 RENDERED_TEXT。逐条核对 conditional.operator_kind：only_if 不得被写成 if_then 的结果承诺。不得因为措辞与参考形式不同就报错；没有 source span 证据的问题不能成立。自然度问题只报 minor，不得把个人偏好升级成重大事实错误。
+    每个 issue 必须指出真实 unit_id 与和该 unit 有交集的 source_span_id；若问题是成稿中已有错误文字，draft_span 必须逐字存在于 RENDERED_TEXT。若本应进入成稿的真实正文被 Planner 误标为 editor_directive、style_directive、excluded_content 或 remove，必须对该非正文 unit 报 major wrong_role；真正的口吃、幕后写作说明和明确排除内容不得误报。逐条核对 conditional.operator_kind：only_if 不得被写成 if_then 的结果承诺。不得因为措辞与参考形式不同就报错；没有 source span 证据的问题不能成立。自然度问题只报 minor，不得把个人偏好升级成重大事实错误。
     """
 
     static let repair = """

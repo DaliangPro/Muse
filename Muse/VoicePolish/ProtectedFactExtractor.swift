@@ -19,7 +19,7 @@ enum ProtectedFactExtractor {
         Pattern(kind: .url, expression: #"https?://[^\s<>，。！？、；：,!?;]+"#, canonicalize: exact),
         Pattern(kind: .email, expression: #"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#, canonicalize: lowercased),
         Pattern(kind: .command, expression: #"`[^`\n]+`"#, canonicalize: exact),
-        Pattern(kind: .date, expression: #"\b\d{4}(?:[-/.年])\d{1,2}(?:[-/.月])\d{1,2}日?\b"#, canonicalize: compactDate),
+        Pattern(kind: .date, expression: #"(?<![A-Za-z0-9_])\d{4}(?:[-/.年])\d{1,2}(?:[-/.月])\d{1,2}日?(?![A-Za-z0-9_])"#, canonicalize: compactDate),
         Pattern(
             kind: .date,
             expression: #"(?:\d{1,2}|[零〇一二两三四五六七八九十]+)\s*月\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]+)\s*日"#,
@@ -41,7 +41,11 @@ enum ProtectedFactExtractor {
             expression: #"百分之[负零〇一二两三四五六七八九十百千万亿点]+"#,
             canonicalize: canonicalChinesePercentage
         ),
-        Pattern(kind: .amount, expression: #"(?:[¥￥$]\s*)?[-+]?\d[\d,]*(?:\.\d+)?\s*(?:万|亿|元|块|美元|人民币)"#, canonicalize: canonicalAmount),
+        Pattern(
+            kind: .amount,
+            expression: #"(?:(?:[¥￥$]|美元|人民币)\s*[-+]?\d[\d,]*(?:\.\d+)?\s*(?:万|亿)?|[-+]?\d[\d,]*(?:\.\d+)?\s*(?:万|亿|元|块|美元|人民币))"#,
+            canonicalize: canonicalAmount
+        ),
         Pattern(
             kind: .amount,
             expression: #"(?:合同)?(?:总)?金额(?:是|为)?\s*(?:[负零〇一二两三四五六七八九十百千万亿点]\s*)+"#,
