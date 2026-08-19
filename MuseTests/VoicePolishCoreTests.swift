@@ -123,6 +123,34 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertFalse(ambiguous.contains { $0.kind == .time })
     }
 
+    func testFastDraftMustPreserveExplicitGroupRecipientButCustomerReplyMayBeDirect() {
+        let groupRequest = makeRequest("跟团队说会议改到周四下午", scene: .workChat)
+        let groupFacts = ProtectedFactExtractor.extract(from: groupRequest.input.segments)
+
+        let missingAudience = VoicePolishValidator.validateFast(
+            output: "会议改到周四下午。",
+            request: groupRequest,
+            sourceFacts: groupFacts
+        )
+        XCTAssertTrue(missingAudience.codes.contains(.missingProtectedFact))
+
+        let directGroupMessage = VoicePolishValidator.validateFast(
+            output: "大家，会议改到周四下午。",
+            request: groupRequest,
+            sourceFacts: groupFacts
+        )
+        XCTAssertFalse(directGroupMessage.codes.contains(.missingProtectedFact))
+
+        let customerRequest = makeRequest("给客户回复已收到", scene: .customerSupport)
+        let customerFacts = ProtectedFactExtractor.extract(from: customerRequest.input.segments)
+        let directCustomerReply = VoicePolishValidator.validateFast(
+            output: "已收到。",
+            request: customerRequest,
+            sourceFacts: customerFacts
+        )
+        XCTAssertFalse(directCustomerReply.codes.contains(.missingProtectedFact))
+    }
+
     func testRelativeDayRemainsPartOfClockFactAndCorrection() {
         let wrongDay = makeRequest("会议安排在今天十点。", scene: .workChat)
         let wrongDayFacts = ProtectedFactExtractor.extract(from: wrongDay.input.segments)
@@ -355,6 +383,17 @@ final class VoicePolishCoreTests: XCTestCase {
         XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "/Users/jiliang/课程 素材/第一章.md" })
         XCTAssertTrue(facts.contains { $0.kind == .filePath && $0.canonicalValue == "/Applications" })
         XCTAssertFalse(facts.contains { $0.kind == .filePath && $0.sourceText.contains("P50/P95") })
+    }
+
+    func testRelativeTechnicalPathDoesNotAbsorbAdjacentChineseProse() {
+        let facts = ProtectedFactExtractor.extract(from: [segment(
+            "在Muse/VoicePolish/VoicePolishPipeline.swift中记录一个bug，第三执行scripts/package-app.sh。"
+        )])
+        let paths = Set(facts.filter { $0.kind == .filePath }.compactMap(\.canonicalValue))
+
+        XCTAssertTrue(paths.contains("Muse/VoicePolish/VoicePolishPipeline.swift"))
+        XCTAssertTrue(paths.contains("scripts/package-app.sh"))
+        XCTAssertFalse(paths.contains(where: { $0.contains("中记录") || $0.hasPrefix("第三执行") }))
     }
 
     func testFactExtractorDeduplicatesSameSemanticFactWithinOneSegment() {

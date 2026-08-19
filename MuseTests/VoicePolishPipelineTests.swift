@@ -353,7 +353,7 @@ final class VoicePolishPipelineTests: XCTestCase {
             (
                 "给开发说：先别重启服务，先导出日志。服务目前无法连接。",
                 "请先重启服务并导出日志。服务目前无法连接。",
-                "请先不要重启服务，先导出日志。服务目前无法连接。"
+                "请开发先不要重启服务，先导出日志。服务目前无法连接。"
             ),
             (
                 "先别改方案，先发给我确认。当前方案并非最终版。",
@@ -2382,7 +2382,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         后面呢，我觉得可能还是要再跟研发沟通一下，因为有些地方怎么讲，就是大家理解得不太一样。然后呢，测试这边也需要再看一看，暂时先这样。
         """
         let polished = """
-        这次复盘主要同步目前的情况。第一部分，我们已经初步检查了页面，整体表现正常。
+        这次复盘主要向大家同步目前的情况。第一部分，我们已经初步检查了页面，整体表现正常。
 
         后续还需要和研发进一步沟通，因为部分内容的理解尚未统一。测试侧也要继续核对，完成后再同步结论。
         """
@@ -2394,7 +2394,7 @@ final class VoicePolishPipelineTests: XCTestCase {
         let result = await pipeline(client).process(makeRequest(source, scene: .document))
 
         XCTAssertFalse(result.usedFallback, "\(result.validationCodes)")
-        XCTAssertTrue(result.text.contains("这次复盘主要同步目前的情况"))
+        XCTAssertTrue(result.text.contains("这次复盘主要向大家同步目前的情况"))
         XCTAssertTrue(result.text.contains("测试侧也要继续核对"))
         for filler in ["复盘呢", "第一部分吧", "怎么讲", "然后呢"] {
             XCTAssertFalse(result.text.contains(filler), result.text)

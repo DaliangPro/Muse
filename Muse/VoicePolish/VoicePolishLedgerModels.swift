@@ -88,13 +88,26 @@ struct VoicePolishLedgerContextMapping: Codable, Sendable, Equatable {
 struct VoicePolishLedgerStructure: Codable, Sendable, Equatable {
     let kind: String
     let orderedUnitIds: [String]
+    /// `mixed` 结构中需要由程序连续编号的正文 unit。`numbered_list`
+    /// 缺省把全部 orderedUnitIds 视为编号项；其他结构缺省为空。
+    let numberedUnitIds: [String]?
+
+    init(
+        kind: String,
+        orderedUnitIds: [String],
+        numberedUnitIds: [String]? = nil
+    ) {
+        self.kind = kind
+        self.orderedUnitIds = orderedUnitIds
+        self.numberedUnitIds = numberedUnitIds
+    }
 }
 
 struct VoicePolishIntentLedger: Codable, Sendable, Equatable {
-    let audience: [VoicePolishLedgerAudience]
+    var audience: [VoicePolishLedgerAudience]
     var units: [VoicePolishLedgerUnit]
-    let corrections: [VoicePolishLedgerCorrection]
-    let conditionals: [VoicePolishLedgerConditional]
+    var corrections: [VoicePolishLedgerCorrection]
+    var conditionals: [VoicePolishLedgerConditional]
     var technicalTokenMappings: [VoicePolishLedgerTokenMapping]
     var dictatedSymbolMappings: [VoicePolishLedgerTokenMapping]
     var contextMappings: [VoicePolishLedgerContextMapping]

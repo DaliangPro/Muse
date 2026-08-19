@@ -671,6 +671,28 @@ enum EntityResolver {
             })
         }
 
+        // 用户安全选中的标题常见形态是“北辰研究：个人语音输入产品对比”。
+        // 冒号前的首行标题本身就是当前肯定实体，不能因为没有引号或“已确认”
+        // 四个字而漏掉。只取文本开头 2...16 个汉字，并排除常见字段标签；
+        // 历史、假设、错误候选仍会在 provenance gate 中被拒绝。
+        if let leadingTitleRegex = try? NSRegularExpression(
+            pattern: #"^\s*([\p{Han}]{2,16})\s*[：:]"#
+        ) {
+            let range = NSRange(bounded.startIndex..<bounded.endIndex, in: bounded)
+            let genericLabels: Set<String> = [
+                "项目名", "项目名称", "标题", "名称", "产品名", "产品名称",
+                "负责人", "截止时间", "时间", "日期", "状态", "备注", "内容",
+                "说明", "任务", "目标", "版本",
+            ]
+            if let match = leadingTitleRegex.firstMatch(in: bounded, range: range),
+               let capture = Range(match.range(at: 1), in: bounded) {
+                let title = String(bounded[capture])
+                if !genericLabels.contains(title) {
+                    terms.append(title)
+                }
+            }
+        }
+
         let cueWords = [
             "刚", "已", "正在", "已经", "即将", "将要", "这次", "本次", "中的",
             "里面", "排期", "配置", "部署", "构建", "启动", "确认", "更新", "修复",
@@ -793,6 +815,14 @@ enum EntityResolver {
         ]
         if unrelatedSuffixes.contains(where: suffixHead.contains) {
             return .unrelated
+        }
+
+        let rawPrefix = String(text[fragmentRange.lowerBound..<candidateRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawSuffix = String(text[candidateRange.upperBound..<fragmentRange.upperBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if rawPrefix.isEmpty, rawSuffix.hasPrefix("：") || rawSuffix.hasPrefix(":") {
+            return .affirmed
         }
 
         let affirmedPrefixes = [

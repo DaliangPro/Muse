@@ -342,6 +342,16 @@ final class PersonalLexiconTests: XCTestCase {
                     recentMuseInputs: ["Muse 的长语音测试刚刚结束。"]
                 )
             ),
+            (
+                "项目名我口述成北城研究，但选中的标题是准的，按标题写。",
+                "项目名我口述成北辰研究，但选中的标题是准的，按标题写。",
+                WritingContext(
+                    scene: .aiPrompt,
+                    level: .selectedText,
+                    safety: .safe,
+                    selectedText: "北辰研究：个人语音输入产品对比 如果客户选择紫色包装，交付日期可能是九月三日。"
+                )
+            ),
         ]
 
         for (source, expected, context) in cases {

@@ -59,7 +59,9 @@ enum ProtectedFactExtractor {
         Pattern(kind: .version, expression: #"\bv?\d+(?:\.\d+){1,3}\b"#, canonicalize: lowercased),
         Pattern(
             kind: .filePath,
-            expression: #"(?<![\p{L}\p{N}._~-])(?:(?<=[“\"'])(?:~?/|\.\.?/)[^“”\"'\r\n]+(?=[”\"'])|(?:~?/|\.\.?/)(?:[\p{L}\p{N}._-]+/)*[\p{L}\p{N}._-]+|(?:[\p{L}\p{N}._-]+/)+[\p{L}\p{N}._-]+\.[\p{L}\p{N}._-]+)"#,
+            // 无引号的相对路径只接受 ASCII 组件，否则“在Muse/...中记录”会
+            // 把前后的中文叙述一起吞成路径。绝对路径和引号路径仍允许中文。
+            expression: #"(?<![A-Za-z0-9._~-])(?:(?<=[“\"'])(?:~?/|\.\.?/)[^“”\"'\r\n]+(?=[”\"'])|(?:~?/|\.\.?/)(?:[\p{L}\p{N}._-]+/)*[\p{L}\p{N}._-]+|(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+)"#,
             canonicalize: exact
         ),
         Pattern(kind: .number, expression: #"[-+]?\d[\d,]*(?:\.\d+)?"#, canonicalize: canonicalNumber),

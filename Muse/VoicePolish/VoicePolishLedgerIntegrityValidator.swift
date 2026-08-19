@@ -230,16 +230,70 @@ enum VoicePolishLedgerIntegrityValidator {
         }
         let verifiedTokenMappings = ledger.technicalTokenMappings
             + ledger.dictatedSymbolMappings
+        // Planner 偶尔把已由安全上下文确认的 alias→canonical 又重复声明成
+        // source correction。二者职责不同：上下文映射由本地 verifiedMappings
+        // 执行，冗余 correction 既不增加证据，反而会因 canonical 不在原文而
+        // 触发 schema repair。仅在映射、span 与 final_only 完全一致时删除它；
+        // 其他改口仍严格走来源 old/final 双证据门禁。
+        ledger.corrections.removeAll { correction in
+            verifiedMappings.contains { mapping in
+                guard correction.renderingPolicy == "final_only",
+                      correction.oldValue == mapping.alias,
+                      Set(correction.oldSpanIds).isSubset(of: Set(mapping.sourceSpanIds)) else {
+                    return false
+                }
+                if correction.finalValue == mapping.canonical,
+                   Set(correction.finalSpanIds).isSubset(of: Set(mapping.sourceSpanIds)) {
+                    return true
+                }
+                // 已确认的上下文纠名不应被 Planner 伪装成来源改口。若所谓
+                // final_value 在它自己声明的来源 span 中根本不存在，删除这条
+                // 幻觉 correction；真正有来源的新值仍交给严格改口门禁处理。
+                return !correction.finalSpanIds.compactMap { spanByID[$0]?.text }
+                    .joined().contains(correction.finalValue)
+            }
+        }
         try validateCorrections(
             ledger.corrections,
             spans: spanByID,
             validSpanIDs: validSpanIDs
         )
+        ledger.conditionals = normalizedConditionals(
+            ledger.conditionals,
+            requiredLogicCues: requiredLogicCues,
+            spans: spanByID
+        )
         let fullSource = spans.map(\.text).joined()
+        if scene == .aiPrompt {
+            appendRecipientUnitsForUncoveredConditionalSpans(
+                to: &ledger,
+                spans: spans
+            )
+            appendRecipientUnitsForRequiredAIPromptMappings(
+                to: &ledger,
+                spans: spans,
+                verifiedMappings: verifiedMappings,
+                fullSource: fullSource
+            )
+        }
+        ledger.audience = try normalizedAudiences(
+            ledger.audience,
+            spans: spanByID,
+            fullSource: fullSource
+        )
         var locallyRemovedEditorUnitIDs: Set<String> = []
         var unitIds: Set<String> = []
         for index in ledger.units.indices {
             var unit = ledger.units[index]
+            let invalidSpanIDs = unit.sourceSpanIds.filter { !validSpanIDs.contains($0) }
+            let evidence = unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
+            if !allowedKinds.contains(unit.kind) {
+                // kind 只影响问句标点与建议展示，不承担事实、角色或状态安全。
+                // Planner 偶尔会把 delivery_role 的值（如 editor_directive）
+                // 错填到 kind；依据已经受 schema 约束的 role/modality 与来源标点
+                // 机械恢复即可。role、status、modality 和 span 仍严格拒绝非法值。
+                unit.kind = inferredUnitKind(for: unit, evidence: evidence)
+            }
             guard !unit.id.isEmpty,
                   unitIds.insert(unit.id).inserted,
                   allowedKinds.contains(unit.kind),
@@ -248,9 +302,12 @@ enum VoicePolishLedgerIntegrityValidator {
                   allowedModalities.contains(unit.modality),
                   !unit.finalMeaning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !unit.sourceSpanIds.isEmpty,
-                  unit.sourceSpanIds.allSatisfy(validSpanIDs.contains) else {
+                  invalidSpanIDs.isEmpty else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                    "unit_identity_enum_or_source_span_invalid:\(unit.id)"
+                    "unit_identity_enum_or_source_span_invalid:"
+                        + "id=\(unit.id),kind=\(unit.kind),role=\(unit.deliveryRole),"
+                        + "status=\(unit.status),modality=\(unit.modality),"
+                        + "invalid_span_ids=\(invalidSpanIDs.joined(separator: ","))"
                 )
             }
             if spans.count >= 3, unit.sourceSpanIds.count > 2 {
@@ -262,34 +319,6 @@ enum VoicePolishLedgerIntegrityValidator {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                     "advice_unit_requires_recommended_modality:\(unit.id)"
                 )
-            }
-            let evidence = unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
-            if scene == .aiPrompt,
-               unit.deliveryRole == "recipient_content",
-               unit.status != "remove",
-               let editorToken = currentAIPromptEditorInstruction(
-                    in: evidence,
-                    unitMeaning: unit.finalMeaning,
-                    fullSource: fullSource
-               ) {
-                unit.deliveryRole = "editor_directive"
-                unit.status = "remove"
-                unit.exactTokens = []
-                unit.surfaceTokens = [editorToken]
-                locallyRemovedEditorUnitIDs.insert(unit.id)
-            }
-            if unit.deliveryRole == "recipient_content" {
-                // surface_tokens 只用于证明幕后说明或排除内容是否泄漏；正文 unit
-                // 不消费这个字段。模型即使冗余填写，也在本地清空，不能让一个
-                // 无语义作用的协议细节导致整段口述回退。
-                unit.surfaceTokens = []
-            } else {
-                guard !unit.surfaceTokens.isEmpty,
-                      unit.surfaceTokens.allSatisfy({ !$0.isEmpty && evidence.contains($0) }) else {
-                    throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                        "non_recipient_unit_requires_source_backed_surface_tokens:\(unit.id)"
-                    )
-                }
             }
             let unitSourceSpanIDs = Set(unit.sourceSpanIds)
             let tokenCanonical = verifiedTokenMappings.compactMap { mapping -> String? in
@@ -312,6 +341,71 @@ enum VoicePolishLedgerIntegrityValidator {
                 in: unit.finalMeaning,
                 against: evidence
             )
+            let sharesSpanWithNonRecipientContent = ledger.units.contains { other in
+                other.id != unit.id
+                    && (other.deliveryRole == "excluded_content"
+                        || other.deliveryRole == "editor_directive")
+                    && !Set(other.sourceSpanIds).isDisjoint(with: unitSourceSpanIDs)
+            }
+            if scene == .aiPrompt,
+               unit.deliveryRole == "recipient_content",
+               unit.status != "remove",
+               !facts(in: unit.finalMeaning).isSubset(of: evidenceFacts),
+               !sharesSpanWithNonRecipientContent {
+                // AI Prompt 的 Planner 若在某个 unit 中擅加受保护事实，最安全的
+                // 本地恢复不是请求它继续猜，而是退回该 unit 自己的 canonical
+                // 来源 span，让 Writer 再做表达清理。混合 editor/excluded span
+                // 不走此路，避免把明确排除内容重新带回正文。
+                unit.finalMeaning = evidence
+                unit.exactTokens = []
+            }
+            if unit.deliveryRole == "recipient_content",
+               unit.status != "remove",
+               let editorToken = supersededFinalOnlyEditorInstruction(
+                    in: evidence,
+                    unitMeaning: unit.finalMeaning,
+                    unitSourceSpanIDs: Set(unit.sourceSpanIds),
+                    corrections: ledger.corrections
+               ) {
+                unit.deliveryRole = "editor_directive"
+                unit.status = "remove"
+                unit.exactTokens = []
+                unit.surfaceTokens = [editorToken]
+                locallyRemovedEditorUnitIDs.insert(unit.id)
+            } else if scene == .aiPrompt,
+               unit.deliveryRole == "recipient_content",
+               unit.status != "remove",
+               let editorToken = currentAIPromptEditorInstruction(
+                    in: evidence,
+                    unitMeaning: unit.finalMeaning,
+                    fullSource: fullSource
+               ) {
+                unit.deliveryRole = "editor_directive"
+                unit.status = "remove"
+                unit.exactTokens = []
+                unit.surfaceTokens = [editorToken]
+                locallyRemovedEditorUnitIDs.insert(unit.id)
+            }
+            if unit.deliveryRole == "recipient_content", unit.status != "remove" {
+                unit.finalMeaning = applyingFinalOnlyCorrections(
+                    to: unit.finalMeaning,
+                    unitSourceSpanIDs: Set(unit.sourceSpanIds),
+                    corrections: ledger.corrections
+                )
+            }
+            if unit.deliveryRole == "recipient_content" {
+                // surface_tokens 只用于证明幕后说明或排除内容是否泄漏；正文 unit
+                // 不消费这个字段。模型即使冗余填写，也在本地清空，不能让一个
+                // 无语义作用的协议细节导致整段口述回退。
+                unit.surfaceTokens = []
+            } else {
+                guard !unit.surfaceTokens.isEmpty,
+                      unit.surfaceTokens.allSatisfy({ !$0.isEmpty && evidence.contains($0) }) else {
+                    throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                        "non_recipient_unit_requires_source_backed_surface_tokens:\(unit.id)"
+                    )
+                }
+            }
             var normalizedExactTokens: [String] = []
             for token in unit.exactTokens {
                 guard !token.isEmpty else {
@@ -320,7 +414,21 @@ enum VoicePolishLedgerIntegrityValidator {
                     )
                 }
                 if evidence.contains(token) || allowedCanonical.contains(token) {
-                    normalizedExactTokens.append(token)
+                    if !normalizedExactTokens.contains(token) {
+                        normalizedExactTokens.append(token)
+                    }
+                    continue
+                }
+                let enclosingCanonical = allowedCanonical.filter {
+                    $0.contains(token) && unit.finalMeaning.contains($0)
+                }
+                if enclosingCanonical.count == 1, let canonical = enclosingCanonical.first {
+                    // Planner 偶尔把完整、已验证路径/命令拆成多个 exact token。
+                    // 局部片段本身不够证明来源，但所属完整 canonical 已由同一
+                    // unit 的口述符号映射机械证明；收口为完整值，不能只放宽片段。
+                    if !normalizedExactTokens.contains(canonical) {
+                        normalizedExactTokens.append(canonical)
+                    }
                     continue
                 }
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
@@ -328,7 +436,8 @@ enum VoicePolishLedgerIntegrityValidator {
                 )
             }
             unit.exactTokens = normalizedExactTokens
-            guard facts(in: unit.finalMeaning).isSubset(of: evidenceFacts) else {
+            let finalFacts = facts(in: unit.finalMeaning)
+            guard finalFacts.isSubset(of: evidenceFacts) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                     "unit_contains_unbacked_fact:\(unit.id)"
                 )
@@ -386,6 +495,9 @@ enum VoicePolishLedgerIntegrityValidator {
                 kind: ledger.structure.kind,
                 orderedUnitIds: ledger.structure.orderedUnitIds.filter {
                     !locallyRemovedEditorUnitIDs.contains($0)
+                },
+                numberedUnitIds: ledger.structure.numberedUnitIds?.filter {
+                    !locallyRemovedEditorUnitIDs.contains($0)
                 }
             )
         }
@@ -427,15 +539,34 @@ enum VoicePolishLedgerIntegrityValidator {
         let recipientUnitIDs = ledger.units.filter {
             $0.deliveryRole == "recipient_content" && $0.status != "remove"
         }.map(\.id)
+        let recipientUnitIDSet = Set(recipientUnitIDs)
+        // structure 只描述最终正文顺序。Planner 偶尔把 style/editor/excluded
+        // unit 一并列进 ordered_unit_ids；这类额外 ID 可机械删除，而缺失正文、
+        // 重复正文或未知 ID 仍由下方严格集合与数量检查拒绝。
+        ledger.structure = VoicePolishLedgerStructure(
+            kind: ledger.structure.kind,
+            orderedUnitIds: ledger.structure.orderedUnitIds.filter(recipientUnitIDSet.contains),
+            numberedUnitIds: normalizedNumberedUnitIDs(
+                structure: ledger.structure,
+                activeRecipientUnitIDs: recipientUnitIDSet
+            )
+        )
+        let numberedUnitIDs = ledger.structure.numberedUnitIds ?? []
         guard !recipientUnitIDs.isEmpty,
               Set(ledger.structure.orderedUnitIds) == Set(recipientUnitIDs),
               ledger.structure.orderedUnitIds.count == recipientUnitIDs.count,
+              Set(numberedUnitIDs).count == numberedUnitIDs.count,
+              Set(numberedUnitIDs).isSubset(of: Set(ledger.structure.orderedUnitIds)),
               ["sentence", "paragraphs", "numbered_list", "mixed", "ai_prompt"]
                 .contains(ledger.structure.kind) else {
             throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                 "structure_must_exactly_order_active_recipient_units"
             )
         }
+        try validateDeclaredCountStructure(
+            ledger: ledger,
+            spans: spanByID
+        )
 
         let referencedSpanIDs = Set(ledger.units.flatMap(\.sourceSpanIds))
         guard validSpanIDs.isSubset(of: referencedSpanIDs) else {
@@ -445,22 +576,6 @@ enum VoicePolishLedgerIntegrityValidator {
             )
         }
 
-        for audience in ledger.audience {
-            guard !audience.text.isEmpty,
-                  !audience.sourceSpanIds.isEmpty,
-                  audience.sourceSpanIds.allSatisfy(validSpanIDs.contains),
-                  !audience.surfaceTokens.isEmpty,
-                  ["direct_address", "explicit_reference"].contains(audience.deliveryMode)
-            else {
-                throw VoicePolishLedgerIntegrityError.invalidLedgerReason("audience_invalid")
-            }
-            let evidence = audience.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
-            guard audience.surfaceTokens.allSatisfy({ evidence.contains($0) }) else {
-                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                    "audience_surface_token_not_in_source"
-                )
-            }
-        }
         let source = spans.map(\.text).joined()
         let requiredAudience = requiredAudienceTokens(in: source)
         let plannedAudience = Set(ledger.audience.flatMap(\.surfaceTokens))
@@ -469,15 +584,6 @@ enum VoicePolishLedgerIntegrityValidator {
             throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                 "required_audience_missing:\(missing)"
             )
-        }
-        do {
-            try validateConditionals(
-                ledger.conditionals,
-                requiredLogicCues: requiredLogicCues,
-                spans: spanByID
-            )
-        } catch {
-            throw VoicePolishLedgerIntegrityError.invalidLedgerReason("conditionals_invalid")
         }
         ledger.contextMappings = verifiedMappings.filter { mapping in
             ledger.units.contains { unit in
@@ -491,6 +597,171 @@ enum VoicePolishLedgerIntegrityValidator {
             }
         }
         return ledger
+    }
+
+    private static func inferredUnitKind(
+        for unit: VoicePolishLedgerUnit,
+        evidence: String
+    ) -> String {
+        switch unit.deliveryRole {
+        case "style_directive":
+            return "style"
+        case "editor_directive", "excluded_content":
+            return "constraint"
+        default:
+            if unit.modality == "recommended" { return "advice" }
+            if unit.modality == "possible" || unit.modality == "pending" {
+                return "uncertainty"
+            }
+            if evidence.contains("？") || evidence.contains("?") {
+                return "question"
+            }
+            if unit.modality == "prohibited" || unit.modality == "not_promised" {
+                return "constraint"
+            }
+            return "claim"
+        }
+    }
+
+    /// `conditional` 是语义关系约束，不是 Writer 可消费的正文 fragment。Planner
+    /// 偶尔会把一整段条件要求只写进 conditionals，导致关系提取正确却仍触发
+    /// `source_spans_without_unit`。仅在 AI Prompt 中，把已经通过本地来源校验、
+    /// 且完全未被任何 unit 处置的条件 span 原样补成正文 unit；普通漏段、被标成
+    /// editor/excluded 的 span 以及非条件 span 仍由完整性门禁拒绝。
+    private static func appendRecipientUnitsForUncoveredConditionalSpans(
+        to ledger: inout VoicePolishIntentLedger,
+        spans: [VoicePolishEvidenceSpan]
+    ) {
+        let referencedSpanIDs = Set(ledger.units.flatMap(\.sourceSpanIds))
+        let conditionalSpanIDs = Set(ledger.conditionals.flatMap { conditional in
+            conditional.condition.sourceSpanIds
+                + conditional.consequences.flatMap(\.sourceSpanIds)
+        })
+        let missingSpans = spans.filter {
+            conditionalSpanIDs.contains($0.id) && !referencedSpanIDs.contains($0.id)
+        }
+        guard !missingSpans.isEmpty else { return }
+
+        var usedUnitIDs = Set(ledger.units.map(\.id))
+        var startByUnitID = Dictionary(uniqueKeysWithValues: ledger.units.map { unit in
+            let start = unit.sourceSpanIds.compactMap { spanID in
+                spans.first(where: { $0.id == spanID })?.start
+            }.min() ?? Int.max
+            return (unit.id, start)
+        })
+        var orderedUnitIDs = ledger.structure.orderedUnitIds
+
+        for span in missingSpans {
+            let baseID = "conditional_" + String(span.id.map { character in
+                character.isLetter || character.isNumber ? character : "_"
+            })
+            var unitID = baseID
+            var suffix = 2
+            while usedUnitIDs.contains(unitID) {
+                unitID = "\(baseID)_\(suffix)"
+                suffix += 1
+            }
+            usedUnitIDs.insert(unitID)
+            ledger.units.append(VoicePolishLedgerUnit(
+                id: unitID,
+                kind: "constraint",
+                deliveryRole: "recipient_content",
+                finalMeaning: span.text,
+                sourceSpanIds: [span.id],
+                status: "keep",
+                modality: "confirmed",
+                exactTokens: [],
+                surfaceTokens: []
+            ))
+            startByUnitID[unitID] = span.start
+            let insertionIndex = orderedUnitIDs.firstIndex {
+                (startByUnitID[$0] ?? Int.max) > span.start
+            } ?? orderedUnitIDs.endIndex
+            orderedUnitIDs.insert(unitID, at: insertionIndex)
+        }
+
+        ledger.structure = VoicePolishLedgerStructure(
+            kind: ledger.structure.kind,
+            orderedUnitIds: orderedUnitIDs,
+            numberedUnitIds: ledger.structure.numberedUnitIds
+        )
+    }
+
+    /// “选中的标题是准的，按标题写”同时包含当前编辑说明和应进入未来
+    /// Prompt 的项目名。Planner 若把整段都标成 editor，不能连已由安全上下文
+    /// 确认的标题一起删掉。这里只识别明确要求采用选中/标准标题的 AI Prompt，
+    /// 并只补 canonical 本身；内部内容、明确不披露映射和普通上下文映射不触发。
+    private static func appendRecipientUnitsForRequiredAIPromptMappings(
+        to ledger: inout VoicePolishIntentLedger,
+        spans: [VoicePolishEvidenceSpan],
+        verifiedMappings: [VoicePolishLedgerContextMapping],
+        fullSource: String
+    ) {
+        let spanByID = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
+        var usedUnitIDs = Set(ledger.units.map(\.id))
+        var orderedUnitIDs = ledger.structure.orderedUnitIds
+        var startByUnitID = Dictionary(uniqueKeysWithValues: ledger.units.map { unit in
+            let start = unit.sourceSpanIds.compactMap { spanByID[$0]?.start }.min() ?? Int.max
+            return (unit.id, start)
+        })
+        let explicitSelectedTitlePattern = #"(?:选中(?:的)?(?:标题|名称|文本|内容)[^。！？\n]{0,24}(?:是准的|为准|正确)|(?:按|以|使用|采用)[^。！？\n]{0,12}(?:选中(?:的)?(?:标题|名称|文本|内容)|标准(?:名|名称)|标题))"#
+
+        for (mappingIndex, mapping) in verifiedMappings.enumerated() {
+            let mappingSpanIDs = Set(mapping.sourceSpanIds)
+            let evidence = mapping.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
+            guard evidence.range(of: explicitSelectedTitlePattern, options: .regularExpression) != nil else {
+                continue
+            }
+            let alreadyDelivered = ledger.units.contains { unit in
+                guard unit.deliveryRole == "recipient_content",
+                      unit.status != "remove",
+                      !Set(unit.sourceSpanIds).isDisjoint(with: mappingSpanIDs),
+                      unit.finalMeaning.contains(mapping.alias)
+                        || unit.finalMeaning.contains(mapping.canonical) else {
+                    return false
+                }
+                let unitEvidence = unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()
+                return currentAIPromptEditorInstruction(
+                    in: unitEvidence,
+                    unitMeaning: unit.finalMeaning,
+                    fullSource: fullSource
+                ) == nil
+            }
+            guard !alreadyDelivered else { continue }
+
+            let baseID = String(format: "context_title_%03d", mappingIndex + 1)
+            var unitID = baseID
+            var suffix = 2
+            while usedUnitIDs.contains(unitID) {
+                unitID = "\(baseID)_\(suffix)"
+                suffix += 1
+            }
+            usedUnitIDs.insert(unitID)
+            let label = evidence.contains("项目名") ? "项目名" : "标题"
+            ledger.units.append(VoicePolishLedgerUnit(
+                id: unitID,
+                kind: "claim",
+                deliveryRole: "recipient_content",
+                finalMeaning: "\(label)：\(mapping.canonical)",
+                sourceSpanIds: mapping.sourceSpanIds,
+                status: "replace",
+                modality: "confirmed",
+                exactTokens: [mapping.canonical],
+                surfaceTokens: []
+            ))
+            let start = mapping.sourceSpanIds.compactMap { spanByID[$0]?.start }.min() ?? Int.max
+            startByUnitID[unitID] = start
+            let insertionIndex = orderedUnitIDs.firstIndex {
+                (startByUnitID[$0] ?? Int.max) > start
+            } ?? orderedUnitIDs.endIndex
+            orderedUnitIDs.insert(unitID, at: insertionIndex)
+        }
+
+        ledger.structure = VoicePolishLedgerStructure(
+            kind: ledger.structure.kind,
+            orderedUnitIds: orderedUnitIDs,
+            numberedUnitIds: ledger.structure.numberedUnitIds
+        )
     }
 
     static func deterministicIssues(
@@ -541,8 +812,7 @@ enum VoicePolishLedgerIntegrityValidator {
         let outputFacts = facts(in: output)
         for unit in ledger.units where unit.deliveryRole == "recipient_content" {
             for fact in protectedFactCandidates(in: unit.finalMeaning) {
-                let semanticValue = fact.canonicalValue ?? fact.sourceText
-                let key = "\(fact.kind.rawValue)|\(semanticValue)"
+                let key = protectedFactKey(fact, in: unit.finalMeaning)
                 guard !outputFacts.contains(key) else { continue }
                 issues.append(VoicePolishReviewerIssue(
                     type: "missing",
@@ -598,12 +868,55 @@ enum VoicePolishLedgerIntegrityValidator {
             ))
         }
 
+        // 群体收件人若被完全删掉，“跟团队说……”会退化成一条没有称呼、
+        // 不知道发给谁的事实陈述。客户一对一回复可自然省略“客户”，但团队、
+        // 同事等群体直达消息至少要保留一个自然群体称呼。
+        for audience in ledger.audience
+        where audience.deliveryMode == "direct_address"
+            && isGroupAudience(audience.text)
+            && !groupAudienceTokens(for: audience.text).contains(where: output.contains) {
+            issues.append(VoicePolishReviewerIssue(
+                type: "wrong_relation",
+                severity: "major",
+                unitIds: ledger.structure.orderedUnitIds,
+                sourceSpanIds: audience.sourceSpanIds,
+                draftSpan: nil,
+                repairInstruction: "用自然称呼保留群体收件人“\(audience.text)”，例如“大家/各位”，再表达正文。"
+            ))
+        }
+
+        // direct_address 的正文应直接对收件人说话，不能把“给客户回一下”这类
+        // 幕后转达动作原样发给客户。只在 Ledger 已确认一对一直达受众时启用。
+        if ledger.audience.contains(where: {
+            $0.deliveryMode == "direct_address" && ["客户", "用户", "对方"].contains($0.text)
+        }), let relayRange = output.range(
+            of: #"(?:给|跟)(?:客户|用户|对方)(?:回一下|回复一下|说一下|发一下)"#,
+            options: .regularExpression
+        ) {
+            let relay = String(output[relayRange])
+            issues.append(VoicePolishReviewerIssue(
+                type: "task_layer",
+                severity: "major",
+                unitIds: ledger.structure.orderedUnitIds,
+                sourceSpanIds: ledger.audience.flatMap(\.sourceSpanIds),
+                draftSpan: relay,
+                repairInstruction: "删除幕后转达动作“\(relay)”，改为直接对客户可发送的第二人称正文。"
+            ))
+        }
+
+        let spanByID = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
         for correction in ledger.corrections {
             let unitIds = recipientUnitIDs(
                 overlapping: correction.oldSpanIds + correction.finalSpanIds,
                 ledger: ledger
             )
-            if !preservesToken(correction.finalValue, in: output) {
+            let declaredCountIsStructurallyPreserved = explicitlyUpdatesDeclaredCount(
+                correction,
+                spans: spanByID
+            ) && declaredCountValue(correction.finalValue).flatMap { Int($0.value) }
+                == ledger.structure.numberedUnitIds?.count
+            if !preservesToken(correction.finalValue, in: output),
+               !declaredCountIsStructurallyPreserved {
                 issues.append(VoicePolishReviewerIssue(
                     type: "missing",
                     severity: "major",
@@ -611,6 +924,18 @@ enum VoicePolishLedgerIntegrityValidator {
                     sourceSpanIds: correction.finalSpanIds,
                     draftSpan: nil,
                     repairInstruction: "恢复“\(correction.subject)”的最终值“\(correction.finalValue)”。"
+                ))
+            }
+            if correction.renderingPolicy == "final_only",
+               explicitlyUpdatesDeclaredCount(correction, spans: spanByID),
+               containsDeclaredCountToken(correction.oldValue, in: output) {
+                issues.append(VoicePolishReviewerIssue(
+                    type: "obsolete_retained",
+                    severity: "major",
+                    unitIds: unitIds,
+                    sourceSpanIds: correction.oldSpanIds,
+                    draftSpan: correction.oldValue,
+                    repairInstruction: "删除已被最终总数“\(correction.finalValue)”替代的旧声明“\(correction.oldValue)”。"
                 ))
             }
         }
@@ -828,6 +1153,45 @@ enum VoicePolishLedgerIntegrityValidator {
         }
     }
 
+    /// 条件关系的方向由本地 cue 决定，模型只负责在证据内拆出主体和后果。
+    /// 若 Planner 漏填、错填枚举或把字段写成同义改写，继续请求它修 JSON
+    /// 只会制造随机回退。此时退化为一条“整句、原文、固定 operator”的保守
+    /// conditional：不提供模型发明的语义细分，但仍保证 only_if/if_then 等
+    /// 方向不被改写，完整正文则由同一 source span 的 Writer unit 交付。
+    private static func normalizedConditionals(
+        _ planned: [VoicePolishLedgerConditional],
+        requiredLogicCues: [VoicePolishLogicCue],
+        spans: [String: VoicePolishEvidenceSpan]
+    ) -> [VoicePolishLedgerConditional] {
+        do {
+            try validateConditionals(
+                planned,
+                requiredLogicCues: requiredLogicCues,
+                spans: spans
+            )
+            return planned
+        } catch {
+            return requiredLogicCues.enumerated().map { index, cue in
+                VoicePolishLedgerConditional(
+                    id: String(format: "local_c%03d", index + 1),
+                    cueIds: [cue.id],
+                    operatorKind: cue.operatorKind,
+                    condition: VoicePolishLedgerCondition(
+                        subject: cue.text,
+                        predicate: cue.text,
+                        polarity: cue.operatorKind != "negative_then",
+                        sourceSpanIds: cue.sourceSpanIds
+                    ),
+                    consequences: [VoicePolishLedgerConsequence(
+                        action: cue.text,
+                        polarity: true,
+                        sourceSpanIds: cue.sourceSpanIds
+                    )]
+                )
+            }
+        }
+    }
+
     private static func validateTokenMappings(
         _ mappings: [VoicePolishLedgerTokenMapping],
         transform expectedTransform: String?,
@@ -895,6 +1259,52 @@ enum VoicePolishLedgerIntegrityValidator {
             return nil
         }
         return String(evidence[range])
+    }
+
+    /// `final_only` 已由来源证据证明时，Planner 不得把“旧数字不要写”继续当
+    /// 收件人正文。这里只识别同时命中旧值、旧值指代和明确删除动作的局部原句，
+    /// 把它作为编辑说明执行；普通“不要做某事”的收件人约束不会进入此路。
+    private static func supersededFinalOnlyEditorInstruction(
+        in evidence: String,
+        unitMeaning: String,
+        unitSourceSpanIDs: Set<String>,
+        corrections: [VoicePolishLedgerCorrection]
+    ) -> String? {
+        let instructionPattern = #"(?:旧(?:数字|值|版本|日期|安排)?|原(?:数字|值|版本|日期|安排)?)[^。！？\n]{0,24}(?:不要|不再|无需)(?:写|保留|放|出现|记录)[^。！？\n]{0,16}"#
+        guard unitMeaning.range(of: instructionPattern, options: .regularExpression) != nil,
+              let sourceRange = evidence.range(of: instructionPattern, options: .regularExpression)
+        else { return nil }
+        let sourceInstruction = String(evidence[sourceRange])
+        let matchesCorrection = corrections.contains { correction in
+            correction.renderingPolicy == "final_only"
+                && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
+                && evidence.contains(correction.oldValue)
+                && unitMeaning.contains(correction.oldValue)
+        }
+        return matchesCorrection ? sourceInstruction : nil
+    }
+
+    /// 已验证的 final_only correction 是本地可信的替换证据。若正文 unit 仍只
+    /// 携带旧值，程序把该值投影为最终值，避免 Writer 被相互冲突的 unit 与
+    /// correction 同时约束。若 unit 同时写了旧值和最终值则不机械改写，留给
+    /// schema repair 明确重建，避免生成“从最终值改为最终值”的病句。
+    private static func applyingFinalOnlyCorrections(
+        to meaning: String,
+        unitSourceSpanIDs: Set<String>,
+        corrections: [VoicePolishLedgerCorrection]
+    ) -> String {
+        var result = meaning
+        for correction in corrections
+        where correction.renderingPolicy == "final_only"
+            && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
+            && result.contains(correction.oldValue)
+            && !result.contains(correction.finalValue) {
+            result = result.replacingOccurrences(
+                of: correction.oldValue,
+                with: correction.finalValue
+            )
+        }
+        return result
     }
 
     private static func locallyVerifiedTokenMappings(
@@ -1087,13 +1497,209 @@ enum VoicePolishLedgerIntegrityValidator {
                     correction,
                     spans: spans
                 )
+            let hasExplicitDeclaredCountUpdate = explicitlyUpdatesDeclaredCount(
+                correction,
+                spans: spans
+            )
             guard (oldValueIsSubjectBacked && finalValueIsSubjectBacked)
                     || hasLocalOmittedSubjectPair
-                    || hasSameSegmentBackwardCancellation else {
+                    || hasSameSegmentBackwardCancellation
+                    || hasExplicitDeclaredCountUpdate else {
+                let code = oldValueIsSubjectBacked
+                    ? "correction_subject_not_bound_to_final_value"
+                    : "correction_subject_not_bound_to_old_value"
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                    oldValueIsSubjectBacked
-                        ? "correction_subject_not_bound_to_final_value"
-                        : "correction_subject_not_bound_to_old_value"
+                    "\(code):\(correction.subject)"
+                )
+            }
+        }
+    }
+
+    /// “部署要做三步……等一下还有一步……所以一共四步”不是普通数值关系，
+    /// 但旧总数与最终总数可由同一来源、同一量词和明确补充/汇总词机械证明。
+    /// 只允许旧值前能找到 correction.subject 的稳定主体核心、旧新值各唯一，
+    /// 且桥接文本同时包含补充或纠正证据和最终总数证据。
+    private static func explicitlyUpdatesDeclaredCount(
+        _ correction: VoicePolishLedgerCorrection,
+        spans: [String: VoicePolishEvidenceSpan]
+    ) -> Bool {
+        guard let oldCount = declaredCountValue(correction.oldValue),
+              let finalCount = declaredCountValue(correction.finalValue),
+              oldCount.classifier == finalCount.classifier,
+              oldCount.value != finalCount.value else { return false }
+
+        var subjectCore = correction.subject.replacingOccurrences(
+            of: #"(?:步骤数|步数|条目数|项目数|项数|件数|轮数|次数|总数|数量|数)$"#,
+            with: "",
+            options: .regularExpression
+        )
+        subjectCore = subjectCore.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard subjectCore.count >= 2 else { return false }
+
+        for oldID in correction.oldSpanIds {
+            guard let oldSpan = spans[oldID] else { continue }
+            for finalID in correction.finalSpanIds {
+                guard let finalSpan = spans[finalID],
+                      oldSpan.segmentID == finalSpan.segmentID else { continue }
+                let segmentText = spans.values
+                    .filter { $0.segmentID == oldSpan.segmentID }
+                    .sorted { $0.start < $1.start }
+                    .map(\.text)
+                    .joined()
+                let oldRanges = ranges(of: correction.oldValue, in: segmentText)
+                let finalRanges = ranges(of: correction.finalValue, in: segmentText)
+                guard oldRanges.count == 1,
+                      finalRanges.count == 1,
+                      let oldRange = oldRanges.first,
+                      let finalRange = finalRanges.first,
+                      NSMaxRange(oldRange) <= finalRange.location,
+                      let prefixRange = Range(
+                        NSRange(location: 0, length: oldRange.location),
+                        in: segmentText
+                      ),
+                      let bridgeRange = Range(
+                        NSRange(
+                            location: NSMaxRange(oldRange),
+                            length: finalRange.location - NSMaxRange(oldRange)
+                        ),
+                        in: segmentText
+                      ) else { continue }
+                let prefix = String(segmentText[prefixRange])
+                let bridge = String(segmentText[bridgeRange])
+                guard String(prefix.suffix(48)).contains(subjectCore),
+                      bridge.count <= 180,
+                      bridge.range(
+                        of: #"(?:等一下|等等|不对|说错|更正|还有|再加|补充|漏了|少算).{0,100}(?:所以|因此|这样|那么)?(?:一共|总共|合计|共)"#,
+                        options: .regularExpression
+                      ) != nil else { continue }
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func declaredCountValue(
+        _ raw: String
+    ) -> (value: String, classifier: String)? {
+        let pattern = #"^\s*([零〇一二两双三四五六七八九十百千万亿\d]+)\s*(步|项|条|件|个|样|轮|次)\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(
+                in: raw,
+                range: NSRange(raw.startIndex..<raw.endIndex, in: raw)
+              ),
+              let valueRange = Range(match.range(at: 1), in: raw),
+              let classifierRange = Range(match.range(at: 2), in: raw),
+              let value = ProtectedFactExtractor.canonicalValue(
+                for: String(raw[valueRange]),
+                kind: .number
+              ) else { return nil }
+        return (value, String(raw[classifierRange]))
+    }
+
+    private static func containsDeclaredCountToken(_ token: String, in text: String) -> Bool {
+        let escaped = NSRegularExpression.escapedPattern(for: token)
+        let numeral = #"零〇一二两双三四五六七八九十百千万亿\d"#
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<![\(numeral)])\(escaped)(?![\(numeral)])"
+        ) else { return false }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, range: range) != nil
+    }
+
+    /// Planner 可以省略可机械恢复的 audience.surface_tokens，或把明确的
+    /// “给团队发……”写成非协议枚举。这里只依据它自己引用的来源 span 和
+    /// 本地识别出的显式收件人做归一，不从普通提及中猜受众。
+    private static func normalizedAudiences(
+        _ audiences: [VoicePolishLedgerAudience],
+        spans: [String: VoicePolishEvidenceSpan],
+        fullSource: String
+    ) throws -> [VoicePolishLedgerAudience] {
+        let validSpanIDs = Set(spans.keys)
+        let requiredAudience = requiredAudienceTokens(in: fullSource)
+        return try audiences.enumerated().map { index, audience in
+            let text = audience.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let invalidSpanIDs = audience.sourceSpanIds.filter {
+                !validSpanIDs.contains($0)
+            }
+            guard !text.isEmpty,
+                  !audience.sourceSpanIds.isEmpty,
+                  invalidSpanIDs.isEmpty else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "audience_invalid:index=\(index),text=\(text),"
+                        + "invalid_span_ids=\(invalidSpanIDs.joined(separator: ","))"
+                )
+            }
+
+            let evidence = audience.sourceSpanIds.compactMap { spans[$0]?.text }.joined()
+            var tokens = audience.surfaceTokens.filter {
+                !$0.isEmpty && evidence.contains($0)
+            }
+            if tokens.isEmpty, evidence.contains(text) {
+                tokens = [text]
+            }
+            if tokens.isEmpty {
+                let candidates = requiredAudience.filter { token in
+                    evidence.contains(token)
+                        && (text.contains(token) || token.contains(text))
+                }
+                if candidates.count == 1, let token = candidates.first {
+                    tokens = [token]
+                }
+            }
+
+            var deliveryMode = audience.deliveryMode
+            if !["direct_address", "explicit_reference"].contains(deliveryMode),
+               tokens.contains(where: requiredAudience.contains) {
+                deliveryMode = "direct_address"
+            }
+            guard !tokens.isEmpty,
+                  ["direct_address", "explicit_reference"].contains(deliveryMode)
+            else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "audience_invalid:index=\(index),text=\(text),"
+                        + "delivery_mode=\(audience.deliveryMode),surface_tokens_missing"
+                )
+            }
+            return VoicePolishLedgerAudience(
+                text: text,
+                sourceSpanIds: audience.sourceSpanIds,
+                surfaceTokens: Array(Set(tokens)).sorted(),
+                deliveryMode: deliveryMode
+            )
+        }
+    }
+
+    private static func normalizedNumberedUnitIDs(
+        structure: VoicePolishLedgerStructure,
+        activeRecipientUnitIDs: Set<String>
+    ) -> [String] {
+        switch structure.kind {
+        case "numbered_list":
+            return structure.orderedUnitIds.filter(activeRecipientUnitIDs.contains)
+        case "mixed":
+            return (structure.numberedUnitIds ?? []).filter(activeRecipientUnitIDs.contains)
+        default:
+            return []
+        }
+    }
+
+    /// “原来说三步，补充后共四步”已经把列表总数变成结构事实。最终 Ledger
+    /// 必须准确指出哪四个 unit 是编号步骤；前言和“完成后启动”不能混进四步。
+    private static func validateDeclaredCountStructure(
+        ledger: VoicePolishIntentLedger,
+        spans: [String: VoicePolishEvidenceSpan]
+    ) throws {
+        for correction in ledger.corrections
+        where correction.renderingPolicy == "final_only"
+            && explicitlyUpdatesDeclaredCount(correction, spans: spans) {
+            guard let finalCount = declaredCountValue(correction.finalValue),
+                  let expected = Int(finalCount.value),
+                  ["numbered_list", "mixed"].contains(ledger.structure.kind),
+                  ledger.structure.numberedUnitIds?.count == expected else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "declared_count_structure_invalid:subject=\(correction.subject),"
+                        + "expected=\(correction.finalValue),"
+                        + "numbered_unit_ids=\((ledger.structure.numberedUnitIds ?? []).joined(separator: ","))"
                 )
             }
         }
@@ -1145,6 +1751,27 @@ enum VoicePolishLedgerIntegrityValidator {
 
     private static func facts(in text: String) -> Set<String> {
         Set(protectedFacts(in: text))
+    }
+
+    /// “预算最后通过的是一万六”与“最终通过的预算是 16000”只改变语序和
+    /// 数字写法。ProtectedFactExtractor 会因“预算是”是否相邻而分别抽成
+    /// number/amount；在没有任何单位或币种时，把 amount 归一回 number。
+    /// 一旦出现元、美元、天、月等 measurement，仍保留原 kind 并走严格门禁。
+    private static func protectedFactKey(
+        _ fact: SourceFactCandidate,
+        in text: String
+    ) -> String {
+        let semanticValue = fact.canonicalValue ?? fact.sourceText
+        if fact.kind == .amount {
+            let scan = measurementScan(in: text)
+            let hasExplicitFamily = scan.occurrences.contains {
+                $0.value == semanticValue
+            }
+            if !hasExplicitFamily {
+                return "\(ProtectedFactKind.number.rawValue)|\(semanticValue)"
+            }
+        }
+        return "\(fact.kind.rawValue)|\(semanticValue)"
     }
 
     private struct MeasurementOccurrence {
@@ -1897,9 +2524,7 @@ enum VoicePolishLedgerIntegrityValidator {
     }
 
     private static func protectedFacts(in text: String) -> [String] {
-        protectedFactCandidates(in: text).map {
-            "\($0.kind.rawValue)|\($0.canonicalValue ?? $0.sourceText)"
-        }
+        protectedFactCandidates(in: text).map { protectedFactKey($0, in: text) }
     }
 
     private static func span(
@@ -1933,6 +2558,21 @@ enum VoicePolishLedgerIntegrityValidator {
             }
             return nil
         })
+    }
+
+    private static func isGroupAudience(_ audience: String) -> Bool {
+        ["团队", "大家", "同事", "开发", "产品组", "老师", "他们", "她们"]
+            .contains(audience)
+    }
+
+    private static func groupAudienceTokens(for audience: String) -> [String] {
+        switch audience {
+        case "开发": return ["开发", "研发", "各位", "大家", "同事"]
+        case "产品组": return ["产品组", "产品同事", "各位", "大家", "同事"]
+        case "老师": return ["老师", "各位", "大家"]
+        case "他们", "她们": return [audience, "各位", "大家"]
+        default: return [audience, "各位", "大家", "同事"]
+        }
     }
 
     private static func preservesNonCommitment(

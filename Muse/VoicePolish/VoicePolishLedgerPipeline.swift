@@ -312,7 +312,9 @@ struct VoicePolishLedgerPipeline: Sendable {
         // Draft Repair 只能改成稿 fragment，不能纠正 Ledger 的角色与结构；
         // 继续修稿会让同一错误 Ledger 在确认阶段被误放行，因此必须显式
         // 停止并让用户重试一次完整规划。
-        if initialIssues.contains(where: { $0.type == "wrong_role" }) {
+        if initialIssues.contains(where: {
+            issueRequiresLedgerReplan($0, ledger: ledger)
+        }) {
             return .unavailable(
                 stage: .reviewing,
                 attempts: attempts,
@@ -572,15 +574,38 @@ struct VoicePolishLedgerPipeline: Sendable {
         invalidResponse: String,
         error: Error
     ) throws -> String {
-        try jsonString([
-            "writing_scene": request.context.scene.rawValue,
-            "source_spans": try jsonObject(spans),
-            "required_logic_cues": try jsonObject(requiredLogicCues),
-            "verified_entity_mappings": try jsonObject(mappings),
-            "additional_requirements": request.preferences.additionalRequirements,
-            "invalid_ledger_response": String(invalidResponse.prefix(24_000)),
-            "validation_error": String(describing: error),
-        ])
+        // 修复请求本身不能再是一个与目标 Ledger 外形相近的大 JSON。真实模型
+        // 曾把整个请求对象原样回显，导致第二次稳定解码失败。用明确的只读分区
+        // 隔离证据、错误和旧响应，系统 Prompt 仍要求最终只返回 Ledger JSON。
+        let sourceSpans = try encodedJSONString(spans)
+        let logicCues = try encodedJSONString(requiredLogicCues)
+        let verifiedMappings = try encodedJSONString(mappings)
+        return """
+        REPAIR_TARGET: VOICE_POLISH_INTENT_LEDGER
+        WRITING_SCENE:
+        \(request.context.scene.rawValue)
+
+        VALIDATION_ERROR:
+        \(String(describing: error))
+
+        ADDITIONAL_REQUIREMENTS:
+        \(request.preferences.additionalRequirements)
+
+        REQUIRED_LOGIC_CUES_JSON:
+        \(logicCues)
+
+        VERIFIED_ENTITY_MAPPINGS_JSON:
+        \(verifiedMappings)
+
+        SOURCE_SPANS_JSON:
+        \(sourceSpans)
+
+        INVALID_LEDGER_JSON:
+        \(String(invalidResponse.prefix(24_000)))
+
+        OUTPUT_REQUIREMENT:
+        只返回修复后的 VoicePolishIntentLedger JSON 对象。不得回显上述分区、字段标签或输入载荷。
+        """
     }
 
     private func writerPayload(
@@ -643,6 +668,16 @@ struct VoicePolishLedgerPipeline: Sendable {
         return try JSONSerialization.jsonObject(with: data)
     }
 
+    private func encodedJSONString<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(value)
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw VoicePolishLedgerIntegrityError.invalidLedger
+        }
+        return string
+    }
+
     private func jsonString(_ object: [String: Any]) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         guard let string = String(data: data, encoding: .utf8) else {
@@ -669,6 +704,7 @@ struct VoicePolishLedgerPipeline: Sendable {
         }
         var fragmentByUnitID: [String: VoicePolishLedgerDraftFragment] = [:]
         var fragmentIDs: Set<String> = []
+        let numberedUnitIDs = Set(ledger.structure.numberedUnitIds ?? [])
         for fragment in document.fragments {
             guard fragment.unitIds.count == 1,
                   let unitID = fragment.unitIds.first,
@@ -682,7 +718,8 @@ struct VoicePolishLedgerPipeline: Sendable {
                   ) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedger
             }
-            if ledger.structure.kind == "numbered_list" {
+            if ledger.structure.kind == "numbered_list"
+                || numberedUnitIDs.contains(unitID) {
                 text = text.replacingOccurrences(
                     of: #"^\s*(?:\d{1,3}[\.、）)]|[-*•])\s*"#,
                     with: "",
@@ -738,7 +775,29 @@ struct VoicePolishLedgerPipeline: Sendable {
                 result += question ? "？" : "。"
             }
             return result
-        case "paragraphs", "mixed", "ai_prompt":
+        case "mixed":
+            let numberedUnitIDs = Set(ledger.structure.numberedUnitIds ?? [])
+            var nextNumber = 1
+            var blocks: [String] = []
+            var numberedBlock: [String] = []
+            for (fragment, text) in zip(document.fragments, texts) {
+                let unitID = fragment.unitIds.first ?? ""
+                if numberedUnitIDs.contains(unitID) {
+                    numberedBlock.append("\(nextNumber). \(text)")
+                    nextNumber += 1
+                } else {
+                    if !numberedBlock.isEmpty {
+                        blocks.append(numberedBlock.joined(separator: "\n"))
+                        numberedBlock.removeAll(keepingCapacity: true)
+                    }
+                    blocks.append(text)
+                }
+            }
+            if !numberedBlock.isEmpty {
+                blocks.append(numberedBlock.joined(separator: "\n"))
+            }
+            return blocks.joined(separator: "\n\n")
+        case "paragraphs", "ai_prompt":
             return texts.joined(separator: "\n\n")
         default:
             return ""
@@ -864,6 +923,12 @@ struct VoicePolishLedgerPipeline: Sendable {
                (issue.draftSpan ?? "").isEmpty {
                 return false
             }
+            // wrong_role 的协议语义是“Planner 把真实正文错分成非正文角色”。
+            // 若 Reviewer 指向的全是 recipient_content，它实际在评论“您/你、
+            // 请/不要请”等成稿风格；这类偏好不能让一份可发送正文进入修复循环。
+            if issue.type == "wrong_role", !onlyNonRecipient {
+                return false
+            }
             return true
         }
         var seen: Set<String> = []
@@ -872,6 +937,20 @@ struct VoicePolishLedgerPipeline: Sendable {
                 .joined(separator: "\u{0}")
             return seen.insert(key).inserted
         }
+    }
+
+    /// 只有 Reviewer 指向非正文 unit 的 wrong_role 才说明 Ledger 把真实正文
+    /// 错分成了 editor/remove/excluded，必须重新规划。若 issue 只指向正文 unit，
+    /// 它描述的是成稿口吻或转达方式，Draft Repair 可以安全局部修正。
+    private func issueRequiresLedgerReplan(
+        _ issue: VoicePolishReviewerIssue,
+        ledger: VoicePolishIntentLedger
+    ) -> Bool {
+        guard issue.type == "wrong_role", !issue.unitIds.isEmpty else { return false }
+        let roleByUnitID = Dictionary(uniqueKeysWithValues: ledger.units.map {
+            ($0.id, $0.deliveryRole)
+        })
+        return issue.unitIds.contains { roleByUnitID[$0] != "recipient_content" }
     }
 
     private func outputBudget(source: String, baseline: Int) -> Int {

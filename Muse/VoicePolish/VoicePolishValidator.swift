@@ -427,6 +427,14 @@ enum VoicePolishValidator {
             }
         }
 
+        // “跟团队说……”不是普通事实陈述，而是面向一个群体的直达消息。
+        // 当前输入框不一定就是目标群聊，因此不能把收件人完全删掉。这里只
+        // 处理可逐字证明的群体转达对象；一对一客户回复仍允许自然省略“客户”。
+        if let audienceTokens = requiredGroupAudienceTokens(in: source),
+           !audienceTokens.contains(where: draft.contains) {
+            append(.missingProtectedFact, to: &codes)
+        }
+
         // 句末只剩“汇总如下”却没有正文，是可由结构直接证明的未完成成稿。
         // 不再按测试夹具里的完整句子做本地语义改写或判定。
         let danglingSummaryLeadIn = ["汇总如下", "总结如下", "整理如下"].contains {
@@ -995,6 +1003,26 @@ enum VoicePolishValidator {
             "告诉供应商", "通知供应商", "请供应商", "让供应商",
             "给读者", "写给读者", "告诉读者", "收件人看到",
         ].contains(where: text.contains)
+    }
+
+    private static func requiredGroupAudienceTokens(in source: String) -> [String]? {
+        let requirements: [([String], [String])] = [
+            (["跟团队说", "给团队说", "告诉团队", "通知团队", "发给团队", "写给团队"],
+             ["团队", "大家", "各位", "同事"]),
+            (["跟大家说", "给大家说", "告诉大家", "通知大家"],
+             ["大家", "各位"]),
+            (["跟同事说", "给同事说", "告诉同事", "通知同事", "发给同事"],
+             ["同事", "大家", "各位"]),
+            (["跟开发说", "给开发说", "告诉开发", "通知开发", "发给开发", "写给开发"],
+             ["开发", "开发同学", "开发团队"]),
+            (["跟产品组说", "给产品组说", "告诉产品组", "通知产品组", "发给产品组"],
+             ["产品组", "产品团队", "产品同学"]),
+            (["跟老师说", "给老师说", "告诉老师", "通知老师", "发给老师"],
+             ["老师"]),
+        ]
+        return requirements.first(where: { signals, _ in
+            signals.contains(where: source.contains)
+        })?.1
     }
 
     /// 精确短语之外，只接受少数能证明语义等价的动作变体。例如
