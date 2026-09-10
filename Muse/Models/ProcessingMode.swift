@@ -98,6 +98,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     // MARK: - Built-in Mode IDs (stable, never change)
     static let directId = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let smartDirectId = UUID(uuidString: "00000000-0000-0000-0000-000000000006")!
+    static let lightPolishId = UUID(uuidString: "7F3A2D91-106E-4FA6-9122-08CC34D1B9A5")!
     static let translateId = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
     static var direct: ProcessingMode {
         ProcessingMode(
@@ -117,6 +118,12 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
 
     var isFormalWritingMode: Bool {
         kind == .voicePolish
+    }
+
+    /// 产品档位由录音时冻结的模式决定，不读取全局旧质量设置。
+    var voicePolishQualityMode: VoicePolishQualityMode? {
+        guard kind == .voicePolish else { return nil }
+        return id == Self.lightPolishId ? .light : .standard
     }
     var isPromptOptimizeMode: Bool {
         kind == .promptOptimize
@@ -158,7 +165,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             return .direct
         case smartDirectId:
             return .smartDirect
-        case formalWritingId:
+        case formalWritingId, lightPolishId:
             return .voicePolish
         case translateId, defaultTranslateId:
             return .translate
@@ -174,13 +181,25 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     static var formalWriting: ProcessingMode {
         ProcessingMode(
             id: formalWritingId,
-            name: L("语音润色", "Voice Polish"),
+            name: L("标准润色", "Standard Polish"),
             // V2 起，默认规则由 VoicePolishPrompts 版本化维护；这里仅保存用户
             // 的附加润色要求，因此新装默认为空。
             prompt: "",
             isBuiltin: true,
-            processingLabel: L("润色中", "Polishing"),
+            processingLabel: L("标准润色中", "Standard polishing"),
             hotkeyCode: 18, hotkeyModifiers: 524288, hotkeyStyle: .toggle
+        )
+    }
+
+    static var lightPolish: ProcessingMode {
+        ProcessingMode(
+            id: lightPolishId,
+            name: L("轻度润色", "Light Polish"),
+            prompt: "",
+            isBuiltin: true,
+            processingLabel: L("轻度润色中", "Light polishing"),
+            // 保留旧模式的 Option+1/2/3；加载旧配置时由 ModeStorage 检查冲突。
+            hotkeyCode: 21, hotkeyModifiers: 524288, hotkeyStyle: .toggle
         )
     }
 
@@ -217,6 +236,6 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
-    static var builtins: [ProcessingMode] { [.direct, .formalWriting] }
-    static var defaults: [ProcessingMode] { [.direct, .formalWriting, .promptOptimize, .translate, .commandMode] }
+    static var builtins: [ProcessingMode] { [.direct, .lightPolish, .formalWriting] }
+    static var defaults: [ProcessingMode] { [.direct, .lightPolish, .formalWriting, .promptOptimize, .translate, .commandMode] }
 }

@@ -17,6 +17,7 @@ struct ModeTrialCard: View {
     @State private var trialError = ""
     @State private var trialDiagnostics = ""
     @State private var isRunningTrial = false
+    @State private var activeTrialID: UUID?
     @State private var didSaveSampleFlash = false
 
     /// 标准测试文案（2026-06-12 用户拍板定稿）：真实语音输入的口语原文
@@ -90,6 +91,8 @@ struct ModeTrialCard: View {
             trialInput = Self.effectiveSample(for: mode)
         }
         .onChange(of: mode.id) { _, _ in
+            activeTrialID = nil
+            isRunningTrial = false
             trialInput = Self.effectiveSample(for: mode)
             clearResult()
         }
@@ -308,8 +311,15 @@ private extension ModeTrialCard {
         guard !input.isEmpty, !isRunningTrial else { return }
 
         isRunningTrial = true
+        let trialID = UUID()
+        activeTrialID = trialID
         clearResult()
-        defer { isRunningTrial = false }
+        defer {
+            if activeTrialID == trialID {
+                isRunningTrial = false
+                activeTrialID = nil
+            }
+        }
 
         var draftMode = mode
         draftMode.name = name
@@ -391,9 +401,10 @@ private extension ModeTrialCard {
                     additionalRequirements: draftMode.prompt,
                     styleProfile: styleProfile
                 ),
-                qualityMode: VoicePolishSettings.qualityMode(),
+                qualityMode: draftMode.voicePolishQualityMode ?? .standard,
                 resolvedEntities: resolvedEntities
             )
+            guard activeTrialID == trialID else { return }
             let layoutExpectation = VoicePolishLayoutExpectation.infer(
                 from: voicePolishRequest
             )
@@ -401,6 +412,7 @@ private extension ModeTrialCard {
                 client: client,
                 config: voicePolishConfig
             ).process(voicePolishRequest)
+            guard activeTrialID == trialID else { return }
             let elapsedMilliseconds = milliseconds(
                 ContinuousClock.now - trialStartedAt
             )
@@ -430,9 +442,11 @@ private extension ModeTrialCard {
                 context: .processingMode,
                 config: llmConfig
             )
+            guard activeTrialID == trialID else { return }
             let cleaned = draftMode.applyingLLMResultCleanup(to: result)
             trialOutput = cleaned.isEmpty ? L("模型返回为空", "The model returned an empty response") : cleaned
         } catch {
+            guard activeTrialID == trialID else { return }
             trialError = error.localizedDescription
         }
     }

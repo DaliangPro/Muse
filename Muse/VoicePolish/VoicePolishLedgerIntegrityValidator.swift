@@ -1837,6 +1837,58 @@ enum VoicePolishLedgerIntegrityValidator {
         }
     }
 
+    /// 三档新路径复用现有数值、技术字符与单位检查，不要求先让模型重建 Ledger。
+    /// 此处只裁决无来源新增；遗漏、改口对象与开放式语义由实际差异复核处理。
+    static func sourceBackedDraftCodes(
+        sourceText: String,
+        outputText: String,
+        scene: WritingScene,
+        allowsPartialTimeReview: Bool = false
+    ) -> [VoicePolishValidationCode] {
+        let source = sourceText
+        let output = scene == .code ? outputText
+            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(in: outputText)
+        let normalizedSource = scene == .code ? source
+            : VoicePolishNumbering.removingContinuousNumberedLineMarkers(in: source)
+        let sourceKeys = facts(in: normalizedSource)
+        let sourceTimes = protectedFactCandidates(in: normalizedSource)
+            .filter { $0.kind == .time }.compactMap(\.canonicalValue)
+        let compactSource = whitespaceInsensitive(normalizedSource)
+        // 口述符号只补充技术字符的匹配来源，不得改写时间、小数或普通词语里的“点”。
+        let compactTechnicalSource = whitespaceInsensitive(
+            VoicePolishValidator.dictatedSymbolProjection(normalizedSource)
+        )
+        let unbacked = protectedFactCandidates(in: output).contains { candidate in
+            if candidate.kind == .quotedPhrase { return false }
+            if sourceKeys.contains(protectedFactKey(candidate, in: output)) { return false }
+            if allowsPartialTimeReview, candidate.kind == .time,
+               let value = candidate.canonicalValue, let separator = value.firstIndex(of: "|") {
+                let day = String(value[...separator])
+                let clock = String(value[value.index(after: separator)...])
+                // 裸时钟与日期都有来源时只能说明可承接，归属对象仍须标准的全文复核。
+                if sourceTimes.contains(clock), sourceTimes.contains(where: { $0.hasPrefix(day) }) {
+                    return false
+                }
+            }
+            switch candidate.kind {
+            case .filePath, .command, .codeIdentifier, .lexiconEntity:
+                let content = candidate.kind == .command && candidate.sourceText.hasPrefix("`")
+                    && candidate.sourceText.hasSuffix("`")
+                    ? String(candidate.sourceText.dropFirst().dropLast()) : candidate.sourceText
+                let token = whitespaceInsensitive(content)
+                return !compactSource.contains(token) && !compactTechnicalSource.contains(token)
+            default:
+                return true
+            }
+        }
+        let measurementsHaveSources = measurementValuesHaveSources(
+            source: measurementScan(in: normalizedSource),
+            final: measurementScan(in: output),
+            requiresCompleteCoverage: false
+        )
+        return unbacked || !measurementsHaveSources ? [.planIntegrityFailure] : []
+    }
+
     private static func facts(in text: String) -> Set<String> {
         Set(protectedFacts(in: text))
     }

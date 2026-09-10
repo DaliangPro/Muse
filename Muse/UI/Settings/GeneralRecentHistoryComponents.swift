@@ -125,6 +125,17 @@ struct RecentHistoryRowView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
 
+                if let modeName = record.processingModeDisplayName {
+                    Text(modeName)
+                        .font(TF.settingsFontMetadata)
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(modeName)
+                        .accessibilityLabel(L("输入模式", "Input mode"))
+                        .accessibilityValue(modeName)
+                }
+
                 if let voicePolishPresentation {
                     Text(L(voicePolishPresentation.labelZH, voicePolishPresentation.labelEN))
                         .font(TF.settingsFontMetadata)

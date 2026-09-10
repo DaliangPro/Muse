@@ -894,6 +894,7 @@ actor RecognitionSession {
 
     /// Switch the processing mode before stopping. Used for cross-mode hotkey stops.
     func switchMode(to mode: ProcessingMode) {
+        guard state == .starting || state == .recording else { return }
         currentMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
     }
 
@@ -1081,6 +1082,7 @@ actor RecognitionSession {
                 VoicePolishPerformanceStore.record(
                     measurement: voicePolishPerformance,
                     latencyMilliseconds: Int(clamping: milliseconds),
+                    qualityMode: currentMode.voicePolishQualityMode,
                     defaults: llmResult.voicePolishVocabularyContext?.userDefaults ?? .standard
                 )
             }
@@ -1453,9 +1455,7 @@ actor RecognitionSession {
                         additionalRequirements: mode.prompt,
                         styleProfile: styleProfile
                     ),
-                    qualityMode: VoicePolishSettings.qualityMode(
-                        defaults: vocabularyContext.userDefaults
-                    ),
+                    qualityMode: mode.voicePolishQualityMode ?? .standard,
                     resolvedEntities: resolvedEntities
                 )
                 let voicePolishConfig: LLMConfig
@@ -1905,7 +1905,7 @@ actor RecognitionSession {
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: rawText,
-            processingMode: currentMode.id == ProcessingMode.directId ? nil : currentMode.name,
+            processingMode: currentMode.name,
             processedText: llmResult.processedText,
             finalText: finalText,
             status: status,
@@ -1937,7 +1937,7 @@ actor RecognitionSession {
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: "",
-            processingMode: currentMode.id == ProcessingMode.directId ? nil : currentMode.name,
+            processingMode: currentMode.name,
             processedText: nil,
             finalText: "",
             status: status,

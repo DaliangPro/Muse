@@ -242,8 +242,8 @@ final class RecognitionSessionTests: XCTestCase {
                 )
             }
         )
-        await session.switchMode(to: .formalWriting)
         await session.setState(.recording)
+        await session.switchMode(to: .formalWriting)
         await session.handleASREventForTesting(.transcript(RecognitionTranscript(
             confirmedSegments: [],
             partialText: "明天下午",
@@ -270,8 +270,8 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.llmFailed, false)
         XCTAssertEqual(result?.historyStatus, "voice_polish_success")
         let requests = await client.recordedRequests()
-        XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests[0].task, .voicePolishFast)
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(try Self.voicePolishPayload(from: requests[0])["mode"] as? String, "standard")
         XCTAssertTrue(requests[0].user.contains(#""user_preferences":"""#))
         XCTAssertTrue(requests[0].user.contains(source))
     }
@@ -328,7 +328,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(payload["canonical_text"] as? String, canonical)
         XCTAssertFalse(request.user.contains("内置整句"))
         let models = await client.recordedModels()
-        XCTAssertEqual(models, ["voice-polish-fast-model"])
+        XCTAssertEqual(models, ["voice-polish-fast-model", "voice-polish-fast-model"])
     }
 
     func testDirectAndVoicePolishShareGlobalCanonicalAndFixedSnippetBehavior() async throws {
@@ -735,58 +735,81 @@ final class RecognitionSessionTests: XCTestCase {
     func testVoicePolishUsesAndRemembersRecentMuseInputsOnlyWhenEnabled() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
-        VoicePolishSettings.setRecentInputContextEnabled(
-            true,
-            defaults: fixture.context.userDefaults
-        )
         let applicationID = "com.example.chat"
-        let recentStore = VoicePolishRecentInputContextStore()
-        await recentStore.remember(
-            "上一条 Muse 输入",
-            applicationBundleID: applicationID
-        )
-        let raw = "这是本次口述。"
-        let polished = "这是本次成稿。"
-        let client = RecognitionSessionVoicePolishLLM(response: polished)
-        let session = RecognitionSession(
-            historyStore: HistoryStore(path: ":memory:"),
-            llmClientFactory: { client },
-            llmConfigLoader: {
-                LLMConfig(
-                    apiKey: "test",
-                    model: "mock-model",
-                    baseURL: "https://example.com/v1"
-                )
-            },
-            voicePolishRecentInputStore: recentStore
-        )
+        let previousInput = "Muse 的长语音测试刚刚结束。无关事项：客户预算九万元。"
+        let raw = "缪斯这次更新先发测试组。"
+        let corrected = "Muse这次更新先发测试组。"
         let transcript = RecognitionTranscript(
             confirmedSegments: [raw],
             partialText: "",
             authoritativeText: raw,
             isFinal: true
         )
+        defer { VoicePolishContextDiagnostics.clearForTesting() }
 
-        let result = await session.postProcessVoicePolishForTesting(
-            rawText: raw,
-            transcript: transcript,
-            writingContext: WritingContext(
-                applicationBundleID: applicationID,
-                scene: .chat
-            ),
-            vocabularyContext: fixture.context
-        )
+        for enabled in [true, false] {
+            VoicePolishSettings.setRecentInputContextEnabled(
+                enabled,
+                defaults: fixture.context.userDefaults
+            )
+            let recentStore = VoicePolishRecentInputContextStore()
+            await recentStore.remember(previousInput, applicationBundleID: applicationID)
+            let expected = enabled ? corrected : raw
+            let client = RecognitionSessionVoicePolishLLM(response: expected)
+            let session = RecognitionSession(
+                historyStore: HistoryStore(path: ":memory:"),
+                llmClientFactory: { client },
+                llmConfigLoader: {
+                    LLMConfig(
+                        apiKey: "test",
+                        model: "mock-model",
+                        baseURL: "https://example.com/v1"
+                    )
+                },
+                voicePolishRecentInputStore: recentStore
+            )
 
-        XCTAssertEqual(result?.finalText, polished)
-        let requests = await client.recordedRequests()
-        let request = try XCTUnwrap(requests.first)
-        let payload = try Self.voicePolishPayload(from: request)
-        let context = try XCTUnwrap(payload["context"] as? [String: Any])
-        XCTAssertEqual(context["recent_muse_inputs"] as? [String], ["上一条 Muse 输入"])
-        let rememberedInputs = await recentStore.recentInputs(
-            applicationBundleID: applicationID
-        )
-        XCTAssertEqual(rememberedInputs, ["上一条 Muse 输入", polished])
+            let result = await session.postProcessVoicePolishForTesting(
+                rawText: raw,
+                transcript: transcript,
+                writingContext: WritingContext(
+                    applicationBundleID: applicationID,
+                    scene: .chat,
+                    level: .metadataOnly,
+                    safety: .safe
+                ),
+                vocabularyContext: fixture.context
+            )
+
+            XCTAssertEqual(result?.finalText, expected, "enabled=\(enabled)")
+            XCTAssertEqual(result?.processedText, expected, "enabled=\(enabled)")
+            XCTAssertEqual(result?.llmFailed, false, "enabled=\(enabled)")
+            let diagnostic = try XCTUnwrap(VoicePolishContextDiagnostics.latest())
+            XCTAssertEqual(diagnostic.applicationBundleID, applicationID)
+            XCTAssertEqual(diagnostic.recentMuseInputCount, enabled ? 1 : 0)
+            let requests = await client.recordedRequests()
+            XCTAssertEqual(requests.count, 2, "标准模式须完成生成和复核")
+            for request in requests {
+                let payload = try Self.voicePolishPayload(from: request)
+                // canonical 已由本地 Resolver 纠正，不能靠模型自行猜对来通过测试。
+                XCTAssertEqual(payload["canonical_text"] as? String, expected)
+                XCTAssertEqual(payload["mode"] as? String, "standard")
+                let context = try XCTUnwrap(payload["authorized_context"] as? [String])
+                XCTAssertEqual(context, enabled ? ["缪斯 → Muse"] : [])
+                XCTAssertFalse(request.user.contains(previousInput))
+                XCTAssertFalse(request.user.contains("长语音测试刚刚结束"))
+                XCTAssertFalse(request.user.contains("客户预算"))
+                XCTAssertFalse(request.user.contains("九万元"))
+            }
+            let rememberedInputs = await recentStore.recentInputs(
+                applicationBundleID: applicationID
+            )
+            XCTAssertEqual(
+                rememberedInputs,
+                enabled ? [previousInput, corrected] : [previousInput],
+                "关闭后不得记忆本次输出"
+            )
+        }
     }
 
     func testVoicePolishEmitsStageAndCanImmediatelyUseCanonicalText() async throws {
@@ -923,43 +946,9 @@ final class RecognitionSessionTests: XCTestCase {
             of: "邮件里不要承诺周五对外发布",
             with: "邮件里说明周五一定不会对外发布"
         )
-        let unit = VoicePolishLedgerUnit(
-            id: "u1",
-            kind: "constraint",
-            deliveryRole: "recipient_content",
-            finalMeaning: source,
-            sourceSpanIds: ["s1"],
-            status: "keep",
-            modality: "not_promised",
-            exactTokens: [],
-            surfaceTokens: []
-        )
-        let ledger = VoicePolishIntentLedger(
-            audience: [],
-            units: [unit],
-            corrections: [],
-            conditionals: [],
-            technicalTokenMappings: [],
-            dictatedSymbolMappings: [],
-            contextMappings: [],
-            structure: VoicePolishLedgerStructure(
-                kind: "paragraphs",
-                orderedUnitIds: ["u1"]
-            )
-        )
-        let pass = VoicePolishReviewerResult(verdict: "pass", issues: [])
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let wrongDraft = VoicePolishLedgerDraftDocument(fragments: [
-            VoicePolishLedgerDraftFragment(id: "f_u1", unitIds: ["u1"], text: wrong),
-        ])
-        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            String(decoding: try encoder.encode(ledger), as: UTF8.self),
-            String(decoding: try encoder.encode(wrongDraft), as: UTF8.self),
-            String(decoding: try encoder.encode(pass), as: UTF8.self),
-            String(decoding: try encoder.encode(wrongDraft), as: UTF8.self),
-            String(decoding: try encoder.encode(pass), as: UTF8.self),
-        ])
+        // 复核给出无法定位的补丁，程序必须拒绝，不能把未经确认的初稿交付。
+        let invalidReview = #"{"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [wrong, invalidReview])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
             historyStore: HistoryStore(path: ":memory:"),
@@ -988,8 +977,8 @@ final class RecognitionSessionTests: XCTestCase {
                 allowsUserChoice: true
             )
         }
-        let reachedFiveRequests = await AsyncTimeout.asyncValue(.seconds(10)) {
-            await client.waitForRequestCount(5)
+        let reachedReview = await AsyncTimeout.asyncValue(.seconds(10)) {
+            await client.waitForRequestCount(2)
             return true
         }
         let unavailable = await AsyncTimeout.asyncValue(.seconds(10)) {
@@ -1001,7 +990,8 @@ final class RecognitionSessionTests: XCTestCase {
         }
 
         let requestCount = await client.requestCount()
-        XCTAssertFalse(reachedFiveRequests.timedOut, "requests=\(requestCount)")
+        XCTAssertFalse(reachedReview.timedOut, "requests=\(requestCount)")
+        XCTAssertEqual(requestCount, 2)
         XCTAssertFalse(unavailable.timedOut, "events=\(recorder.values)")
         XCTAssertTrue(
             recorder.values.contains("voicePolishUnavailable:validationFailed"),
@@ -1028,41 +1018,10 @@ final class RecognitionSessionTests: XCTestCase {
             of: "邮件里不要承诺周五对外发布",
             with: "邮件里说明周五一定不会对外发布"
         )
-        let polished = "周五上午先发内部试看；邮件里不要承诺周五对外发布。"
-        let unit = VoicePolishLedgerUnit(
-            id: "u1",
-            kind: "constraint",
-            deliveryRole: "recipient_content",
-            finalMeaning: source,
-            sourceSpanIds: ["s1"],
-            status: "keep",
-            modality: "not_promised",
-            exactTokens: [],
-            surfaceTokens: []
-        )
-        let ledger = VoicePolishIntentLedger(
-            audience: [],
-            units: [unit],
-            corrections: [],
-            conditionals: [],
-            technicalTokenMappings: [],
-            dictatedSymbolMappings: [],
-            contextMappings: [],
-            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
-        )
-        let pass = VoicePolishReviewerResult(verdict: "pass", issues: [])
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let encodedLedger = String(decoding: try encoder.encode(ledger), as: UTF8.self)
-        let encodedPass = String(decoding: try encoder.encode(pass), as: UTF8.self)
-        func encodedDraft(_ text: String) throws -> String {
-            String(decoding: try encoder.encode(VoicePolishLedgerDraftDocument(fragments: [
-                VoicePolishLedgerDraftFragment(id: "f_u1", unitIds: ["u1"], text: text),
-            ])), as: UTF8.self)
-        }
+        let polished = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。\n\n邮件里不要承诺周五对外发布。"
+        let invalidReview = #"{"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            encodedLedger, try encodedDraft(wrong), encodedPass, try encodedDraft(wrong), encodedPass,
-            encodedLedger, try encodedDraft(polished), encodedPass,
+            wrong, invalidReview, polished, #"{"edits":[]}"#,
         ])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1098,19 +1057,24 @@ final class RecognitionSessionTests: XCTestCase {
 
         XCTAssertFalse(firstRun.timedOut)
         let firstRequestCount = await client.requestCount()
-        XCTAssertEqual(firstRequestCount, 5)
+        XCTAssertEqual(firstRequestCount, 2)
+        // 复核失败后已经冻结标准档位，迟到的轻度快捷键不能改写本次重试。
+        await session.switchMode(to: .lightPolish)
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
         let retryAccepted = await session.retryVoicePolishResult()
         XCTAssertTrue(retryAccepted)
         let secondRun = await AsyncTimeout.asyncValue(.seconds(10)) {
-            await client.waitForRequestCount(8)
+            await client.waitForRequestCount(4)
             return true
         }
         let result = await pendingTask.value
         let requestCount = await client.requestCount()
 
         XCTAssertFalse(secondRun.timedOut)
-        XCTAssertEqual(requestCount, 8)
+        XCTAssertEqual(requestCount, 4)
+        for request in await client.recordedRequests() {
+            XCTAssertEqual(try Self.voicePolishPayload(from: request)["mode"] as? String, "standard")
+        }
         XCTAssertEqual(result?.finalText, polished)
         XCTAssertEqual(result?.processedText, polished)
         XCTAssertFalse(result?.llmFailed ?? true)
@@ -1361,6 +1325,9 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
         models.append(config.model)
         if request.options.responseFormat == .jsonObject,
            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
+            if payload["mode"] as? String == "standard" {
+                return LLMResponse(text: #"{"edits":[]}"#, model: config.model)
+            }
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase
             if payload["draft_document"] != nil {
@@ -1523,6 +1490,7 @@ private actor RecognitionSessionScriptedVoicePolishLLM: LLMClient {
     func warmUp(baseURL: String) async {}
 
     func requestCount() -> Int { requests.count }
+    func recordedRequests() -> [LLMRequest] { requests }
 
     func waitForRequestCount(_ count: Int) async {
         guard requests.count < count else { return }

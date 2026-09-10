@@ -10,6 +10,7 @@ struct SettingsView: View {
 
     @Environment(AppState.self) private var appState
     @State private var selectedTab: SettingsTab = .general
+    @State private var voicePolishSettingsModeID = ProcessingMode.formalWriting.id
     @State private var isSidebarSettingsPanelOpen = false
     @State private var storageRecoveryNotice: StorageRecoveryNotice?
     @AppStorage(DefaultsKeys.language) private var language = AppLanguage.systemSelection
@@ -59,7 +60,8 @@ struct SettingsView: View {
 
                 SettingsContentArea(
                     selectedTab: selectedTab,
-                    pageInsets: settingsPageInsets
+                    pageInsets: settingsPageInsets,
+                    voicePolishModeID: voicePolishSettingsModeID
                 )
                     .frame(width: contentWidth, height: proxy.size.height, alignment: .topLeading)
                     .offset(x: contentOriginX)
@@ -122,6 +124,11 @@ struct SettingsView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .navigateToTab)) { note in
             if let tab = note.object as? SettingsTab {
+                if tab == .voicePolish,
+                   let modeID = note.userInfo?["voicePolishModeID"] as? UUID,
+                   modeID == ProcessingMode.lightPolishId || modeID == ProcessingMode.formalWriting.id {
+                    voicePolishSettingsModeID = modeID
+                }
                 selectedTab = tab
             }
         }

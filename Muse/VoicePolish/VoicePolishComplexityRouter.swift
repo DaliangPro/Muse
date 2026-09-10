@@ -115,6 +115,10 @@ enum VoicePolishComplexityRouter {
         request: VoicePolishRequest
     ) -> VoicePolishRoute {
         switch request.qualityMode {
+        case .light:
+            return .fast
+        case .standard:
+            return .structured
         case .automatic:
             // 生产模式统一走可校验的纯文本成稿协议。真实 Provider 验收已经证明，
             // 同一批输入在 JSON Plan 协议下会因字段或格式漂移整段回退，尤其会让

@@ -117,9 +117,11 @@ struct WritingContext: Sendable, Equatable, Codable {
 }
 
 enum VoicePolishQualityMode: String, Codable, CaseIterable, Sendable, Equatable {
-    /// 唯一生产模式：根据输入内容自动选择内部处理策略。
+    /// 用户通过输入模式明确选择的两档润色。
+    case light
+    case standard
+    /// 以下值仅保留旧数据与既有管线回归兼容，生产入口按输入模式传递新档位。
     case automatic
-    /// 以下三项仅保留旧数据解码与内部回归测试兼容，不再暴露给用户。
     case fast
     case balanced
     case quality

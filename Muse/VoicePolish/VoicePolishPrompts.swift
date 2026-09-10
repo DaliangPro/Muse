@@ -1,8 +1,8 @@
 import Foundation
 
 enum VoicePolishPrompts {
-    // payload/plan schema 版本。v35 允许有界局部排版修复并复核实际渲染结果；
-    // 用户仍只看到一个“语音润色”模式。
+    // 旧 payload/plan schema 版本。三档新路径使用独立的编辑协议版本，
+    // 此版本保留已冻结的旧管线回归证据。
     static let version = 35
 
     static let common = """

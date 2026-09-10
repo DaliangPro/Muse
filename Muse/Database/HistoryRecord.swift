@@ -12,6 +12,13 @@ struct HistoryRecord: Identifiable, Hashable, Sendable {
     let characterCount: Int?
     let tokenCount: Int?
 
+    /// 只展示写入时的模式名；旧记录没有模式时不推断轻度、标准或直出。
+    var processingModeDisplayName: String? {
+        guard let processingMode,
+              !processingMode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return processingMode
+    }
+
     init(
         id: String,
         createdAt: Date,

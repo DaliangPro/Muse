@@ -105,15 +105,14 @@ struct ModeDetailInner: View, SettingsCardHelpers {
                     .font(TF.settingsFontBodyLarge)
                     .foregroundStyle(TF.settingsAccentAmber)
                     .accessibilityHidden(true)
-                Text(L("语音润色是 Muse 的系统模式", "Voice Polish is a Muse system mode"))
+                Text(mode.name)
                     .font(TF.settingsFontSectionTitle)
                     .foregroundStyle(TF.settingsText)
             }
 
-            Text(L(
-                "这里继续管理快捷键和触发方式。附加润色要求、上下文与表达学习已集中到一级“语音润色”页面，避免出现两个互相冲突的编辑入口。",
-                "Keep managing the shortcut and trigger behavior here. Additional requirements, context, and style learning now live on the top-level Voice Polish page so there is only one editing source."
-            ))
+            Text(mode.voicePolishQualityMode == .light
+                ? L("快速修正口误、错词和必要标点，保留原句顺序。这里管理快捷键；本档的附加要求与文字试跑在“语音润色”页面。", "Quickly fixes slips, word errors, and essential punctuation while preserving sentence order. Manage the shortcut here; this mode's requirements and text trial are on the Voice Polish page.")
+                : L("准确纠错并梳理逻辑、段落和列表，保留原意与个人口吻。这里管理快捷键；本档的附加要求与文字试跑在“语音润色”页面。", "Corrects errors and organizes logic, paragraphs, and lists while preserving intent and personal voice. Manage the shortcut here; this mode's requirements and text trial are on the Voice Polish page."))
             .font(TF.settingsFontBody)
             .foregroundStyle(TF.settingsTextSecondary)
             .lineSpacing(3)
@@ -131,7 +130,11 @@ struct ModeDetailInner: View, SettingsCardHelpers {
 
                 SettingsTextButton(L("前往语音润色设置", "Open Voice Polish Settings"), variant: .primary) {
                     flushPendingSave()
-                    NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.voicePolish)
+                    NotificationCenter.default.post(
+                        name: .navigateToTab,
+                        object: SettingsTab.voicePolish,
+                        userInfo: ["voicePolishModeID": mode.id]
+                    )
                 }
                 .accessibilityHint(L("打开附加润色要求和上下文设置", "Opens requirements and context settings"))
             }

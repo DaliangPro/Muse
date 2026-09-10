@@ -2,12 +2,13 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Voice Polish 的唯一产品级设置入口。
+/// 轻度与标准润色共用的产品设置入口，附加要求和试跑按所选档位分别处理。
 ///
 /// 输入模式页只负责快捷键与触发方式；普通用户只需要表达偏好与个人词汇，
 /// 其余产品策略采用成熟默认，并通过高级设置保留透明度与退出能力。
 struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     var showsIntroduction = true
+    var initialModeID = ProcessingMode.formalWriting.id
 
     @Environment(AppState.self) private var appState
     @AppStorage(DefaultsKeys.voicePolishContextLevel)
@@ -20,6 +21,7 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     private var selectedLLMProviderRaw = LLMProvider.doubao.rawValue
 
     @State private var mode = ProcessingMode.formalWriting
+    @State private var selectedModeID = ProcessingMode.formalWriting.id
     @State private var prompt = ""
     @State private var corrections: [VoicePolishCorrectionRecord] = []
     @State private var sceneOverrides: [String: WritingScene] = [:]
@@ -29,8 +31,8 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
     @State private var terminologyLearningEnabled = VoicePolishSettings.terminologyLearningEnabled()
     @State private var recentInputContextEnabled = VoicePolishSettings.recentInputContextEnabled()
     @State private var contextDiagnostic = VoicePolishContextDiagnostics.latest()
-    @State private var performanceSummary = VoicePolishPerformanceStore.summary()
-    @State private var performanceSampleCount = VoicePolishPerformanceStore.automaticSampleCount()
+    @State private var performanceSummary = VoicePolishPerformanceStore.summary(qualityMode: .standard)
+    @State private var performanceSampleCount = VoicePolishPerformanceStore.automaticSampleCount(qualityMode: .standard)
     @State private var saveTask: Task<Void, Never>?
     @State private var saveStatus = ""
     @State private var errorMessage = ""
@@ -44,6 +46,7 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
             if showsIntroduction {
                 introduction
             }
+            polishModePicker
             promptCard
             automaticCapabilitiesCard
             personalVocabularyCard
@@ -52,6 +55,9 @@ struct VoicePolishSettingsTab: View, SettingsCardHelpers {
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .task { await reload() }
+        .onChange(of: initialModeID) { _, newID in
+            selectMode(newID)
+        }
         .onChange(of: prompt) { _, newValue in
             schedulePromptSave(newValue)
         }
@@ -116,8 +122,8 @@ private extension VoicePolishSettingsTab {
             }
 
             Text(L(
-                "Muse 会自动纠错、清理口误、重建标点并按内容排版；你只需要决定自己想怎么表达。",
-                "Muse automatically corrects terms, removes false starts, rebuilds punctuation, and formats by meaning. You only decide how you want to sound."
+                "轻度润色快速修正小问题，保留原句顺序；标准润色进一步梳理逻辑与结构。直出继续保留识别文字，不调用润色模型。",
+                "Light Polish quickly fixes small issues while preserving sentence order. Standard Polish also organizes logic and structure. Direct Output keeps the transcript without a polishing model call."
             ))
             .font(TF.settingsFontBody)
             .foregroundStyle(TF.settingsTextSecondary)
@@ -125,6 +131,26 @@ private extension VoicePolishSettingsTab {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    var polishModePicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker(L("润色档位", "Polishing mode"), selection: Binding(
+                get: { selectedModeID },
+                set: { selectMode($0) }
+            )) {
+                Text(L("轻度润色", "Light Polish")).tag(ProcessingMode.lightPolishId)
+                Text(L("标准润色", "Standard Polish")).tag(ProcessingMode.formalWriting.id)
+            }
+            .pickerStyle(.segmented)
+            Text(isLightPolish
+                ? L("以速度和准确性为先，只修正口误、错词、口吃和必要标点。", "Prioritizes speed and accuracy: fixes slips, clear word errors, stutters, and essential punctuation.")
+                : L("在准确纠错的基础上整理内容顺序、段落和真实列表关系。", "Corrects errors and organizes content order, paragraphs, and genuine lists."))
+                .font(TF.settingsFontCaption)
+                .foregroundStyle(TF.settingsTextSecondary)
+        }
+    }
+
+    var isLightPolish: Bool { selectedModeID == ProcessingMode.lightPolishId }
 
     var automaticCapabilitiesCard: some View {
         settingsGroupCard(
@@ -143,11 +169,19 @@ private extension VoicePolishSettingsTab {
                     title: L("清理口误和重复", "Remove false starts and repetition"),
                     detail: L("一句话说错后重说，只保留最终有效表达。", "When you restart a sentence, only the final intended version remains.")
                 )
-                capabilityRow(
-                    icon: "list.number",
-                    title: L("重建标点并自动排版", "Rebuild punctuation and format automatically"),
-                    detail: L("长内容自然分段，步骤和并列事项自动整理成列表。", "Long content becomes semantic paragraphs; steps and parallel items become lists.")
-                )
+                if isLightPolish {
+                    capabilityRow(
+                        icon: "textformat",
+                        title: L("局部纠错，保留表达", "Local corrections, same voice"),
+                        detail: L("修正必要标点和断句，保持原句顺序，不自动重写或列提纲。", "Fixes essential punctuation and sentence boundaries without reordering, rewriting, or outlining.")
+                    )
+                } else {
+                    capabilityRow(
+                        icon: "list.number",
+                        title: L("整理结构并自然分段", "Organize structure and paragraphs"),
+                        detail: L("多主题自然分段，真实步骤和并列事项按需要整理为列表。", "Uses paragraphs for distinct topics and lists for genuine steps or parallel items when needed.")
+                    )
+                }
             }
         }
     }
@@ -258,10 +292,9 @@ private extension VoicePolishSettingsTab {
             expandVertically: false
         ) {
             VStack(alignment: .leading, spacing: 10) {
-                Text(L(
-                    "可选。这里的语气、简洁度、分段和列表偏好会进入每次成稿契约；术语纠正和事实保护由 Muse 单独处理。",
-                    "Optional. Tone, brevity, paragraph, and list preferences become part of every writing contract; Muse handles terminology and fact protection separately."
-                ))
+                Text(isLightPolish
+                    ? L("仅用于轻度润色。可补充术语和局部纠错偏好；重写、重排或列提纲要求不改变轻度处理范围。", "Applies only to Light Polish. Add terminology or local correction preferences; rewriting, reordering, and outlining remain outside this mode.")
+                    : L("仅用于标准润色。可补充语气、自然分段和列表偏好；事实与最终意图始终保留。", "Applies only to Standard Polish. Add tone, paragraph, or list preferences while preserving facts and final intent."))
                 .font(TF.settingsFontCaption)
                 .foregroundStyle(TF.settingsTextTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -271,10 +304,9 @@ private extension VoicePolishSettingsTab {
                         .accessibilityLabel(L("附加润色要求", "Additional polishing requirements"))
 
                     if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(L(
-                            "例如：保留我的口语感；按语义自然分段；多个事项自动用 1. 2. 3. 排列。",
-                            "For example: Keep my natural voice, use semantic paragraphs, and format multiple items as 1. 2. 3."
-                        ))
+                        Text(isLightPolish
+                            ? L("例如：保留我的语气词；只修正明确的错词。", "For example: Keep my conversational tone; correct only clear word errors.")
+                            : L("例如：保留我的口语感；按主题自然分段；真实步骤使用编号。", "For example: Keep my natural voice, group topics into paragraphs, and number actual steps."))
                         .font(TF.settingsFontReading)
                         .foregroundStyle(TF.settingsTextTertiary.opacity(0.58))
                         .padding(.leading, 1)
@@ -289,7 +321,7 @@ private extension VoicePolishSettingsTab {
 
                 HStack(spacing: 8) {
                     SettingsTextButton(L("恢复默认", "Restore Default"), controlSize: .compact) {
-                        prompt = ProcessingMode.formalWriting.prompt
+                        prompt = ""
                     }
                     Spacer(minLength: 0)
                     Text(L("输入后自动保存", "Saves automatically"))
@@ -620,14 +652,17 @@ private extension VoicePolishSettingsTab {
     @ViewBuilder
     var performanceStatus: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(L("最近真实表现", "Recent actual performance"))
+            Text(L("本档最近真实表现", "Recent performance for this mode"))
                 .font(TF.settingsFontBodyStrong)
                 .foregroundStyle(TF.settingsText)
 
             if let performanceSummary {
+                Text("P50 \(performanceSummary.p50Milliseconds) ms · P95 \(performanceSummary.p95Milliseconds) ms")
+                    .font(TF.settingsFontMetadata)
+                    .foregroundStyle(TF.settingsTextSecondary)
                 HStack(spacing: 6) {
                     SettingsChip(
-                        L("单次完成 \(percent(performanceSummary.singleCallRate))", "Single-call \(percent(performanceSummary.singleCallRate))"),
+                        L("无修复完成 \(percent(performanceSummary.unrepairedSuccessRate))", "Completed without repair \(percent(performanceSummary.unrepairedSuccessRate))"),
                         controlSize: .compact,
                         font: TF.settingsFontMetadata,
                         foreground: TF.settingsTextSecondary
@@ -647,8 +682,8 @@ private extension VoicePolishSettingsTab {
                 }
 
                 Text(L(
-                    "最近 \(performanceSummary.sampleCount) 次正式语音润色中，单次/修复率按 \(performanceSummary.llmRequestSampleCount) 次实际模型请求计算，回退率按 \(performanceSummary.automaticSampleCount) 次系统自动处理计算（不含主动使用纠正原文）；不包含文字试跑，也不代表目标承诺。",
-                    "Across the latest \(performanceSummary.sampleCount) Voice Polish sessions, single-call/repair rates use \(performanceSummary.llmRequestSampleCount) actual model requests, while fallback uses \(performanceSummary.automaticSampleCount) automatic runs (excluding manual corrected-transcript exits). Text trials are excluded; these are measurements, not promises."
+                    "本档最近 \(performanceSummary.sampleCount) 次会话：无修复完成和回退率按 \(performanceSummary.automaticSampleCount) 次自动处理计算，修复率按 \(performanceSummary.llmRequestSampleCount) 次发生模型调用的会话计算。标准的正常复核不算修复；比率与耗时不包含主动使用原文或文字试跑，耗时为停止说话至文字可用。",
+                    "Across this mode's latest \(performanceSummary.sampleCount) sessions, completion without repair and fallback use \(performanceSummary.automaticSampleCount) automatic runs; repair uses \(performanceSummary.llmRequestSampleCount) sessions with model calls. Standard review is not a repair. Rates and latency exclude manual transcript exits and text trials; latency runs from stopping speech to usable text."
                 ))
                 .font(TF.settingsFontMetadata)
                 .foregroundStyle(TF.settingsTextTertiary)
@@ -826,6 +861,8 @@ private extension VoicePolishSettingsTab {
 
     @MainActor
     func reload() async {
+        selectedModeID = initialModeID == ProcessingMode.lightPolishId
+            ? ProcessingMode.lightPolishId : ProcessingMode.formalWriting.id
         reloadMode()
         modelOverride = VoicePolishSettings.modelOverride() ?? ""
         terminologyLearningEnabled = VoicePolishSettings.terminologyLearningEnabled()
@@ -848,9 +885,21 @@ private extension VoicePolishSettingsTab {
     }
 
     @MainActor
+    func selectMode(_ newID: UUID) {
+        guard newID != selectedModeID,
+              newID == ProcessingMode.lightPolishId || newID == ProcessingMode.formalWriting.id else { return }
+        flushPromptSave()
+        guard errorMessage.isEmpty else { return }
+        selectedModeID = newID
+        reloadMode()
+        reloadPerformanceSummary()
+    }
+
+    @MainActor
     func reloadMode() {
         let loaded = ModeStorage().load()
-        mode = loaded.first(where: { $0.kind == .voicePolish }) ?? .formalWriting
+        mode = loaded.first(where: { $0.id == selectedModeID })
+            ?? (isLightPolish ? .lightPolish : .formalWriting)
         prompt = mode.prompt
     }
 
@@ -879,7 +928,7 @@ private extension VoicePolishSettingsTab {
     @MainActor
     func savePrompt(_ value: String) {
         var modes = ModeStorage().load()
-        guard let index = modes.firstIndex(where: { $0.kind == .voicePolish }) else {
+        guard let index = modes.firstIndex(where: { $0.id == selectedModeID && $0.kind == .voicePolish }) else {
             errorMessage = L("没有找到稳定的语音润色模式。", "The stable Voice Polish mode could not be found.")
             return
         }
@@ -927,8 +976,8 @@ private extension VoicePolishSettingsTab {
 
     @MainActor
     func reloadPerformanceSummary() {
-        performanceSampleCount = VoicePolishPerformanceStore.automaticSampleCount()
-        performanceSummary = VoicePolishPerformanceStore.summary()
+        performanceSampleCount = VoicePolishPerformanceStore.automaticSampleCount(qualityMode: mode.voicePolishQualityMode)
+        performanceSummary = VoicePolishPerformanceStore.summary(qualityMode: mode.voicePolishQualityMode)
     }
 
     @MainActor

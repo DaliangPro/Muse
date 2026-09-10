@@ -166,7 +166,11 @@ private extension ModesSettingsTab {
                         minWidth: 94,
                         onCanvas: true
                     ) {
-                        NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.voicePolish)
+                        NotificationCenter.default.post(
+                            name: .navigateToTab,
+                            object: SettingsTab.voicePolish,
+                            userInfo: ["voicePolishModeID": mode.id]
+                        )
                     }
                     .help(L("打开一级语音润色设置", "Open the top-level Voice Polish settings"))
                 }

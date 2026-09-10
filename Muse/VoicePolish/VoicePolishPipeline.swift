@@ -216,6 +216,15 @@ struct VoicePolishPipeline: Sendable {
         _ request: VoicePolishRequest,
         startedAt suppliedStart: ContinuousClock.Instant? = nil
     ) async -> VoicePolishResult {
+        if request.qualityMode == .light || request.qualityMode == .standard {
+            return await VoicePolishEditingPipeline(
+                client: client,
+                config: config,
+                totalTimeout: usesAdaptiveTotalTimeout ? nil : totalTimeout,
+                stageTimeout: usesAdaptiveFirstRequestTimeout ? nil : firstRequestTimeout,
+                onStage: onStage
+            ).process(request)
+        }
         let startedAt = suppliedStart ?? ContinuousClock.now
         let sourceFactSegments = request.context.scene == .code
             ? request.input.segments

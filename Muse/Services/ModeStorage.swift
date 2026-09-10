@@ -51,7 +51,7 @@ struct ModeStorage {
             if mode.id == ProcessingMode.translateId {
                 return migrateDefaultMode(mode, fallback: .translate)
             }
-            if mode.id == ProcessingMode.formalWriting.id {
+            if mode.id == ProcessingMode.formalWriting.id || mode.id == ProcessingMode.lightPolishId {
                 var migrated = migrateSeededDefaultPrompt(
                     mode,
                     legacyPrompts: [
@@ -87,7 +87,17 @@ struct ModeStorage {
 
         // Ensure required built-in modes always exist.
         let resultIds = Set(result.map(\.id))
-        for builtin in ProcessingMode.builtins where !resultIds.contains(builtin.id) {
+        for template in ProcessingMode.builtins where !resultIds.contains(template.id) {
+            var builtin = template
+            if builtin.id == ProcessingMode.lightPolishId,
+               let code = builtin.hotkeyCode,
+               result.contains(where: {
+                   $0.hotkeyCode == code && ($0.hotkeyModifiers ?? 0) == (builtin.hotkeyModifiers ?? 0)
+               }) {
+                // 升级只补全新入口；已有绑定保持不变，用户可随后给轻度配置快捷键。
+                builtin.hotkeyCode = nil
+                builtin.hotkeyModifiers = nil
+            }
             if let idx = ProcessingMode.builtins.firstIndex(where: { $0.id == builtin.id }) {
                 let insertAt = min(idx, result.count)
                 result.insert(builtin, at: insertAt)
@@ -141,7 +151,8 @@ struct ModeStorage {
     private static let knownDefaultNames: [UUID: Set<String>] = [
         ProcessingMode.direct.id: ["直出模式", "Direct Output"],
         ProcessingMode.smartDirect.id: ["智能模式", "Smart Mode"],
-        ProcessingMode.formalWriting.id: ["语音润色", "Voice Polish"],
+        ProcessingMode.formalWriting.id: ["语音润色", "Voice Polish", "标准润色", "Standard Polish"],
+        ProcessingMode.lightPolishId: ["轻度润色", "Light Polish"],
         ProcessingMode.promptOptimize.id: ["Prompt优化", "Promp优化", "Prompt Optimizer"],
         ProcessingMode.translate.id: ["英文翻译", "Translation"],
         ProcessingMode.commandMode.id: ["命令模式", "Command Mode"],
@@ -149,7 +160,8 @@ struct ModeStorage {
 
     /// 各默认模式的「已知默认处理标签」集合：同名称逻辑，自定义标签保留
     private static let knownDefaultLabels: [UUID: Set<String>] = [
-        ProcessingMode.formalWriting.id: ["润色中", "Polishing"],
+        ProcessingMode.formalWriting.id: ["润色中", "Polishing", "标准润色中", "Standard polishing"],
+        ProcessingMode.lightPolishId: ["轻度润色中", "Light polishing"],
         ProcessingMode.promptOptimize.id: ["优化中", "Optimizing"],
         ProcessingMode.translate.id: ["翻译中", "Translating"],
         ProcessingMode.commandMode.id: ["执行中", "Executing"],

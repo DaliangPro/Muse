@@ -2,6 +2,50 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishPerformanceStoreTests: XCTestCase {
+    func testModeSummariesDoNotMixLegacyLightAndStandardMeasurements() throws {
+        let suiteName = "VoicePolishModePerformanceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        VoicePolishPerformanceStore.record(
+            result: result(route: .fast, attempts: 1), latencyMilliseconds: 50, defaults: defaults
+        )
+        for latency in [100, 200] {
+            VoicePolishPerformanceStore.record(
+                result: result(route: .fast, attempts: 1), latencyMilliseconds: latency,
+                qualityMode: .light, defaults: defaults
+            )
+        }
+        VoicePolishPerformanceStore.record(
+            result: result(route: .fast, attempts: 2), latencyMilliseconds: 900,
+            qualityMode: .standard, defaults: defaults
+        )
+        let light = try XCTUnwrap(VoicePolishPerformanceStore.summary(
+            minimumSampleCount: 1, qualityMode: .light, defaults: defaults
+        ))
+        let standard = try XCTUnwrap(VoicePolishPerformanceStore.summary(
+            minimumSampleCount: 1, qualityMode: .standard, defaults: defaults
+        ))
+        XCTAssertEqual(light.sampleCount, 2)
+        XCTAssertEqual(light.p50Milliseconds, 100)
+        XCTAssertEqual(light.p95Milliseconds, 200)
+        XCTAssertEqual(standard.sampleCount, 1)
+        XCTAssertEqual(standard.p50Milliseconds, 900)
+        XCTAssertEqual(standard.repairRate, 0)
+        XCTAssertEqual(standard.unrepairedSuccessRate, 1)
+        XCTAssertEqual(light.unrepairedSuccessRate, 1)
+        XCTAssertEqual(VoicePolishPerformanceStore.automaticSampleCount(qualityMode: .light, defaults: defaults), 2)
+        XCTAssertNil(VoicePolishPerformanceStore.samples(defaults: defaults).first?.qualityMode)
+    }
+
+    func testOldPerformanceJSONRemainsReadableWithoutInventingAMode() throws {
+        let sample = try JSONDecoder().decode(VoicePolishPerformanceSample.self, from: Data(
+            #"{"recordedAt":0,"route":"fast","latencyMilliseconds":123,"llmAttemptCount":1,"usedRepair":false,"usedFallback":false}"#.utf8
+        ))
+        XCTAssertEqual(sample.latencyMilliseconds, 123)
+        XCTAssertEqual(sample.resolvedOutcome, .success)
+        XCTAssertNil(sample.qualityMode)
+    }
+
     func testSummaryUsesEndToEndLatencyAndSeparatesDeepBaseCallsFromRepair() throws {
         let suiteName = "VoicePolishPerformanceStoreTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -106,6 +150,7 @@ final class VoicePolishPerformanceStoreTests: XCTestCase {
         XCTAssertEqual(summary.automaticSampleCount, 2)
         XCTAssertEqual(try XCTUnwrap(summary.singleCallRate), 1)
         XCTAssertEqual(summary.fallbackRate, 1)
+        XCTAssertEqual(summary.unrepairedSuccessRate, 0)
         XCTAssertTrue(summary.routes.allSatisfy { $0.route != .structured })
     }
 

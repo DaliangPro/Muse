@@ -8,9 +8,11 @@
 
 2026-09-10 确认：语音输入提供 **直出、轻度润色、标准润色** 三档。直出沿用现有不润色行为；轻度润色兼顾速度与准确性，快速修正口误、错词等小问题；标准润色在纠错和保留原意的基础上整理内容结构。
 
-这是当前版本的终极开发与验收目标，三档实现和分模式验收尚待完成。完整边界、测试范围与验收要求见[三档模式产品需求](docs/2026-08-17-Muse-Voice-Polish-Product-Requirements.md)。
+这是当前版本的终极开发与验收目标。候选代码已接入三档入口及处理链路，正在完成工程回归与独立代码审查，并冻结真实跑测候选。本轮尚未调用真实模型，也未部署，真实成稿质量、速度和安装版体验仍待独立验收。完整边界、测试范围与验收要求见[三档模式产品需求](docs/2026-08-17-Muse-Voice-Polish-Product-Requirements.md)，当前候选路线见[架构方案](docs/2026-08-17-Muse-Voice-Polish-Architecture-Reset.md)。
 
 ## 产品展示
+
+以下为既有界面截图；三档候选界面尚待运行核验。
 
 <p align="center">
   <img src="docs/images/muse-onboarding.png" width="860" alt="Muse 使用引导首页">
@@ -66,7 +68,7 @@
 | 阿里云百炼 Fun-ASR / Paraformer | 是 | 可切换云端多语种流式模型；双模型自动同步本地热词（权重 5） | API Key；Workspace ID 可选 |
 | SenseVoice + Qwen3-ASR | 否 | Apple Silicon 本地离线识别 | 下载本地模型 |
 
-文本处理支持云端 LLM、Ollama 和 Muse 本地模型，可按不同输入模式分别配置。
+文本处理支持云端 LLM、Ollama 和 Muse 本地模型。当前三档候选中，轻度与标准共用已选择的文本处理 Provider 和模型；可共用同 Provider 下的语音润色专用模型名称设置。直出不调用润色模型，管线不暗中切换模型。
 
 ## 系统要求
 

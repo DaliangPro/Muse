@@ -2,6 +2,24 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishHistoryPresentationTests: XCTestCase {
+    func testHistoryShowsRecordedModeNamesWithoutGuessingLegacyModes() {
+        for name in [ProcessingMode.direct.name, ProcessingMode.lightPolish.name,
+                     ProcessingMode.formalWriting.name, "语音润色", "我的自定义工作表达"] {
+            let record = historyRecord(mode: name)
+            XCTAssertEqual(record.processingModeDisplayName, name)
+        }
+        XCTAssertNil(historyRecord(mode: nil).processingModeDisplayName)
+        XCTAssertNil(historyRecord(mode: " ").processingModeDisplayName)
+    }
+
+    private func historyRecord(mode: String?) -> HistoryRecord {
+        HistoryRecord(
+            id: "mode-label", createdAt: Date(), durationSeconds: 1,
+            rawText: "原文", processingMode: mode, processedText: nil,
+            finalText: "原文", status: "completed", characterCount: 2
+        )
+    }
+
     func testKnownStatusesHaveDistinctVisibleAndAccessibleMeanings() throws {
         let cases: [(String, VoicePolishHistoryPresentation.Kind, VoicePolishHistoryPresentation.Tone, String)] = [
             ("voice_polish_success", .success, .success, "润色完成"),

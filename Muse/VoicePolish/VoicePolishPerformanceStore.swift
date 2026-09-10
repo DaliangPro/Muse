@@ -44,6 +44,8 @@ struct VoicePolishPerformanceSample: Codable, Sendable, Equatable {
     let usedFallback: Bool
     /// optional 用于兼容已经写入的 v1 样本；nil 时由 usedFallback 推断。
     let outcome: VoicePolishPerformanceOutcome?
+    /// 旧记录没有产品档位，保持 nil，不根据历史路由猜测轻度或标准。
+    var qualityMode: VoicePolishQualityMode? = nil
 
     var resolvedOutcome: VoicePolishPerformanceOutcome {
         outcome ?? (usedFallback ? .fallback : .success)
@@ -66,10 +68,14 @@ struct VoicePolishPerformanceSummary: Sendable, Equatable {
     let automaticSampleCount: Int
     /// 尚无实际模型请求时为 nil，避免把 0/0 错写成 0%。
     let singleCallRate: Double?
+    /// 未追加修复且成功成稿的自动会话占比；标准的正常生成加复核计为无需修复。
+    let unrepairedSuccessRate: Double
     /// 尚无实际模型请求时为 nil，避免把 0/0 错写成 0%。
     let repairRate: Double?
     let fallbackRate: Double
     let routes: [VoicePolishRoutePerformanceSummary]
+    let p50Milliseconds: Int
+    let p95Milliseconds: Int
 }
 
 /// 仅保存最近的工程指标，不保存识别或润色正文。
@@ -89,12 +95,14 @@ enum VoicePolishPerformanceStore {
     static func record(
         result: VoicePolishResult,
         latencyMilliseconds: Int,
+        qualityMode: VoicePolishQualityMode? = nil,
         recordedAt: Date = Date(),
         defaults: UserDefaults = .standard
     ) {
         record(
             measurement: VoicePolishPerformanceMeasurement(result: result),
             latencyMilliseconds: latencyMilliseconds,
+            qualityMode: qualityMode,
             recordedAt: recordedAt,
             defaults: defaults
         )
@@ -103,10 +111,12 @@ enum VoicePolishPerformanceStore {
     static func record(
         measurement: VoicePolishPerformanceMeasurement,
         latencyMilliseconds: Int,
+        qualityMode: VoicePolishQualityMode? = nil,
         recordedAt: Date = Date(),
         defaults: UserDefaults = .standard
     ) {
-        let baseAttemptCount = measurement.route == .deep ? 2 : 1
+        // 标准润色的生成与独立复核都是正常流程，不把第二次调用误报成修复。
+        let baseAttemptCount = qualityMode == .standard || measurement.route == .deep ? 2 : 1
         let sample = VoicePolishPerformanceSample(
             recordedAt: recordedAt,
             route: measurement.route,
@@ -116,7 +126,8 @@ enum VoicePolishPerformanceStore {
                 && measurement.llmAttemptCount > baseAttemptCount,
             usedFallback: measurement.outcome == .fallback
                 || measurement.outcome == .setupFailure,
-            outcome: measurement.outcome
+            outcome: measurement.outcome,
+            qualityMode: qualityMode
         )
         let storage = SendableDefaults(value: defaults)
         lock.withLock { _ in
@@ -141,15 +152,21 @@ enum VoicePolishPerformanceStore {
         return lock.withLock { _ in loadUnlocked(defaults: storage.value) }
     }
 
-    static func automaticSampleCount(defaults: UserDefaults = .standard) -> Int {
-        samples(defaults: defaults).filter { $0.resolvedOutcome != .canonicalExit }.count
+    static func automaticSampleCount(
+        qualityMode: VoicePolishQualityMode? = nil,
+        defaults: UserDefaults = .standard
+    ) -> Int {
+        samples(defaults: defaults).filter {
+            $0.resolvedOutcome != .canonicalExit && (qualityMode == nil || $0.qualityMode == qualityMode)
+        }.count
     }
 
     static func summary(
         minimumSampleCount: Int = minimumVisibleSampleCount,
+        qualityMode: VoicePolishQualityMode? = nil,
         defaults: UserDefaults = .standard
     ) -> VoicePolishPerformanceSummary? {
-        let values = samples(defaults: defaults)
+        let values = samples(defaults: defaults).filter { qualityMode == nil || $0.qualityMode == qualityMode }
         let automaticValues = values.filter { $0.resolvedOutcome != .canonicalExit }
         guard automaticValues.count >= max(1, minimumSampleCount) else { return nil }
         let llmRequestValues = automaticValues.filter { $0.llmAttemptCount > 0 }
@@ -173,6 +190,10 @@ enum VoicePolishPerformanceStore {
                 numerator: llmRequestValues.filter { $0.llmAttemptCount == 1 }.count,
                 denominator: llmRequestValues.count
             ),
+            unrepairedSuccessRate: rate(
+                numerator: automaticValues.filter { $0.resolvedOutcome == .success && !$0.usedRepair }.count,
+                denominator: automaticValues.count
+            ) ?? 0,
             repairRate: rate(
                 numerator: llmRequestValues.filter(\.usedRepair).count,
                 denominator: llmRequestValues.count
@@ -183,7 +204,9 @@ enum VoicePolishPerformanceStore {
                 }.count,
                 denominator: automaticValues.count
             ) ?? 0,
-            routes: routeSummaries
+            routes: routeSummaries,
+            p50Milliseconds: percentile(0.50, values: automaticValues.map(\.latencyMilliseconds).sorted()),
+            p95Milliseconds: percentile(0.95, values: automaticValues.map(\.latencyMilliseconds).sorted())
         )
     }
 
