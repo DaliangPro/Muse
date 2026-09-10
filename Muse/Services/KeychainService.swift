@@ -328,6 +328,27 @@ enum KeychainService {
         "tf_llm_\(provider.rawValue)"
     }
 
+    /// 专用 CLI 授权入口的一次读取。由系统征求当前制品的访问许可；不修改
+    /// ACL、不回退到文件、不返回凭据。常规录音及质量跑测不调用此方法。
+    static func authorizeLLMCredentialAccess(for provider: LLMProvider) -> OSStatus {
+        guard provider != .localQwen else { return errSecParam }
+        if isRunningTests {
+            return withIsolatedTestStorage {
+                $0.secureData[llmStorageKey(for: provider)] == nil ? errSecItemNotFound : errSecSuccess
+            }
+        }
+        let interactionStatus = SecKeychainSetUserInteractionAllowed(true)
+        guard interactionStatus == errSecSuccess else { return interactionStatus }
+        defer { SecKeychainSetUserInteractionAllowed(false) }
+
+        var query = keychainQuery(for: llmStorageKey(for: provider))
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var data: CFTypeRef?
+        // 仅在进程内接收并丢弃结果；系统确认可能持久记录本制品的访问许可。
+        return SecItemCopyMatching(query as CFDictionary, &data)
+    }
+
     private static func sanitizeLLMCredentials(_ values: [String: String]) -> [String: String] {
         var sanitized = values
         for key in ["apiKey", "model", "baseURL"] {

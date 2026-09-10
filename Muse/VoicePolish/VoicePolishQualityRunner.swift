@@ -289,6 +289,9 @@ enum VoicePolishQualityRunner {
 
     @MainActor
     static func startIfRequested(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
+        if VoicePolishQualityAuthorization.startIfRequested(arguments: arguments) {
+            return true
+        }
         let invocation: Invocation
         do {
             guard let parsed = try parseInvocation(arguments: arguments) else { return false }
@@ -309,10 +312,14 @@ enum VoicePolishQualityRunner {
 
     static func isRequested(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
         arguments.contains("--voice-polish-quality-run")
+            || arguments.contains(VoicePolishQualityAuthorization.argument)
     }
 
     static func parseInvocation(arguments: [String]) throws -> Invocation? {
-        guard isRequested(arguments: arguments) else { return nil }
+        guard arguments.contains("--voice-polish-quality-run") else { return nil }
+        guard !arguments.contains(VoicePolishQualityAuthorization.argument) else {
+            throw VoicePolishQualityAuthorization.InvocationError.mixedOperations
+        }
 
         func value(after flag: String) -> String? {
             guard let index = arguments.firstIndex(of: flag), arguments.indices.contains(index + 1) else {
