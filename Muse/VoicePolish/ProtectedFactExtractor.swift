@@ -463,7 +463,7 @@ enum ProtectedFactExtractor {
         if numberText == "一", prefix.hasSuffix("任") || prefix.hasSuffix("任何") { return false }
         let units = [
             "个月", "月", "天", "年", "周", "小时", "分钟", "秒", "个工作日", "工作日",
-            "条", "项", "款", "位", "人", "个人", "个产品", "个渠道", "个问题", "个建议", "个版本",
+            "条", "项", "款", "位", "名", "人", "个人", "个产品", "个渠道", "个问题", "个建议", "个版本",
             "个任务", "次", "遍", "轮",
         ]
         if ["次", "遍", "轮"].contains(where: unitText.hasPrefix) {

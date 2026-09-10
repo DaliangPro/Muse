@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 
 enum VoicePolishLedgerIntegrityError: Error, Equatable, CustomStringConvertible {
     case invalidLedger
@@ -396,14 +397,8 @@ enum VoicePolishLedgerIntegrityValidator {
                    let oldValues = Set(oldScan.occurrences.map(\.value) + Array(oldScan.bareValueCounts.keys))
                    let oldCount: Int
                    if let declared = declaredCountValue(correction.oldValue) {
-                       let pattern = #"[零〇一二两双三四五六七八九十百千万亿\d]+\s*"#
-                           + NSRegularExpression.escapedPattern(for: declared.classifier)
-                       let regex = try? NSRegularExpression(pattern: pattern)
-                       oldCount = regex?.matches(in: evidence, range: NSRange(evidence.startIndex..<evidence.endIndex, in: evidence))
-                           .filter { match in
-                               guard let range = Range(match.range, in: evidence) else { return false }
-                               return declaredCountValue(String(evidence[range]))?.value == declared.value
-                           }.count ?? 0
+                       oldCount = declaredCountRanges(value: declared.value,
+                           classifier: declared.classifier, in: evidence).count
                    } else if oldValues.count == 1, let value = oldValues.first {
                        let sourceScan = measurementScan(in: evidence)
                        oldCount = sourceScan.occurrences.filter { $0.value == value }.count
@@ -615,11 +610,19 @@ enum VoicePolishLedgerIntegrityValidator {
         let source = spans.map(\.text).joined()
         let requiredAudience = requiredAudienceTokens(in: source)
         let plannedAudience = Set(ledger.audience.flatMap(\.surfaceTokens))
-        guard requiredAudience.isSubset(of: plannedAudience) else {
-            let missing = requiredAudience.subtracting(plannedAudience).sorted().joined(separator: ",")
-            throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                "required_audience_missing:\(missing)"
-            )
+        let unclassifiedAudience = requiredAudience.subtracting(plannedAudience)
+        if !unclassifiedAudience.isEmpty {
+            // “告诉他”可能是正文里的第三方动作，词面不能证明他也是收件人。
+            // 保留为必答的来源语义问题，不能强制补收件人，也不能直接忽略。
+            let relevantSpans = audienceEvidenceSpans(for: unclassifiedAudience, spans: spans)
+            let sourceIDs = Set(relevantSpans.map(\.id))
+            ledger.pendingSemanticChecks?.append(VoicePolishSemanticCheck(
+                id: "audience_context", kind: "audience_relation",
+                claim: "核对来源中“\(unclassifiedAudience.sorted().joined(separator: "、"))”在当前任务中是成稿收件人还是正文所述第三方。成稿须正确保留受众和转述关系；不能把每个‘告诉他’都当作写给他的要求。",
+                unitIds: ledger.units.filter { !Set($0.sourceSpanIds).isDisjoint(with: sourceIDs) }.map(\.id),
+                sourceSpanIds: relevantSpans.map(\.id),
+                requiredEvidence: relevantSpans.map { .init(spanId: $0.id, text: $0.text) }
+            ))
         }
         ledger.contextMappings = verifiedMappings.filter { mapping in
             ledger.units.contains { unit in
@@ -636,7 +639,7 @@ enum VoicePolishLedgerIntegrityValidator {
             let sourceIDs = Set(correction.oldSpanIds + correction.finalSpanIds)
             ledger.pendingSemanticChecks?.append(VoicePolishSemanticCheck(
                 id: "correction_\(index + 1)", kind: "correction_relation",
-                claim: "待核对的改口：主体=\(correction.subject)，旧值=\(correction.oldValue)，最终值=\(correction.finalValue)，呈现策略=\(correction.renderingPolicy)。这些是待验证假设。确认确属同一事项，保留其他事项同值、仍有效原因和公开更正所需旧值。",
+                claim: "待核对的改口：主体=\(correction.subject)，旧值=\(correction.oldValue)，最终值=\(correction.finalValue)，呈现策略=\(correction.renderingPolicy)。这些均是待验证假设。按来源判断普通口误还是公开更正：普通口误只留最终值；原文明示已公布或按旧值执行时保留有用旧值。两种情况都须保留仍有效的原因、身份和其他事项。",
                 unitIds: ledger.units.filter {
                     !Set($0.sourceSpanIds).isDisjoint(with: sourceIDs)
                 }.map(\.id),
@@ -681,7 +684,8 @@ enum VoicePolishLedgerIntegrityValidator {
     static func validateSemanticReview(
         _ review: VoicePolishReviewerResult,
         ledger: VoicePolishIntentLedger,
-        spans: [VoicePolishEvidenceSpan]
+        spans: [VoicePolishEvidenceSpan],
+        allowRepairFindings: Bool = false
     ) throws {
         let pending = ledger.pendingSemanticChecks ?? []
         let answers = review.semanticChecks ?? []
@@ -691,9 +695,13 @@ enum VoicePolishLedgerIntegrityValidator {
             throw VoicePolishLedgerIntegrityError.invalidLedgerReason("semantic_checks_incomplete")
         }
         let spanByID = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
+        let unitIDs = Set(ledger.units.map(\.id))
         for check in pending {
-            guard let answer = answers.first(where: { $0.checkId == check.id }),
-                  answer.verdict == "supported",
+            guard !check.sourceSpanIds.isEmpty,
+                  !check.unitIds.isEmpty,
+                  Set(check.unitIds).isSubset(of: unitIDs),
+                  let answer = answers.first(where: { $0.checkId == check.id }),
+                  !answer.evidence.isEmpty,
                   Set(answer.evidence.map(\.spanId)) == Set(check.sourceSpanIds),
                   (check.requiredEvidence ?? []).allSatisfy({ required in
                       answer.evidence.contains { $0.spanId == required.spanId && $0.text.contains(required.text) }
@@ -703,6 +711,21 @@ enum VoicePolishLedgerIntegrityValidator {
                       return quote.text.rangeOfCharacter(from: .alphanumerics) != nil
                           && span.text.contains(quote.text)
                   }) else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "semantic_decision_unverified:\(check.id)"
+                )
+            }
+            // 有证据的“不支持”是修稿输入。它不能作为成功结论，但也不应在
+            // 进入局部修复前就抛错。修复后的成稿仍须通过新一轮完整确认。
+            let hasLinkedRepair = review.issues.contains { issue in
+                issue.severity == "major" && issue.type != "style_shift"
+                    && !issue.repairInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !Set(issue.unitIds).isDisjoint(with: check.unitIds)
+                    && !Set(issue.sourceSpanIds).isDisjoint(with: check.sourceSpanIds)
+            }
+            guard answer.verdict == "supported"
+                    || (allowRepairFindings && review.verdict == "repair"
+                        && answer.verdict == "unsupported" && hasLinkedRepair) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                     "semantic_decision_unverified:\(check.id)"
                 )
@@ -1650,13 +1673,24 @@ enum VoicePolishLedgerIntegrityValidator {
     }
 
     private static func containsDeclaredCountToken(_ token: String, in text: String) -> Bool {
-        let escaped = NSRegularExpression.escapedPattern(for: token)
+        guard let count = declaredCountValue(token) else { return false }
+        return !declaredCountRanges(value: count.value, classifier: count.classifier, in: text).isEmpty
+    }
+
+    /// 总数“三步”与序数“第三步”有确定的字符边界；中英文数字等值处理。
+    private static func declaredCountRanges(value: String, classifier: String, in text: String) -> [NSRange] {
         let numeral = #"零〇一二两双三四五六七八九十百千万亿\d"#
         guard let regex = try? NSRegularExpression(
-            pattern: "(?<![\(numeral)])\(escaped)(?![\(numeral)])"
-        ) else { return false }
+            pattern: "(?<![第\(numeral)])[\(numeral)]+\\s*"
+                + NSRegularExpression.escapedPattern(for: classifier) + "(?![\(numeral)])"
+        ) else { return [] }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return regex.firstMatch(in: text, range: range) != nil
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let swiftRange = Range(match.range, in: text),
+                  text[..<swiftRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).last != "第",
+                  declaredCountValue(String(text[swiftRange]))?.value == value else { return nil }
+            return match.range
+        }
     }
 
     /// Planner 可以省略可机械恢复的 audience.surface_tokens，或把明确的
@@ -1805,15 +1839,30 @@ enum VoicePolishLedgerIntegrityValidator {
     /// 同时拒绝把相同数值的工期与预算等关系互换；日期范围会先排除，避免把
     /// `2026-08-28` 与 `2026年8月28日` 的安全格式化误判为工期变化。
     private static func measurementScan(in text: String) -> MeasurementScan {
-        let pattern = #"(?:([$¥￥]|美元|人民币)\s*)?([-+]?\d[\d,]*(?:\.\d+)?|[负零〇一二两双三四五六七八九十百千万亿点]+)\s*(万|亿)?\s*(年|个月|月|周|天|日|小时|分钟|秒|美元|人民币|元|块)?"#
+        let pattern = #"(?:([$¥￥]|美元|人民币)\s*)?([-+]?\d[\d,]*(?:\.\d+)?|[负零〇一二两双三四五六七八九十百千万亿点]+)\s*(万|亿)?\s*(年|个月|月|周|天|日|小时|分钟|秒|美元|人民币|元|块|个人|人|位|名)?"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return MeasurementScan(occurrences: [], bareValueCounts: [:])
         }
         let dateRanges = measurementDateRanges(in: text)
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, range: fullRange)
+        let personUnits: Set<String> = ["个人", "人", "位", "名"]
+        var wordEnds: Set<String.Index> = []
+        if matches.contains(where: { match in
+            Range(match.range(at: 4), in: text).map { personUnits.contains(String(text[$0])) } == true
+        }) {
+            // 数量单位不得截进后面的整词。使用项目已有的系统分词能力，
+            // 区分“两个｜人”与“一个｜人工智能”，不维护业务词语特判表。
+            let tokenizer = NLTokenizer(unit: .word)
+            tokenizer.string = text
+            tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+                wordEnds.insert(range.upperBound)
+                return true
+            }
+        }
         var occurrences: [MeasurementOccurrence] = []
         var bareValueCounts: [String: Int] = [:]
-        for match in regex.matches(in: text, range: fullRange) {
+        for match in matches {
             guard !dateRanges.contains(where: {
                 NSIntersectionRange($0, match.range).length > 0
             }),
@@ -1855,6 +1904,15 @@ enum VoicePolishLedgerIntegrityValidator {
                 case "秒": return "duration_second"
                 case "美元": return "currency_usd"
                 case "人民币", "元", "块": return "currency_cny"
+                case "个人", "人", "位", "名":
+                    // “第一名 / 第一位”描述名次或顺序，不是人数；允许
+                    // “冠军 / 首位”等等义表达，关系仍交由冷复核确认。
+                    let beforeNumber = text[..<numberRange.lowerBound]
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard beforeNumber.last != "第",
+                          let wholeRange = Range(match.range, in: text),
+                          wordEnds.contains(wholeRange.upperBound) else { return nil }
+                    return "count_person"
                 default: return nil
                 }
             }()
@@ -2557,6 +2615,9 @@ enum VoicePolishLedgerIntegrityValidator {
     }
 
     private static func preservesToken(_ token: String, in output: String) -> Bool {
+        if declaredCountValue(token) != nil {
+            return containsDeclaredCountToken(token, in: output)
+        }
         if let clock = ProtectedFactExtractor.canonicalValue(for: token, kind: .time) {
             // “十点”是“十点半”的子串，但二者不是同一个时间事实。
             return protectedFactCandidates(in: output).contains {
@@ -2613,6 +2674,27 @@ enum VoicePolishLedgerIntegrityValidator {
             }
             return nil
         })
+    }
+
+    /// 先在完整来源定位受众措辞，再按 UTF-16 区间映射全部相交片段。
+    /// ASR 可以在词中分段，不能要求每个片段独立包含完整“跟客户说”。
+    private static func audienceEvidenceSpans(
+        for tokens: Set<String>, spans: [VoicePolishEvidenceSpan]
+    ) -> [VoicePolishEvidenceSpan] {
+        let source = spans.map(\.text).joined()
+        let range = NSRange(source.startIndex..<source.endIndex, in: source)
+        let matches = explicitAudiencePattern.matches(in: source, range: range).filter { match in
+            (1..<match.numberOfRanges).contains { index in
+                guard let tokenRange = Range(match.range(at: index), in: source) else { return false }
+                return tokens.contains(String(source[tokenRange]))
+            }
+        }
+        var offset = 0
+        return spans.filter { span in
+            let spanRange = NSRange(location: offset, length: span.text.utf16.count)
+            offset += spanRange.length
+            return matches.contains { NSIntersectionRange($0.range, spanRange).length > 0 }
+        }
     }
 
     private static func isGroupAudience(_ audience: String) -> Bool {

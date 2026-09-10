@@ -31,6 +31,7 @@ enum VoicePolishLedgerPrompts {
     - corrections 只描述来源中同一对象关系的“旧值 → 最终值”。subject 必须复制来源里直接绑定该对象的最短原词，不能自造上位词或把两条不同约束凑成改口。“不要承诺/不能保证/不要假设/禁止”是 modality，不是 correction；不得把“不承诺周五对外发布”和“周五仅内部试看”伪造成发布状态改口。
     - 私下口误用 final_only；对已经发出的公告作更正、说明旧安排变化或按旧价退款时用 announce_change，正文必须保留有用的旧值、新值和相应处理，不能把已付款的旧价也改成新价。
     - 改口只撤销发生变化的值；旧句中仍成立的原因、准备状态、负责人和限制不随旧日期一起删除。替换截止日期时，“材料还没备齐”这样的当前状态仍须单独保留。
+    - 同一来源里的最终数量与解释是分别需要保留的信息。人数调整时，“其中有人只是临时协助”的身份与原因不能随旧总数一起删除；只留下最终人数不算完整。合并同一事项时逐项核对数量、身份、原因和条件，不用“按后面的解释”代替解释本身。
     - “不要承诺/不能保证”必须使用 modality=not_promised，不能写成 confirmed 的“不会发生”。已经作出的承诺才用 promised。
     - advice 必须用 recommended，不能升级成确定因果或结果保证。
     - style_directive/editor_directive 只执行不照抄；明确不允许告诉当前收件人的内部内容使用 excluded_content。
@@ -49,6 +50,7 @@ enum VoicePolishLedgerPrompts {
 
     重新阅读 SOURCE_SPANS、REQUIRED_LOGIC_CUES、VERIFIED_ENTITY_MAPPINGS 和 VALIDATION_ERROR，针对错误原因修正。若错误是 source_spans_without_unit，逐个核对错误码列出的 span；即使该 span 已被 conditional 引用，也必须另建一个 Writer 可消费的 recipient_content unit，不得把 conditional 当作正文 unit；若错误是 unit_identity_enum_or_source_span_invalid，按错误码逐项把 kind、delivery_role、status、modality 改回 schema 已列出的枚举，并只引用 SOURCE_SPANS_JSON 中真实存在的 id；若错误是 audience_invalid，显式收件人的 text、surface_tokens 必须逐字来自所引 source span，“给/跟 X 说、给 X 发、告诉 X”使用 direct_address；若错误是 declared_count_structure_invalid，把旧总数与补充过程标为 editor_directive/remove，实际最终步骤各建 action unit，用 numbered_unit_ids 精确列出最终数量，完成后的非步骤动作留在 mixed 结构但不得加入编号；若错误是 unit_contains_unbacked_exact_token，移除普通日期/数字的逐字格式要求，技术路径或命令只保留程序可验证的完整 canonical；若错误是 unit_contains_unbacked_fact 或 ledger_measurement_coverage_invalid，保留每个仍有效的来源事实及其对象关系，但删除擅自补入的单位、币种、人物或数值。若错误是 correction_subject_not_bound_to_old_value 或 correction_subject_not_bound_to_final_value，逐条重查该 correction：只有旧值和最终值确实属于同一来源对象时才保留，并把 subject 改为来源中直接绑定两值的最短原词；“不要承诺/不能保证/不要假设/禁止”不是改口，必须删除对应伪 correction，改用 not_promised/prohibited unit；不得用上位词或另一条相邻约束补对象。确保每个 source span 都由至少一个 unit 处置，全部 recipient_content 恰好进入 ordered_unit_ids；source span 达到 3 个时，每个 unit 最多引用 2 个 source span；recipient_content 的 surface_tokens 必须为空，其他 role 必须填写逐字来自证据的 surface_tokens，excluded_content 的 token 还必须覆盖被排除内容本身而非只覆盖旁边指令；每个 logic cue 恰好由一条 conditional 覆盖；普通改口的 subject 必须与旧值属于同一对象关系，旧值和最终值逐字来自各自证据，rendering_policy=final_only 时 recipient unit 的 final_meaning 只能写最终值，像“旧数字不要写”这样的过程说明必须标 editor_directive/remove；VERIFIED_ENTITY_MAPPINGS 已确认的别名→标准名不要再重复声明为 correction；technical_token_mappings 与 dictated_symbol_mappings 必须为空，程序会自行恢复可证明的断词和口述符号；上下文映射只能复制 VERIFIED_ENTITY_MAPPINGS。AI Prompt 中“先别开始研究，只整理任务/要求”这类针对当前润色的说明必须标 editor_directive/remove，不能进入 recipient_content。
     若错误为 recipient_unit_contains_editor_process，把当前编辑操作单独标为 editor_directive/remove，同一来源中的预算、项目和其他真实约束须另建正文。若错误为 recipient_unit_retains_superseded_value，按来源把该正文更新为最终事实，且必须引用最终值实际所在 source span，不能仅引用旧值来源；仍有效原因、准备状态与其他对象同值照常保留。旧值取消过程另标 editor_directive/remove，不能把整句删除，也不能将最终日期替换进取消语句。
+    修复一处错误时，先列清该来源仍有效的事实，再检查修后每项都能交给 Writer。最终数量、临时人员身份、变更原因不能互相替代；数值覆盖错误必须补回有来源的遗漏项，不能扩大 editor_directive.surface_tokens 把它们排除，也不能移动到不进正文的 unit 来满足格式。
     不得借修复新增原文没有的事实、受众、条件或映射。只返回完整修复后的 Ledger JSON，不要回显错误、解释或 Markdown。
     若结构检查失败且全部 unit 都是非正文角色，重新找出来源中的真实事实或引用示例并单独建 recipient_content，不能把 editor_directive 的 ID 填进 ordered_unit_ids 充数。更正公告需要 announce_change，公开旧值和旧价处理仍有意义；不要把它当作只留新值的私下口误。
     连续改口仍须逐项记录逐字存在的值。例如“周一九点，不对周二九点，九点半”应记录“周一九点→周二九点”和“周二九点→九点半”；不得把来源没有连续说出的“周二九点半”写入 final_value。其他事项的日期不得参与承接。
@@ -76,12 +78,14 @@ enum VoicePolishLedgerPrompts {
     只返回 JSON：
     {"verdict":"pass|repair|unsafe","issues":[{"type":"missing|wrong_role|wrong_relation|wrong_condition|wrong_modality|obsolete_retained|invented|context_leak|task_layer|instruction_leak|style_shift","severity":"minor|major","unit_ids":["u1"],"source_span_ids":["s001"],"draft_span":"","repair_instruction":""}],"semantic_checks":[{"check_id":"待核对项 id","verdict":"supported|unsupported","evidence":[{"span_id":"s001","text":"该来源中逐字存在的关系证据"}]}]}
 
-    SOURCE_UNIT_INDEX 仅用于定位问题，不证明某片段该保留还是删除。完整来源中每个仍有效的事实、原因、准备状态、责任人、条件与限制都要在成稿有对应。即使来源关联的 unit 在 DRAFT_DOCUMENT 没有片段，遗漏也须报 major missing；不要因为候选没有写出来就默认它不重要。问题使用与来源相交的真实 unit_id；现有错误的 draft_span 必须逐字存在于 RENDERED_TEXT，遗漏时留空。
-    首先确认谁在对谁说话。客户稿要表达我方边界，不能把“别先答应赔偿”变成命令客户不要答应；给内部同事的要求则应保留相应动作主体。给编辑的措辞要求只执行、不抄入正文，报错用 wrong_role 或 instruction_leak。不要一概删除所有“不承诺/不要”类内容。
-    对照原始来源核对最终值、公开更正所需旧值、退款动作、主体—动作—期限、币种、条件极性和全部后果、上限下限、否定范围、待确认与不承诺、技术标识和有意引用。旧日期取消不能连带删除仍有效的原因，其他事项同值不能跟着删除。不能只比对数字集合；同样 100 元可能分别是预算和退款。只有必要条件不能变成充分条件。
-    原文不保证发生，不能变成确定不会发生；禁止无依据推断也不能套成不承诺。安全上下文只能使用 VERIFIED_ENTITY_MAPPINGS，不得借用其他背景事实。AI Prompt 应交付未来可执行的任务本身，不执行它。自然度和排版问题报 minor；确认独立约束、事实或受众误改才报 major。
+    按以下次序判断，只有成稿实际存在的问题才放入 issues；已满足的要求、核对提醒和假设风险都不是问题。
+    1. 先确定最终稿写给谁、用来做什么。“给客户回复”要求成稿直接对客户说话；原文明说发给内部同事，才使用内部沟通口吻。来源中“告诉他”等第三方动作不自动增加一个收件人。客服稿表达“我们暂时不能承诺……”属于我方边界，不应改回命令客户或内部同事的指示。
+    2. 区分需进入成稿的事实与本次编辑要求。“分开写清楚、不要归咎对方、不要写进客户回复”只需执行，不需要把这些要求写出来；没有归咎对方不等于要新增“不是你的问题”。明确排除的内部内容不得补回；原文明示要对收件人说明的费用待确认等事实仍须保留。AI Prompt 交付未来可执行的任务，省去对 Muse 的“帮我整理、先别开始研究、只整理任务”；与这些说明同句的预算、项目和交付要求必须保留。
+    3. 区分普通改口与公开更正。口述中临时改主意、取消旧值、要求只留最终值时，删旧值是正确处理，不报 missing。只有来源明确涉及已经发布、按旧值执行、退款或要求公开说明变更，旧值才需进入成稿。两种情况都不能连带删掉仍有效的原因、准备状态、人员身份与其他事项；最终人数正确不能代替临时人员说明。同值的其他项目不随旧值作废。
+    4. 逐项核对最终事实、主体—动作—期限、币种、全部条件后果、上下限、否定范围、不承诺和待确认、技术标识及有意引用。只有必要条件不能变成充分条件；不保证发生不能变成确定不发生；禁止无证据推断不能套成不承诺。安全上下文仅用 VERIFIED_ENTITY_MAPPINGS，不增加背景事实。
+    SOURCE_UNIT_INDEX 仅用于定位，不能证明候选角色正确。仍有效的独立事实、原因、身份或条件没有成稿对应时，即使相关 unit 没有片段也报 major missing；编辑要求已被执行则不报遗漏。问题使用真实 unit_id 与相交 source_span_id。instruction_leak、wrong_role 等已出现的错误必须在 draft_span 逐字引用成稿中实际有问题的文字，不能拿来源中的指令当作成稿文字，也不能要求删除成稿已经没有的内容。缺失事实时 draft_span 留空。事实或受众问题报 major；自然度、排版和措辞偏好报 minor。
     PENDING_SEMANTIC_CHECKS 是尚未证明的关系问题，其中 claim 不是正确答案。每项必须重新对照原始来源与实际成稿回答，不能省略、合并或新增 id。supported 表示来源确实支持该关系且实际成稿保持关系；不确定或不支持都填 unsupported，并在 issues 指出具体错误。每个回答引用该项全部 source_span_ids 的逐字证据，至少完整覆盖 required_evidence 中的原文子句，可以合并为该 span 的更长连续原文。不能只引用标点或孤立数字；这些引文仅是原始证据，不代表待核对关系已经正确。没有 pending 时返回空数组。修复后的复核也必须重新回答全部项。
-    最后核对自然段和步骤：同一事项连续成段，不把约千字文本压成一段或拆成几十个单句段；明确多步骤必须逐项呈现，不能将两个独立步骤挤进一个编号。措辞可不同，只依据原始意图、可读性与来源判断。pass 必须 issues 为空且全部待核对项 supported。
+    最后核对自然段和步骤：同一事项连续成段，多主题千字文本应有自然分段；不要把它压成一段或拆成几十个单句段。来源本身是多条独立行动的清单时应列点，不要以段落过多为由取消清单。两个独立步骤不能挤进一个编号；序号“第三步”不表示“总共三步”。措辞可不同，只依据原始意图、可读性与来源判断。没有实际错误就返回 pass、issues=[]，且全部待核对项 supported。
     """
 
     static let repair = """

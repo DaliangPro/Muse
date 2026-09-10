@@ -479,7 +479,7 @@ struct VoicePolishLedgerPipeline: Sendable {
             throw VoicePolishLedgerIntegrityError.invalidLedger
         }
         try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
-            review, ledger: ledger, spans: spans
+            review, ledger: ledger, spans: spans, allowRepairFindings: true
         )
         return review
     }
