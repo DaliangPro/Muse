@@ -700,13 +700,23 @@ struct VoicePolishLedgerPipeline: Sendable {
             return (unit.id, unit)
         })
         let expectedIDs = ledger.structure.orderedUnitIds
-        guard document.fragments.count == expectedIDs.count else {
+        let knownRemovedUnitIDs = Set(ledger.units.filter {
+            $0.deliveryRole != "recipient_content" || $0.status == "remove"
+        }.map(\.id))
+        let recipientFragments = document.fragments.filter { fragment in
+            guard fragment.unitIds.count == 1, let id = fragment.unitIds.first,
+                  fragment.id == "f_\(id)" else { return true }
+            return !knownRemovedUnitIDs.contains(id)
+        }
+        // Writer 偶尔也返回 Ledger 明确排除的片段，程序只丢弃这些已知 ID。
+        // 未知 ID、重复正文和缺失正文仍失败；Reviewer 继续核对 Planner 的角色。
+        guard recipientFragments.count == expectedIDs.count else {
             throw VoicePolishLedgerIntegrityError.invalidLedger
         }
         var fragmentByUnitID: [String: VoicePolishLedgerDraftFragment] = [:]
         var fragmentIDs: Set<String> = []
         let numberedUnitIDs = Set(ledger.structure.numberedUnitIds ?? [])
-        for fragment in document.fragments {
+        for fragment in recipientFragments {
             guard fragment.unitIds.count == 1,
                   let unitID = fragment.unitIds.first,
                   let unit = activeUnits[unitID],
@@ -922,25 +932,22 @@ struct VoicePolishLedgerPipeline: Sendable {
         ledger: VoicePolishIntentLedger,
         validSpanIDs: Set<String>
     ) -> [VoicePolishReviewerIssue] {
-        let roleByUnitID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0.deliveryRole) })
+        let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
         let modelIssues = review.issues.filter { issue in
             guard !issue.repairInstruction.isEmpty,
                   issue.sourceSpanIds.allSatisfy(validSpanIDs.contains) else { return false }
             let onlyNonRecipient = !issue.unitIds.isEmpty && issue.unitIds.allSatisfy {
-                guard let role = roleByUnitID[$0] else { return false }
-                return role != "recipient_content"
+                guard let unit = unitByID[$0] else { return false }
+                return unit.deliveryRole != "recipient_content" || unit.status == "remove"
             }
             if onlyNonRecipient,
                issue.type == "missing",
                (issue.draftSpan ?? "").isEmpty {
                 return false
             }
-            // wrong_role 的协议语义是“Planner 把真实正文错分成非正文角色”。
-            // 若 Reviewer 指向的全是 recipient_content，它实际在评论“您/你、
-            // 请/不要请”等成稿风格；这类偏好不能让一份可发送正文进入修复循环。
-            if issue.type == "wrong_role", !onlyNonRecipient {
-                return false
-            }
+            // 正文也可能出现真实角色错误，例如把内部承诺边界变成命令客户。
+            // 本地不能只看 recipient_content 就断言 Reviewer 在评论风格；
+            // 保留该问题进入局部修复，是否改对仍由下一次独立复核确认。
             return true
         }
         var seen: Set<String> = []
@@ -959,10 +966,11 @@ struct VoicePolishLedgerPipeline: Sendable {
         ledger: VoicePolishIntentLedger
     ) -> Bool {
         guard issue.type == "wrong_role", !issue.unitIds.isEmpty else { return false }
-        let roleByUnitID = Dictionary(uniqueKeysWithValues: ledger.units.map {
-            ($0.id, $0.deliveryRole)
-        })
-        return issue.unitIds.contains { roleByUnitID[$0] != "recipient_content" }
+        let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
+        return issue.unitIds.contains {
+            guard let unit = unitByID[$0] else { return true }
+            return unit.deliveryRole != "recipient_content" || unit.status == "remove"
+        }
     }
 
     private func outputBudget(source: String, baseline: Int) -> Int {

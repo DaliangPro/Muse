@@ -816,8 +816,9 @@ enum VoicePolishLedgerIntegrityValidator {
         }
         if source.count >= 280,
            nearOriginalSimilarity(source, output) >= 0.94 {
+            let remainingScaffolding = Set(highConfidenceOralScaffolding(in: output))
             for artifact in highConfidenceOralScaffolding(in: source)
-            where output.contains(artifact) {
+            where remainingScaffolding.contains(artifact) {
                 issues.append(issue(
                     type: "instruction_leak",
                     instruction: "成稿与原口述近似原样，仍残留高置信口述支架“\(artifact)”，请完成自然语言收口。"
@@ -1358,7 +1359,7 @@ enum VoicePolishLedgerIntegrityValidator {
         where correction.renderingPolicy == "final_only"
             && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
             && result.contains(correction.oldValue)
-            && !result.contains(correction.finalValue) {
+            && !preservesToken(correction.finalValue, in: result) {
             result = result.replacingOccurrences(
                 of: correction.oldValue,
                 with: correction.finalValue
@@ -2088,7 +2089,7 @@ enum VoicePolishLedgerIntegrityValidator {
             }
         }
         return MeasurementScan(
-            occurrences: scans.flatMap(\.occurrences),
+            occurrences: deduplicatedSourceMeasurements(scans.flatMap(\.occurrences)),
             bareValueCounts: bareValueCounts
         )
     }
@@ -2268,7 +2269,9 @@ enum VoicePolishLedgerIntegrityValidator {
         corrections: [VoicePolishLedgerCorrection],
         spans: [String: VoicePolishEvidenceSpan]
     ) -> [NSRange] {
-        corrections.filter { $0.oldSpanIds.contains(spanID) }.flatMap { correction in
+        corrections.filter {
+            $0.renderingPolicy == "final_only" && $0.oldSpanIds.contains(spanID)
+        }.flatMap { correction in
             let valueRanges = ranges(of: correction.oldValue, in: text)
             let strictlyBound = valueRanges.filter { range in
                 correctionRangeIsSubjectBacked(
@@ -2582,6 +2585,13 @@ enum VoicePolishLedgerIntegrityValidator {
         var result: [String] = []
         for match in pattern.matches(in: source, range: range) {
             guard let swiftRange = Range(match.range, in: source) else { continue }
+            let token = String(source[swiftRange])
+            if token.count == 1, ["嗯", "呃", "额"].contains(token) {
+                let before = source[..<swiftRange.lowerBound].last
+                let after = source[swiftRange.upperBound...].first
+                guard before.map({ $0.isWhitespace || $0.isPunctuation }) ?? true,
+                      after.map({ $0.isWhitespace || $0.isPunctuation }) ?? true else { continue }
+            }
             let lower = source.index(swiftRange.lowerBound, offsetBy: -18, limitedBy: source.startIndex)
                 ?? source.startIndex
             let upper = source.index(swiftRange.upperBound, offsetBy: 18, limitedBy: source.endIndex)
