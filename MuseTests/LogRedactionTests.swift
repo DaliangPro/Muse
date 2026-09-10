@@ -141,6 +141,23 @@ final class LogRedactionTests: XCTestCase {
         XCTAssertTrue(DebugFileLogger.isFileLoggingDisabledForTests)
     }
 
+    func test质量跑测与钥匙串授权专用进程在解析日志路径前禁用写盘() {
+        for flag in ["--voice-polish-quality-run", "--voice-polish-quality-authorize-keychain"] {
+            XCTAssertTrue(DebugFileLogger.shouldDisableFileLogging(
+                arguments: ["Muse", flag], isRunningTests: false
+            ))
+        }
+        XCTAssertTrue(DebugFileLogger.shouldDisableFileLogging(
+            arguments: ["Muse"], isRunningTests: true
+        ))
+        XCTAssertFalse(DebugFileLogger.shouldDisableFileLogging(
+            arguments: ["Muse"], isRunningTests: false
+        ))
+        XCTAssertFalse(DebugFileLogger.shouldDisableFileLogging(
+            arguments: ["Muse", "a-file-containing--voice-polish-quality-run"], isRunningTests: false
+        ))
+    }
+
     private func permissions(of url: URL) throws -> Int {
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
         return (attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1

@@ -31,6 +31,228 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         XCTAssertEqual(invocation.providerAuditPath, "/tmp/provider-audit.jsonl")
         XCTAssertEqual(invocation.runNonce, runNonce)
         XCTAssertEqual(invocation.limit, 9)
+        XCTAssertEqual(invocation.mode, .legacyAutomatic)
+    }
+
+    func test三档模式必须显式保留各自的调用语义() throws {
+        for mode in [VoicePolishQualityRunner.Mode.direct, .light, .standard] {
+            let invocation = try XCTUnwrap(VoicePolishQualityRunner.parseInvocation(
+                arguments: runnerArguments + ["--mode", mode.rawValue]
+            ))
+            XCTAssertEqual(invocation.mode, mode)
+        }
+        XCTAssertNil(VoicePolishQualityRunner.Mode.direct.qualityMode)
+        XCTAssertEqual(VoicePolishQualityRunner.Mode.light.qualityMode, .light)
+        XCTAssertEqual(VoicePolishQualityRunner.Mode.standard.qualityMode, .standard)
+        XCTAssertEqual(VoicePolishQualityRunner.Mode.legacyAutomatic.qualityMode, .automatic)
+    }
+
+    func test非法缺失或重复模式不会静默降为旧自动模式() {
+        for suffix in [
+            ["--mode"], ["--mode", "automatic"], ["--mode", "legacy_automatic"],
+            ["--mode", "fast"], ["--mode", "light", "--mode", "standard"],
+        ] {
+            XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(
+                arguments: runnerArguments + suffix
+            ))
+        }
+    }
+
+    func test直出在凭据与Provider配置读取之前分流() throws {
+        var configurationReads = 0
+        let result = try VoicePolishQualityRunner.configuration(for: .direct) {
+            configurationReads += 1
+            throw LLMError.timedOut
+        }
+        XCTAssertNil(result)
+        XCTAssertEqual(configurationReads, 0)
+
+        for mode in [VoicePolishQualityRunner.Mode.light, .standard] {
+            XCTAssertThrowsError(try VoicePolishQualityRunner.configuration(for: mode) {
+                configurationReads += 1
+                throw LLMError.timedOut
+            })
+        }
+        XCTAssertEqual(configurationReads, 2)
+    }
+
+    func test直出只沿用既有纠词与首尾清理不触发润色清洗() {
+        let source = "  嗯嗯现在剪切板里的输入消息不要删，预算一万六。\n"
+        XCTAssertEqual(
+            VoicePolishQualityRunner.directOutput(source),
+            "嗯嗯现在剪切板里的输入消息不要删，预算一万六。"
+        )
+        XCTAssertEqual(
+            VoicePolishQualityRunner.directOutput("用飞猪记录嗯嗯", terminology: ["飞猪": "飞书"]),
+            "用飞书记录嗯嗯"
+        )
+    }
+
+    func test直出报告保留原始证据且不伪造模型调用() throws {
+        let source = "  嗯明天不对后天见，预算一万六。  "
+        let fixture = try writeRunnerFixture(spokenInput: source, segmentTexts: [source])
+        defer { try? FileManager.default.trashItem(at: fixture.deletingLastPathComponent(), resultingItemURL: nil) }
+        let reports = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: VoicePolishQualityRunner.directCaseReportsForTesting(at: fixture.path)
+        ) as? [[String: Any]])
+        let report = try XCTUnwrap(reports.first)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(report["mode"] as? String, "direct")
+        XCTAssertEqual(report["spoken_input"] as? String, source)
+        XCTAssertEqual(report["segment_texts"] as? [String], [source])
+        XCTAssertEqual(report["canonical_input"] as? String, source)
+        XCTAssertEqual(report["model_output"] as? String, source.trimmingCharacters(in: .whitespacesAndNewlines))
+        XCTAssertEqual(report["executed_route"] as? String, "direct")
+        XCTAssertEqual(report["llm_call_count"] as? Int, 0)
+        XCTAssertEqual(report["llm_attempt_count"] as? Int, 0)
+        XCTAssertEqual(report["internal_chunk_count"] as? Int, 0)
+        XCTAssertEqual((report["stage_responses"] as? [Any])?.count, 0)
+        XCTAssertEqual(report["fallback_used"] as? Bool, false)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(report["latency_milliseconds"] as? Int), 0)
+        XCTAssertNotNil(report["started_at"] as? String)
+        XCTAssertNotNil(report["finished_at"] as? String)
+    }
+
+    func test千字边界原样接受且超限输入拒绝而不截断() throws {
+        for count in [1_000, 1_001] {
+            let source = String(repeating: "字", count: count)
+            let fixture = try writeRunnerFixture(spokenInput: source, segmentTexts: [source])
+            defer { try? FileManager.default.trashItem(at: fixture.deletingLastPathComponent(), resultingItemURL: nil) }
+            let original = try Data(contentsOf: fixture)
+            if count == 1_000 {
+                XCTAssertEqual(try VoicePolishQualityRunner.validatedInputCount(
+                    at: fixture.path, maximumInputCharacters: 1_000
+                ), 1)
+            } else {
+                XCTAssertThrowsError(try VoicePolishQualityRunner.validatedInputCount(
+                    at: fixture.path, maximumInputCharacters: 1_000
+                )) { error in
+                    XCTAssertTrue(error.localizedDescription.contains("spoken_input"))
+                    XCTAssertTrue(error.localizedDescription.contains("1001"))
+                }
+                XCTAssertThrowsError(try VoicePolishQualityRunner.directCaseReportsForTesting(at: fixture.path))
+            }
+            XCTAssertEqual(try Data(contentsOf: fixture), original)
+        }
+    }
+
+    func test源分段总长不能绕过千字上限且必须非空() throws {
+        let samples: [(String, [String], String)] = [
+            ("短文", [String(repeating: "甲", count: 500), String(repeating: "乙", count: 501)], "segment_texts"),
+            ("源文本", [], "源分段"),
+        ]
+        for (source, segments, expectedError) in samples {
+            let fixture = try writeRunnerFixture(spokenInput: source, segmentTexts: segments)
+            defer { try? FileManager.default.trashItem(at: fixture.deletingLastPathComponent(), resultingItemURL: nil) }
+            XCTAssertThrowsError(try VoicePolishQualityRunner.validatedInputCount(
+                at: fixture.path, maximumInputCharacters: 1_000
+            )) { error in
+                XCTAssertTrue(error.localizedDescription.contains(expectedError))
+            }
+        }
+    }
+
+    func test组合字符按原始码点计数且源文分段证据分别保留() throws {
+        let repeated = String(repeating: "e\u{301}", count: 501)
+        let fixture = try writeRunnerFixture(spokenInput: repeated, segmentTexts: [repeated])
+        defer { try? FileManager.default.trashItem(at: fixture.deletingLastPathComponent(), resultingItemURL: nil) }
+        XCTAssertEqual(repeated.count, 501)
+        XCTAssertThrowsError(try VoicePolishQualityRunner.validatedInputCount(
+            at: fixture.path, maximumInputCharacters: 1_000
+        ))
+
+        let differentBytes = try writeRunnerFixture(spokenInput: "é", segmentTexts: ["e\u{301}"])
+        defer { try? FileManager.default.trashItem(at: differentBytes.deletingLastPathComponent(), resultingItemURL: nil) }
+        XCTAssertEqual(try VoicePolishQualityRunner.validatedInputCount(
+            at: differentBytes.path, maximumInputCharacters: 1_000
+        ), 1)
+        let reports = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: VoicePolishQualityRunner.directCaseReportsForTesting(at: differentBytes.path)
+        ) as? [[String: Any]])
+        XCTAssertEqual((reports.first?["spoken_input"] as? String)?.unicodeScalars.count, 1)
+        XCTAssertEqual((reports.first?["segment_texts"] as? [String])?.first?.unicodeScalars.count, 2)
+    }
+
+    func test旧阶段记录可解码且不会伪造缺失的计时证据() throws {
+        let data = Data(#"{"task":"voicePolishFast","requestPayload":"源文","responseText":"成稿"}"#.utf8)
+        let result = try JSONDecoder().decode(VoicePolishQualityStageResponse.self, from: data)
+        XCTAssertEqual(result.responseText, "成稿")
+        XCTAssertNil(result.startedAt)
+        XCTAssertNil(result.finishedAt)
+        XCTAssertNil(result.latencyMilliseconds)
+        XCTAssertNil(result.status)
+    }
+
+    func test完整终稿段落不会被原始ASR分段覆盖() throws {
+        let source = "周五发第一版。\n\n预算一万六。"
+        let segments = ["周五发第一版。", "预算一万六。"]
+        let fixture = try writeRunnerFixture(spokenInput: source, segmentTexts: segments)
+        defer { try? FileManager.default.trashItem(at: fixture.deletingLastPathComponent(), resultingItemURL: nil) }
+        let envelope = try XCTUnwrap(VoicePolishQualityRunner.envelopesForTesting(at: fixture.path).first)
+        XCTAssertEqual(envelope.canonicalText, source)
+        XCTAssertEqual(envelope.fallbackText, source)
+        XCTAssertEqual(envelope.segments.map(\.text).joined(), source)
+        XCTAssertEqual(envelope.segments.count, 1)
+        let reports = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: VoicePolishQualityRunner.directCaseReportsForTesting(at: fixture.path)
+        ) as? [[String: Any]])
+        XCTAssertEqual(reports.first?["spoken_input"] as? String, source)
+        XCTAssertEqual(reports.first?["segment_texts"] as? [String], segments)
+    }
+
+    func test轻度千字整段编辑不冒充历史fast分片() {
+        let source = String(repeating: "明天再确认。", count: 150)
+        XCTAssertLessThanOrEqual(source.count, 1_000)
+        XCTAssertEqual(VoicePolishQualityRunner.internalChunkCount(
+            for: source, executedRoute: .fast, qualityMode: .light, maximumSourceTokens: 20
+        ), 1)
+        XCTAssertGreaterThan(VoicePolishQualityRunner.internalChunkCount(
+            for: source, executedRoute: .fast, qualityMode: .automatic, maximumSourceTokens: 20
+        ), 1)
+    }
+
+    func test实体映射报告保留来源段置信度且字段可独立解码() throws {
+        let entities = [ResolvedEntity(
+            surfaceText: "缪斯", canonical: "Muse", sourceSegmentIDs: ["s1"],
+            candidateSource: .authorizedContext, confidence: 0.96
+        )]
+        let evidence = VoicePolishQualityRunner.resolvedEntitiesForReport(entities)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(evidence)) as? [[String: Any]])
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(row["surface_text"] as? String, "缪斯")
+        XCTAssertEqual(row["canonical"] as? String, "Muse")
+        XCTAssertEqual(row["source_segment_ids"] as? [String], ["s1"])
+        XCTAssertEqual(row["candidate_source"] as? String, "authorizedContext")
+        XCTAssertEqual(row["confidence"] as? Double, 0.96)
+        XCTAssertEqual(Set(row.keys), ["surface_text", "canonical", "source_segment_ids", "candidate_source", "confidence"])
+    }
+
+    func test失败阶段保留真实尝试序号起止与耗时但不计成功调用() async throws {
+        let counter = VoicePolishProviderAuditSuccessCounter()
+        let request = LLMRequest(
+            context: .processingMode, task: .voicePolishFast,
+            system: "只润色", user: "源输入", options: .init()
+        )
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let ordinal = await counter.recordStarted(request: request, at: startedAt)
+        await counter.recordFinished(
+            ordinal: ordinal, response: nil, error: LLMError.timedOut,
+            at: startedAt.addingTimeInterval(1.25), elapsed: .milliseconds(1_250)
+        )
+        let successCount = await counter.currentCount()
+        let stages = await counter.stageResponses()
+        let stage = try XCTUnwrap(stages.first)
+        XCTAssertEqual(successCount, 0)
+        XCTAssertEqual(stage.attemptOrdinal, 1)
+        XCTAssertEqual(stage.status, "failed")
+        XCTAssertEqual(stage.startedAt, startedAt)
+        XCTAssertEqual(stage.finishedAt, startedAt.addingTimeInterval(1.25))
+        XCTAssertEqual(stage.latencyMilliseconds, 1_250)
+        XCTAssertEqual(stage.requestPayload, "源输入")
+        XCTAssertEqual(stage.responseText, "")
+        XCTAssertNotNil(stage.failureReason)
     }
 
     func test非法数量参数会被拒绝() {
@@ -639,6 +861,35 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             result["cross_implementation_binding"] as? String,
             "ab82d49a29f6f0541f3af63569db7b372e22b6026a43f7903e22f1e6f68bc4f2"
         )
+    }
+
+    private var runnerArguments: [String] {
+        [
+            "Muse", "--voice-polish-quality-run",
+            "--run-input", "/tmp/runner-input.json",
+            "--report", "/tmp/report.json",
+            "--provider-audit", "/tmp/provider-audit.jsonl",
+            "--run-nonce", runNonce,
+        ]
+    }
+
+    private func writeRunnerFixture(spokenInput: String, segmentTexts: [String]) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseThreeModeRunnerTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("runner-input.json")
+        let document: [String: Any] = [
+            "schema_version": 1,
+            "name": "three-mode-fixture",
+            "inputs": [[
+                "test_input_id": "mode-001", "base_case_id": "mode-001",
+                "input_kind": "base", "writing_scene": "chat", "spoken_input": spokenInput,
+                "preconditions": [], "context_type": "none", "segment_texts": segmentTexts,
+                "context_fixture": NSNull(),
+            ]],
+        ]
+        try JSONSerialization.data(withJSONObject: document).write(to: path)
+        return path
     }
 
     private var repositoryRoot: URL {

@@ -9,19 +9,57 @@ struct VoicePolishQualityStageResponse: Codable, Sendable, Equatable {
     let task: String
     let requestPayload: String
     let responseText: String
+    // 可选字段保持旧报告可解码；新报告按真实尝试记录失败与耗时。
+    var attemptOrdinal: Int? = nil
+    var status: String? = nil
+    var startedAt: Date? = nil
+    var finishedAt: Date? = nil
+    var latencyMilliseconds: Int64? = nil
+    var failureReason: String? = nil
 }
 
 actor VoicePolishProviderAuditSuccessCounter {
     private var count = 0
     private var responses: [VoicePolishQualityStageResponse] = []
+    private var runningStarts: [Int: ContinuousClock.Instant] = [:]
 
-    func recordSuccess(request: LLMRequest, response: LLMResponse) {
-        count += 1
+    func recordStarted(request: LLMRequest, at startedAt: Date) -> Int {
+        let ordinal = responses.count + 1
+        runningStarts[ordinal] = .now
         responses.append(VoicePolishQualityStageResponse(
             task: request.task.rawValue,
             requestPayload: request.user,
-            responseText: response.text
+            responseText: "",
+            attemptOrdinal: ordinal,
+            status: "running",
+            startedAt: startedAt
         ))
+        return ordinal
+    }
+
+    func recordFinished(
+        ordinal: Int,
+        response: LLMResponse?,
+        error: Error?,
+        at finishedAt: Date,
+        elapsed: Duration
+    ) {
+        guard responses.indices.contains(ordinal - 1) else { return }
+        guard responses[ordinal - 1].status == "running" else { return }
+        let started = responses[ordinal - 1]
+        runningStarts.removeValue(forKey: ordinal)
+        if response != nil { count += 1 }
+        responses[ordinal - 1] = VoicePolishQualityStageResponse(
+            task: started.task,
+            requestPayload: started.requestPayload,
+            responseText: response?.text ?? "",
+            attemptOrdinal: ordinal,
+            status: response == nil ? "failed" : "succeeded",
+            startedAt: started.startedAt,
+            finishedAt: finishedAt,
+            latencyMilliseconds: VoicePolishQualityRunner.milliseconds(elapsed),
+            failureReason: error.map { LogRedactor.redact($0.localizedDescription) }
+        )
     }
 
     func currentCount() -> Int {
@@ -29,7 +67,15 @@ actor VoicePolishProviderAuditSuccessCounter {
     }
 
     func stageResponses() -> [VoicePolishQualityStageResponse] {
-        responses
+        responses.map { stage in
+            guard let ordinal = stage.attemptOrdinal,
+                  let startedAt = runningStarts[ordinal] else { return stage }
+            // 外层预算可能已经结束，而底层取消尚未返回。保留 running 与空
+            // finishedAt，同时给出截至取证时的耗时，不伪造已完成的 Provider 回执。
+            var pending = stage
+            pending.latencyMilliseconds = VoicePolishQualityRunner.milliseconds(ContinuousClock.now - startedAt)
+            return pending
+        }
     }
 }
 
@@ -58,17 +104,29 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
     }
 
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
-        let response = try await VoicePolishProviderAudit.withContext(
-            runNonce: context.runNonce,
-            testInputID: context.testInputID,
-            receiptPath: context.receiptPath
-        ) {
-            try await base.generate(request, config: config)
+        let startedAt = ContinuousClock.now
+        let ordinal = await successCounter.recordStarted(request: request, at: Date())
+        do {
+            let response = try await VoicePolishProviderAudit.withContext(
+                runNonce: context.runNonce,
+                testInputID: context.testInputID,
+                receiptPath: context.receiptPath
+            ) {
+                try await base.generate(request, config: config)
+            }
+            // 网络层只有在 HTTP 200 响应解析成功且回执已经 fsync 后才返回。
+            await successCounter.recordFinished(
+                ordinal: ordinal, response: response, error: nil,
+                at: Date(), elapsed: ContinuousClock.now - startedAt
+            )
+            return response
+        } catch {
+            await successCounter.recordFinished(
+                ordinal: ordinal, response: nil, error: error,
+                at: Date(), elapsed: ContinuousClock.now - startedAt
+            )
+            throw error
         }
-        // 网络层只有在 HTTP 200 响应完成解析且回执已经 fsync 后才会返回。
-        // 预算尝试可能在超时、本地校验或非 200 响应处结束，不能冒充成功调用数。
-        await successCounter.recordSuccess(request: request, response: response)
-        return response
     }
 
     func process(
@@ -94,7 +152,24 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
 /// XCTest 必须继续使用隔离凭据；该入口只在传入专用参数时运行，复用正式应用
 /// 的 Provider 配置，但不会把 API Key 写入参数、日志或报告。
 enum VoicePolishQualityRunner {
-    private static let reportSchemaVersion = 4
+    private static let reportSchemaVersion = 5
+
+    enum Mode: String, CaseIterable {
+        case direct
+        case light
+        case standard
+        // 缺省参数仅用于旧调用兼容，不冒充标准模式，也不开放为新 CLI 选项。
+        case legacyAutomatic = "legacy_automatic"
+
+        var qualityMode: VoicePolishQualityMode? {
+            switch self {
+            case .direct: return nil
+            case .light: return .light
+            case .standard: return .standard
+            case .legacyAutomatic: return .automatic
+            }
+        }
+    }
 
     struct Invocation: Equatable {
         let runInputPath: String
@@ -102,6 +177,7 @@ enum VoicePolishQualityRunner {
         let providerAuditPath: String
         let runNonce: String
         let limit: Int?
+        let mode: Mode
     }
 
     private struct QualityRunInputDocument: Decodable {
@@ -171,6 +247,25 @@ enum VoicePolishQualityRunner {
         let diagnosticCodes: [String]
     }
 
+    /// 单独定义审计字段拼写，避免 sourceSegmentIDs 的缩写自动编码产生歧义。
+    struct QualityResolvedEntityEvidence: Codable, Equatable {
+        let surfaceText: String
+        let canonical: String
+        let sourceSegmentIds: [String]
+        let candidateSource: EntityCandidateSource
+        let confidence: Double
+    }
+
+    static func resolvedEntitiesForReport(_ entities: [ResolvedEntity]) -> [QualityResolvedEntityEvidence] {
+        entities.map {
+            QualityResolvedEntityEvidence(
+                surfaceText: $0.surfaceText, canonical: $0.canonical,
+                sourceSegmentIds: $0.sourceSegmentIDs,
+                candidateSource: $0.candidateSource, confidence: $0.confidence
+            )
+        }
+    }
+
     private struct QualityInput: Decodable {
         let testInputId: String
         let baseCaseId: String
@@ -207,6 +302,12 @@ enum VoicePolishQualityRunner {
         let diagnosticCodes: [String]
         let failureReason: String?
         let plannerValidationTrace: VoicePolishPlannerValidationTrace?
+        var mode: String? = nil
+        var startedAt: Date? = nil
+        var finishedAt: Date? = nil
+        var preResolutionCanonicalInput: String? = nil
+        var canonicalSegments: [RecognitionSegment]? = nil
+        var resolvedEntities: [QualityResolvedEntityEvidence]? = nil
     }
 
     private struct QualityRunReport: Codable {
@@ -229,11 +330,18 @@ enum VoicePolishQualityRunner {
         let requestedInputCount: Int
         let completedInputCount: Int
         let cases: [QualityCaseReport]
+        var mode: String? = nil
+        var finishedAt: Date? = nil
+        var editingPromptVersion: Int? = nil
+        var latencyMeasurementScope: String? = nil
     }
 
     private enum RunnerError: LocalizedError {
         case missingArgument(String)
         case invalidLimit(String)
+        case invalidMode(String)
+        case inputTooLong(testID: String, field: String, count: Int)
+        case invalidSegments(String)
         case invalidRunNonce(String)
         case duplicateCaseID(String)
         case invalidRunInput
@@ -255,6 +363,12 @@ enum VoicePolishQualityRunner {
                 return "缺少参数 \(argument)"
             case .invalidLimit(let value):
                 return "limit 必须是正整数，当前为 \(value)"
+            case .invalidMode(let value):
+                return "mode 必须是 direct、light 或 standard，当前为 \(value)"
+            case .inputTooLong(let testID, let field, let count):
+                return "\(testID) 的 \(field) 共 \(count) 字，超过本轮 1,000 字上限；输入未截断"
+            case .invalidSegments(let testID):
+                return "\(testID) 的源分段必须为非空字符串数组"
             case .invalidRunNonce(let value):
                 return "run nonce 必须是 64 位小写十六进制，当前为 \(value)"
             case .duplicateCaseID(let id):
@@ -355,23 +469,50 @@ enum VoicePolishQualityRunner {
         } else {
             limit = nil
         }
+        let mode: Mode
+        if arguments.contains("--mode") {
+            guard arguments.filter({ $0 == "--mode" }).count == 1,
+                  let rawMode = value(after: "--mode"),
+                  let parsed = Mode(rawValue: rawMode),
+                  parsed != .legacyAutomatic else {
+                throw RunnerError.invalidMode(value(after: "--mode") ?? "缺失")
+            }
+            mode = parsed
+        } else {
+            mode = .legacyAutomatic
+        }
         return Invocation(
             runInputPath: runInputPath,
             reportPath: reportPath,
             providerAuditPath: providerAuditPath,
             runNonce: runNonce,
-            limit: limit
+            limit: limit,
+            mode: mode
         )
     }
 
-    static func validatedInputCount(at runInputPath: String) throws -> Int {
-        try validatedInputs(from: loadRunInput(at: runInputPath)).count
+    /// 默认仅供旧数据集的静态兼容回归；实际 run 始终传入 1,000 字上限。
+    static func validatedInputCount(
+        at runInputPath: String,
+        maximumInputCharacters: Int? = nil
+    ) throws -> Int {
+        try validatedInputs(
+            from: loadRunInput(at: runInputPath),
+            maximumInputCharacters: maximumInputCharacters
+        ).count
+    }
+
+    /// 直出必须在取得任何 Provider 选择、配置、凭据之前分流。
+    static func configuration(
+        for mode: Mode,
+        load: () throws -> (provider: LLMProvider, config: LLMConfig)
+    ) rethrows -> (provider: LLMProvider, config: LLMConfig)? {
+        guard mode != .direct else { return nil }
+        return try load()
     }
 
     @MainActor
     private static func run(_ invocation: Invocation) async {
-        let provider = KeychainService.selectedLLMProvider
-        let qualityMode = VoicePolishQualityMode.automatic
         var report = QualityRunReport(
             schemaVersion: reportSchemaVersion,
             status: "running",
@@ -383,25 +524,22 @@ enum VoicePolishQualityRunner {
             runInputSchemaVersion: nil,
             runInputSHA256: nil,
             executableSHA256: nil,
-            provider: provider.rawValue,
+            provider: invocation.mode == .direct ? "none" : "unresolved",
             model: nil,
             endpointURL: nil,
             promptVersion: VoicePolishPrompts.version,
-            qualityMode: qualityMode.rawValue,
+            qualityMode: invocation.mode.qualityMode?.rawValue ?? "direct",
             commit: "unverified",
             requestedInputCount: 0,
             completedInputCount: 0,
-            cases: []
+            cases: [],
+            mode: invocation.mode.rawValue,
+            editingPromptVersion: [.light, .standard].contains(invocation.mode)
+                ? VoicePolishEditingPrompts.version : nil,
+            latencyMeasurementScope: "asr_final_fixture_to_output"
         )
 
         do {
-            // LAContext.interactionNotAllowed 不覆盖 macOS 传统钥匙串的全部
-            // 交互路径。质量进程额外关闭本进程的传统交互，避免后台跑测
-            // 等待系统授权窗口；不修改钥匙串条目、权限或安装版进程。
-            let keychainStatus = SecKeychainSetUserInteractionAllowed(false)
-            guard keychainStatus == errSecSuccess else {
-                throw RunnerError.noninteractiveKeychainUnavailable(keychainStatus)
-            }
             let providerAuditURL = try validatedEmptyProviderAuditURL(
                 at: invocation.providerAuditPath
             )
@@ -409,15 +547,25 @@ enum VoicePolishQualityRunner {
                 runInputPath: invocation.runInputPath
             )
             let runInput = try loadRunInput(at: invocation.runInputPath)
-            var inputs = try validatedInputs(from: runInput)
+            // 先核对全部输入，再应用 limit；缺省兼容调用也不能绕过本轮上限。
+            var inputs = try validatedInputs(from: runInput, maximumInputCharacters: 1_000)
             if let limit = invocation.limit {
                 inputs = Array(inputs.prefix(limit))
             }
-            guard let loadedConfig = KeychainService.loadLLMConfig() else {
-                throw RunnerError.missingLLMConfig
+            let configured = try configuration(for: invocation.mode) {
+                // 仅润色质量进程关闭本进程的钥匙串交互，不修改存储和安装版。
+                let keychainStatus = SecKeychainSetUserInteractionAllowed(false)
+                guard keychainStatus == errSecSuccess else {
+                    throw RunnerError.noninteractiveKeychainUnavailable(keychainStatus)
+                }
+                let provider = KeychainService.selectedLLMProvider
+                guard let loadedConfig = KeychainService.loadLLMConfig() else {
+                    throw RunnerError.missingLLMConfig
+                }
+                let config = VoicePolishSettings.modelOverride().map(loadedConfig.withModel) ?? loadedConfig
+                return (provider, config)
             }
-            let config = VoicePolishSettings.modelOverride().map(loadedConfig.withModel) ?? loadedConfig
-            let providerClient = LLMProviderRegistry.makeClient(for: provider)
+            let providerClient = configured.map { LLMProviderRegistry.makeClient(for: $0.provider) }
             report = QualityRunReport(
                 schemaVersion: report.schemaVersion,
                 status: report.status,
@@ -429,30 +577,53 @@ enum VoicePolishQualityRunner {
                 runInputSchemaVersion: runInput.schemaVersion,
                 runInputSHA256: artifactEvidence.runInputSHA256,
                 executableSHA256: artifactEvidence.executableSHA256,
-                provider: provider.rawValue,
-                model: config.model,
-                endpointURL: try endpointIdentity(
-                    rawBaseURL: config.baseURL,
-                    provider: provider
-                ),
+                provider: configured?.provider.rawValue ?? "none",
+                model: configured?.config.model,
+                endpointURL: try configured.map {
+                    try endpointIdentity(rawBaseURL: $0.config.baseURL, provider: $0.provider)
+                },
                 promptVersion: report.promptVersion,
                 qualityMode: report.qualityMode,
                 commit: artifactEvidence.sourceCommit,
                 requestedInputCount: inputs.count,
                 completedInputCount: 0,
-                cases: []
+                cases: [],
+                mode: invocation.mode.rawValue,
+                editingPromptVersion: report.editingPromptVersion,
+                latencyMeasurementScope: report.latencyMeasurementScope
             )
             try write(report, to: invocation.reportPath)
 
             var caseReports: [QualityCaseReport] = []
             var expectedProviderReceiptCount = 0
             for (index, input) in inputs.enumerated() {
+                if invocation.mode == .direct {
+                    caseReports.append(makeDirectCaseReport(for: input))
+                    let receiptCount = try providerAuditReceiptCount(at: providerAuditURL)
+                    guard receiptCount == 0 else {
+                        throw RunnerError.providerAuditCountMismatch(
+                            testID: input.testInputId, expected: 0, actual: receiptCount
+                        )
+                    }
+                    report = replacing(
+                        report, status: "running", error: nil,
+                        completedInputCount: index + 1, cases: caseReports
+                    )
+                    try write(report, to: invocation.reportPath)
+                    print("VOICE_POLISH_QUALITY_PROGRESS \(index + 1)/\(inputs.count) \(input.testInputId)")
+                    continue
+                }
+                guard let configured, let providerClient,
+                      let qualityMode = invocation.mode.qualityMode else {
+                    throw RunnerError.missingLLMConfig
+                }
+                let startedAt = ContinuousClock.now
+                let wallStartedAt = Date()
                 let terminology = terminologyRules(from: input.preconditions)
-                let envelope = makeEnvelope(for: input, terminology: terminology)
-                let canonicalInput = envelope.canonicalText
+                let envelope = try makeEnvelope(for: input, terminology: terminology)
                 let writingContext = makeWritingContext(for: input)
                 let inputEvidence = reportInputEvidence(
-                    segmentTexts: envelope.rawSegments.map(\.text),
+                    segmentTexts: input.segmentTexts,
                     contextFixture: input.contextFixture,
                     contextType: input.contextType,
                     appliedContext: writingContext
@@ -474,7 +645,7 @@ enum VoicePolishQualityRunner {
                     qualityMode: qualityMode,
                     resolvedEntities: resolvedEntities
                 )
-                let startedAt = ContinuousClock.now
+                let canonicalInput = request.fallbackText
                 let successCounter = VoicePolishProviderAuditSuccessCounter()
                 let auditedClient = VoicePolishProviderAuditedLLMClient(
                     base: providerClient,
@@ -485,7 +656,7 @@ enum VoicePolishQualityRunner {
                 )
                 let result = await VoicePolishPipeline(
                     client: auditedClient,
-                    config: config
+                    config: configured.config
                 ).process(request)
                 let elapsed = ContinuousClock.now - startedAt
                 let successfulProviderCallCount = await successCounter.currentCount()
@@ -518,7 +689,8 @@ enum VoicePolishQualityRunner {
                     executedRoute: result.executedRoute.rawValue,
                     internalChunkCount: internalChunkCount(
                         for: request.fallbackText,
-                        executedRoute: result.executedRoute
+                        executedRoute: result.executedRoute,
+                        qualityMode: qualityMode
                     ),
                     llmCallCount: successfulProviderCallCount,
                     llmAttemptCount: result.llmAttemptCount,
@@ -527,7 +699,13 @@ enum VoicePolishQualityRunner {
                     hardValidationCodes: validationEvidence.hardValidationCodes,
                     diagnosticCodes: validationEvidence.diagnosticCodes,
                     failureReason: result.failureReason?.rawValue,
-                    plannerValidationTrace: result.plannerValidationTrace
+                    plannerValidationTrace: result.plannerValidationTrace,
+                    mode: invocation.mode.rawValue,
+                    startedAt: wallStartedAt,
+                    finishedAt: Date(),
+                    preResolutionCanonicalInput: envelope.fallbackText,
+                    canonicalSegments: envelope.segments,
+                    resolvedEntities: resolvedEntitiesForReport(resolvedEntities)
                 ))
                 report = replacing(
                     report,
@@ -592,62 +770,137 @@ enum VoicePolishQualityRunner {
     }
 
     private static func validatedInputs(
-        from document: QualityRunInputDocument
+        from document: QualityRunInputDocument,
+        maximumInputCharacters: Int? = nil
     ) throws -> [QualityInput] {
         var seenIDs = Set<String>()
         for item in document.inputs {
             guard seenIDs.insert(item.testInputId).inserted else {
                 throw RunnerError.duplicateCaseID(item.testInputId)
             }
+            if let maximumInputCharacters {
+                let segmentText = item.segmentTexts.joined()
+                for (field, text) in [("spoken_input", item.spokenInput), ("segment_texts", segmentText)] {
+                    // 与 Python 验收脚本的 len 一致，组合字符不能绕过原始输入上限。
+                    let characterCount = text.unicodeScalars.count
+                    guard characterCount <= maximumInputCharacters else {
+                        throw RunnerError.inputTooLong(
+                            testID: item.testInputId, field: field, count: characterCount
+                        )
+                    }
+                }
+                guard !item.segmentTexts.isEmpty,
+                      item.segmentTexts.allSatisfy({ !$0.isEmpty }) else {
+                    throw RunnerError.invalidSegments(item.testInputId)
+                }
+            }
         }
         return document.inputs
+    }
+
+    /// 固定为空个人词库和空片段；只应用测试夹具明确给定的已确认术语。
+    /// 与正式直出共用纠词、插入前清理纯函数，不读取配置、上下文或凭据。
+    static func directOutput(_ spokenInput: String, terminology: [String: String] = [:]) -> String {
+        let canonical = EntityResolver.applyingKnownCorrections(terminology, to: spokenInput)
+        let mode = ProcessingMode(
+            id: ProcessingMode.directId,
+            name: "直出",
+            prompt: "",
+            isBuiltin: true,
+            processingLabel: "直出",
+            hotkeyStyle: .toggle
+        )
+        return RecognitionSession.finalizeInsertionText(canonical, mode: mode, isLLMOutput: false)
+    }
+
+    private static func makeDirectCaseReport(for input: QualityInput) -> QualityCaseReport {
+        let startedAt = ContinuousClock.now
+        let wallStartedAt = Date()
+        let terminology = terminologyRules(from: input.preconditions)
+        let canonical = EntityResolver.applyingKnownCorrections(terminology, to: input.spokenInput)
+        let output = directOutput(input.spokenInput, terminology: terminology)
+        let inputEvidence = reportInputEvidence(
+            segmentTexts: input.segmentTexts,
+            contextFixture: input.contextFixture,
+            contextType: input.contextType,
+            appliedContext: makeWritingContext(for: input)
+        )
+        return QualityCaseReport(
+            testInputID: input.testInputId,
+            baseCaseID: input.baseCaseId,
+            inputKind: input.inputKind,
+            writingScene: input.writingScene.rawValue,
+            spokenInput: input.spokenInput,
+            canonicalInput: canonical,
+            segmentCount: inputEvidence.segmentTexts.count,
+            segmentTexts: inputEvidence.segmentTexts,
+            contextFixture: inputEvidence.contextFixture,
+            modelOutput: output,
+            rejectedModelOutput: nil,
+            stageResponses: [],
+            detectedRoute: "direct",
+            executedRoute: "direct",
+            internalChunkCount: 0,
+            llmCallCount: 0,
+            llmAttemptCount: 0,
+            latencyMilliseconds: milliseconds(ContinuousClock.now - startedAt),
+            fallbackUsed: false,
+            hardValidationCodes: [],
+            diagnosticCodes: [],
+            failureReason: nil,
+            plannerValidationTrace: nil,
+            mode: Mode.direct.rawValue,
+            startedAt: wallStartedAt,
+            finishedAt: Date(),
+            preResolutionCanonicalInput: canonical,
+            canonicalSegments: [],
+            resolvedEntities: []
+        )
+    }
+
+    /// 只读隔离夹具并执行正式直出报告构造器，不启动应用或访问真实用户设置。
+    static func directCaseReportsForTesting(at path: String) throws -> Data {
+        let inputs = try validatedInputs(from: loadRunInput(at: path), maximumInputCharacters: 1_000)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(inputs.map(makeDirectCaseReport))
     }
 
     private static func makeEnvelope(
         for input: QualityInput,
         terminology: [String: String]
-    ) -> VoiceInputEnvelope {
-        let rawSegments = input.segmentTexts.enumerated().map { index, text in
-            RecognitionSegment(
-                id: "s\(index + 1)",
-                text: text,
-                startTimeMs: nil,
-                endTimeMs: nil,
-                confidence: nil,
-                isFinal: true
-            )
-        }
-        let canonicalSegments = rawSegments.map { segment in
-            RecognitionSegment(
-                id: segment.id,
-                text: EntityResolver.applyingKnownCorrections(terminology, to: segment.text),
-                startTimeMs: nil,
-                endTimeMs: nil,
-                confidence: nil,
-                isFinal: true
-            )
-        }
-        let edits = terminology.compactMap { alias, canonical -> VoiceTerminologyEdit? in
-            let sourceSegmentIDs = rawSegments.compactMap { segment -> String? in
-                EntityResolver.applyingKnownCorrections([alias: canonical], to: segment.text)
-                    == segment.text ? nil : segment.id
-            }
-            guard !sourceSegmentIDs.isEmpty else { return nil }
-            return VoiceTerminologyEdit(
-                alias: alias,
-                canonical: canonical,
-                sourceSegmentIDs: sourceSegmentIDs
-            )
-        }
-        return VoiceInputEnvelope(
-            providerFinalText: input.spokenInput,
-            rawSegments: rawSegments,
-            canonicalText: canonicalSegments.map(\.text).joined(),
-            segments: canonicalSegments,
-            requiredEntityEdits: edits,
-            durationMs: 0,
-            provider: KeychainService.selectedASRProvider
+    ) throws -> VoiceInputEnvelope {
+        // 完整终稿是唯一编辑来源。ASR 原始分段可能没有终稿新增的段落；
+        // 共用生产构造器的保守回退，不能用拼段结果覆盖全文。
+        let canonical = EntityResolver.applyingKnownCorrections(terminology, to: input.spokenInput)
+        let transcript = RecognitionTranscript(
+            confirmedSegments: input.segmentTexts,
+            partialText: "",
+            authoritativeText: input.spokenInput,
+            isFinal: true
         )
+        guard let envelope = VoiceInputEnvelope.fromFinalTranscript(
+            transcript,
+            rawFinalText: input.spokenInput,
+            canonicalText: canonical,
+            preferredCanonicalSegmentTexts: input.segmentTexts.map {
+                EntityResolver.applyingKnownCorrections(terminology, to: $0)
+            },
+            deterministicCorrections: terminology,
+            durationMs: 0,
+            // 固定文本夹具没有真实 ASR 调用，不读取用户 ASR 设置冒充本次来源。
+            provider: .volcano
+        ) else {
+            throw RunnerError.invalidRunInput
+        }
+        return envelope
+    }
+
+    static func envelopesForTesting(at path: String) throws -> [VoiceInputEnvelope] {
+        try validatedInputs(from: loadRunInput(at: path), maximumInputCharacters: 1_000).map {
+            try makeEnvelope(for: $0, terminology: terminologyRules(from: $0.preconditions))
+        }
     }
 
     private static func makeWritingContext(for input: QualityInput) -> WritingContext {
@@ -752,8 +1005,11 @@ enum VoicePolishQualityRunner {
     static func internalChunkCount(
         for text: String,
         executedRoute: VoicePolishRoute,
+        qualityMode: VoicePolishQualityMode = .automatic,
         maximumSourceTokens: Int = VoicePolishPipeline.fastChunkSourceTokenLimit
     ) -> Int {
+        // 新三档协议整段编辑，不能用历史 fast 的估算切片数冒充真实调用。
+        if qualityMode == .light || qualityMode == .standard { return 1 }
         guard executedRoute == .fast else { return 1 }
         return max(
             1,
@@ -891,7 +1147,7 @@ enum VoicePolishQualityRunner {
         return lines.count
     }
 
-    private static func milliseconds(_ duration: Duration) -> Int64 {
+    static func milliseconds(_ duration: Duration) -> Int64 {
         duration.components.seconds * 1_000
             + Int64(duration.components.attoseconds / 1_000_000_000_000_000)
     }
@@ -922,7 +1178,11 @@ enum VoicePolishQualityRunner {
             commit: report.commit,
             requestedInputCount: report.requestedInputCount,
             completedInputCount: completedInputCount,
-            cases: cases
+            cases: cases,
+            mode: report.mode,
+            finishedAt: status == "running" ? nil : Date(),
+            editingPromptVersion: report.editingPromptVersion,
+            latencyMeasurementScope: report.latencyMeasurementScope
         )
     }
 
@@ -972,12 +1232,30 @@ enum VoicePolishQualityRunner {
             model: nil,
             endpointURL: nil,
             promptVersion: VoicePolishPrompts.version,
-            qualityMode: VoicePolishQualityMode.automatic.rawValue,
+            qualityMode: startupMode(arguments: arguments) == Mode.legacyAutomatic.rawValue
+                ? VoicePolishQualityMode.automatic.rawValue : startupMode(arguments: arguments),
             commit: artifactEvidence?.sourceCommit ?? "unknown",
             requestedInputCount: 0,
             completedInputCount: 0,
-            cases: []
+            cases: [],
+            mode: startupMode(arguments: arguments),
+            finishedAt: Date(),
+            editingPromptVersion: [Mode.light.rawValue, Mode.standard.rawValue].contains(
+                startupMode(arguments: arguments)
+            ) ? VoicePolishEditingPrompts.version : nil,
+            latencyMeasurementScope: "asr_final_fixture_to_output"
         )
         try? write(report, to: arguments[reportIndex + 1])
+    }
+
+    private static func startupMode(arguments: [String]) -> String {
+        guard let index = arguments.firstIndex(of: "--mode") else {
+            return Mode.legacyAutomatic.rawValue
+        }
+        guard arguments.indices.contains(index + 1),
+              let mode = Mode(rawValue: arguments[index + 1]), mode != .legacyAutomatic else {
+            return "invalid"
+        }
+        return mode.rawValue
     }
 }

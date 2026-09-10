@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""亲启冻结候选并校验三档原始证据；语义质量始终留给独立评审。"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from datetime import datetime, timezone
+import hashlib
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import secrets
+import statistics
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+_spec = importlib.util.spec_from_file_location(
+    "legacy_voice_polish_evaluator", ROOT / "scripts/evaluate-voice-polish-quality-report.py"
+)
+legacy = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(legacy)
+
+MODES = ("direct", "light", "standard")
+INPUT_FIELDS = {
+    "test_input_id", "base_case_id", "input_kind", "writing_scene", "spoken_input",
+    "preconditions", "context_type", "segment_texts", "context_fixture",
+}
+
+
+def object_sha(value: object) -> str:
+    data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def frozen_json(path: Path, expected_sha256: str) -> dict:
+    expected = legacy.validate_hex(expected_sha256, 64, "外部冻结 SHA-256")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"冻结文件必须是常规非符号链接文件：{path}")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError(f"冻结文件 SHA-256 不一致：{path.name}")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise ValueError("冻结文件不是 JSON 对象")
+    return value
+
+
+def validate_inputs(inputs: list[dict]) -> None:
+    if not isinstance(inputs, list) or not inputs:
+        raise ValueError("输入集合不能为空")
+    seen = set()
+    for item in inputs:
+        if not isinstance(item, dict) or set(item) != INPUT_FIELDS:
+            raise ValueError("Runner 输入字段必须严格白名单，禁止携带答案或评分契约")
+        test_id = item["test_input_id"]
+        if not isinstance(test_id, str) or not test_id or test_id in seen:
+            raise ValueError("输入 ID 缺失或重复")
+        seen.add(test_id)
+        text, segments = item["spoken_input"], item["segment_texts"]
+        if not isinstance(text, str) or not 0 < len(text) <= 1000:
+            raise ValueError(f"{test_id}: 正文必须为 1–1000 字，不截断")
+        if (not isinstance(segments, list) or not segments
+                or any(not isinstance(s, str) or not s for s in segments)
+                or not 0 < len("".join(segments)) <= 1000):
+            raise ValueError(f"{test_id}: 原始分段必须非空且总长不超过1000字")
+        if not isinstance(item["preconditions"], list) or any(
+            not isinstance(p, str) for p in item["preconditions"]
+        ):
+            raise ValueError(f"{test_id}: preconditions 必须是字符串数组")
+
+
+def validated_dataset(path: Path, expected_sha: str, contract_path: Path, contract_sha: str) -> dict:
+    document = frozen_json(path, expected_sha)
+    if document.get("schema_version") != 1 or document.get("modes") != list(MODES):
+        raise ValueError("三档数据集版本或模式不匹配")
+    inputs = document.get("inputs")
+    validate_inputs(inputs)
+    if document.get("input_count") != len(inputs) or document.get("maximum_input_characters") != 1000:
+        raise ValueError("数据集输入数量或上限声明不一致")
+    origins = document.get("input_provenance", [])
+    if len(origins) != len(inputs) or {x.get("test_input_id") for x in origins} != {
+        x["test_input_id"] for x in inputs
+    }:
+        raise ValueError("输入来源记录不完整或重复")
+    by_id = {x["test_input_id"]: x for x in inputs}
+    for origin in origins:
+        if origin.get("input_sha256") != object_sha(by_id[origin["test_input_id"]]):
+            raise ValueError("输入与其逐条冻结哈希不一致")
+    if dict(Counter(x["suite"] for x in origins)) != document.get("suite_counts"):
+        raise ValueError("分组覆盖数量与来源不一致")
+    contract = frozen_json(contract_path, contract_sha)
+    cases = contract.get("cases", [])
+    if (contract.get("schema_version") != 1 or contract.get("dataset_sha256") != expected_sha
+            or contract.get("input_count") != len(inputs) or len(cases) != len(inputs)
+            or {x.get("test_input_id") for x in cases} != set(by_id)):
+        raise ValueError("评分契约与冻结数据集未一一绑定")
+    for item in cases:
+        if item.get("input_sha256") != object_sha(by_id[item["test_input_id"]]):
+            raise ValueError("评分契约绑定了另一条输入")
+    return document
+
+
+def selected_inputs(document: dict, test_ids: list[str] | None) -> list[dict]:
+    if test_ids is None:
+        return document["inputs"]
+    if not test_ids or len(test_ids) != len(set(test_ids)):
+        raise ValueError("诊断 ID 不能为空或重复")
+    by_id = {x["test_input_id"]: x for x in document["inputs"]}
+    if not set(test_ids) <= set(by_id):
+        raise ValueError("诊断 ID 不属于冻结数据集")
+    return [by_id[test_id] for test_id in test_ids]
+
+
+def write_exclusive(path: Path, value: object) -> None:
+    data = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def validated_manifest(args) -> dict:
+    manifest = legacy.validated_build_manifest(
+        args.build_manifest, expected_manifest_sha256=args.expected_build_manifest_sha256,
+        expected_source_commit=args.expected_source_commit, expected_source_tree=args.expected_source_tree,
+        expected_executable_sha256=args.expected_executable_sha256,
+        expected_dataset_sha256=args.expected_dataset_sha256,
+        expected_designated_requirement_sha256=args.expected_designated_requirement_sha256,
+    )
+    if (manifest.get("quality_profile") != "three_mode"
+            or manifest.get("supported_modes") != list(MODES)
+            or manifest.get("scoring_contract_sha256") != args.expected_contract_sha256):
+        raise ValueError("构建清单未冻结三档数据集、模式和独立评分契约")
+    return manifest
+
+
+def candidate_evidence(args) -> dict:
+    subprocess.run(
+        ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(args.candidate_app)],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    candidate = legacy.candidate_app_evidence(args.candidate_app)
+    for key, expected in [
+        ("source_commit", args.expected_source_commit),
+        ("executable_sha256", args.expected_executable_sha256),
+    ]:
+        if candidate[key] != expected:
+            raise ValueError(f"候选 {key} 与外部冻结值不一致")
+    if legacy.sha256_text(candidate["designated_requirement"]) != args.expected_designated_requirement_sha256:
+        raise ValueError("候选签名身份与外部冻结值不一致")
+    return candidate
+
+
+def sandbox_policy() -> str:
+    # 使用当前 uid 的真实主目录，不接受 HOME 重定向冒充已隔离用户数据。
+    support = str(Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/Application Support/Muse")
+    return ('(version 1)\n(allow default)\n'
+            f'(deny file-read* file-write* (subpath {json.dumps(support)}))\n'
+            '(deny device-microphone)\n(deny appleevent-send)\n')
+
+
+def validate_run_root(path: Path) -> None:
+    support = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/Application Support/Muse"
+    resolved = path.resolve()
+    if support.resolve() == resolved or support.resolve() in resolved.parents:
+        raise ValueError("run-root 不得指向真实 Muse 用户数据目录")
+    if not path.is_absolute() or path.exists() or path.is_symlink():
+        raise ValueError("run-root 必须是不存在的独占绝对目录")
+
+
+def launch_command(executable: Path, run_input: Path, report: Path, audit: Path,
+                   sandbox: Path, mode: str, nonce: str) -> list[str]:
+    if mode not in MODES:
+        raise ValueError("实际启动必须显式指定三档之一")
+    return ["/usr/bin/sandbox-exec", "-f", str(sandbox), "/usr/bin/nice", "-n", "15",
+            str(executable), "--voice-polish-quality-run", "--mode", mode,
+            "--run-input", str(run_input), "--report", str(report),
+            "--provider-audit", str(audit), "--run-nonce", nonce]
+
+
+def launch_run(executable: Path, run_input: Path, directory: Path, mode: str, timeout: int) -> tuple:
+    directory.mkdir(mode=0o700)
+    report_path, audit_path = directory / "report.json", directory / "provider-audit.jsonl"
+    with audit_path.open("xb"):
+        pass
+    audit_path.chmod(0o600)
+    audit_identity = (audit_path.stat().st_dev, audit_path.stat().st_ino)
+    sandbox = directory / "protect-user-data.sb"
+    with sandbox.open("x", encoding="utf-8") as handle:
+        handle.write(sandbox_policy())
+    nonce = secrets.token_hex(32)
+    command = launch_command(executable, run_input, report_path, audit_path, sandbox, mode, nonce)
+    started = datetime.now(timezone.utc)
+    with (directory / "process.log").open("xb") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        write_exclusive(directory / "launch-evidence.json", {
+            "mode": mode, "command": command, "run_nonce": nonce, "process_id": process.pid,
+            "started_at": started.isoformat(), "input_sha256": legacy.sha256_file(run_input),
+            "sandbox_sha256": legacy.sha256_file(sandbox), "nice_level": 15,
+        })
+        try:
+            return_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise ValueError(f"{mode} 候选超时；保留原始日志，不启动授权窗口") from error
+    finished = datetime.now(timezone.utc)
+    write_exclusive(directory / "process-evidence.json", {
+        "process_id": process.pid, "run_nonce": nonce, "return_code": return_code,
+        "started_at": started.isoformat(), "finished_at": finished.isoformat(),
+    })
+    if return_code != 0:
+        raise ValueError(f"{mode} 候选退出码 {return_code}，详见该档 process.log")
+    if (audit_path.is_symlink() or not audit_path.is_file()
+            or (audit_path.stat().st_dev, audit_path.stat().st_ino) != audit_identity):
+        raise ValueError("Provider 审计文件被替换")
+    if report_path.is_symlink() or not report_path.is_file() or report_path.stat().st_mtime < started.timestamp():
+        raise ValueError("候选没有新生成常规报告")
+    data = audit_path.read_bytes()
+    if data and not data.endswith(b"\n"):
+        raise ValueError("Provider 回执末行不完整")
+    receipts = [json.loads(line) for line in data.splitlines()]
+    report = json.loads(report_path.read_bytes())
+    return report, receipts, nonce, process.pid, started, finished
+
+
+def valid_integer(value, minimum=0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def audit_time(value, started: datetime, finished: datetime, label: str, failures: list[str]):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or not started.timestamp() - 2 <= parsed.timestamp() <= finished.timestamp() + 2:
+            raise ValueError()
+        return parsed
+    except (AttributeError, TypeError, ValueError):
+        failures.append(f"{label}: 起止时间缺失或超出本次进程窗口")
+        return None
+
+
+def available_context_evidence(item: dict) -> list[str]:
+    fixture = legacy.expected_context_fixture(item)
+    if fixture["safety"] != "safe":
+        return []
+    result = []
+    if fixture["safety"] == "safe" and fixture["level"] != "metadataOnly":
+        result += [fixture["selected_text"]] if fixture["selected_text"] is not None else []
+        if fixture["level"] == "nearbyText":
+            result += [fixture[key] for key in ("text_before_cursor", "text_after_cursor") if fixture[key] is not None]
+    return result + [x.strip() for x in fixture["recent_muse_inputs"] if x.strip()]
+
+
+def sanitized_fallback(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    def allowed(char):
+        value = ord(char)
+        return value in (9, 10) or not (
+            value <= 31 or 127 <= value <= 159 or 0xFDD0 <= value <= 0xFDEF
+            or value & 0xFFFF in (0xFFFE, 0xFFFF)
+        )
+    return "".join(c for c in text if allowed(c)).strip()
+
+
+def explained_by_mappings(source: str, target: str, mappings: list[tuple[str, str]]) -> bool:
+    """仅重放已记录的局部字面映射；不复制 Swift 的音近推断、候选排名或语义判断。"""
+    if len(source) > 8192 or len(target) > 8192:
+        return False
+    mappings = list(set(mappings))
+    reachable = [set() for _ in range(len(source) + 1)]
+    reachable[0].add(0)
+    for index in range(len(source)):
+        matches = [(before, after) for before, after in mappings if source.startswith(before, index)]
+        for destination in reachable[index]:
+            if destination < len(target) and source[index] == target[destination]:
+                reachable[index + 1].add(destination + 1)
+            for before, after in matches:
+                if target.startswith(after, destination):
+                    reachable[index + len(before)].add(destination + len(after))
+    return len(target) in reachable[-1]
+
+
+def resolved_entity_evidence(item: dict, row: dict) -> tuple[list[str], list[str]]:
+    failures, mappings = [], []
+    tid = item["test_input_id"]
+    entities = row.get("resolved_entities")
+    segments = row.get("canonical_segments")
+    prepared = row.get("pre_resolution_canonical_input")
+    expected_prepared = sanitized_fallback(legacy.canonical_input(item))
+    if prepared != expected_prepared:
+        failures.append(f"{tid}: 实体解析前正文不对应完整原文及夹具明确术语")
+    if not isinstance(entities, list) or any(not isinstance(x, dict) for x in entities):
+        return [], failures + [f"{tid}: 缺少完整 resolved_entities 派生证据"]
+    if not isinstance(segments, list) or not segments or any(
+        not isinstance(x, dict) or not isinstance(x.get("id"), str) or not isinstance(x.get("text"), str)
+        for x in segments
+    ):
+        return [], failures + [f"{tid}: 缺少 canonical 段及其ID"]
+    by_id = {x["id"]: x["text"] for x in segments}
+    if len(by_id) != len(segments) or sanitized_fallback("".join(x["text"] for x in segments)) != prepared:
+        failures.append(f"{tid}: canonical 分段未无损对应解析前正文")
+    bodies = available_context_evidence(item)
+    for entity in entities:
+        if set(entity) != {"surface_text", "canonical", "source_segment_ids", "candidate_source", "confidence"}:
+            failures.append(f"{tid}: 实体映射结构不完整")
+            continue
+        surface, canonical = entity["surface_text"], entity["canonical"]
+        source_ids, confidence = entity["source_segment_ids"], entity["confidence"]
+        if (not isinstance(surface, str) or not surface or not isinstance(canonical, str) or not canonical
+                or not isinstance(source_ids, list) or not source_ids or any(not isinstance(x, str) for x in source_ids)):
+            failures.append(f"{tid}: 实体映射文本或引用段无效")
+            continue
+        if surface not in expected_prepared or any(surface not in by_id.get(segment_id, "") for segment_id in source_ids):
+            failures.append(f"{tid}: 实体surface没有出现在完整来源和其引用段内")
+        # Runner 的个人词库、片段与热词固定为空。产品已确认别名也只能在
+        # 安全夹具明确出现 canonical 时由 Resolver 启用，不放行任意名称。
+        if entity["candidate_source"] != "authorizedContext" or not any(canonical in body for body in bodies):
+            failures.append(f"{tid}: 实体canonical没有冻结安全夹具来源")
+        if (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
+                or not math.isfinite(confidence) or not 0.88 <= confidence <= 1):
+            failures.append(f"{tid}: 实体置信度缺失或不满足已确认阈值")
+        mappings.append((surface, canonical))
+    actual = row.get("canonical_input")
+    if not isinstance(actual, str) or not explained_by_mappings(expected_prepared, actual, mappings):
+        failures.append(f"{tid}: 最终canonical含有已记录局部实体映射无法解释的改动")
+    return [f"{before} → {after}" for before, after in mappings], failures
+
+
+def apply_recorded_edits(source: str, response: str) -> str:
+    document = json.loads(response)
+    if not isinstance(document, dict) or set(document) != {"edits"} or not isinstance(document["edits"], list):
+        raise ValueError("编辑响应不是独立 edits 对象")
+    located = []
+    for edit in document["edits"]:
+        before, after = edit.get("before"), edit.get("after")
+        if not isinstance(before, str) or not before or not isinstance(after, str) or source.count(before) != 1:
+            raise ValueError("编辑锚点缺失或重复")
+        start = source.index(before)
+        end = start + len(before)
+        if any(start < prior_end and end > prior_start for prior_start, prior_end, _ in located):
+            raise ValueError("编辑锚点重叠")
+        located.append((start, end, after))
+    output = source
+    for start, end, after in sorted(located, reverse=True):
+        output = output[:start] + after + output[end:]
+    return output
+
+
+def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, mode: str,
+                    expected: dict, nonce: str, process_id: int,
+                    started: datetime, finished: datetime) -> tuple[list[str], list[str]]:
+    """证据失败与质量失败分开；这里不自动授予 direct_send 或发布通过。"""
+    failures, quality = [], []
+    pairs = {
+        "schema_version": 5, "status": "complete", "mode": mode, "quality_mode": mode,
+        "run_nonce": nonce, "process_id": process_id, "run_input_sha256": expected["run_input_sha256"],
+        "executable_sha256": expected["executable_sha256"], "commit": expected["source_commit"],
+        "requested_input_count": len(inputs), "completed_input_count": len(inputs),
+        "prompt_version": expected["prompt_version"],
+        "latency_measurement_scope": "asr_final_fixture_to_output",
+        "provider": "none" if mode == "direct" else expected["provider"],
+    }
+    if mode != "direct":
+        pairs.update(model=expected["model"], endpoint_url=expected["endpoint_url"],
+                     editing_prompt_version=expected["editing_prompt_version"])
+    for key, value in pairs.items():
+        if report.get(key) != value:
+            failures.append(f"顶层 {key} 与冻结预期不一致")
+    if report.get("error") is not None:
+        failures.append("候选报告包含运行错误；不计为通过")
+    if mode == "direct" and any(report.get(key) is not None for key in ("model", "endpoint_url", "editing_prompt_version")):
+        failures.append("直出冒充模型或编辑协议调用")
+    audit_time(report.get("run_at"), started, finished, "报告开始", failures)
+    audit_time(report.get("finished_at"), started, finished, "报告结束", failures)
+    cases = report.get("cases", [])
+    if not isinstance(cases, list) or any(not isinstance(x, dict) for x in cases):
+        return failures + ["cases 不是对象数组"], quality
+    actual = {x.get("test_input_id"): x for x in cases}
+    ids = {x["test_input_id"] for x in inputs}
+    if len(cases) != len(actual) or set(actual) != ids:
+        failures.append("结果 ID 集合缺失、重复或被替换")
+    for item in inputs:
+        tid = item["test_input_id"]
+        row = actual.get(tid, {})
+        for key in ("base_case_id", "input_kind", "writing_scene", "spoken_input", "segment_texts"):
+            if row.get(key) != item[key]:
+                failures.append(f"{tid}: 原始 {key} 被改变")
+        if row.get("context_fixture") != legacy.expected_context_fixture(item):
+            failures.append(f"{tid}: 上下文夹具被改变")
+        route = {"direct": "direct", "light": "fast", "standard": "structured"}[mode]
+        if row.get("mode") != mode or row.get("executed_route") != route or row.get("detected_route") != route:
+            failures.append(f"{tid}: 选择模式与实际路径错配")
+        if row.get("segment_count") != len(item["segment_texts"]):
+            failures.append(f"{tid}: 原始分段数错配")
+        for field in ("llm_call_count", "llm_attempt_count", "latency_milliseconds", "internal_chunk_count"):
+            if not valid_integer(row.get(field)):
+                failures.append(f"{tid}: {field} 无有效非负整数证据")
+        begin = audit_time(row.get("started_at"), started, finished, tid, failures)
+        end = audit_time(row.get("finished_at"), started, finished, tid, failures)
+        if begin and end and end < begin:
+            failures.append(f"{tid}: 结束早于开始")
+        if not isinstance(row.get("model_output"), str):
+            failures.append(f"{tid}: 缺少实际输出")
+        if not isinstance(row.get("fallback_used"), bool):
+            failures.append(f"{tid}: 缺少明确回退状态")
+        for field in ("hard_validation_codes", "diagnostic_codes"):
+            if not isinstance(row.get(field), list) or any(not isinstance(x, str) for x in row[field]):
+                failures.append(f"{tid}: {field} 类型不正确")
+        if row.get("fallback_used") or row.get("hard_validation_codes") or row.get("failure_reason"):
+            quality.append(f"{tid}: 回退、硬校验失败或处理失败，不能算润色成功")
+        stages = row.get("stage_responses")
+        if not isinstance(stages, list) or any(not isinstance(s, dict) for s in stages):
+            failures.append(f"{tid}: 缺少阶段审计数组")
+            continue
+        if mode == "direct":
+            if stages or any(row.get(k) != 0 for k in ("llm_call_count", "llm_attempt_count", "internal_chunk_count")):
+                failures.append(f"{tid}: 直出必须为零调用、零尝试、零模型切片")
+            canonical = legacy.canonical_input(item)
+            if row.get("canonical_input") != canonical or row.get("model_output") != canonical.strip():
+                failures.append(f"{tid}: 直出偏离既有术语纠正及首尾清理基线")
+            if row.get("resolved_entities") != [] or row.get("canonical_segments") != []:
+                failures.append(f"{tid}: 直出不得伪造上下文实体解析")
+            if row.get("pre_resolution_canonical_input") != canonical:
+                failures.append(f"{tid}: 直出canonical来源证据不完整")
+            continue
+        expected_mappings, mapping_failures = resolved_entity_evidence(item, row)
+        failures += mapping_failures
+        if (not valid_integer(row.get("llm_attempt_count")) or row["llm_attempt_count"] < len(stages)
+                or (not row.get("fallback_used") and row["llm_attempt_count"] != len(stages))):
+            failures.append(f"{tid}: 尝试数与阶段记录不一致")
+        if row.get("internal_chunk_count") != 1:
+            failures.append(f"{tid}: 新润色协议必须记录一次整段输入，不冒充旧分片")
+        if valid_integer(row.get("llm_attempt_count")) and valid_integer(row.get("llm_call_count")):
+            if row["llm_call_count"] > row["llm_attempt_count"]:
+                failures.append(f"{tid}: 成功调用多于尝试")
+        successful = []
+        for ordinal, stage in enumerate(stages, 1):
+            if stage.get("attempt_ordinal") != ordinal or stage.get("status") not in {"succeeded", "failed", "running"}:
+                failures.append(f"{tid}: 阶段序号或状态不正确")
+            audit_time(stage.get("started_at"), started, finished, f"{tid} 阶段开始", failures)
+            if stage.get("status") != "running":
+                audit_time(stage.get("finished_at"), started, finished, f"{tid} 阶段结束", failures)
+            if not valid_integer(stage.get("latency_milliseconds")):
+                failures.append(f"{tid}: 阶段失败或成功耗时缺失")
+            if stage.get("status") == "succeeded":
+                successful.append(stage)
+                if stage.get("failure_reason") is not None:
+                    failures.append(f"{tid}: 成功阶段同时声称失败")
+            elif stage.get("response_text") != "" or (stage.get("status") == "failed" and not stage.get("failure_reason")):
+                failures.append(f"{tid}: 失败阶段伪造正文或缺少失败原因")
+            try:
+                payload = json.loads(stage["request_payload"])
+                if payload.get("mode") != mode or payload.get("canonical_text") != row.get("canonical_input"):
+                    failures.append(f"{tid}: 阶段请求模式或 canonical_text 不匹配")
+                if (payload.get("schema_version") != expected["editing_prompt_version"]
+                        or payload.get("writing_scene") != item["writing_scene"]
+                        or payload.get("authorized_context") != expected_mappings
+                        or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
+                    failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
+            except (KeyError, TypeError, json.JSONDecodeError, AttributeError):
+                failures.append(f"{tid}: 阶段请求不是可审计三档 JSON")
+        tasks = [s.get("task") for s in stages]
+        allowed = ["voicePolishFast"] if mode == "light" else ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
+        if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
+            failures.append(f"{tid}: 阶段任务顺序与模式不对应")
+        if not row.get("fallback_used") and (len(tasks) < (1 if mode == "light" else 2) or any(s.get("status") != "succeeded" for s in stages)):
+            failures.append(f"{tid}: 成功输出缺少完整模式链路")
+        if row.get("llm_call_count") != len(successful):
+            failures.append(f"{tid}: 成功阶段数与调用数不一致")
+        case_receipts = [r for r in receipts if r.get("test_input_id") == tid]
+        if len(case_receipts) != len(successful):
+            failures.append(f"{tid}: 成功阶段缺少一一对应 Provider 回执")
+        for stage, receipt in zip(successful, case_receipts):
+            if (receipt.get("llm_task") != stage.get("task")
+                    or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
+                failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
+        if not row.get("fallback_used") and successful:
+            try:
+                if mode == "light":
+                    if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"]) != row["model_output"]:
+                        failures.append(f"{tid}: 最终轻度输出不是实际Provider补丁的应用结果")
+                else:
+                    last = successful[-1]
+                    if (json.loads(last["request_payload"]).get("draft_text") != row["model_output"]
+                            or json.loads(last["response_text"]) != {"edits": []}):
+                        failures.append(f"{tid}: 标准最终稿未被最后冷复核确认")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                failures.append(f"{tid}: 不能将实际阶段响应对应到最终输出")
+    if mode == "direct":
+        if receipts:
+            failures.append("直出必须没有 Provider 回执")
+    else:
+        failures += legacy.provider_audit_failures(
+            receipts, expected_run_nonce=nonce, expected_provider=expected["provider"],
+            expected_model=expected["model"], expected_endpoint_url=expected["endpoint_url"],
+            expected_test_ids=ids, actual_by_id=actual, run_started_at=started, run_finished_at=finished,
+        )
+    return failures, quality
+
+
+def performance_summary(report: dict, document: dict) -> dict:
+    origins = {x["test_input_id"]: x["suite"] for x in document["input_provenance"]}
+    groups = {}
+    for row in report.get("cases", []):
+        group = f"{origins.get(row.get('test_input_id'), 'unknown')}/{row.get('input_kind')}"
+        groups.setdefault(group, []).append(row)
+    result = {}
+    for group, rows in groups.items():
+        latencies = sorted(x["latency_milliseconds"] for x in rows if valid_integer(x.get("latency_milliseconds")))
+        result[group] = {
+            "input_count": len(rows), "unique_spoken_texts": len({x.get("spoken_input") for x in rows}),
+            "unique_input_fixtures": len({object_sha({k: x.get(k) for k in ('spoken_input', 'segment_texts', 'context_fixture')}) for x in rows}),
+            "p50_milliseconds": statistics.median(latencies) if latencies else None,
+            "p95_milliseconds": latencies[max(0, (95 * len(latencies) + 99) // 100 - 1)] if latencies else None,
+            "llm_calls": sum(x.get("llm_call_count", 0) for x in rows if valid_integer(x.get("llm_call_count"))),
+            "llm_attempts": sum(x.get("llm_attempt_count", 0) for x in rows if valid_integer(x.get("llm_attempt_count"))),
+            "fallback_count": sum(x.get("fallback_used") is True for x in rows),
+            "semantic_quality_status": "待独立逐条评审",
+        }
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for flag in ("dataset", "contracts", "candidate-app", "build-manifest", "run-root"):
+        parser.add_argument("--" + flag, type=Path, required=True)
+    for flag in ("build-manifest-sha256", "source-commit", "source-tree", "executable-sha256", "dataset-sha256", "contract-sha256", "designated-requirement-sha256"):
+        parser.add_argument("--expected-" + flag, required=True)
+    parser.add_argument("--expected-provider")
+    parser.add_argument("--expected-model")
+    parser.add_argument("--expected-endpoint-url")
+    parser.add_argument("--expected-prompt-version", type=int, required=True)
+    parser.add_argument("--expected-editing-prompt-version", type=int, required=True)
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--test-ids", nargs="+")
+    parser.add_argument("--run-timeout-seconds", type=int, default=21600)
+    args = parser.parse_args()
+    if len(set(args.modes)) != len(args.modes) or args.run_timeout_seconds < 1:
+        parser.error("模式不得重复，超时必须为正数")
+    if set(args.modes) - {"direct"}:
+        if not args.expected_provider or not args.expected_model or not args.expected_endpoint_url:
+            parser.error("润色模式必须提供冻结 Provider、模型与真实 Endpoint")
+        legacy.validated_provider_endpoint(args.expected_endpoint_url)
+    document = validated_dataset(args.dataset, args.expected_dataset_sha256, args.contracts, args.expected_contract_sha256)
+    manifest = validated_manifest(args)
+    if manifest.get("three_mode_input_count") != document["input_count"]:
+        raise ValueError("候选构建清单的三档输入数与冻结数据集不一致")
+    candidate = candidate_evidence(args)
+    inputs = selected_inputs(document, args.test_ids)
+    scope = "full" if args.test_ids is None and set(args.modes) == set(MODES) else "diagnostic"
+    validate_run_root(args.run_root)
+    args.run_root.mkdir(mode=0o700)
+    run_input_path = args.run_root / "runner-input.json"
+    write_exclusive(run_input_path, {"schema_version": 1, "name": document["name"], "inputs": inputs})
+    expected = {
+        "source_commit": args.expected_source_commit, "executable_sha256": args.expected_executable_sha256,
+        "run_input_sha256": legacy.sha256_file(run_input_path), "provider": args.expected_provider,
+        "model": args.expected_model, "endpoint_url": args.expected_endpoint_url,
+        "prompt_version": args.expected_prompt_version, "editing_prompt_version": args.expected_editing_prompt_version,
+    }
+    tool_hashes = {str(path): legacy.sha256_file(path) for path in [
+        Path(__file__), ROOT / "scripts/evaluate-voice-polish-quality-report.py",
+        ROOT / "scripts/voice_polish_quality_checks.py",
+    ]}
+    write_exclusive(args.run_root / "frozen-evidence.json", {
+        "scope": scope, "expected": expected, "modes": args.modes,
+        "dataset_sha256": args.expected_dataset_sha256, "contract_sha256": args.expected_contract_sha256,
+        "build_manifest_sha256": args.expected_build_manifest_sha256,
+        "source_tree": args.expected_source_tree,
+        "designated_requirement_sha256": args.expected_designated_requirement_sha256,
+        "evaluator_sha256": legacy.sha256_file(Path(__file__)),
+        "legacy_audit_implementation_sha256": legacy.sha256_file(ROOT / "scripts/evaluate-voice-polish-quality-report.py"),
+        "tool_hashes": tool_hashes,
+        "test_input_ids": [x["test_input_id"] for x in inputs], "quality_status": "待独立语义评审",
+    })
+    outcomes = {}
+    for mode in args.modes:
+        directory = args.run_root / mode
+        try:
+            report, receipts, nonce, pid, started, finished = launch_run(
+                candidate["executable_path"], run_input_path, directory, mode, args.run_timeout_seconds
+            )
+            failures, blockers = validate_report(report, receipts, inputs, mode=mode, expected=expected,
+                                                nonce=nonce, process_id=pid, started=started, finished=finished)
+            if legacy.sha256_file(run_input_path) != expected["run_input_sha256"]:
+                failures.append("本轮输入文件在运行期间发生变化")
+            validated_dataset(args.dataset, args.expected_dataset_sha256, args.contracts, args.expected_contract_sha256)
+            validated_manifest(args)
+            candidate_evidence(args)
+            for path, frozen_hash in tool_hashes.items():
+                if legacy.sha256_file(Path(path)) != frozen_hash:
+                    failures.append("证据校验工具在运行期间变化")
+            outcome = {"mode": mode, "scope": scope, "evidence_passed": not failures,
+                       "evidence_failures": failures, "quality_blockers": blockers,
+                       "quality_status": "待独立语义评审；非发布通过结论",
+                       "report_sha256": legacy.sha256_file(directory / "report.json"),
+                       "provider_audit_sha256": legacy.sha256_file(directory / "provider-audit.jsonl"),
+                       "groups": performance_summary(report, document)}
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            outcome = {"mode": mode, "scope": scope, "evidence_passed": False,
+                       "evidence_failures": [str(error)], "quality_status": "未完成"}
+        outcomes[mode] = outcome
+        write_exclusive(args.run_root / f"{mode}-verification.json", outcome)
+        print(json.dumps({"mode": mode, "scope": scope, "evidence_passed": outcome["evidence_passed"]}, ensure_ascii=False), flush=True)
+    write_exclusive(args.run_root / "summary.json", {"scope": scope, "modes": outcomes,
+                    "quality_status": "必须分别独立评审，不合算分数或自动批准发布"})
+    if not all(x["evidence_passed"] for x in outcomes.values()):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"FAIL: {error}") from error

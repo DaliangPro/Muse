@@ -296,11 +296,17 @@ final class DoubaoChatClientTests: XCTestCase {
         let successfulCallCount = await successCounter.currentCount()
         XCTAssertEqual(successfulCallCount, 1)
         let stageResponses = await successCounter.stageResponses()
-        XCTAssertEqual(stageResponses, [VoicePolishQualityStageResponse(
-            task: "voicePolishFast",
-            requestPayload: "嗯润色一下",
-            responseText: "润色完成。"
-        )])
+        XCTAssertEqual(stageResponses.count, 1)
+        let stage = try XCTUnwrap(stageResponses.first)
+        XCTAssertEqual(stage.task, "voicePolishFast")
+        XCTAssertEqual(stage.requestPayload, "嗯润色一下")
+        XCTAssertEqual(stage.responseText, "润色完成。")
+        XCTAssertEqual(stage.attemptOrdinal, 1)
+        XCTAssertEqual(stage.status, "succeeded")
+        XCTAssertNotNil(stage.startedAt)
+        XCTAssertNotNil(stage.finishedAt)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(stage.latencyMilliseconds), 0)
+        XCTAssertNil(stage.failureReason)
         let encodedTrace = try JSONEncoder().encode(stageResponses)
         XCTAssertFalse(String(decoding: encodedTrace, as: UTF8.self).contains("test-only-key"))
     }
@@ -344,6 +350,14 @@ final class DoubaoChatClientTests: XCTestCase {
 
         let successfulCallCount = await successCounter.currentCount()
         XCTAssertEqual(successfulCallCount, 0)
+        let stageResponses = await successCounter.stageResponses()
+        XCTAssertEqual(stageResponses.count, 1)
+        XCTAssertEqual(stageResponses.first?.status, "failed")
+        XCTAssertEqual(stageResponses.first?.responseText, "")
+        XCTAssertNotNil(stageResponses.first?.startedAt)
+        XCTAssertNotNil(stageResponses.first?.finishedAt)
+        XCTAssertNotNil(stageResponses.first?.latencyMilliseconds)
+        XCTAssertNotNil(stageResponses.first?.failureReason)
     }
 
     func testProvider没有ResponseID时不得产生可冒充的成功回执() async throws {

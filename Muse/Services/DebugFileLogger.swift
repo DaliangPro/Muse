@@ -100,19 +100,32 @@ enum DebugFileLogger {
 
     static var isFileLoggingDisabledForTests: Bool { isRunningTests }
 
-    static var logURL: URL {
+    /// 专用质量/授权进程在 AppState 之前启动，仍可能被底层客户端调用日志。
+    /// 在解析用户目录之前关闭写盘；外部 sandbox 继续作为第二道隔离边界。
+    static func shouldDisableFileLogging(arguments: [String], isRunningTests: Bool) -> Bool {
+        isRunningTests
+            || arguments.contains("--voice-polish-quality-run")
+            || arguments.contains("--voice-polish-quality-authorize-keychain")
+    }
+
+    private static let isFileLoggingDisabled = shouldDisableFileLogging(
+        arguments: ProcessInfo.processInfo.arguments,
+        isRunningTests: isRunningTests
+    )
+
+    private static var logURL: URL {
         AppPaths.ensureSupportDir().appendingPathComponent("debug.log")
     }
 
     static func startSession() {
-        guard !isRunningTests else { return }
+        guard !isFileLoggingDisabled else { return }
         queue.async {
             try? DebugLogFileWriter.startSession(at: logURL)
         }
     }
 
     static func log(_ message: String) {
-        guard !isRunningTests else { return }
+        guard !isFileLoggingDisabled else { return }
         queue.async {
             try? DebugLogFileWriter.append(
                 message,

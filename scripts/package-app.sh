@@ -44,7 +44,13 @@ fi
 APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/Muse.app}"
 QUALITY_BUILD_MANIFEST_PATH="${MUSE_QUALITY_BUILD_MANIFEST_PATH:-}"
 QUALITY_DATASET_PATH=""
+QUALITY_PROFILE="${MUSE_QUALITY_PROFILE:-legacy}"
+QUALITY_CONTRACT_PATH=""
 if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
+    case "$QUALITY_PROFILE" in
+        legacy|three_mode) ;;
+        *) echo "MUSE_QUALITY_PROFILE must be legacy or three_mode" >&2; exit 1 ;;
+    esac
     case "$QUALITY_BUILD_MANIFEST_PATH" in
         /*) ;;
         *) echo "MUSE_QUALITY_BUILD_MANIFEST_PATH must be an absolute path" >&2; exit 1 ;;
@@ -72,7 +78,11 @@ if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
             echo "MUSE_QUALITY_DATASET_PATH cannot override the frozen production dataset" >&2
             exit 1
         fi
-        QUALITY_DATASET_PATH="$PROJECT_DIR/docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json"
+        if [ "$QUALITY_PROFILE" = "three_mode" ]; then
+            QUALITY_DATASET_PATH="$PROJECT_DIR/docs/2026-09-10-Muse-Three-Mode-Quality-Test-Set.json"
+        else
+            QUALITY_DATASET_PATH="$PROJECT_DIR/docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json"
+        fi
     fi
     case "$QUALITY_DATASET_PATH" in
         /*) ;;
@@ -81,6 +91,25 @@ if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
     if [ ! -f "$QUALITY_DATASET_PATH" ] || [ -L "$QUALITY_DATASET_PATH" ]; then
         echo "Quality dataset must be an existing regular non-symlink file: $QUALITY_DATASET_PATH" >&2
         exit 1
+    fi
+    if [ "$QUALITY_PROFILE" = "three_mode" ]; then
+        if [ "${MUSE_PACKAGE_TEST_MODE:-0}" = "1" ]; then
+            QUALITY_CONTRACT_PATH="${MUSE_QUALITY_CONTRACT_PATH:-}"
+        else
+            if [ -n "${MUSE_QUALITY_CONTRACT_PATH:-}" ]; then
+                echo "MUSE_QUALITY_CONTRACT_PATH cannot override frozen production contracts" >&2
+                exit 1
+            fi
+            QUALITY_CONTRACT_PATH="$PROJECT_DIR/docs/2026-09-10-Muse-Three-Mode-Quality-Contracts.json"
+        fi
+        case "$QUALITY_CONTRACT_PATH" in
+            /*) ;;
+            *) echo "Three-mode scoring contracts must use an absolute path" >&2; exit 1 ;;
+        esac
+        if [ ! -f "$QUALITY_CONTRACT_PATH" ] || [ -L "$QUALITY_CONTRACT_PATH" ]; then
+            echo "Three-mode scoring contracts must be a regular non-symlink file" >&2
+            exit 1
+        fi
     fi
 fi
 APP_NAME="${APP_NAME:-Muse}"
@@ -459,13 +488,18 @@ if [ -n "$QUALITY_BUILD_MANIFEST_PATH" ]; then
     MUSE_MANIFEST_SOURCE_TREE="$MUSE_SOURCE_TREE_VALUE" \
     MUSE_MANIFEST_EXECUTABLE_SHA256="$PACKAGED_EXECUTABLE_SHA256" \
     MUSE_MANIFEST_DATASET_SHA256="$QUALITY_DATASET_SHA256" \
+    MUSE_MANIFEST_QUALITY_PROFILE="$QUALITY_PROFILE" \
+    MUSE_MANIFEST_CONTRACT_PATH="$QUALITY_CONTRACT_PATH" \
+    MUSE_MANIFEST_DATASET_PATH="$QUALITY_DATASET_PATH" \
     MUSE_MANIFEST_DESIGNATED_REQUIREMENT="$DESIGNATED_REQUIREMENT" \
     MUSE_MANIFEST_DESIGNATED_REQUIREMENT_SHA256="$DESIGNATED_REQUIREMENT_SHA256" \
         /usr/bin/python3 - "$QUALITY_BUILD_MANIFEST_PATH" <<'PY'
 import datetime
+import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 
 path = sys.argv[1]
 document = {
@@ -485,6 +519,22 @@ document = {
         "+00:00", "Z"
     ),
 }
+document["quality_profile"] = os.environ["MUSE_MANIFEST_QUALITY_PROFILE"]
+if document["quality_profile"] == "three_mode":
+    contract_path = Path(os.environ["MUSE_MANIFEST_CONTRACT_PATH"])
+    dataset_path = Path(os.environ["MUSE_MANIFEST_DATASET_PATH"])
+    contract_data = contract_path.read_bytes()
+    contract = json.loads(contract_data)
+    dataset = json.loads(dataset_path.read_bytes())
+    if contract.get("dataset_sha256") != document["dataset_sha256"]:
+        raise SystemExit("Three-mode contracts do not bind the frozen dataset")
+    if contract.get("input_count") != len(dataset.get("inputs", [])):
+        raise SystemExit("Three-mode contracts and dataset input counts differ")
+    document.update(
+        supported_modes=["direct", "light", "standard"],
+        scoring_contract_sha256=hashlib.sha256(contract_data).hexdigest(),
+        three_mode_input_count=len(dataset["inputs"]),
+    )
 data = (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
     "utf-8"
 )
@@ -506,6 +556,10 @@ PY
     echo "MUSE_QUALITY_EXPECTED_SOURCE_TREE=$MUSE_SOURCE_TREE_VALUE"
     echo "MUSE_QUALITY_EXPECTED_EXECUTABLE_SHA256=$PACKAGED_EXECUTABLE_SHA256"
     echo "MUSE_QUALITY_EXPECTED_DATASET_SHA256=$QUALITY_DATASET_SHA256"
+    if [ "$QUALITY_PROFILE" = "three_mode" ]; then
+        QUALITY_CONTRACT_SHA256="$(/usr/bin/shasum -a 256 "$QUALITY_CONTRACT_PATH" | /usr/bin/awk '{print $1}')"
+        echo "MUSE_QUALITY_EXPECTED_CONTRACT_SHA256=$QUALITY_CONTRACT_SHA256"
+    fi
     echo "MUSE_QUALITY_EXPECTED_DESIGNATED_REQUIREMENT_SHA256=$DESIGNATED_REQUIREMENT_SHA256"
 fi
 
