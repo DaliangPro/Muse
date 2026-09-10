@@ -1,6 +1,7 @@
 import AppKit
 import CommonCrypto
 import Foundation
+import Security
 
 /// 仅由显式质量跑测入口写入调用方指定的报告，用来区分模型初稿、修复与
 /// 本地处理造成的变化；生产历史和诊断日志不采集正文，也不记录配置或凭据。
@@ -238,6 +239,7 @@ enum VoicePolishQualityRunner {
         case invalidRunInput
         case forbiddenRunInputField(String)
         case missingLLMConfig
+        case noninteractiveKeychainUnavailable(OSStatus)
         case missingExecutableURL
         case missingSourceCommit
         case invalidSourceCommit(String)
@@ -263,6 +265,8 @@ enum VoicePolishQualityRunner {
                 return "运行输入包含禁止交给 Runner 的答案字段：\(field)"
             case .missingLLMConfig:
                 return "当前 LLM Provider 没有可用配置"
+            case .noninteractiveKeychainUnavailable(let status):
+                return "无法禁用质量跑测进程的钥匙串交互，状态码：\(status)"
             case .missingExecutableURL:
                 return "无法确定当前运行二进制路径"
             case .missingSourceCommit:
@@ -384,6 +388,13 @@ enum VoicePolishQualityRunner {
         )
 
         do {
+            // LAContext.interactionNotAllowed 不覆盖 macOS 传统钥匙串的全部
+            // 交互路径。质量进程额外关闭本进程的传统交互，避免后台跑测
+            // 等待系统授权窗口；不修改钥匙串条目、权限或安装版进程。
+            let keychainStatus = SecKeychainSetUserInteractionAllowed(false)
+            guard keychainStatus == errSecSuccess else {
+                throw RunnerError.noninteractiveKeychainUnavailable(keychainStatus)
+            }
             let providerAuditURL = try validatedEmptyProviderAuditURL(
                 at: invocation.providerAuditPath
             )
