@@ -610,18 +610,25 @@ enum VoicePolishLedgerIntegrityValidator {
         let source = spans.map(\.text).joined()
         let requiredAudience = requiredAudienceTokens(in: source)
         let plannedAudience = Set(ledger.audience.flatMap(\.surfaceTokens))
-        let unclassifiedAudience = requiredAudience.subtracting(plannedAudience)
-        if !unclassifiedAudience.isEmpty {
-            // “告诉他”可能是正文里的第三方动作，词面不能证明他也是收件人。
-            // 保留为必答的来源语义问题，不能强制补收件人，也不能直接忽略。
-            let relevantSpans = audienceEvidenceSpans(for: unclassifiedAudience, spans: spans)
-            let sourceIDs = Set(relevantSpans.map(\.id))
+        let audienceMentions = requiredAudience.union(plannedAudience)
+        if !audienceMentions.isEmpty {
+            // 受众名称正确不等于说话视角正确。关系可能延续到后面的片段，
+            // 所以完整来源都须参与核对，也覆盖 ASR 在受众词中间分段的情况。
             ledger.pendingSemanticChecks?.append(VoicePolishSemanticCheck(
                 id: "audience_context", kind: "audience_relation",
-                claim: "核对来源中“\(unclassifiedAudience.sorted().joined(separator: "、"))”在当前任务中是成稿收件人还是正文所述第三方。成稿须正确保留受众和转述关系；不能把每个‘告诉他’都当作写给他的要求。",
-                unitIds: ledger.units.filter { !Set($0.sourceSpanIds).isDisjoint(with: sourceIDs) }.map(\.id),
-                sourceSpanIds: relevantSpans.map(\.id),
-                requiredEvidence: relevantSpans.map { .init(spanId: $0.id, text: $0.text) }
+                claim: "独立核对谁向谁表达、每项行动或承诺由谁承担。来源中的“\(audienceMentions.sorted().joined(separator: "、"))”可能是收件人或正文第三方，Planner 分类不是答案。直接客户稿中发件方暂不承诺的边界不能变成命令客户不要承诺；原文明说要求客户执行的动作则保留。给内部收件人的下游沟通、措辞和验收要求属于任务正文。逐项对照成稿的实际主体，名字出现不代表视角正确。",
+                unitIds: ledger.units.map(\.id),
+                sourceSpanIds: spans.map(\.id),
+                requiredEvidence: spans.map { .init(spanId: $0.id, text: $0.text) }
+            ))
+        }
+        for unit in ledger.units where unit.deliveryRole != "recipient_content" || unit.status == "remove" {
+            let evidence = unit.sourceSpanIds.compactMap { spanByID[$0] }
+            ledger.pendingSemanticChecks?.append(VoicePolishSemanticCheck(
+                id: "source_role_\(unit.id)", kind: "source_disposition",
+                claim: "这些来源被候选计划作为非正文处置，但该分类尚未证明。逐句检查是否混有本次产出的对象名、主题、有效事实、原因、身份或收件人的行动要求；它们不能随编辑指令一起消失。明确要求不对收件人披露的内容和已撤销的值不能补回。只有最终稿保留全部应交付信息、并正确执行实际编辑要求，才能回答 supported。",
+                unitIds: [unit.id], sourceSpanIds: evidence.map(\.id),
+                requiredEvidence: evidence.map { .init(spanId: $0.id, text: $0.text) }
             ))
         }
         ledger.contextMappings = verifiedMappings.filter { mapping in
@@ -708,7 +715,16 @@ enum VoicePolishLedgerIntegrityValidator {
                   }),
                   answer.evidence.allSatisfy({ quote in
                       guard let span = spanByID[quote.spanId] else { return false }
-                      return quote.text.rangeOfCharacter(from: .alphanumerics) != nil
+                      // 全来源核对可能含独立空行、标点或表情。只允许按本地
+                      // requiredEvidence 引用该非文字 span 全文，不能从正文摘标点冒充证据。
+                      let completeNonLexicalSpan = ["audience_relation", "source_disposition"].contains(check.kind)
+                          && !span.text.isEmpty
+                          && span.text.rangeOfCharacter(from: .alphanumerics) == nil
+                          && quote.text == span.text
+                          && (check.requiredEvidence ?? []).contains {
+                              $0.spanId == quote.spanId && $0.text == span.text
+                          }
+                      return (quote.text.rangeOfCharacter(from: .alphanumerics) != nil || completeNonLexicalSpan)
                           && span.text.contains(quote.text)
                   }) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
@@ -896,6 +912,35 @@ enum VoicePolishLedgerIntegrityValidator {
             orderedUnitIds: orderedUnitIDs,
             numberedUnitIds: ledger.structure.numberedUnitIds
         )
+    }
+
+    /// 整篇包含命令不代表命令属于正确步骤。局部修复按 unit ID 定位，
+    /// 因此必须同时检查单元与文本的绑定，避免标题占位造成后续内容全部错位。
+    static func fragmentBindingIssues(
+        document: VoicePolishLedgerDraftDocument,
+        ledger: VoicePolishIntentLedger
+    ) -> [VoicePolishReviewerIssue] {
+        let activeUnits = ledger.units.filter {
+            $0.deliveryRole == "recipient_content" && $0.status != "remove"
+        }
+        var issues: [VoicePolishReviewerIssue] = []
+        for unit in activeUnits {
+            let ownText = document.fragments.filter { $0.unitIds.contains(unit.id) }
+                .map(\.text).joined(separator: "\n")
+            for token in unit.exactTokens where !token.isEmpty && !ownText.contains(token) {
+                let otherIDs = Set(document.fragments.filter {
+                    !$0.unitIds.contains(unit.id) && $0.text.contains(token)
+                }.flatMap(\.unitIds))
+                let affected = activeUnits.filter { $0.id == unit.id || otherIDs.contains($0.id) }
+                issues.append(VoicePolishReviewerIssue(
+                    type: "missing", severity: "major", unitIds: affected.map(\.id),
+                    sourceSpanIds: Array(Set(affected.flatMap(\.sourceSpanIds))).sorted(),
+                    draftSpan: nil,
+                    repairInstruction: "单元 \(unit.id) 对应的片段必须承载自身 final_meaning 和标识“\(token)”。标识出现在其他片段不算本项完成。核对涉及的片段与各自单元，修正错位内容；不得移动 id/unit_ids 或用标题替代行动，编号由程序生成。"
+                ))
+            }
+        }
+        return issues
     }
 
     static func deterministicIssues(
@@ -2674,27 +2719,6 @@ enum VoicePolishLedgerIntegrityValidator {
             }
             return nil
         })
-    }
-
-    /// 先在完整来源定位受众措辞，再按 UTF-16 区间映射全部相交片段。
-    /// ASR 可以在词中分段，不能要求每个片段独立包含完整“跟客户说”。
-    private static func audienceEvidenceSpans(
-        for tokens: Set<String>, spans: [VoicePolishEvidenceSpan]
-    ) -> [VoicePolishEvidenceSpan] {
-        let source = spans.map(\.text).joined()
-        let range = NSRange(source.startIndex..<source.endIndex, in: source)
-        let matches = explicitAudiencePattern.matches(in: source, range: range).filter { match in
-            (1..<match.numberOfRanges).contains { index in
-                guard let tokenRange = Range(match.range(at: index), in: source) else { return false }
-                return tokens.contains(String(source[tokenRange]))
-            }
-        }
-        var offset = 0
-        return spans.filter { span in
-            let spanRange = NSRange(location: offset, length: span.text.utf16.count)
-            offset += spanRange.length
-            return matches.contains { NSIntersectionRange($0.range, spanRange).length > 0 }
-        }
     }
 
     private static func isGroupAudience(_ audience: String) -> Bool {

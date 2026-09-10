@@ -293,6 +293,8 @@ struct VoicePolishLedgerPipeline: Sendable {
                 request: request,
                 ledger: ledger,
                 spans: spans
+            ) + VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(
+                document: initialDocument, ledger: ledger
             ),
             ledger: ledger,
             validSpanIDs: Set(spans.map(\.id))
@@ -403,6 +405,8 @@ struct VoicePolishLedgerPipeline: Sendable {
                 request: request,
                 ledger: ledger,
                 spans: spans
+            ) + VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(
+                document: repairedDocument, ledger: ledger
             ),
             ledger: ledger,
             validSpanIDs: Set(spans.map(\.id))
@@ -446,7 +450,7 @@ struct VoicePolishLedgerPipeline: Sendable {
             deadline: deadline,
             config: reviewerConfig
         )
-        let review = try decode(VoicePolishReviewerResult.self, from: response)
+        let decodedReview = try decode(VoicePolishReviewerResult.self, from: response)
         let allowedVerdicts = Set(["pass", "repair", "unsafe"])
         let allowedTypes = Set([
             "missing", "wrong_relation", "wrong_condition", "wrong_modality",
@@ -457,6 +461,22 @@ struct VoicePolishLedgerPipeline: Sendable {
         let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
         let validUnitIDs = Set(unitByID.keys)
         let rendered = renderedText(from: draft, ledger: ledger)
+        // 轻微排版建议有时用省略号概括整段。只去掉这类建议的不实引文，
+        // 保留问题及其单元/来源定位，仍须修复并重新确认；事实类引文继续严格校验。
+        let review = VoicePolishReviewerResult(
+            verdict: decodedReview.verdict,
+            issues: decodedReview.issues.map { issue in
+                guard issue.type == "style_shift", issue.severity == "minor",
+                      let quote = issue.draftSpan, !quote.isEmpty, !rendered.contains(quote)
+                else { return issue }
+                return VoicePolishReviewerIssue(
+                    type: issue.type, severity: issue.severity, unitIds: issue.unitIds,
+                    sourceSpanIds: issue.sourceSpanIds, draftSpan: nil,
+                    repairInstruction: issue.repairInstruction
+                )
+            },
+            semanticChecks: decodedReview.semanticChecks
+        )
         let issuesAreValid = review.issues.allSatisfy { issue -> Bool in
             guard allowedTypes.contains(issue.type),
                   ["minor", "major"].contains(issue.severity),

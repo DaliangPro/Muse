@@ -233,7 +233,8 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         let editor = VoicePolishLedgerDraftFragment(id: "f_u1", unitIds: ["u1"], text: spans[0].text)
         let body = VoicePolishLedgerDraftFragment(id: "f_u2", unitIds: ["u2"], text: spans[1].text)
         let document = VoicePolishLedgerDraftDocument(fragments: [editor, body])
-        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document), try encoded(passReview())])
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document),
+            try encoded(passReview(checkIDs: ["source_role_u1"], spans: [spans[0]]))])
         let result = await productionLedgerPipeline(client).process(request)
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, spans[1].text)
@@ -1373,7 +1374,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
             try encoded(wrongPlan),
             try encoded(repairedPlan),
             try encoded(draft),
-            try encoded(passReview(checkIDs: ["correction_1"], spans: spans)),
+            try encoded(passReview(checkIDs: ["correction_1", "source_role_process"], spans: spans)),
         ])
 
         let result = await productionLedgerPipeline(client).process(request)
@@ -2574,14 +2575,15 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
                 type: "wrong_role", severity: "major", unitIds: ["u1"],
                 sourceSpanIds: spans.map(\.id), draftSpan: "请先开启权限",
                 repairInstruction: "把‘请’改成更直接的口吻。"
-            )]
+            )],
+            semanticChecks: passReview(checkIDs: ["audience_context"], spans: spans).semanticChecks
         )
         let client = LedgerScriptedLLM(responses: [
             try encoded(plan),
             try encoded(draft("请先开启权限。")),
             try encoded(styleOpinion),
             try encoded(draft("请先开启权限。")),
-            try encoded(passReview()),
+            try encoded(passReview(checkIDs: ["audience_context"], spans: spans)),
         ])
 
         let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
@@ -2602,9 +2604,12 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         let wrong = "先不要答应赔偿，费用还没确认。"
         let wrongRole = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
             type: "wrong_role", severity: "major", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
-            draftSpan: "先不要答应赔偿", repairInstruction: "这是给写作者的要求，改为直接告知客户费用尚未确认，不能承诺赔偿。")])
+            draftSpan: "先不要答应赔偿", repairInstruction: "这是给写作者的要求，改为直接告知客户费用尚未确认，不能承诺赔偿。")],
+            semanticChecks: [.init(checkId: "audience_context", verdict: "unsupported",
+                evidence: spans.map { .init(spanId: $0.id, text: $0.text) })])
         let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(wrong)),
-            try encoded(wrongRole), try encoded(draft(finalText)), try encoded(passReview())])
+            try encoded(wrongRole), try encoded(draft(finalText)),
+            try encoded(passReview(checkIDs: ["audience_context"], spans: spans))])
         let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
         XCTAssertEqual(result.text, finalText)
         XCTAssertEqual(result.attempts, 5)
@@ -2777,7 +2782,8 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
                 sourceSpanIds: [spans[1].id],
                 draftSpan: nil,
                 repairInstruction: "这是面向团队的真实行动要求，不能作为幕后指令删除。"
-            )]
+            )], semanticChecks: [.init(checkId: "source_role_u2", verdict: "unsupported",
+                evidence: [.init(spanId: spans[1].id, text: spans[1].text)])]
         )
         let client = LedgerScriptedLLM(responses: [
             try encoded(plan),
@@ -2795,6 +2801,7 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertNil(result.text)
         XCTAssertEqual(result.failureStage, .reviewing)
         XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.validationCodes, [.semanticDecisionUnverified])
         let requestCount = await client.requestCount()
         XCTAssertEqual(requestCount, 3)
     }
@@ -2808,13 +2815,16 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         plan.structure = .init(kind: "paragraphs", orderedUnitIds: ["u1"])
         let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
             type: "wrong_role", severity: "major", unitIds: ["u2"], sourceSpanIds: [spans[1].id],
-            draftSpan: nil, repairInstruction: "截图行动仍有效，不能因为 status=remove 而删除正文。")])
+            draftSpan: nil, repairInstruction: "截图行动仍有效，不能因为 status=remove 而删除正文。")],
+            semanticChecks: [.init(checkId: "source_role_u2", verdict: "unsupported",
+                evidence: [.init(spanId: spans[1].id, text: spans[1].text)])])
         let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(spans[0].text)),
             try encoded(review)])
         let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
         XCTAssertNil(result.text)
         XCTAssertEqual(result.failureStage, .reviewing)
         XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.validationCodes, [.semanticDecisionUnverified])
     }
 
     func testSourceBoundPercentageCannotDisappearFromDraft() async throws {
@@ -3012,11 +3022,13 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
             type: "missing", severity: "major", unitIds: [removedID], sourceSpanIds: plan.units[removedIndex].sourceSpanIds,
             draftSpan: nil, repairInstruction: "恢复仍有效的截图未补齐状态。"
-        )])
+        )], semanticChecks: [.init(checkId: "source_role_\(removedID)", verdict: "unsupported",
+            evidence: spans.map { .init(spanId: $0.id, text: $0.text) })])
         let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(doc), try encoded(review)])
         let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
         XCTAssertNil(result.text)
         XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.validationCodes, [.semanticDecisionUnverified])
         let requests = await client.requests()
         let payload = try XCTUnwrap(requests.last?.user)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
@@ -3263,6 +3275,214 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
                          VoicePolishReviewerResult(verdict: "repair", issues: [], semanticChecks: review.semanticChecks)] {
             XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(unlinked,
                 ledger: checked, spans: spans, allowRepairFindings: true))
+        }
+    }
+
+    func test已识别收件人仍必须核对后续片段的承诺主体() throws {
+        let request = makeRequest("给客户回复我们还在检查。费用还没确认，先别答应赔偿。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "我们还在检查。费用尚未确认，暂不能承诺赔偿。", spanIDs: spans.map(\.id))
+        plan.audience = [.init(text: "客户", sourceSpanIds: [spans[0].id],
+            surfaceTokens: ["客户"], deliveryMode: "direct_address")]
+        let checked = try validated(plan, for: request)
+        let check = try XCTUnwrap(checked.pendingSemanticChecks?.first { $0.id == "audience_context" })
+        XCTAssertEqual(Set(check.sourceSpanIds), Set(spans.map(\.id)))
+        XCTAssertEqual(Set(check.requiredEvidence?.map(\.text) ?? []), Set(spans.map(\.text)))
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            passReview(), ledger: checked, spans: spans))
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            passReview(checkIDs: [check.id], spans: spans), ledger: checked, spans: spans))
+    }
+
+    func test所有非正文处置都必须回答混合来源事实是否保留() throws {
+        let request = makeRequest("把想法整理成青禾交接页的需求说明。可以查找资料。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        for (role, status) in [("editor_directive", "remove"), ("style_directive", "keep"),
+                               ("excluded_content", "remove"), ("recipient_content", "remove")] {
+            var plan = ledger(finalMeaning: "可以查找资料。", spanIDs: spans.map(\.id))
+            plan.units.append(.init(id: "u2", kind: "claim", deliveryRole: role,
+                finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: status,
+                modality: "confirmed", exactTokens: ["青禾交接页"],
+                surfaceTokens: role == "recipient_content" ? [] : [spans[0].text]))
+            plan.pendingSemanticChecks = []
+            let checked = try validated(plan, for: request)
+            let check = try XCTUnwrap(checked.pendingSemanticChecks?.first { $0.id == "source_role_u2" })
+            XCTAssertEqual(check.kind, "source_disposition")
+            XCTAssertEqual(check.unitIds, ["u2"])
+            XCTAssertTrue(check.requiredEvidence?.contains { $0.text.contains("青禾交接页") } == true)
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                passReview(), ledger: checked, spans: spans), role)
+            let unsupported = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+                type: "missing", severity: "major", unitIds: ["u2"], sourceSpanIds: [spans[0].id],
+                draftSpan: nil, repairInstruction: "恢复需求对象名。"
+            )], semanticChecks: [.init(checkId: check.id, verdict: "unsupported",
+                                      evidence: [.init(spanId: spans[0].id, text: spans[0].text)])])
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                unsupported, ledger: checked, spans: spans), role)
+        }
+    }
+
+    func test只改钟点保留原日期和另一活动具体安排() throws {
+        let request = makeRequest("会议原定周三上午十点，培训安排周四上午十点。会议时间改成十点半，日期不变。培训安排也不变。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 3)
+        var plan = ledger(finalMeaning: "会议安排在周三上午十点半。", spanIDs: [spans[0].id, spans[1].id])
+        plan.units.append(.init(id: "u2", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "培训仍安排在周四上午十点。", sourceSpanIds: [spans[0].id, spans[2].id],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        plan.structure = .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2"])
+        plan.corrections = [.init(subject: "会议", oldValue: "周三上午十点", finalValue: "十点半",
+            oldSpanIds: [spans[0].id], finalSpanIds: [spans[1].id], renderingPolicy: "final_only")]
+        let checked = try validated(plan, for: request)
+        let issues = VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: plan.units.map(\.finalMeaning).joined(), request: request, ledger: checked, spans: spans)
+        XCTAssertTrue(issues.isEmpty, "\(issues)")
+        plan.units[0].finalMeaning = "会议安排在周三上午十点。"
+        XCTAssertThrowsError(try validated(plan, for: request))
+    }
+
+    func test命令在整篇出现仍必须在本步骤修复后重新确认() async throws {
+        let request = makeRequest("先跑swift test，再跑swift build。", scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "跑swift test。", spanIDs: spans.map(\.id))
+        plan.units[0].exactTokens = ["swift test"]
+        plan.units.append(.init(id: "u2", kind: "action", deliveryRole: "recipient_content",
+            finalMeaning: "跑swift build。", sourceSpanIds: spans.map(\.id), status: "keep",
+            modality: "confirmed", exactTokens: ["swift build"], surfaceTokens: []))
+        plan.structure = .init(kind: "numbered_list", orderedUnitIds: ["u1", "u2"])
+        let shifted = VoicePolishLedgerDraftDocument(fragments: [
+            .init(id: "f_u1", unitIds: ["u1"], text: "部署步骤如下："),
+            .init(id: "f_u2", unitIds: ["u2"], text: "跑swift test，再跑swift build。"),
+        ])
+        let fixed = VoicePolishLedgerDraftDocument(fragments: plan.units.map {
+            .init(id: "f_\($0.id)", unitIds: [$0.id], text: $0.finalMeaning)
+        })
+        for patch in [fixed, shifted] {
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(shifted),
+                try encoded(passReview()), try encoded(patch), try encoded(passReview())])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertEqual(result.attempts, 5)
+            if patch == fixed {
+                XCTAssertEqual(result.text, "1. 跑swift test。\n2. 跑swift build。")
+            } else {
+                XCTAssertNil(result.text)
+                XCTAssertEqual(result.failureStage, .confirming)
+            }
+            let requests = await client.requests()
+            let repair = try XCTUnwrap(requests.first { $0.task == .voicePolishRepair })
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(repair.user.utf8)) as? [String: Any])
+            XCTAssertEqual(Set(payload["allowed_fragment_ids"] as? [String] ?? []), ["f_u1", "f_u2"])
+        }
+    }
+
+    func test片段技术标识不能被其他同版本名称冒充() {
+        var plan = ledger(finalMeaning: "检查api/v2/query。")
+        plan.units[0].exactTokens = ["api/v2/query"]
+        let wrong = draft("检查other/v2/query。")
+        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(document: wrong, ledger: plan).isEmpty)
+        XCTAssertTrue(VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(
+            document: draft("检查api/v2/query。"), ledger: plan).isEmpty)
+    }
+
+    func test轻微排版的概括引文可按有效单元修复但不能跳过确认() async throws {
+        let request = makeRequest("说明背景，再说明安排。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
+            draftSpan: "说明背景……说明安排", repairInstruction: "同一主题连续成句。"
+        )])
+        for confirm in [passReview(), review] {
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(request.fallbackText)),
+                try encoded(review), try encoded(draft("先说明背景，再说明安排。")), try encoded(confirm)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertEqual(result.attempts, 5)
+            XCTAssertEqual(result.text != nil, confirm.verdict == "pass")
+            if confirm.verdict != "pass" { XCTAssertEqual(result.failureStage, .confirming) }
+            let requests = await client.requests()
+            let repair = try XCTUnwrap(requests.first { $0.task == .voicePolishRepair })
+            XCTAssertTrue(repair.user.contains("同一主题连续成句"))
+            XCTAssertFalse(repair.user.contains("说明背景……说明安排"))
+        }
+    }
+
+    func test事实错误及无效定位不能借排版引文容错放行() async throws {
+        let request = makeRequest("说明背景，再说明安排。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        let variants: [(String, String, [String], [String], String)] = [
+            ("style_shift", "major", ["u1"], spans.map(\.id), "修复事实。"),
+            ("wrong_role", "minor", ["u1"], spans.map(\.id), "修复角色。"),
+            ("missing", "major", ["u1"], spans.map(\.id), "恢复事实。"),
+            ("style_shift", "minor", ["unknown"], spans.map(\.id), "调整排版。"),
+            ("style_shift", "minor", ["u1"], ["unknown"], "调整排版。"),
+            ("style_shift", "minor", ["u1"], spans.map(\.id), ""),
+        ]
+        for (type, severity, units, sourceIDs, instruction) in variants {
+            let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+                type: type, severity: severity, unitIds: units, sourceSpanIds: sourceIDs,
+                draftSpan: "说明背景……说明安排", repairInstruction: instruction
+            )])
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(request.fallbackText)),
+                try encoded(review)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertNil(result.text)
+            XCTAssertEqual(result.attempts, 3)
+            XCTAssertEqual(result.failureStage, .reviewing)
+            XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
+        }
+    }
+
+    func test全来源复核可引用完整非文字片段但不能拿标点代替正文证据() throws {
+        for separator in ["\n", "\n\n", "！？", "🙂"] {
+            let texts = ["给客户回复。", separator, "我们还在核实。"]
+            var offset = 0
+            let spans = texts.enumerated().map { index, text -> VoicePolishEvidenceSpan in
+                defer { offset += text.count }
+                return .init(id: "s\(index + 1)", segmentID: "s\(index + 1)",
+                    start: offset, end: offset + text.count, text: text, digest: "test")
+            }
+            var plan = ledger(finalMeaning: "我们还在核实。", spanIDs: ["s1", "s3"])
+            plan.units.append(.init(id: "u2", kind: "style", deliveryRole: "style_directive",
+                finalMeaning: "处理分隔符", sourceSpanIds: ["s2"], status: "remove", modality: "confirmed",
+                exactTokens: [], surfaceTokens: [separator]))
+            let checked = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+                verifiedMappings: [], requiredLogicCues: [], scene: .customerSupport)
+            let checks = try XCTUnwrap(checked.pendingSemanticChecks)
+            XCTAssertEqual(Set(checks.map(\.id)), ["audience_context", "source_role_u2"])
+            let answers = checks.map { check in
+                VoicePolishSemanticCheckResult(checkId: check.id, verdict: "supported", evidence: spans.filter {
+                    check.sourceSpanIds.contains($0.id)
+                }.map { .init(spanId: $0.id, text: $0.text) })
+            }
+            let supported = VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: answers)
+            XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                supported, ledger: checked, spans: spans), separator)
+            for (spanID, invalidQuote) in [("s1", "。"), ("s2", ""), ("s2", String(separator.dropLast()))] {
+                let badAnswers = answers.map { answer in
+                    VoicePolishSemanticCheckResult(checkId: answer.checkId, verdict: answer.verdict,
+                        evidence: answer.evidence.map { quote in
+                            quote.spanId == spanID ? .init(spanId: spanID, text: invalidQuote) : quote
+                        })
+                }
+                XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                    .init(verdict: "pass", issues: [], semanticChecks: badAnswers), ledger: checked, spans: spans))
+            }
+            var otherKind = checked
+            otherKind.pendingSemanticChecks = checks.map { check in
+                .init(id: check.id, kind: "measurement", claim: check.claim, unitIds: check.unitIds,
+                    sourceSpanIds: check.sourceSpanIds, requiredEvidence: check.requiredEvidence)
+            }
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                supported, ledger: otherKind, spans: spans))
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                passReview(), ledger: checked, spans: spans))
+            let unsupported = answers.map {
+                VoicePolishSemanticCheckResult(checkId: $0.checkId, verdict: "unsupported", evidence: $0.evidence)
+            }
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                .init(verdict: "pass", issues: [], semanticChecks: unsupported), ledger: checked, spans: spans,
+                allowRepairFindings: true))
         }
     }
 
