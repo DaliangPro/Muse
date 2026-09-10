@@ -3486,6 +3486,180 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         }
     }
 
+    func test排版补丁可以去除程序生成的错误单号且保留全部正文() async throws {
+        let fixture = try layoutRepairFixture()
+        for stepWording in ["两步", "两个步骤"] {
+            var fragment = fixture.document.fragments[1]
+            fragment.text = fragment.text.replacingOccurrences(of: "两步", with: stepWording)
+            let patch = VoicePolishLedgerDraftPatch(
+                fragments: [fragment],
+                structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: [])
+            )
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(fixture.review), try encoded(patch), try encoded(passReview(checkIDs: ["measurement_u2"], spans: [fixture.spans[1]]))])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertEqual(result.text, fixture.document.fragments.map(\.text).joined(separator: "\n\n").replacingOccurrences(of: "两步", with: stepWording),
+                           "\(result.failureStage as Any) \(result.validationCodes)")
+            XCTAssertEqual(result.attempts, 5)
+            let requests = await client.requests()
+            let repairPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(requests.dropFirst(3).first).user.utf8)) as? [String: Any])
+            XCTAssertEqual(repairPayload["allowed_structure_unit_ids"] as? [String], ["u2"])
+            XCTAssertEqual(repairPayload["allowed_fragment_ids"] as? [String], ["f_u2"])
+            let confirmPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(requests.dropFirst(4).first).user.utf8)) as? [String: Any])
+            XCTAssertEqual(confirmPayload["rendered_text"] as? String, result.text)
+            XCTAssertFalse((confirmPayload["rendered_text"] as? String ?? "").contains("1. "))
+        }
+    }
+
+    func test仅全局排版问题可以改变整篇段落形式() async throws {
+        let fixture = try layoutRepairFixture()
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u1", "u2", "u3"], sourceSpanIds: fixture.spans.map(\.id),
+            draftSpan: nil, repairInstruction: "调整整篇的段落排版，保留全部内容。"
+        )], semanticChecks: fixture.review.semanticChecks)
+        for kind in ["sentence", "paragraphs"] {
+            let patch = VoicePolishLedgerDraftPatch(fragments: fixture.document.fragments,
+                structure: .init(kind: kind, orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []))
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(review), try encoded(patch),
+                try encoded(passReview(checkIDs: ["measurement_u2"], spans: [fixture.spans[1]]))])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertEqual(result.text, fixture.document.fragments.map(\.text).joined(separator: kind == "sentence" ? "" : "\n\n"))
+            XCTAssertEqual(result.attempts, 5)
+        }
+    }
+
+    func test旧文本补丁仍需确认且不能伪装已经去除程序编号() async throws {
+        let fixture = try layoutRepairFixture()
+        let textOnly = VoicePolishLedgerDraftDocument(fragments: [fixture.document.fragments[1]])
+        let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+            try encoded(fixture.review), try encoded(textOnly), try encoded(fixture.review)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .confirming)
+        XCTAssertEqual(result.attempts, 5)
+        XCTAssertTrue(result.rejectedDraft?.contains("1. 操作分为两步") == true)
+    }
+
+    func test排版补丁不能重排漏掉正文或修改无关单元编号() async throws {
+        let fixture = try layoutRepairFixture()
+        let variants: [VoicePolishLedgerStructure] = [
+            .init(kind: "sentence", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u3", "u2", "u1"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2"], numberedUnitIds: []),
+            .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u1"]),
+            .init(kind: "numbered_list", orderedUnitIds: ["u1", "u2", "u3"]),
+            .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u2", "u2"]),
+            .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["unknown"]),
+            .init(kind: "unknown", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u2"]),
+        ]
+        for structure in variants {
+            let patch = VoicePolishLedgerDraftPatch(fragments: [fixture.document.fragments[1]], structure: structure)
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(fixture.review), try encoded(patch)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertNil(result.text, "\(structure)")
+            XCTAssertEqual(result.failureStage, .repairing, "\(structure)")
+            XCTAssertEqual(result.attempts, 4, "\(structure)")
+        }
+    }
+
+    func test非排版问题不能提交结构补丁() async throws {
+        let fixture = try layoutRepairFixture()
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "missing", severity: "major", unitIds: ["u2"], sourceSpanIds: fixture.plan.units[1].sourceSpanIds,
+            draftSpan: nil, repairInstruction: "恢复完整操作要求。"
+        )], semanticChecks: fixture.review.semanticChecks)
+        let patch = VoicePolishLedgerDraftPatch(fragments: [fixture.document.fragments[1]],
+            structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []))
+        let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+            try encoded(review), try encoded(patch)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .repairing)
+        XCTAssertEqual(result.attempts, 4)
+        let requests = await client.requests()
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(requests.dropFirst(3).first).user.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["allowed_structure_unit_ids"] as? [String], [])
+    }
+
+    func test排版修好之后仍然检查错误数字和复核拒绝() async throws {
+        let fixture = try layoutRepairFixture()
+        for wrongNumber in [false, true] {
+            var fragment = fixture.document.fragments[1]
+            if wrongNumber { fragment.text = fragment.text.replacingOccurrences(of: "2分钟", with: "3分钟") }
+            let patch = VoicePolishLedgerDraftPatch(fragments: [fragment],
+                structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []))
+            let stillRejected = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+                type: "style_shift", severity: "minor", unitIds: ["u2"], sourceSpanIds: fixture.plan.units[1].sourceSpanIds,
+                draftSpan: nil, repairInstruction: "仍需调整当前操作要求的表达。"
+            )], semanticChecks: fixture.review.semanticChecks)
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(fixture.review), try encoded(patch), try encoded(wrongNumber ? passReview(checkIDs: ["measurement_u2"], spans: [fixture.spans[1]]) : stillRejected)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertNil(result.text)
+            XCTAssertEqual(result.failureStage, .confirming)
+            XCTAssertEqual(result.attempts, 5)
+        }
+    }
+
+    func test排版补丁不能删除明确更新后的步骤总数() async throws {
+        let request = makeRequest("步骤原来是两步，补充后共三步：核对来源、检查数字、确认名称。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let meanings = ["步骤共三步。", "核对来源。", "检查数字。", "确认名称。"]
+        var plan = ledger(finalMeaning: meanings[0], spanIDs: spans.map(\.id))
+        plan.units = meanings.enumerated().map { index, text in
+            .init(id: "u\(index + 1)", kind: "action", deliveryRole: "recipient_content", finalMeaning: text,
+                  sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: [])
+        }
+        plan.corrections = [.init(subject: "步骤", oldValue: "两步", finalValue: "三步",
+            oldSpanIds: spans.map(\.id), finalSpanIds: spans.map(\.id), renderingPolicy: "final_only")]
+        plan.structure = .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3", "u4"], numberedUnitIds: ["u2", "u3", "u4"])
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(checked.pendingSemanticChecks?.map(\.id), ["correction_1"])
+        let document = VoicePolishLedgerDraftDocument(fragments: plan.units.map {
+            .init(id: "f_\($0.id)", unitIds: [$0.id], text: $0.finalMeaning, paragraphBreakBefore: true)
+        })
+        var review = passReview(checkIDs: ["correction_1"], spans: spans)
+        review = .init(verdict: "repair", issues: [.init(type: "style_shift", severity: "minor", unitIds: ["u2"],
+            sourceSpanIds: spans.map(\.id), draftSpan: "1. 核对来源。", repairInstruction: "调整这个编号。")],
+            semanticChecks: review.semanticChecks)
+        let patch = VoicePolishLedgerDraftPatch(fragments: [document.fragments[1]],
+            structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3", "u4"], numberedUnitIds: ["u3", "u4"]))
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document), try encoded(review), try encoded(patch)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .repairing)
+        XCTAssertEqual(result.attempts, 4)
+    }
+
+    private func layoutRepairFixture() throws -> (
+        request: VoicePolishRequest, spans: [VoicePolishEvidenceSpan], plan: VoicePolishIntentLedger,
+        document: VoicePolishLedgerDraftDocument, review: VoicePolishReviewerResult
+    ) {
+        let meanings = ["这个功能需要先开启权限。", "操作分为两步，预计耗时2分钟：打开辅助功能，然后完全退出软件再重新打开。", "准备系统版本和错误截图。"]
+        let request = makeRequest(meanings.joined(), scene: .customerSupport)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: meanings[0], spanIDs: spans.map(\.id))
+        plan.units = meanings.enumerated().map { index, text in
+            .init(id: "u\(index + 1)", kind: "action", deliveryRole: "recipient_content", finalMeaning: text,
+                  sourceSpanIds: spans.filter { $0.text == text }.map(\.id), status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: [])
+        }
+        plan.structure = .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u2"])
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(checked.pendingSemanticChecks?.map(\.id), ["measurement_u2"])
+        let document = VoicePolishLedgerDraftDocument(fragments: plan.units.map {
+            .init(id: "f_\($0.id)", unitIds: [$0.id], text: $0.finalMeaning, paragraphBreakBefore: true)
+        })
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u2"], sourceSpanIds: plan.units[1].sourceSpanIds,
+            draftSpan: "1. \(meanings[1])", repairInstruction: "去掉程序生成的单独编号，保留完整操作说明。"
+        )], semanticChecks: passReview(checkIDs: ["measurement_u2"], spans: [spans[1]]).semanticChecks)
+        return (request, spans, plan, document, review)
+    }
+
     private func validated(_ plan: VoicePolishIntentLedger, for request: VoicePolishRequest) throws -> VoicePolishIntentLedger {
         try VoicePolishLedgerIntegrityValidator.validatedLedger(plan,
             spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request),

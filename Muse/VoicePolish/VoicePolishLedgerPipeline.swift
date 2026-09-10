@@ -328,6 +328,7 @@ struct VoicePolishLedgerPipeline: Sendable {
         }
 
         let repairedDocument: VoicePolishLedgerDraftDocument
+        let repairedLedger: VoicePolishIntentLedger
         let repairedDraft: String
         do {
             let affectedFragmentIDs = affectedFragments(
@@ -357,15 +358,24 @@ struct VoicePolishLedgerPipeline: Sendable {
                 deadline: deadline,
                 config: generationConfig
             )
-            let patch = try decode(VoicePolishLedgerDraftDocument.self, from: response)
+            let patch = try decode(VoicePolishLedgerDraftPatch.self, from: response)
+            repairedLedger = try applyingStructurePatch(
+                patch.structure,
+                to: ledger,
+                issues: initialIssues,
+                request: request,
+                spans: spans,
+                mappings: mappings,
+                requiredLogicCues: requiredLogicCues
+            )
             repairedDocument = try applyingPatch(
-                patch,
+                VoicePolishLedgerDraftDocument(fragments: patch.fragments),
                 to: initialDocument,
                 affectedFragmentIDs: affectedFragmentIDs,
                 request: request,
-                ledger: ledger
+                ledger: repairedLedger
             )
-            repairedDraft = renderedText(from: repairedDocument, ledger: ledger)
+            repairedDraft = renderedText(from: repairedDocument, ledger: repairedLedger)
             guard !repairedDraft.isEmpty else { throw VoicePolishLedgerIntegrityError.invalidLedger }
         } catch {
             return unavailable(
@@ -383,7 +393,7 @@ struct VoicePolishLedgerPipeline: Sendable {
             confirmation = try await review(
                 request: request,
                 spans: spans,
-                ledger: ledger,
+                ledger: repairedLedger,
                 mappings: mappings,
                 draft: repairedDocument,
                 timeout: .seconds(60),
@@ -403,12 +413,12 @@ struct VoicePolishLedgerPipeline: Sendable {
             deterministic: VoicePolishLedgerIntegrityValidator.deterministicIssues(
                 output: repairedDraft,
                 request: request,
-                ledger: ledger,
+                ledger: repairedLedger,
                 spans: spans
             ) + VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(
-                document: repairedDocument, ledger: ledger
+                document: repairedDocument, ledger: repairedLedger
             ),
-            ledger: ledger,
+            ledger: repairedLedger,
             validSpanIDs: Set(spans.map(\.id))
         )
         guard confirmation.verdict != "unsafe", confirmationIssues.isEmpty else {
@@ -685,6 +695,7 @@ struct VoicePolishLedgerPipeline: Sendable {
             "rendered_text": renderedText(from: draft, ledger: ledger),
             "review_issues": try jsonObject(issues),
             "allowed_fragment_ids": affectedFragmentIDs.sorted(),
+            "allowed_structure_unit_ids": allowedStructureUnitIDs(issues: issues, ledger: ledger).sorted(),
         ])
     }
 
@@ -880,6 +891,61 @@ struct VoicePolishLedgerPipeline: Sendable {
             }
         }
         return result.isEmpty ? Set(document.fragments.map(\.id)) : result
+    }
+
+    /// 只有 Reviewer 实际指出排版问题时才能改变结构；正文顺序及非排版语义保持。
+    private func allowedStructureUnitIDs(
+        issues: [VoicePolishReviewerIssue],
+        ledger: VoicePolishIntentLedger
+    ) -> Set<String> {
+        let layoutIssues = issues.filter { $0.type == "style_shift" }
+        let activeIDs = Set(ledger.structure.orderedUnitIds)
+        if layoutIssues.contains(where: { $0.unitIds.isEmpty }) { return activeIDs }
+        return Set(layoutIssues.flatMap(\.unitIds)).intersection(activeIDs)
+    }
+
+    private func applyingStructurePatch(
+        _ structure: VoicePolishLedgerStructure?,
+        to ledger: VoicePolishIntentLedger,
+        issues: [VoicePolishReviewerIssue],
+        request: VoicePolishRequest,
+        spans: [VoicePolishEvidenceSpan],
+        mappings: [VoicePolishLedgerContextMapping],
+        requiredLogicCues: [VoicePolishLogicCue]
+    ) throws -> VoicePolishIntentLedger {
+        guard let structure else { return ledger }
+        let allowedIDs = allowedStructureUnitIDs(issues: issues, ledger: ledger)
+        let numberedIDs = structure.numberedUnitIds ?? []
+        guard !allowedIDs.isEmpty,
+              structure.kind == ledger.structure.kind
+                || allowedIDs == Set(ledger.structure.orderedUnitIds),
+              structure.orderedUnitIds == ledger.structure.orderedUnitIds,
+              Set(numberedIDs).count == numberedIDs.count,
+              Set(numberedIDs).isSubset(of: Set(structure.orderedUnitIds)),
+              structure.kind == "mixed" || structure.kind == "numbered_list" || numberedIDs.isEmpty,
+              structure.kind != "numbered_list"
+                || structure.numberedUnitIds == nil
+                || numberedIDs == structure.orderedUnitIds else {
+            throw VoicePolishLedgerIntegrityError.invalidLedger
+        }
+        var candidate = ledger
+        candidate.structure = structure
+        let checked = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            candidate,
+            spans: spans,
+            verifiedMappings: mappings,
+            requiredLogicCues: requiredLogicCues,
+            scene: request.context.scene
+        )
+        // 局部修复保持全局 kind；再按完整校验后的实际编号集合核对影响范围。
+        let changedNumberedIDs = Set(ledger.structure.numberedUnitIds ?? [])
+            .symmetricDifference(Set(checked.structure.numberedUnitIds ?? []))
+        var unchanged = checked
+        unchanged.structure = ledger.structure
+        guard changedNumberedIDs.isSubset(of: allowedIDs), unchanged == ledger else {
+            throw VoicePolishLedgerIntegrityError.invalidLedger
+        }
+        return checked
     }
 
     private func applyingPatch(

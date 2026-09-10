@@ -97,7 +97,8 @@ enum VoicePolishLedgerPrompts {
     static let repair = """
     你是 Muse 语音润色的局部修复器。只根据 SOURCE_SPANS、INTENT_LEDGER、CURRENT_DRAFT_DOCUMENT、RENDERED_TEXT 与 REVIEW_ISSUES 修复有证据的问题。
 
-    只返回 JSON：{"fragments":[{"id":"f_u1","unit_ids":["u1"],"text":"修复后的片段"}]}。只能返回 ALLOWED_FRAGMENT_IDS 指定的片段，id 与 unit_ids 必须和原片段完全一致；不得返回或改写其他片段。不得把 CURRENT_DRAFT_DOCUMENT 当作新事实来源，不得新增 source 没有的事实。
+    只返回 JSON：{"fragments":[{"id":"f_u1","unit_ids":["u1"],"text":"修复后的片段","paragraph_break_before":true}]}。只能返回 ALLOWED_FRAGMENT_IDS 指定的片段，id 与 unit_ids 必须和原片段完全一致；不得返回或改写其他片段。不得把 CURRENT_DRAFT_DOCUMENT 当作新事实来源，不得新增 source 没有的事实。
+    若问题是程序生成的编号或排版，仅改 text 无法生效。只有 ALLOWED_STRUCTURE_UNIT_IDS 非空时，才可额外返回 "structure":{"kind":"sentence|paragraphs|numbered_list|mixed|ai_prompt","ordered_unit_ids":["原顺序逐字复制"],"numbered_unit_ids":[]}。只调整这些允许单元是否编号，其他单元的编号状态不变；仅当允许范围包含全部正文单元时才能改变 kind，否则 kind 必须保持原值；ordered_unit_ids 必须与 INTENT_LEDGER 完全一致，不得增删、拆并或重排正文。numbered_list 必须列出全部正文单元，mixed 只列实际编号项，其他 kind 的编号数组为空。声明的步骤总数仍须准确；拿不准时不返回 structure，不能借排版修复改动角色、事实或来源。
     按 unit_id 重新核对片段内容：每个片段必须表达自己单元的 final_meaning 和 exact_tokens，不能保留上一版标题占位或内容错移。只能改片段文本，不能通过交换 ID 掩盖错位。所有 text 都不写清单编号，程序负责 numbered_list 或 mixed.numbered_unit_ids 的编号；清单外的后续动作不得带编号。
     对照原始来源保留语气，不能只按 modality 标签套用句式。真实不承诺不得改成确定不会发生；禁止无根据推断不能改写成不承诺。缺失的已确认 canonical 只恢复该实体，不带入上下文其他事实。
     条件问题只按 conditionals 修复，保持条件极性和全部共同后果。技术标识与口述符号只恢复经过本地验证的 canonical。

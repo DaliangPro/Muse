@@ -153,6 +153,12 @@ struct VoicePolishLedgerDraftDocument: Codable, Sendable, Equatable {
     var fragments: [VoicePolishLedgerDraftFragment]
 }
 
+/// 局部修复默认只返回文字；排版问题可额外修改渲染结构，不能重规划正文单元。
+struct VoicePolishLedgerDraftPatch: Codable, Sendable, Equatable {
+    var fragments: [VoicePolishLedgerDraftFragment]
+    var structure: VoicePolishLedgerStructure? = nil
+}
+
 struct VoicePolishReviewerIssue: Codable, Sendable, Equatable {
     let type: String
     let severity: String
