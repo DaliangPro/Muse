@@ -35,6 +35,13 @@ enum ProtectedFactExtractor {
             expression: #"(?:(?:(?:今天|明天|后天|(?:本|下)?周[一二三四五六日天]|星期[一二三四五六日天])\s*(?:凌晨|早上|上午|中午|下午|晚上|晚间)?|(?:凌晨|早上|上午|中午|下午|晚上|晚间))\s*)(?:[01]?\d|2[0-3]|[零〇一二两三四五六七八九十]{1,3})\s*点(?:半|(?:[0-5]?\d|[零〇一二两三四五六七八九十]{1,3})\s*分)?"#,
             canonicalize: canonicalTime
         ),
+        Pattern(
+            kind: .time,
+            // 明确带分钟的省略时间仍是时钟事实；“十点建议”没有分钟，
+            // 不进入此规则。连续改口里的“十点半”不能因此消失。
+            expression: #"(?:[01]?\d|2[0-3]|[零〇一二两三四五六七八九十]{1,3})\s*点(?:半|(?:[0-5]?\d|[零〇一二两三四五六七八九十]{1,3})\s*分)"#,
+            canonicalize: canonicalTime
+        ),
         Pattern(kind: .percentage, expression: #"[-+]?\d[\d,]*(?:\.\d+)?\s*%"#, canonicalize: canonicalPercentage),
         Pattern(
             kind: .percentage,
@@ -44,6 +51,11 @@ enum ProtectedFactExtractor {
         Pattern(
             kind: .amount,
             expression: #"(?:(?:[¥￥$]|美元|人民币)\s*[-+]?\d[\d,]*(?:\.\d+)?\s*(?:万|亿)?|[-+]?\d[\d,]*(?:\.\d+)?\s*(?:万|亿|元|块|美元|人民币))"#,
+            canonicalize: canonicalAmount
+        ),
+        Pattern(
+            kind: .amount,
+            expression: #"(?:[¥￥$]|美元|人民币)?\s*[负零〇一二两三四五六七八九十百千万亿点]+\s*(?:美元|人民币|元|块)"#,
             canonicalize: canonicalAmount
         ),
         Pattern(
@@ -114,6 +126,10 @@ enum ProtectedFactExtractor {
                         continue
                     }
                     let source = String(segment.text[range])
+                    if pattern.kind == .amount, source.hasSuffix("块"),
+                       segment.text[..<range.lowerBound].last.map({ "这那哪每".contains($0) }) == true {
+                        continue
+                    }
                     if pattern.kind == .number,
                        source.count == 1,
                        !isBoundedQuantity(numberRange: range, in: segment.text) {
@@ -292,6 +308,7 @@ enum ProtectedFactExtractor {
             .replacingOccurrences(of: ",", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var multiplier = Decimal(1)
+        if let chinese = canonicalChineseNumber(value) { return chinese }
         if value.hasSuffix("万") {
             multiplier = Decimal(10_000)
             value.removeLast()
@@ -440,6 +457,10 @@ enum ProtectedFactExtractor {
         }
         let unitText = String(text[unitStart...].prefix(12))
             .filter { !$0.isWhitespace }
+        let numberText = String(text[numberRange])
+        let prefix = String(text[..<numberRange.lowerBound].suffix(2))
+        // “任何一项/任一条”里的“一”是任指，不是数量为 1 的承诺。
+        if numberText == "一", prefix.hasSuffix("任") || prefix.hasSuffix("任何") { return false }
         let units = [
             "个月", "月", "天", "年", "周", "小时", "分钟", "秒", "个工作日", "工作日",
             "条", "项", "款", "位", "人", "个人", "个产品", "个渠道", "个问题", "个建议", "个版本",
@@ -472,7 +493,6 @@ enum ProtectedFactExtractor {
             "名额为", "名额是", "数量为", "数量是",
         ]
         if leadingQuantityLabels.contains(where: labelText.hasSuffix) { return true }
-        let numberText = String(text[numberRange])
         if numberText == "十",
            unitText.hasPrefix("个是") || unitText.hasPrefix("个为") {
             return true

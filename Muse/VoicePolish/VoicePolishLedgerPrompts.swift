@@ -27,6 +27,9 @@ enum VoicePolishLedgerPrompts {
     - “不要承诺/不能保证”必须使用 modality=not_promised，不能写成 confirmed 的“不会发生”。已经作出的承诺才用 promised。
     - advice 必须用 recommended，不能升级成确定因果或结果保证。
     - style_directive/editor_directive 只执行不照抄；明确不允许告诉当前收件人的内部内容使用 excluded_content。
+    - “给客户回一下/帮我给对方写一封邮件”是在指定最终稿收件人，audience.delivery_mode=direct_address；正文直接对收件人说话。对 Muse 的措辞要求单独建 editor_directive/remove，例如要求回复时不归咎对方，不应变成命令对方“不要说这是你的问题”。只有正文确实需要提及第三方时才用 explicit_reference。
+    - corrections.old_value 和 final_value 必须是对应 source span 中逐字连续存在的原词，不能填润色后的整句。连续改口应逐项记录，最终正文只采用最后仍有效的值；省略的日期或主语可在 final_meaning 中承接，但不能把补全后的词放入 final_value。
+    - AI Prompt 开头若同时包含当前整理要求与真实项目名称，应拆成 editor_directive/remove 和保留项目名称的 recipient_content 两个 unit；不能因为项目名称需要保留，就把“请整理成 Prompt”也交给未来 AI。
     - context_mappings 只能使用输入中 VERIFIED_ENTITY_MAPPINGS 已确认的条目，不能从普通上下文猜新映射。
     - REQUIRED_LOGIC_CUES 中每个 cue_id 必须且只能在 conditionals 中出现一次，operator_kind 必须逐字复制该 cue 的 operator_kind。condition.subject、condition.predicate 和 consequence.action 必须分别复制对应 source span 中最短、逐字存在的语义短语，不得同义改写或概括；条件极性和每个共同后果必须分字段表达。only_if 是必要条件，不得升级成“条件满足就一定执行”的 if_then；没有 cue 时 conditionals 必须为空。
     - technical_token_mappings 与 dictated_symbol_mappings 统一返回空数组；技术断词及斜杠、短横线、点、双横线等口述符号由程序从来源 span 机械验证和恢复，Planner 不得自报或猜测映射。`Swift 6`、`Node 20`、`Claude Code` 等合法名称、版本或普通英文短语不得合并。
@@ -45,9 +48,10 @@ enum VoicePolishLedgerPrompts {
     你是 Muse 语音润色 Writer。请根据 SOURCE_SPANS 和 INTENT_LEDGER 写出一份可直接发送或直接使用的最终成稿。
 
     只返回一个 JSON 对象，不输出分析、Markdown 或解释：
-    {"fragments":[{"id":"f_u1","unit_ids":["u1"],"text":"该意图单元的成稿"}]}
+    {"fragments":[{"id":"f_u1","unit_ids":["u1"],"text":"该意图单元的成稿","paragraph_break_before":true}]}
     structure.ordered_unit_ids 中每个 unit 必须恰好对应一个 fragment，id 固定为 f_<unit_id>，顺序必须一致；不得合并、遗漏、重复或新增 unit。text 不要自行添加列表编号，numbered_list 的全部正文和 mixed.numbered_unit_ids 指定的局部清单均由程序统一编号；mixed 中未列入 numbered_unit_ids 的前言或后续动作必须保持为清单外正文。
     逐项兑现 recipient_content；style_directive/editor_directive 只执行不照抄；excluded_content 绝不能进入成稿。
+    每个 fragment 必须填写 paragraph_break_before。意图单元不是自然段：同一话题的事实、条件、约束与解释应连续成段，仅换话题或邮件称呼/落款时另起段。不得把一封约千字邮件拆成几十个单句段落。字段只控制段落，不得合并或删掉 fragment；各 fragment 的 text 必须包含连接后所需的标点。
     保持最终事实、收件人、主体—动作—期限、否定范围、待确认状态、不承诺边界和有意强调。群体 direct_address 要用“大家/各位/团队”等自然称呼体现收件人；一对一客户回复可省略“客户”字样，但必须直接对客户说话，不能照抄“给客户回一下/让他”等幕后转达口吻。final_only 改口只留最终值；announce_change 必须让收件人知道旧安排取消或发生变更。
     modality=not_promised 只能写成“不承诺/不保证”，不得偷换成事情确定不会发生。recommended 不得写成保证结果。
     context_mappings 的 canonical 必须统一使用，alias 不得残留；exact_tokens 必须精确保留。
@@ -64,6 +68,7 @@ enum VoicePolishLedgerPrompts {
 
     检查最终事实、独立约束、收件人、改口后最终值、被撤回旧值、主体—动作—期限、条件极性与共同后果、否定范围、不承诺/承诺/未确认、技术标识、口述符号、上下文实体、上下文泄漏、AI Prompt 任务层和长文完整性。群体 direct_address 若被删成无收件人陈述，报 wrong_relation；一对一客户直达稿若仍写“给客户回一下/让他”等幕后转达口吻，报 wrong_role。
     modality=not_promised 若被写成“不会发生”必须报 wrong_modality；安全上下文确认且属于正文的 canonical 若缺失必须报 missing。
+    收件人和文本角色按用户要交付的成稿判断：“给客户回一下”生成直达客户的正文属于正确转换，不需要字面出现“客户”，也不需要在“我们”后加“客服”。用于指导 Muse 如何写这次回复的措辞说明只需执行，不应转成向收件人发出的新指令。
     每个 issue 必须指出真实 unit_id 与和该 unit 有交集的 source_span_id；若问题是成稿中已有错误文字，draft_span 必须逐字存在于 RENDERED_TEXT。若本应进入成稿的真实正文被 Planner 误标为 editor_directive、style_directive、excluded_content 或 remove，必须对该非正文 unit 报 major wrong_role；真正的口吃、幕后写作说明和明确排除内容不得误报。逐条核对 conditional.operator_kind：only_if 不得被写成 if_then 的结果承诺。不得因为措辞与参考形式不同就报错；没有 source span 证据的问题不能成立。自然度问题只报 minor，不得把个人偏好升级成重大事实错误。
     """
 

@@ -64,15 +64,16 @@ struct VoicePolishLedgerPipeline: Sendable {
         minimumCharacterCount: Int = 80
     ) -> Bool {
         let text = request.input.fallbackText
-        // Ledger 的主场景是日常中长口述。80 字以下继续使用成熟的一次 Fast
-        // 成稿与本地硬门禁，避免一句改口承担 Planner JSON 修复和冷复核的
-        // 延迟；80～279 字只有出现明确风险才升级，280～1,800 字统一使用。
+        // 字数不能证明语义简单：一句话也可能包含连续改口或必要条件。
+        // 简单短句仍一次成稿；出现既有风险信号时统一交给 Ledger 和冷复核，
+        // 避免旧 Fast 校验先误拦正确稿，再把已作废的事实修复回来。
         // 更长文本仍留给既有有界分片链路，作为压力边界单独演进。
-        guard text.count >= max(0, minimumCharacterCount), text.count <= 1_800 else {
+        guard !text.isEmpty, text.count <= 1_800 else {
             return false
         }
         if text.count >= 280 { return true }
-        if !request.resolvedEntities.isEmpty || !request.input.requiredEntityEdits.isEmpty {
+        if text.count >= max(0, minimumCharacterCount),
+           !request.resolvedEntities.isEmpty || !request.input.requiredEntityEdits.isEmpty {
             return true
         }
         if text.count >= 20, request.context.scene == .code || request.context.scene == .aiPrompt {
@@ -741,7 +742,8 @@ struct VoicePolishLedgerPipeline: Sendable {
             fragmentByUnitID[unitID] = VoicePolishLedgerDraftFragment(
                 id: fragment.id,
                 unitIds: [unitID],
-                text: text
+                text: text,
+                paragraphBreakBefore: fragment.paragraphBreakBefore
             )
         }
         guard Set(fragmentByUnitID.keys) == Set(expectedIDs) else {
@@ -798,7 +800,17 @@ struct VoicePolishLedgerPipeline: Sendable {
             }
             return blocks.joined(separator: "\n\n")
         case "paragraphs", "ai_prompt":
-            return texts.joined(separator: "\n\n")
+            var result = texts[0]
+            for (fragment, text) in zip(document.fragments.dropFirst(), texts.dropFirst()) {
+                if fragment.paragraphBreakBefore ?? true {
+                    result += "\n\n"
+                } else if result.unicodeScalars.last.map(Self.isASCIIWordScalar) == true
+                            && text.unicodeScalars.first.map(Self.isASCIIWordScalar) == true {
+                    result += " "
+                }
+                result += text
+            }
+            return result
         default:
             return ""
         }

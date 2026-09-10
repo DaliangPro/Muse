@@ -334,9 +334,37 @@ enum VoicePolishLedgerIntegrityValidator {
                     Array(verifiedCanonicalBySpanID[spanID] ?? [])
                 } + tokenCanonical
             )
-            let evidenceFacts = facts(in: evidence).union(
+            var evidenceFacts = facts(in: evidence).union(
                 allowedCanonical.flatMap { facts(in: $0) }
             )
+            let sourceTimes = protectedFactCandidates(in: evidence).filter { $0.kind == .time }
+            for fact in protectedFactCandidates(in: unit.finalMeaning) where fact.kind == .time {
+                guard let value = fact.canonicalValue,
+                      let separator = value.firstIndex(of: "|") else { continue }
+                let day = String(value[..<separator])
+                let clock = String(value[value.index(after: separator)...])
+                // 只允许来源中已出现的日期承接显式改口里的省略时钟。
+                // 例如旧值含日期，最终值只说半点；其他 unit 的时间不可借用。
+                let hasPartialClock = sourceTimes.contains { $0.canonicalValue == clock }
+                let hasSourceDay = sourceTimes.contains { $0.canonicalValue?.hasPrefix(day + "|") == true }
+                let hasCorrection = ledger.corrections.contains { correction in
+                    Set(correction.finalSpanIds).isSubset(of: unitSourceSpanIDs)
+                        && Set(correction.oldSpanIds).isSubset(of: unitSourceSpanIDs)
+                        && ProtectedFactExtractor.canonicalValue(for: correction.finalValue, kind: .time) == clock
+                        && ProtectedFactExtractor.canonicalValue(for: correction.oldValue, kind: .time)?.hasPrefix(day + "|") == true
+                }
+                if hasPartialClock && hasSourceDay && hasCorrection {
+                    evidenceFacts.insert(protectedFactKey(fact, in: unit.finalMeaning))
+                }
+            }
+            // 给来源中已有短语加引号只改变标点。仍要求引号内逐字来自该
+            // unit 自己的证据，不能借此新增引语，也不影响命令的精确保留。
+            for fact in protectedFactCandidates(in: unit.finalMeaning) where fact.kind == .quotedPhrase {
+                let inner = String(fact.sourceText.dropFirst().dropLast())
+                if !inner.isEmpty, evidence.contains(inner) {
+                    evidenceFacts.insert(protectedFactKey(fact, in: unit.finalMeaning))
+                }
+            }
             unit.finalMeaning = normalizingUnsupportedMeasurementFamilies(
                 in: unit.finalMeaning,
                 against: evidence
@@ -439,7 +467,7 @@ enum VoicePolishLedgerIntegrityValidator {
             let finalFacts = facts(in: unit.finalMeaning)
             guard finalFacts.isSubset(of: evidenceFacts) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                    "unit_contains_unbacked_fact:\(unit.id)"
+                    "unit_contains_unbacked_fact:\(unit.id):unexpected=\(finalFacts.subtracting(evidenceFacts).sorted())"
                 )
             }
             let evidenceMeasurements = activeMeasurementScan(
@@ -459,7 +487,7 @@ enum VoicePolishLedgerIntegrityValidator {
                     requiresCompleteCoverage: false
                 ) else {
                     throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                        "unit_contains_unbacked_fact:\(unit.id)"
+                        "unit_contains_unbacked_fact:\(unit.id):source_measurements=\(evidenceMeasurements.summary),final_measurements=\(finalMeasurements.summary)"
                     )
                 }
             }
@@ -532,7 +560,7 @@ enum VoicePolishLedgerIntegrityValidator {
                 requiresCompleteCoverage: true
             ) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                    "ledger_measurement_coverage_invalid"
+                    "ledger_measurement_coverage_invalid:source=\(sourceMeasurements.summary),final=\(finalMeasurements.summary)"
                 )
             }
         }
@@ -915,8 +943,16 @@ enum VoicePolishLedgerIntegrityValidator {
                 spans: spanByID
             ) && declaredCountValue(correction.finalValue).flatMap { Int($0.value) }
                 == ledger.structure.numberedUnitIds?.count
+            let supersededByLaterCorrection = ledger.corrections.contains { next in
+                guard next.subject == correction.subject,
+                      next.oldValue == correction.finalValue,
+                      let currentFinal = correctionPositions(correction, spans: spanByID)?.final,
+                      let nextPositions = correctionPositions(next, spans: spanByID) else { return false }
+                return currentFinal == nextPositions.old && nextPositions.final > currentFinal
+            }
             if !preservesToken(correction.finalValue, in: output),
-               !declaredCountIsStructurallyPreserved {
+               !declaredCountIsStructurallyPreserved,
+               !supersededByLaterCorrection {
                 issues.append(VoicePolishReviewerIssue(
                     type: "missing",
                     severity: "major",
@@ -1329,6 +1365,26 @@ enum VoicePolishLedgerIntegrityValidator {
             )
         }
         return result
+    }
+
+    /// 连续改口按原文位置连接，不能仅凭两个相同值把循环改口的最终值也作废。
+    private static func correctionPositions(
+        _ correction: VoicePolishLedgerCorrection,
+        spans: [String: VoicePolishEvidenceSpan]
+    ) -> (old: Int, final: Int)? {
+        func positions(_ value: String, ids: [String]) -> [Int] {
+            ids.flatMap { id -> [Int] in
+                guard let span = spans[id] else { return [] }
+                return ranges(of: value, in: span.text).compactMap { range in
+                    guard let swiftRange = Range(range, in: span.text) else { return nil }
+                    return span.start + span.text.distance(from: span.text.startIndex, to: swiftRange.lowerBound)
+                }
+            }
+        }
+        guard let final = positions(correction.finalValue, ids: correction.finalSpanIds).max(),
+              let old = positions(correction.oldValue, ids: correction.oldSpanIds).filter({ $0 < final }).max()
+        else { return nil }
+        return (old, final)
     }
 
     private static func locallyVerifiedTokenMappings(
@@ -1808,6 +1864,11 @@ enum VoicePolishLedgerIntegrityValidator {
     private struct MeasurementScan {
         let occurrences: [MeasurementOccurrence]
         let bareValueCounts: [String: Int]
+
+        /// 仅供 Planner 的证据修复定位；生产诊断仍只记录冒号前的稳定错误码。
+        var summary: String {
+            occurrences.map { "\($0.anchor)|\($0.value)|\($0.family)" }.joined(separator: ";")
+        }
     }
 
     /// ProtectedFactExtractor 负责数值本身的规范化；这里额外保留容易改变原意的
@@ -1835,6 +1896,12 @@ enum VoicePolishLedgerIntegrityValidator {
             let prefix = Range(match.range(at: 1), in: text).map { String(text[$0]) } ?? ""
             let scale = Range(match.range(at: 3), in: text).map { String(text[$0]) } ?? ""
             let unit = Range(match.range(at: 4), in: text).map { String(text[$0]) } ?? ""
+            if unit == "块", prefix.isEmpty,
+               let wholeRange = Range(match.range, in: text),
+               text[..<wholeRange.lowerBound].last.map({ "这那哪每".contains($0) }) == true {
+                // “这一块内容”中的块是普通量词，不是人民币单位。
+                continue
+            }
             if !scale.isEmpty,
                let scaled = scaledMeasurementValue(value, scale: scale) {
                 value = scaled
@@ -1862,7 +1929,8 @@ enum VoicePolishLedgerIntegrityValidator {
                 default: return nil
                 }
             }()
-            let anchor = measurementAnchor(in: text, matchRange: match.range)
+            let isCalendarYear = unit == "年" && Int(value).map { (1000...2999).contains($0) } == true
+            let anchor = isCalendarYear ? "#calendar_year" : measurementAnchor(in: text, matchRange: match.range)
             if let prefixFamily, let unitFamily, prefixFamily != unitFamily {
                 occurrences.append(MeasurementOccurrence(
                     value: value,
@@ -2047,7 +2115,6 @@ enum VoicePolishLedgerIntegrityValidator {
         func assign(_ finalIndex: Int, visited: inout Set<Int>) -> Bool {
             let candidate = final.occurrences[finalIndex]
             for sourceIndex in source.occurrences.indices {
-                guard visited.insert(sourceIndex).inserted else { continue }
                 let evidence = source.occurrences[sourceIndex]
                 let singletonUnanchoredRelation = evidence.anchor.isEmpty
                     && candidate.anchor.isEmpty
@@ -2058,6 +2125,9 @@ enum VoicePolishLedgerIntegrityValidator {
                       (measurementAnchorsAreCompatible(evidence.anchor, candidate.anchor)
                         || singletonUnanchoredRelation)
                 else { continue }
+                // 只标记实际存在的边；提前标记不兼容节点会阻断后续增广路径，
+                // 使同值事实的合法重排依赖遍历顺序。
+                guard visited.insert(sourceIndex).inserted else { continue }
                 if sourceMatch[sourceIndex] == -1 {
                     sourceMatch[sourceIndex] = finalIndex
                     return true
@@ -2392,9 +2462,9 @@ enum VoicePolishLedgerIntegrityValidator {
                 measurementAnchorsAreCompatible(occurrence.anchor, subjectAnchor)
             }
         }
-        // 非 measurement 的颜色、地点等改口仍允许同小句对象绑定；数值关系
-        // 已在上面走严格对象锚点，不能再用“整句出现过 subject”短路。
-        return clause(in: text, containing: range).contains(subject)
+        // 非 measurement 的指代可以跨逗号承接，保留在同一句来源范围内，
+        // 具体关系仍须冷复核；金额与工期已在上面走严格对象锚点。
+        return sentence(in: text, containing: range).contains(subject)
     }
 
     private static func ranges(of needle: String, in text: String) -> [NSRange] {
@@ -2551,6 +2621,20 @@ enum VoicePolishLedgerIntegrityValidator {
     }
 
     private static func preservesToken(_ token: String, in output: String) -> Bool {
+        if let clock = ProtectedFactExtractor.canonicalValue(for: token, kind: .time) {
+            // “十点”是“十点半”的子串，但二者不是同一个时间事实。
+            return protectedFactCandidates(in: output).contains {
+                $0.kind == .time && ($0.canonicalValue == clock
+                    || (!clock.contains("|") && $0.canonicalValue?.hasSuffix("|" + clock) == true))
+            }
+        }
+        let exactNumericFacts = protectedFactCandidates(in: token).filter {
+            $0.sourceText == token && [.number, .amount, .percentage, .date, .version].contains($0.kind)
+        }
+        if !exactNumericFacts.isEmpty {
+            return Set(exactNumericFacts.map { protectedFactKey($0, in: token) })
+                .isSubset(of: Set(protectedFacts(in: output)))
+        }
         if output.contains(token) { return true }
         let tokenFacts = protectedFacts(in: token)
         guard !tokenFacts.isEmpty else { return false }

@@ -121,6 +121,9 @@ struct VoicePolishLedgerDraftFragment: Codable, Sendable, Equatable {
     let id: String
     let unitIds: [String]
     var text: String
+    /// 意图覆盖和自然段边界独立。省略时兼容旧阶段记录的一单元一段；
+    /// 新 Writer 显式决定相邻单元是否继续同一段，不改变逐项来源与修复边界。
+    var paragraphBreakBefore: Bool? = nil
 }
 
 struct VoicePolishLedgerDraftDocument: Codable, Sendable, Equatable {

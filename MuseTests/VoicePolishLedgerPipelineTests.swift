@@ -57,6 +57,68 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy { $0.options.reasoningPolicy == .disabled })
     }
 
+    func test多个意图单元可以连续成段且继续逐项核对() async throws {
+        let request = makeRequest("明天把初稿给我。数字不能漏核对。后天再讨论发布。", scene: .document)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let document = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).enumerated().map { index, pair in
+            VoicePolishLedgerDraftFragment(
+                id: "f_\(pair.0.id)", unitIds: [pair.0.id], text: pair.1.text,
+                paragraphBreakBefore: index != 1
+            )
+        })
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document), try encoded(passReview())])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "明天把初稿给我。数字不能漏核对。\n\n后天再讨论发布。")
+        XCTAssertEqual(result.llmAttemptCount, 3)
+    }
+
+    func test连续改口的半点时间可通过且旧整点不再算作残留() async throws {
+        let source = "会议改到周三上午十点不对周四上午十点哎十点半才对地点还是三号会议室"
+        let finalText = "会议改到周四上午十点半，地点还是三号会议室。"
+        let request = makeRequest(source, scene: .workChat)
+        let ids = evidenceSpanIDs(for: request)
+        var plan = ledger(unit: VoicePolishLedgerUnit(
+            id: "u1", kind: "action", deliveryRole: "recipient_content", finalMeaning: finalText,
+            sourceSpanIds: ids, status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        ))
+        plan.corrections = [
+            .init(subject: "会议", oldValue: "周三上午十点", finalValue: "周四上午十点", oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only"),
+            .init(subject: "会议", oldValue: "周四上午十点", finalValue: "十点半", oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only"),
+        ]
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(finalText)), try encoded(passReview())])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes) \(String(describing: result.plannerValidationTrace))")
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        for wrong in ["会议改到周四上午十点，地点还是三号会议室。", "会议改到周三上午十点半，地点还是三号会议室。"] {
+            let rejectedClient = LedgerScriptedLLM(responses: [
+                try encoded(plan), try encoded(draft(wrong)), try encoded(passReview()),
+                try encoded(draft(wrong)), try encoded(passReview()),
+            ])
+            let rejected = await productionLedgerPipeline(rejectedClient).process(request)
+            XCTAssertTrue(rejected.usedFallback, "冷复核即使误放行，时钟事实仍须阻断：\(wrong)")
+        }
+    }
+
+    func test金额年份与引用的安全格式化不触发误拦() throws {
+        let acceptedPairs = [
+            ("报名费为二百六十元。", "报名费为260元。"),
+            ("调研一下二零二六年主流工具。", "调研2026年主流工具。"),
+            ("不要因为内容长就把这一块概括掉。", "保留这一部分的全部内容。"),
+            ("连续说两遍真的很难要保留。", "连续说两遍“真的很难”要保留。"),
+        ]
+        for (source, finalMeaning) in acceptedPairs {
+            let request = makeRequest(source)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let plan = ledger(unit: .init(id: "u1", kind: "claim", deliveryRole: "recipient_content", finalMeaning: finalMeaning,
+                sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+            XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+                verifiedMappings: [], requiredLogicCues: [], scene: .document), source)
+        }
+    }
+
     func testRecipientSurfaceTokensAreLocallyIgnoredInsteadOfTriggeringPlanRepair() async throws {
         let source = "明天开会，请团队准时参加，不要迟到。"
         let finalText = source
@@ -427,20 +489,20 @@ final class VoicePolishLedgerPipelineTests: XCTestCase {
         XCTAssertEqual(requestCount, 5)
     }
 
-    func testVeryShortTextKeepsLightPathWhileRiskyMediumTextUsesLedger() {
-        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+    func test复杂短句按语义风险路由简单问句保持轻量() {
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "如果还是不行，让他把系统版本和错误截图发过来。",
             scene: .customerSupport
         )))
-        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "跟团队说会议改到周四下午。",
             scene: .workChat
         )))
-        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "只有客户确认，才能对外发布。",
             scene: .workChat
         )))
-        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
             "不要覆盖安装，建议先跑测试。",
             scene: .workChat
         )))
