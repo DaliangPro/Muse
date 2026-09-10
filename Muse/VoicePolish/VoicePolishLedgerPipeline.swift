@@ -440,7 +440,8 @@ struct VoicePolishLedgerPipeline: Sendable {
                 draft: draft
             ),
             responseFormat: .jsonObject,
-            maxOutputTokens: 3_072,
+            maxOutputTokens: outputBudget(
+                source: try encodedJSONString(ledger.pendingSemanticChecks ?? []), baseline: 3_072),
             timeout: timeout,
             deadline: deadline,
             config: reviewerConfig
@@ -456,28 +457,30 @@ struct VoicePolishLedgerPipeline: Sendable {
         let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
         let validUnitIDs = Set(unitByID.keys)
         let rendered = renderedText(from: draft, ledger: ledger)
+        let issuesAreValid = review.issues.allSatisfy { issue -> Bool in
+            guard allowedTypes.contains(issue.type),
+                  ["minor", "major"].contains(issue.severity),
+                  !issue.unitIds.isEmpty, !issue.sourceSpanIds.isEmpty,
+                  issue.sourceSpanIds.allSatisfy(validSpanIDs.contains),
+                  issue.unitIds.allSatisfy(validUnitIDs.contains),
+                  !issue.repairInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return false }
+            let sharesSource = issue.unitIds.contains { unitID in
+                guard let unit = unitByID[unitID] else { return false }
+                return !Set(unit.sourceSpanIds).isDisjoint(with: issue.sourceSpanIds)
+            }
+            let draftSpan = issue.draftSpan ?? ""
+            return sharesSource && (draftSpan.isEmpty || rendered.contains(draftSpan))
+        }
         guard allowedVerdicts.contains(review.verdict),
               review.verdict != "pass" || review.issues.isEmpty,
               review.verdict != "repair" || !review.issues.isEmpty,
-              review.issues.allSatisfy({ issue in
-                  allowedTypes.contains(issue.type)
-                      && ["minor", "major"].contains(issue.severity)
-                      && !issue.unitIds.isEmpty
-                      && !issue.sourceSpanIds.isEmpty
-                      && issue.sourceSpanIds.allSatisfy(validSpanIDs.contains)
-                      && issue.unitIds.allSatisfy(validUnitIDs.contains)
-                      && issue.unitIds.contains(where: { unitID in
-                          guard let unit = unitByID[unitID] else { return false }
-                          return !Set(unit.sourceSpanIds).isDisjoint(with: issue.sourceSpanIds)
-                      })
-                      && ((issue.draftSpan ?? "").isEmpty
-                          || rendered.contains(issue.draftSpan ?? ""))
-                      && !issue.repairInstruction.trimmingCharacters(
-                          in: .whitespacesAndNewlines
-                      ).isEmpty
-              }) else {
+              issuesAreValid else {
             throw VoicePolishLedgerIntegrityError.invalidLedger
         }
+        try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            review, ledger: ledger, spans: spans
+        )
         return review
     }
 
@@ -634,7 +637,10 @@ struct VoicePolishLedgerPipeline: Sendable {
         try jsonString([
             "writing_scene": request.context.scene.rawValue,
             "source_spans": try jsonObject(spans),
-            "intent_ledger": try jsonObject(ledger),
+            "source_unit_index": ledger.units.map {
+                ["unit_id": $0.id, "source_span_ids": $0.sourceSpanIds] as [String: Any]
+            },
+            "pending_semantic_checks": try jsonObject(ledger.pendingSemanticChecks ?? []),
             "verified_entity_mappings": try jsonObject(mappings),
             "draft_document": try jsonObject(draft),
             "rendered_text": renderedText(from: draft, ledger: ledger),
@@ -932,24 +938,11 @@ struct VoicePolishLedgerPipeline: Sendable {
         ledger: VoicePolishIntentLedger,
         validSpanIDs: Set<String>
     ) -> [VoicePolishReviewerIssue] {
-        let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
         let modelIssues = review.issues.filter { issue in
-            guard !issue.repairInstruction.isEmpty,
-                  issue.sourceSpanIds.allSatisfy(validSpanIDs.contains) else { return false }
-            let onlyNonRecipient = !issue.unitIds.isEmpty && issue.unitIds.allSatisfy {
-                guard let unit = unitByID[$0] else { return false }
-                return unit.deliveryRole != "recipient_content" || unit.status == "remove"
-            }
-            if onlyNonRecipient,
-               issue.type == "missing",
-               (issue.draftSpan ?? "").isEmpty {
-                return false
-            }
-            // 正文也可能出现真实角色错误，例如把内部承诺边界变成命令客户。
-            // 本地不能只看 recipient_content 就断言 Reviewer 在评论风格；
-            // 保留该问题进入局部修复，是否改对仍由下一次独立复核确认。
-            return true
+            !issue.repairInstruction.isEmpty
+                && issue.sourceSpanIds.allSatisfy(validSpanIDs.contains)
         }
+        // Reviewer 不接收候选角色，不能因 Planner 标了 remove 就吞掉 missing。
         var seen: Set<String> = []
         return (modelIssues + deterministic).filter {
             let key = [$0.type, $0.unitIds.joined(separator: ","), $0.repairInstruction]
@@ -958,14 +951,13 @@ struct VoicePolishLedgerPipeline: Sendable {
         }
     }
 
-    /// 只有 Reviewer 指向非正文 unit 的 wrong_role 才说明 Ledger 把真实正文
-    /// 错分成了 editor/remove/excluded，必须重新规划。若 issue 只指向正文 unit，
-    /// 它描述的是成稿口吻或转达方式，Draft Repair 可以安全局部修正。
+    /// 冷复核发现被错误排除的正文时需要重规划，不能在没有 fragment 的单元上
+    /// 局部修补。正文已有片段的角色或遗漏问题仍可进入局部修复。
     private func issueRequiresLedgerReplan(
         _ issue: VoicePolishReviewerIssue,
         ledger: VoicePolishIntentLedger
     ) -> Bool {
-        guard issue.type == "wrong_role", !issue.unitIds.isEmpty else { return false }
+        guard ["wrong_role", "missing"].contains(issue.type), !issue.unitIds.isEmpty else { return false }
         let unitByID = Dictionary(uniqueKeysWithValues: ledger.units.map { ($0.id, $0) })
         return issue.unitIds.contains {
             guard let unit = unitByID[$0] else { return true }
@@ -984,7 +976,12 @@ struct VoicePolishLedgerPipeline: Sendable {
         error: Error,
         rejectedDraft: String? = nil
     ) -> VoicePolishLedgerRunResult {
-        .unavailable(
+        if case VoicePolishLedgerIntegrityError.invalidLedgerReason(let reason) = error,
+           reason.hasPrefix("semantic_") {
+            return .unavailable(stage: stage, attempts: attempts,
+                codes: [.semanticDecisionUnverified], reason: .validationFailed, rejectedDraft: rejectedDraft)
+        }
+        return .unavailable(
             stage: stage,
             attempts: attempts,
             codes: [code],

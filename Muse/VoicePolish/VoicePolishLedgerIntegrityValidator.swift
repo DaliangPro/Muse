@@ -183,6 +183,7 @@ enum VoicePolishLedgerIntegrityValidator {
         scene: WritingScene
     ) throws -> VoicePolishIntentLedger {
         var ledger = rawLedger
+        ledger.pendingSemanticChecks = []
         let spanByID = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
         let validSpanIDs = Set(spanByID.keys)
         let verifiedCanonicalBySpanID = verifiedMappings.reduce(into: [String: Set<String>]()) {
@@ -281,7 +282,6 @@ enum VoicePolishLedgerIntegrityValidator {
             spans: spanByID,
             fullSource: fullSource
         )
-        var locallyRemovedEditorUnitIDs: Set<String> = []
         var unitIds: Set<String> = []
         for index in ledger.units.indices {
             var unit = ledger.units[index]
@@ -387,38 +387,47 @@ enum VoicePolishLedgerIntegrityValidator {
                 unit.finalMeaning = evidence
                 unit.exactTokens = []
             }
-            if unit.deliveryRole == "recipient_content",
-               unit.status != "remove",
-               let editorToken = supersededFinalOnlyEditorInstruction(
-                    in: evidence,
-                    unitMeaning: unit.finalMeaning,
-                    unitSourceSpanIDs: Set(unit.sourceSpanIds),
-                    corrections: ledger.corrections
-               ) {
-                unit.deliveryRole = "editor_directive"
-                unit.status = "remove"
-                unit.exactTokens = []
-                unit.surfaceTokens = [editorToken]
-                locallyRemovedEditorUnitIDs.insert(unit.id)
-            } else if scene == .aiPrompt,
-               unit.deliveryRole == "recipient_content",
-               unit.status != "remove",
-               let editorToken = currentAIPromptEditorInstruction(
-                    in: evidence,
-                    unitMeaning: unit.finalMeaning,
-                    fullSource: fullSource
-               ) {
-                unit.deliveryRole = "editor_directive"
-                unit.status = "remove"
-                unit.exactTokens = []
-                unit.surfaceTokens = [editorToken]
-                locallyRemovedEditorUnitIDs.insert(unit.id)
+            if unit.deliveryRole == "recipient_content", unit.status != "remove",
+               ledger.corrections.contains(where: { correction in
+                   guard correction.renderingPolicy == "final_only",
+                         !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds),
+                         preservesToken(correction.oldValue, in: unit.finalMeaning) else { return false }
+                   let oldScan = measurementScan(in: correction.oldValue)
+                   let oldValues = Set(oldScan.occurrences.map(\.value) + Array(oldScan.bareValueCounts.keys))
+                   let oldCount: Int
+                   if let declared = declaredCountValue(correction.oldValue) {
+                       let pattern = #"[零〇一二两双三四五六七八九十百千万亿\d]+\s*"#
+                           + NSRegularExpression.escapedPattern(for: declared.classifier)
+                       let regex = try? NSRegularExpression(pattern: pattern)
+                       oldCount = regex?.matches(in: evidence, range: NSRange(evidence.startIndex..<evidence.endIndex, in: evidence))
+                           .filter { match in
+                               guard let range = Range(match.range, in: evidence) else { return false }
+                               return declaredCountValue(String(evidence[range]))?.value == declared.value
+                           }.count ?? 0
+                   } else if oldValues.count == 1, let value = oldValues.first {
+                       let sourceScan = measurementScan(in: evidence)
+                       oldCount = sourceScan.occurrences.filter { $0.value == value }.count
+                           + sourceScan.bareValueCounts[value, default: 0]
+                   } else {
+                       oldCount = ranges(of: correction.oldValue, in: evidence).count
+                   }
+                   // 同值多事项不能整体作废；这里只要求唯一旧值的计划显式更新。
+                   let returnsToOldValue = ledger.corrections.contains {
+                       $0.subject == correction.subject && $0.finalValue == correction.oldValue
+                   }
+                   return oldCount == 1 && !returnsToOldValue
+               }) {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "recipient_unit_retains_superseded_value:\(unit.id)"
+                )
             }
-            if unit.deliveryRole == "recipient_content", unit.status != "remove" {
-                unit.finalMeaning = applyingFinalOnlyCorrections(
-                    to: unit.finalMeaning,
-                    unitSourceSpanIDs: Set(unit.sourceSpanIds),
-                    corrections: ledger.corrections
+            if scene == .aiPrompt,
+               unit.deliveryRole == "recipient_content", unit.status != "remove",
+               currentAIPromptEditorInstruction(
+                    in: evidence, unitMeaning: unit.finalMeaning, fullSource: fullSource
+               ) != nil {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "recipient_unit_contains_editor_process:\(unit.id)"
                 )
             }
             if unit.deliveryRole == "recipient_content" {
@@ -481,7 +490,7 @@ enum VoicePolishLedgerIntegrityValidator {
                 corrections: ledger.corrections
             )
             if unit.deliveryRole == "recipient_content", unit.status != "remove" {
-                guard measurementsAreSourceBacked(
+                guard measurementValuesHaveSources(
                     source: evidenceMeasurements,
                     final: finalMeasurements,
                     requiresCompleteCoverage: false
@@ -490,6 +499,16 @@ enum VoicePolishLedgerIntegrityValidator {
                         "unit_contains_unbacked_fact:\(unit.id):source_measurements=\(evidenceMeasurements.summary),final_measurements=\(finalMeasurements.summary)"
                     )
                 }
+            }
+            if unit.deliveryRole == "recipient_content", unit.status != "remove",
+               !evidenceMeasurements.occurrences.isEmpty || !finalMeasurements.occurrences.isEmpty
+                    || !numericSourceEvidence(spanIDs: unit.sourceSpanIds, spans: spanByID).isEmpty {
+                ledger.pendingSemanticChecks?.append(VoicePolishSemanticCheck(
+                    id: "measurement_\(unit.id)", kind: "measurement_relation",
+                    claim: "核对该片段所有数值的主体、动作、币种、上限下限和条件，不能借用同值的其他事项。",
+                    unitIds: [unit.id], sourceSpanIds: unit.sourceSpanIds,
+                    requiredEvidence: numericSourceEvidence(spanIDs: unit.sourceSpanIds, spans: spanByID)
+                ))
             }
             if explicitNonCommitment(in: unit.finalMeaning) {
                 unit.modality = "not_promised"
@@ -518,17 +537,6 @@ enum VoicePolishLedgerIntegrityValidator {
             }
             ledger.units[index] = unit
         }
-        if !locallyRemovedEditorUnitIDs.isEmpty {
-            ledger.structure = VoicePolishLedgerStructure(
-                kind: ledger.structure.kind,
-                orderedUnitIds: ledger.structure.orderedUnitIds.filter {
-                    !locallyRemovedEditorUnitIDs.contains($0)
-                },
-                numberedUnitIds: ledger.structure.numberedUnitIds?.filter {
-                    !locallyRemovedEditorUnitIDs.contains($0)
-                }
-            )
-        }
         let activeRecipientUnits = ledger.units.filter {
             $0.deliveryRole == "recipient_content" && $0.status != "remove"
         }
@@ -554,7 +562,7 @@ enum VoicePolishLedgerIntegrityValidator {
                     )
                 }
             )
-            guard measurementsAreSourceBacked(
+            guard measurementValuesHaveSources(
                 source: sourceMeasurements,
                 final: finalMeasurements,
                 requiresCompleteCoverage: true
@@ -624,7 +632,82 @@ enum VoicePolishLedgerIntegrityValidator {
                         || unit.exactTokens.contains(mapping.canonical))
             }
         }
+        for (index, correction) in ledger.corrections.enumerated() {
+            let sourceIDs = Set(correction.oldSpanIds + correction.finalSpanIds)
+            ledger.pendingSemanticChecks?.append(VoicePolishSemanticCheck(
+                id: "correction_\(index + 1)", kind: "correction_relation",
+                claim: "待核对的改口：主体=\(correction.subject)，旧值=\(correction.oldValue)，最终值=\(correction.finalValue)，呈现策略=\(correction.renderingPolicy)。这些是待验证假设。确认确属同一事项，保留其他事项同值、仍有效原因和公开更正所需旧值。",
+                unitIds: ledger.units.filter {
+                    !Set($0.sourceSpanIds).isDisjoint(with: sourceIDs)
+                }.map(\.id),
+                sourceSpanIds: sourceIDs.sorted(),
+                requiredEvidence: sourceEvidence(spanIDs: sourceIDs.sorted(), spans: spanByID,
+                    tokens: [correction.oldValue, correction.finalValue])
+            ))
+        }
         return ledger
+    }
+
+    private static func numericSourceEvidence(
+        spanIDs: [String], spans: [String: VoicePolishEvidenceSpan]
+    ) -> [VoicePolishSourceQuote] {
+        let numericKinds: Set<ProtectedFactKind> = [.number, .amount, .percentage, .date, .time]
+        return spanIDs.flatMap { id in
+            sourceEvidence(spanIDs: [id], spans: spans,
+                tokens: protectedFactCandidates(in: spans[id]?.text ?? "")
+                    .filter { numericKinds.contains($0.kind) }.map(\.sourceText))
+        }
+    }
+
+    /// 只按明确标点取得值所在原文子句，不推断主语、受众或取消范围。
+    private static func sourceEvidence(
+        spanIDs: [String], spans: [String: VoicePolishEvidenceSpan], tokens: [String]
+    ) -> [VoicePolishSourceQuote] {
+        var result: [VoicePolishSourceQuote] = []
+        for id in spanIDs {
+            guard let text = spans[id]?.text else { continue }
+            for token in tokens where !token.isEmpty {
+                for range in ranges(of: token, in: text) {
+                    let quote = VoicePolishSourceQuote(spanId: id, text: clause(in: text, containing: range))
+                    if !result.contains(quote) { result.append(quote) }
+                }
+            }
+        }
+        return result
+    }
+
+    /// 引用真实性可由本地证明，关系是否成立由 Reviewer 承担。两者缺一不可。
+    /// 每次初审和修复后的确认都必须重新回答全部检查，不能沿用上次 supported。
+    static func validateSemanticReview(
+        _ review: VoicePolishReviewerResult,
+        ledger: VoicePolishIntentLedger,
+        spans: [VoicePolishEvidenceSpan]
+    ) throws {
+        let pending = ledger.pendingSemanticChecks ?? []
+        let answers = review.semanticChecks ?? []
+        let answerIDs = answers.map(\.checkId)
+        guard Set(answerIDs).count == answerIDs.count,
+              Set(answerIDs) == Set(pending.map(\.id)) else {
+            throw VoicePolishLedgerIntegrityError.invalidLedgerReason("semantic_checks_incomplete")
+        }
+        let spanByID = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
+        for check in pending {
+            guard let answer = answers.first(where: { $0.checkId == check.id }),
+                  answer.verdict == "supported",
+                  Set(answer.evidence.map(\.spanId)) == Set(check.sourceSpanIds),
+                  (check.requiredEvidence ?? []).allSatisfy({ required in
+                      answer.evidence.contains { $0.spanId == required.spanId && $0.text.contains(required.text) }
+                  }),
+                  answer.evidence.allSatisfy({ quote in
+                      guard let span = spanByID[quote.spanId] else { return false }
+                      return quote.text.rangeOfCharacter(from: .alphanumerics) != nil
+                          && span.text.contains(quote.text)
+                  }) else {
+                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
+                    "semantic_decision_unverified:\(check.id)"
+                )
+            }
+        }
     }
 
     private static func inferredUnitKind(
@@ -1046,7 +1129,9 @@ enum VoicePolishLedgerIntegrityValidator {
         }
 
         for unit in ledger.units
-        where unit.deliveryRole == "recipient_content" && unit.modality == "not_promised" {
+        where unit.deliveryRole == "recipient_content" && unit.status != "remove"
+            && unit.modality == "not_promised"
+            && explicitNonCommitment(in: unit.sourceSpanIds.compactMap { spanByID[$0]?.text }.joined()) {
             if !preservesNonCommitment(output: output, unit: unit) {
                 issues.append(VoicePolishReviewerIssue(
                     type: "wrong_modality",
@@ -1298,76 +1383,6 @@ enum VoicePolishLedgerIntegrityValidator {
         return String(evidence[range])
     }
 
-    /// `final_only` 已由来源证据证明时，Planner 不得把“旧数字不要写”继续当
-    /// 收件人正文。这里只识别同时命中旧值、旧值指代和明确删除动作的局部原句，
-    /// 把它作为编辑说明执行；普通“不要做某事”的收件人约束不会进入此路。
-    private static func supersededFinalOnlyEditorInstruction(
-        in evidence: String,
-        unitMeaning: String,
-        unitSourceSpanIDs: Set<String>,
-        corrections: [VoicePolishLedgerCorrection]
-    ) -> String? {
-        for correction in corrections
-        where correction.renderingPolicy == "final_only"
-            && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
-            && evidence.contains(correction.oldValue)
-            && unitMeaning.contains(correction.oldValue) {
-            for oldRange in ranges(of: correction.oldValue, in: evidence) {
-                let oldSentence = sentence(in: evidence, containing: oldRange)
-                let hasHistoricalCue = oldSentence.range(
-                    of: #"(?:原来|原定|原先|之前|先前|本来)"#,
-                    options: .regularExpression
-                ) != nil
-                let hasCancellationCue = oldSentence.range(
-                    of: #"(?:取消|作废|不再采用|不算|不要了)"#,
-                    options: .regularExpression
-                ) != nil
-                // `final_only` 已由前面的来源关系门禁证明。旧句若明确只是
-                // “原来……这个取消”的历史说明，应整体执行并移出正文；
-                // 绝不能把其中旧值机械替换成最终值，制造“最终安排也取消”。
-                if hasHistoricalCue && hasCancellationCue {
-                    return oldSentence
-                }
-            }
-        }
-
-        let instructionPattern = #"(?:旧(?:数字|值|版本|日期|安排)?|原(?:数字|值|版本|日期|安排)?)[^。！？\n]{0,24}(?:不要|不再|无需)(?:写|保留|放|出现|记录)[^。！？\n]{0,16}"#
-        guard unitMeaning.range(of: instructionPattern, options: .regularExpression) != nil,
-              let sourceRange = evidence.range(of: instructionPattern, options: .regularExpression)
-        else { return nil }
-        let sourceInstruction = String(evidence[sourceRange])
-        let matchesCorrection = corrections.contains { correction in
-            correction.renderingPolicy == "final_only"
-                && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
-                && evidence.contains(correction.oldValue)
-                && unitMeaning.contains(correction.oldValue)
-        }
-        return matchesCorrection ? sourceInstruction : nil
-    }
-
-    /// 已验证的 final_only correction 是本地可信的替换证据。若正文 unit 仍只
-    /// 携带旧值，程序把该值投影为最终值，避免 Writer 被相互冲突的 unit 与
-    /// correction 同时约束。若 unit 同时写了旧值和最终值则不机械改写，留给
-    /// schema repair 明确重建，避免生成“从最终值改为最终值”的病句。
-    private static func applyingFinalOnlyCorrections(
-        to meaning: String,
-        unitSourceSpanIDs: Set<String>,
-        corrections: [VoicePolishLedgerCorrection]
-    ) -> String {
-        var result = meaning
-        for correction in corrections
-        where correction.renderingPolicy == "final_only"
-            && !unitSourceSpanIDs.isDisjoint(with: correction.oldSpanIds)
-            && result.contains(correction.oldValue)
-            && !preservesToken(correction.finalValue, in: result) {
-            result = result.replacingOccurrences(
-                of: correction.oldValue,
-                with: correction.finalValue
-            )
-        }
-        return result
-    }
-
     /// 连续改口按原文位置连接，不能仅凭两个相同值把循环改口的最终值也作废。
     private static func correctionPositions(
         _ correction: VoicePolishLedgerCorrection,
@@ -1540,59 +1555,16 @@ enum VoicePolishLedgerIntegrityValidator {
                     "correction_schema_invalid"
                 )
             }
-            let oldEvidence = correction.oldSpanIds.compactMap { spans[$0]?.text }.joined()
-            let finalEvidence = correction.finalSpanIds.compactMap { spans[$0]?.text }.joined()
-            guard oldEvidence.contains(correction.oldValue),
-                  finalEvidence.contains(correction.finalValue) else {
+            // 改口值必须完整出现于一个真实 span；不能把不相邻的片段拼成新值。
+            guard correction.oldSpanIds.contains(where: { spans[$0]?.text.contains(correction.oldValue) == true }),
+                  correction.finalSpanIds.contains(where: { spans[$0]?.text.contains(correction.finalValue) == true }) else {
                 throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
                     "correction_value_not_found_in_its_source_span"
                 )
             }
-            let oldValueIsSubjectBacked = correction.oldSpanIds.contains { spanID in
-                guard let text = spans[spanID]?.text else { return false }
-                return ranges(of: correction.oldValue, in: text).contains { range in
-                    correctionRangeIsSubjectBacked(
-                        range,
-                        in: text,
-                        subject: correction.subject
-                    )
-                }
-            }
-            let finalValueIsSubjectBacked = correction.finalSpanIds.contains { spanID in
-                guard let text = spans[spanID]?.text else { return false }
-                return ranges(of: correction.finalValue, in: text).contains { range in
-                    correctionRangeIsSubjectBacked(
-                        range,
-                        in: text,
-                        subject: correction.subject
-                    )
-                }
-            }
-            let localOmittedSubjectRanges = locallyPairedCorrectionOldRanges(
-                correction,
-                spans: spans
-            )
-            let hasLocalOmittedSubjectPair = !localOmittedSubjectRanges.isEmpty
-            let hasSameSegmentBackwardCancellation = finalValueIsSubjectBacked
-                && explicitlyCancelsOldValueInSameSegment(
-                    correction,
-                    spans: spans
-                )
-            let hasExplicitDeclaredCountUpdate = explicitlyUpdatesDeclaredCount(
-                correction,
-                spans: spans
-            )
-            guard (oldValueIsSubjectBacked && finalValueIsSubjectBacked)
-                    || hasLocalOmittedSubjectPair
-                    || hasSameSegmentBackwardCancellation
-                    || hasExplicitDeclaredCountUpdate else {
-                let code = oldValueIsSubjectBacked
-                    ? "correction_subject_not_bound_to_final_value"
-                    : "correction_subject_not_bound_to_old_value"
-                throw VoicePolishLedgerIntegrityError.invalidLedgerReason(
-                    "\(code):\(correction.subject)"
-                )
-            }
+            // 对象、指代和改口范围由隔离 Reviewer 逐项确认。
+            // 后续即使词面完全相同也必须带来源回答，不能用裸 pass 清除。
+
         }
     }
 
@@ -1784,50 +1756,6 @@ enum VoicePolishLedgerIntegrityValidator {
                 )
             }
         }
-    }
-
-    /// 自然交接里常先给最终安排，再补一句“原来说周二录，这个取消”。旧句
-    /// 会省略“录制安排”全称，但同一个 ASR segment 已明确包含最终对象、旧值
-    /// 与取消证据。这里只接受非 measurement、同 segment、旧/新值各自唯一且
-    /// 旧句同时带历史状态与取消词的反向改口，不能跨 segment 借另一个对象。
-    private static func explicitlyCancelsOldValueInSameSegment(
-        _ correction: VoicePolishLedgerCorrection,
-        spans: [String: VoicePolishEvidenceSpan]
-    ) -> Bool {
-        guard measurementScan(in: correction.oldValue).occurrences.isEmpty,
-              measurementScan(in: correction.finalValue).occurrences.isEmpty else {
-            return false
-        }
-        for oldID in correction.oldSpanIds {
-            guard let oldSpan = spans[oldID] else { continue }
-            for finalID in correction.finalSpanIds {
-                guard let finalSpan = spans[finalID],
-                      oldSpan.segmentID == finalSpan.segmentID else { continue }
-                let segmentSpans = spans.values
-                    .filter { $0.segmentID == oldSpan.segmentID }
-                    .sorted { $0.start < $1.start }
-                let segmentText = segmentSpans.map(\.text).joined()
-                guard ranges(of: correction.oldValue, in: segmentText).count == 1,
-                      ranges(of: correction.finalValue, in: segmentText).count == 1 else {
-                    continue
-                }
-                let oldClause = clause(
-                    in: oldSpan.text,
-                    containing: ranges(of: correction.oldValue, in: oldSpan.text).first
-                        ?? NSRange(location: 0, length: 0)
-                )
-                let hasHistoricalCue = oldClause.range(
-                    of: #"(?:原来|原定|原先|之前|先前|本来)"#,
-                    options: .regularExpression
-                ) != nil
-                let hasCancellationCue = oldSpan.text.range(
-                    of: #"(?:取消|作废|不再采用|不算|不要了)"#,
-                    options: .regularExpression
-                ) != nil
-                if hasHistoricalCue && hasCancellationCue { return true }
-            }
-        }
-        return false
     }
 
     private static func facts(in text: String) -> Set<String> {
@@ -2094,7 +2022,7 @@ enum VoicePolishLedgerIntegrityValidator {
         )
     }
 
-    private static func measurementsAreSourceBacked(
+    private static func measurementValuesHaveSources(
         source: MeasurementScan,
         final: MeasurementScan,
         requiresCompleteCoverage: Bool
@@ -2111,21 +2039,15 @@ enum VoicePolishLedgerIntegrityValidator {
                 <= source.bareValueCounts[value, default: 0]
         }) else { return false }
 
-        // 二分图匹配按对象—数值—单位关系核对，顺序不参与语义判断。
+        // 这里只证明数值、单位与数量有来源，绝不证明对象关系。
+        // 调用方为每个带测量的正文单元建立必须回答的冷复核项。
         var sourceMatch = Array(repeating: -1, count: source.occurrences.count)
         func assign(_ finalIndex: Int, visited: inout Set<Int>) -> Bool {
             let candidate = final.occurrences[finalIndex]
             for sourceIndex in source.occurrences.indices {
                 let evidence = source.occurrences[sourceIndex]
-                let singletonUnanchoredRelation = evidence.anchor.isEmpty
-                    && candidate.anchor.isEmpty
-                    && source.occurrences.count == 1
-                    && final.occurrences.count == 1
                 guard candidate.value == evidence.value,
-                      candidate.family == evidence.family,
-                      (measurementAnchorsAreCompatible(evidence.anchor, candidate.anchor)
-                        || singletonUnanchoredRelation)
-                else { continue }
+                      candidate.family == evidence.family else { continue }
                 // 只标记实际存在的边；提前标记不兼容节点会阻断后续增广路径，
                 // 使同值事实的合法重排依赖遍历顺序。
                 guard visited.insert(sourceIndex).inserted else { continue }
@@ -2284,7 +2206,11 @@ enum VoicePolishLedgerIntegrityValidator {
                 correction,
                 spans: spans
             )[spanID] ?? []
-            return Array(Set(strictlyBound + locallyPaired))
+            let totalOldOccurrences = correction.oldSpanIds.reduce(0) { count, id in
+                count + ranges(of: correction.oldValue, in: spans[id]?.text ?? "").count
+            }
+            let uniquelyLocated = totalOldOccurrences == 1 ? valueRanges : []
+            return Array(Set(strictlyBound + locallyPaired + uniquelyLocated))
         }
     }
 

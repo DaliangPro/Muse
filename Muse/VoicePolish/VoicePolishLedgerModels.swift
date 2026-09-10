@@ -112,6 +112,29 @@ struct VoicePolishIntentLedger: Codable, Sendable, Equatable {
     var dictatedSymbolMappings: [VoicePolishLedgerTokenMapping]
     var contextMappings: [VoicePolishLedgerContextMapping]
     var structure: VoicePolishLedgerStructure
+    /// 只能由本地来源校验重建；模型自报的列表一律丢弃。
+    var pendingSemanticChecks: [VoicePolishSemanticCheck]? = nil
+}
+
+struct VoicePolishSemanticCheck: Codable, Sendable, Equatable {
+    let id: String
+    let kind: String
+    let claim: String
+    let unitIds: [String]
+    let sourceSpanIds: [String]
+    /// 引文至少覆盖这些原文子句，不能用孤立标点或数字冒充关系证据。
+    var requiredEvidence: [VoicePolishSourceQuote]? = nil
+}
+
+struct VoicePolishSourceQuote: Codable, Sendable, Equatable {
+    let spanId: String
+    let text: String
+}
+
+struct VoicePolishSemanticCheckResult: Codable, Sendable, Equatable {
+    let checkId: String
+    let verdict: String
+    let evidence: [VoicePolishSourceQuote]
 }
 
 /// Writer 不再返回无法核对覆盖范围的一整段自由文本。每个需要交付的 unit
@@ -142,6 +165,7 @@ struct VoicePolishReviewerIssue: Codable, Sendable, Equatable {
 struct VoicePolishReviewerResult: Codable, Sendable, Equatable {
     let verdict: String
     let issues: [VoicePolishReviewerIssue]
+    var semanticChecks: [VoicePolishSemanticCheckResult]? = nil
 }
 
 enum VoicePolishLedgerFailureStage: String, Sendable, Equatable {
