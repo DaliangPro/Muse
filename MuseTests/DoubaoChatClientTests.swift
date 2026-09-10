@@ -295,6 +295,14 @@ final class DoubaoChatClientTests: XCTestCase {
         XCTAssertEqual(receipt.requestOrdinal, 1)
         let successfulCallCount = await successCounter.currentCount()
         XCTAssertEqual(successfulCallCount, 1)
+        let stageResponses = await successCounter.stageResponses()
+        XCTAssertEqual(stageResponses, [VoicePolishQualityStageResponse(
+            task: "voicePolishFast",
+            requestPayload: "嗯润色一下",
+            responseText: "润色完成。"
+        )])
+        let encodedTrace = try JSONEncoder().encode(stageResponses)
+        XCTAssertFalse(String(decoding: encodedTrace, as: UTF8.self).contains("test-only-key"))
     }
 
     func test质量Runner不会把超时尝试计为成功Provider调用() async {

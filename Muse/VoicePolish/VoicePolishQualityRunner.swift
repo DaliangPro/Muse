@@ -2,15 +2,33 @@ import AppKit
 import CommonCrypto
 import Foundation
 
+/// 仅由显式质量跑测入口写入调用方指定的报告，用来区分模型初稿、修复与
+/// 本地处理造成的变化；生产历史和诊断日志不采集正文，也不记录配置或凭据。
+struct VoicePolishQualityStageResponse: Codable, Sendable, Equatable {
+    let task: String
+    let requestPayload: String
+    let responseText: String
+}
+
 actor VoicePolishProviderAuditSuccessCounter {
     private var count = 0
+    private var responses: [VoicePolishQualityStageResponse] = []
 
-    func recordSuccess() {
+    func recordSuccess(request: LLMRequest, response: LLMResponse) {
         count += 1
+        responses.append(VoicePolishQualityStageResponse(
+            task: request.task.rawValue,
+            requestPayload: request.user,
+            responseText: response.text
+        ))
     }
 
     func currentCount() -> Int {
         count
+    }
+
+    func stageResponses() -> [VoicePolishQualityStageResponse] {
+        responses
     }
 }
 
@@ -48,7 +66,7 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
         }
         // 网络层只有在 HTTP 200 响应完成解析且回执已经 fsync 后才会返回。
         // 预算尝试可能在超时、本地校验或非 200 响应处结束，不能冒充成功调用数。
-        await successCounter.recordSuccess()
+        await successCounter.recordSuccess(request: request, response: response)
         return response
     }
 
@@ -176,6 +194,7 @@ enum VoicePolishQualityRunner {
         let contextFixture: QualityContextFixture
         let modelOutput: String
         let rejectedModelOutput: String?
+        let stageResponses: [VoicePolishQualityStageResponse]
         let detectedRoute: String
         let executedRoute: String
         let internalChunkCount: Int
@@ -476,6 +495,7 @@ enum VoicePolishQualityRunner {
                     contextFixture: inputEvidence.contextFixture,
                     modelOutput: result.text,
                     rejectedModelOutput: result.rejectedDraft,
+                    stageResponses: await successCounter.stageResponses(),
                     detectedRoute: result.detectedRoute.rawValue,
                     executedRoute: result.executedRoute.rawValue,
                     internalChunkCount: internalChunkCount(
