@@ -387,23 +387,34 @@ actor DoubaoChatClient: LLMClient {
             reasoningPolicy: reasoningPolicy
         ))
         Self.authorizeLocalServiceRequest(&request, provider: provider)
+        let probe = try VoicePolishRequestProbeEvidence.captureIfRequested(body: request.httpBody, task: auditTask)
 
         logger.info(
             "LLM request: \(textLength) chars, endpoint=\(config.model), stream=\(useStreaming), thinking=\(config.thinkingMode.rawValue), controlled=\(appliesThinkingControl)"
         )
 
         let requestStartedAt = ContinuousClock.now
-        let result = useStreaming
-            ? try await processStreaming(
-                request: request,
-                model: config.model,
-                requestStartedAt: requestStartedAt
-            )
-            : try await processNonStreaming(
-                request: request,
-                model: config.model,
-                requestStartedAt: requestStartedAt
-            )
+        let result: LLMExecutionResult
+        do {
+            result = useStreaming
+                ? try await processStreaming(
+                    request: request,
+                    model: config.model,
+                    requestStartedAt: requestStartedAt
+                )
+                : try await processNonStreaming(
+                    request: request,
+                    model: config.model,
+                    requestStartedAt: requestStartedAt
+                )
+        } catch {
+            try probe?.recordResponse(status: "request_or_response_failed")
+            throw error
+        }
+        try probe?.recordResponse(
+            status: "response_parsed", text: result.text, httpStatus: result.httpStatus,
+            responseModel: result.responseModel, transport: result.transport
+        )
         let controlAccepted = appliesThinkingControl
             && provider.thinkingRequestField(for: config.model).isExplicitlyControllable
         logger.info("LLM result: \(result.text.count) chars")

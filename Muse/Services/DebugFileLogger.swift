@@ -104,8 +104,7 @@ enum DebugFileLogger {
     /// 在解析用户目录之前关闭写盘；外部 sandbox 继续作为第二道隔离边界。
     static func shouldDisableFileLogging(arguments: [String], isRunningTests: Bool) -> Bool {
         isRunningTests
-            || arguments.contains("--voice-polish-quality-run")
-            || arguments.contains("--voice-polish-quality-authorize-keychain")
+            || VoicePolishQualityRunner.isRequested(arguments: arguments)
     }
 
     private static let isFileLoggingDisabled = shouldDisableFileLogging(

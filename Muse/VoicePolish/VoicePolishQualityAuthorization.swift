@@ -25,7 +25,8 @@ enum VoicePolishQualityAuthorization {
 
     static func requestedProvider(arguments: [String]) throws -> LLMProvider? {
         guard arguments.contains(argument) else { return nil }
-        guard !arguments.contains("--voice-polish-quality-run") else {
+        guard !arguments.contains("--voice-polish-quality-run"),
+              !arguments.contains(VoicePolishRequestProbe.argument) else {
             throw InvocationError.mixedOperations
         }
         guard let index = arguments.firstIndex(of: "--provider"),

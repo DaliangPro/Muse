@@ -404,6 +404,15 @@ enum VoicePolishQualityRunner {
 
     @MainActor
     static func startIfRequested(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
+        do {
+            try VoicePolishRequestProbe.validateOperations(arguments: arguments)
+        } catch {
+            // 混合入口不能进入授权或配置读取，也不使用可能含凭据的参数写启动报告。
+            print("VOICE_POLISH_HEADLESS_FAILED mixed_operations")
+            NSApp.terminate(nil)
+            return true
+        }
+        if VoicePolishRequestProbe.startIfRequested(arguments: arguments) { return true }
         if VoicePolishQualityAuthorization.startIfRequested(arguments: arguments) {
             return true
         }
@@ -428,11 +437,13 @@ enum VoicePolishQualityRunner {
     static func isRequested(arguments: [String] = ProcessInfo.processInfo.arguments) -> Bool {
         arguments.contains("--voice-polish-quality-run")
             || arguments.contains(VoicePolishQualityAuthorization.argument)
+            || arguments.contains(VoicePolishRequestProbe.argument)
     }
 
     static func parseInvocation(arguments: [String]) throws -> Invocation? {
         guard arguments.contains("--voice-polish-quality-run") else { return nil }
-        guard !arguments.contains(VoicePolishQualityAuthorization.argument) else {
+        guard !arguments.contains(VoicePolishQualityAuthorization.argument),
+              !arguments.contains(VoicePolishRequestProbe.argument) else {
             throw VoicePolishQualityAuthorization.InvocationError.mixedOperations
         }
 
