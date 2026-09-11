@@ -657,24 +657,27 @@ private extension VoicePolishSettingsTab {
                 .foregroundStyle(TF.settingsText)
 
             if let performanceSummary {
-                Text("P50 \(performanceSummary.p50Milliseconds) ms · P95 \(performanceSummary.p95Milliseconds) ms")
+                Text(L("停止至可用", "Stop to usable") + " · P50 \(durationLabel(performanceSummary.p50Milliseconds)) · P95 \(durationLabel(performanceSummary.p95Milliseconds))")
+                    .font(TF.settingsFontMetadata)
+                    .foregroundStyle(TF.settingsTextSecondary)
+                Text(L("终稿就绪至可用", "Final transcript to usable") + " · P50 \(durationLabel(performanceSummary.asrReadyP50Milliseconds)) · P95 \(durationLabel(performanceSummary.asrReadyP95Milliseconds))")
                     .font(TF.settingsFontMetadata)
                     .foregroundStyle(TF.settingsTextSecondary)
                 HStack(spacing: 6) {
                     SettingsChip(
-                        L("无修复完成 \(percent(performanceSummary.unrepairedSuccessRate))", "Completed without repair \(percent(performanceSummary.unrepairedSuccessRate))"),
+                        L("首轮无修复完成 \(percent(performanceSummary.unrepairedSuccessRate))", "First run without repair \(percent(performanceSummary.unrepairedSuccessRate))"),
                         controlSize: .compact,
                         font: TF.settingsFontMetadata,
                         foreground: TF.settingsTextSecondary
                     )
                     SettingsChip(
-                        L("修复 \(percent(performanceSummary.repairRate))", "Repair \(percent(performanceSummary.repairRate))"),
+                        L("首轮局部修复 \(percent(performanceSummary.repairRate))", "First-run local repair \(percent(performanceSummary.repairRate))"),
                         controlSize: .compact,
                         font: TF.settingsFontMetadata,
                         foreground: TF.settingsTextSecondary
                     )
                     SettingsChip(
-                        L("回退 \(percent(performanceSummary.fallbackRate))", "Fallback \(percent(performanceSummary.fallbackRate))"),
+                        L("首次自动失败 \(percent(performanceSummary.fallbackRate))", "First automatic failure \(percent(performanceSummary.fallbackRate))"),
                         controlSize: .compact,
                         font: TF.settingsFontMetadata,
                         foreground: TF.settingsTextSecondary
@@ -682,16 +685,16 @@ private extension VoicePolishSettingsTab {
                 }
 
                 Text(L(
-                    "本档最近 \(performanceSummary.sampleCount) 次会话：无修复完成和回退率按 \(performanceSummary.automaticSampleCount) 次自动处理计算，修复率按 \(performanceSummary.llmRequestSampleCount) 次发生模型调用的会话计算。标准的正常复核不算修复；比率与耗时不包含主动使用原文或文字试跑，耗时为停止说话至文字可用。",
-                    "Across this mode's latest \(performanceSummary.sampleCount) sessions, completion without repair and fallback use \(performanceSummary.automaticSampleCount) automatic runs; repair uses \(performanceSummary.llmRequestSampleCount) sessions with model calls. Standard review is not a repair. Rates and latency exclude manual transcript exits and text trials; latency runs from stopping speech to usable text."
+                    "本档 \(performanceSummary.automaticSampleCount) 次有首轮结果的会话，主动重试 \(performanceSummary.userRetrySampleCount) 次、使用原文 \(performanceSummary.canonicalExitSampleCount) 次、取消 \(performanceSummary.cancelledSampleCount) 次。后续成功或选原文不会覆盖首次失败；重试不算局部修复，修复指标只使用有实际计数的记录。两段耗时只统计成功成稿，包含重试处理、扣除选择等待，不含文字试跑。另有 \(performanceSummary.legacySampleCount) 条旧口径记录不参与新统计。",
+                    "\(performanceSummary.automaticSampleCount) sessions have a first automatic outcome: \(performanceSummary.userRetrySampleCount) retried, \(performanceSummary.canonicalExitSampleCount) used the transcript, and \(performanceSummary.cancelledSampleCount) cancelled. Later choices do not overwrite the first failure. Retries are separate from measured local repairs. Both latency metrics cover successful drafts, include retry processing, and exclude decision waits and text trials. \(performanceSummary.legacySampleCount) legacy records are excluded."
                 ))
                 .font(TF.settingsFontMetadata)
                 .foregroundStyle(TF.settingsTextTertiary)
                 .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text(L(
-                    "已积累 \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) 次系统自动处理；主动使用纠正原文不计入门槛，样本足够后再显示实测指标。",
-                    "Collected \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) automatic runs. Manual corrected-transcript exits do not count; measured metrics appear only after enough samples."
+                    "已积累 \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) 次有首轮结果的会话，样本足够后显示指标。取得自动结果前主动退出不计入门槛；旧记录缺少档位或首轮证据时不混入新统计。",
+                    "Collected \(performanceSampleCount)/\(VoicePolishPerformanceStore.minimumVisibleSampleCount) first automatic outcomes. Metrics appear once enough samples exist. Early manual exits and legacy records lacking mode or first-outcome evidence are excluded."
                 ))
                 .font(TF.settingsFontCaption)
                 .foregroundStyle(TF.settingsTextTertiary)
@@ -837,6 +840,10 @@ private extension VoicePolishSettingsTab {
         case .nearbyText:
             return L("在安全的标准输入框中参考光标附近文字，帮助延续语气和指代。", "References text around the cursor in a safe standard text field to maintain tone and references.")
         }
+    }
+
+    func durationLabel(_ milliseconds: Int?) -> String {
+        milliseconds.map { "\($0) ms" } ?? L("暂无", "Unavailable")
     }
 
     func percent(_ value: Double?) -> String {

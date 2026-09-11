@@ -1080,7 +1080,9 @@ actor RecognitionSession {
                 let milliseconds = elapsed.components.seconds * 1_000
                     + Int64(elapsed.components.attoseconds / 1_000_000_000_000_000)
                 VoicePolishPerformanceStore.record(
-                    measurement: voicePolishPerformance,
+                    measurement: voicePolishPerformance.completing(
+                        stopElapsedMilliseconds: Int(clamping: milliseconds)
+                    ),
                     latencyMilliseconds: Int(clamping: milliseconds),
                     qualityMode: currentMode.voicePolishQualityMode,
                     defaults: llmResult.voicePolishVocabularyContext?.userDefaults ?? .standard
@@ -1261,6 +1263,7 @@ actor RecognitionSession {
         vocabularyContext: VocabularyStorageContext = .production,
         allowsVoicePolishUserChoice: Bool = false
     ) async -> LLMPostProcessingResult? {
+        let asrReadyAt = ContinuousClock.now
         // rawText 必须原样留给历史审计。所有模式共用统一术语仓库生成 canonical；
         // 固定/整句 Snippet 仍由运行时先执行，应用级规则只读取录音开始时冻结的目标应用。
         var finalText = canonicalText(
@@ -1272,6 +1275,29 @@ actor RecognitionSession {
         var llmFailed = false
         var voicePolishHistoryStatus: String?
         var voicePolishPerformance: VoicePolishPerformanceMeasurement?
+        let frozenQualityMode = currentMode.voicePolishQualityMode
+        var performance = VoicePolishSessionPerformance(stoppedAt: stopT0, asrReadyAt: asrReadyAt)
+        var returnedPolishResult = false
+        func finalized(_ value: LLMPostProcessingResult) -> LLMPostProcessingResult {
+            var value = value
+            if let measurement = value.voicePolishPerformance {
+                value.voicePolishPerformance = performance.measurement(outcome: measurement.outcome)
+                returnedPolishResult = true
+            }
+            return value
+        }
+        defer {
+            if frozenQualityMode != nil, !returnedPolishResult {
+                // 取消也留下一条不含正文的统计；先前自动失败不能随会话退出消失。
+                let measurement = performance.measurement(outcome: .cancelled)
+                VoicePolishPerformanceStore.record(
+                    measurement: measurement,
+                    latencyMilliseconds: measurement.stopLatencyMilliseconds ?? 0,
+                    qualityMode: frozenQualityMode,
+                    defaults: vocabularyContext.userDefaults
+                )
+            }
+        }
 
         // LLM post-processing: prefer early result (fired at stop time),
         // fall back to synchronous call for very short recordings where
@@ -1348,29 +1374,32 @@ actor RecognitionSession {
                     provider: provider
                 )
                 guard envelope == nil, allowsVoicePolishUserChoice else { break }
-                switch await waitForVoicePolishChoice(
-                    reason: .setupFailed,
-                    sessionID: sessionID
-                ) {
+                performance.recordSetupFailure()
+                let waitingAt = ContinuousClock.now
+                let choice = await waitForVoicePolishChoice(reason: .setupFailed, sessionID: sessionID)
+                performance.decisionWait += ContinuousClock.now - waitingAt
+                switch choice {
                 case .retry:
+                    performance.userRetryCount += 1
                     continue
                 case .useCanonical:
                     _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
-                    return canonicalVoicePolishResult(
+                    return finalized(canonicalVoicePolishResult(
                         finalText,
                         vocabularyContext: vocabularyContext
-                    )
+                    ))
                 case .cancel:
                     return nil
                 }
             } while envelope == nil
 
             guard let envelope else {
+                performance.recordSetupFailure()
                 voicePolishCanonicalOptionSessionID = nil
                 llmFailed = true
                 voicePolishHistoryStatus = "voice_polish_fallback"
                 onASREvent?(.processingResult(text: finalText))
-                return LLMPostProcessingResult(
+                return finalized(LLMPostProcessingResult(
                     finalText: finalText,
                     processedText: nil,
                     llmFailed: true,
@@ -1379,36 +1408,38 @@ actor RecognitionSession {
                         outcome: .setupFailure
                     ),
                     voicePolishVocabularyContext: vocabularyContext
-                )
+                ))
             }
 
             if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                return canonicalVoicePolishResult(
+                return finalized(canonicalVoicePolishResult(
                     envelope,
                     vocabularyContext: vocabularyContext
-                )
+                ))
             }
 
             var loadedLLMConfig = await loadLLMConfigOffActor()
             if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                return canonicalVoicePolishResult(
+                return finalized(canonicalVoicePolishResult(
                     envelope,
                     vocabularyContext: vocabularyContext
-                )
+                ))
             }
             while loadedLLMConfig == nil, allowsVoicePolishUserChoice {
-                switch await waitForVoicePolishChoice(
-                    reason: .setupFailed,
-                    sessionID: sessionID
-                ) {
+                performance.recordSetupFailure()
+                let waitingAt = ContinuousClock.now
+                let choice = await waitForVoicePolishChoice(reason: .setupFailed, sessionID: sessionID)
+                performance.decisionWait += ContinuousClock.now - waitingAt
+                switch choice {
                 case .retry:
+                    performance.userRetryCount += 1
                     loadedLLMConfig = await loadLLMConfigOffActor()
                 case .useCanonical:
                     _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
-                    return canonicalVoicePolishResult(
+                    return finalized(canonicalVoicePolishResult(
                         envelope,
                         vocabularyContext: vocabularyContext
-                    )
+                    ))
                 case .cancel:
                     return nil
                 }
@@ -1443,10 +1474,10 @@ actor RecognitionSession {
                     styleProfile = nil
                 }
                 if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                    return canonicalVoicePolishResult(
+                    return finalized(canonicalVoicePolishResult(
                         envelope,
                         vocabularyContext: vocabularyContext
-                    )
+                    ))
                 }
                 let request = VoicePolishRequest(
                     input: envelope,
@@ -1485,6 +1516,11 @@ actor RecognitionSession {
                     voicePolishTask = task
                     voicePolishTaskSessionID = sessionID
                     let currentResult = await task.value
+                    performance.record(
+                        currentResult,
+                        completedAutomatically: isCurrent(sessionID)
+                            && canonicalVoicePolishRequestSessionID != sessionID
+                    )
                     if voicePolishTaskSessionID == sessionID {
                         voicePolishTask = nil
                         voicePolishTaskSessionID = nil
@@ -1499,33 +1535,36 @@ actor RecognitionSession {
                         return nil
                     }
                     if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                        return canonicalVoicePolishResult(
+                        return finalized(canonicalVoicePolishResult(
                             envelope,
                             pipelineResult: accumulatedResult,
                             vocabularyContext: vocabularyContext
-                        )
+                        ))
                     }
                     guard currentResult.usedFallback,
                           allowsVoicePolishUserChoice else {
                         result = accumulatedResult
                         break
                     }
-                    switch await waitForVoicePolishChoice(
-                        reason: currentResult.failureReason,
-                        sessionID: sessionID
-                    ) {
+                    let waitingAt = ContinuousClock.now
+                    let choice = await waitForVoicePolishChoice(
+                        reason: currentResult.failureReason, sessionID: sessionID
+                    )
+                    performance.decisionWait += ContinuousClock.now - waitingAt
+                    switch choice {
                     case .retry:
+                        performance.userRetryCount += 1
                         // 用户明确重试是一轮新的有界请求，不能继续消耗从录音停止
                         // 时开始计算的旧 deadline。
                         pipelineStartedAt = .now
                         continue
                     case .useCanonical:
                         _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
-                        return canonicalVoicePolishResult(
+                        return finalized(canonicalVoicePolishResult(
                             envelope,
                             pipelineResult: accumulatedResult,
                             vocabularyContext: vocabularyContext
-                        )
+                        ))
                     case .cancel:
                         return nil
                     }
@@ -1552,6 +1591,7 @@ actor RecognitionSession {
                     }
                 }
             } else {
+                performance.recordSetupFailure()
                 DebugFileLogger.log("stop: no LLM credentials for voice polish, falling back")
                 llmFailed = true
                 voicePolishHistoryStatus = "voice_polish_fallback"
@@ -1674,7 +1714,7 @@ actor RecognitionSession {
             voicePolishCanonicalOptionSessionID = nil
         }
 
-        return LLMPostProcessingResult(
+        return finalized(LLMPostProcessingResult(
             finalText: finalText,
             processedText: processedText,
             llmFailed: llmFailed,
@@ -1683,7 +1723,7 @@ actor RecognitionSession {
             voicePolishVocabularyContext: voicePolishPerformance == nil
                 ? nil
                 : vocabularyContext
-        )
+        ))
     }
 
     private func emitVoicePolishStage(
@@ -1816,7 +1856,8 @@ actor RecognitionSession {
             validationCodes: result.validationCodes,
             usedFallback: result.usedFallback,
             failureReason: result.failureReason,
-            rejectedDraft: result.rejectedDraft
+            rejectedDraft: result.rejectedDraft,
+            repairAttemptCount: result.repairAttemptCount
         )
     }
 
@@ -2659,7 +2700,8 @@ extension RecognitionSession {
         finalText: String,
         processedText: String?,
         llmFailed: Bool,
-        historyStatus: String?
+        historyStatus: String?,
+        performance: VoicePolishPerformanceMeasurement?
     )? {
         await postProcessForTesting(
             rawText: rawText,
@@ -2689,7 +2731,8 @@ extension RecognitionSession {
         finalText: String,
         processedText: String?,
         llmFailed: Bool,
-        historyStatus: String?
+        historyStatus: String?,
+        performance: VoicePolishPerformanceMeasurement?
     )? {
         let sessionID: RecognitionSessionID
         if let currentSessionID {
@@ -2727,7 +2770,8 @@ extension RecognitionSession {
                 finalText: $0.finalText,
                 processedText: $0.processedText,
                 llmFailed: $0.llmFailed,
-                historyStatus: $0.voicePolishHistoryStatus
+                historyStatus: $0.voicePolishHistoryStatus,
+                performance: $0.voicePolishPerformance
             )
         }
     }

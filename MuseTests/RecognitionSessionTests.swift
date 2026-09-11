@@ -1007,6 +1007,10 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertFalse(result?.llmFailed ?? true)
         XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
         XCTAssertTrue(recorder.values.contains("processing:\(source)"))
+        XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
+        XCTAssertEqual(result?.performance?.outcome, .canonicalExit)
+        XCTAssertEqual(result?.performance?.llmAttemptCount, 2)
+        XCTAssertEqual(result?.performance?.repairAttemptCount, 1)
     }
 
     func testVoicePolishExplicitRetryStartsFreshPipelineAndReturnsReviewedDraft() async throws {
@@ -1081,6 +1085,71 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.historyStatus, "voice_polish_success")
         XCTAssertTrue(recorder.values.contains("processing:\(polished)"))
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
+        XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
+        XCTAssertEqual(result?.performance?.outcome, .success)
+        XCTAssertEqual(result?.performance?.userRetryCount, 1)
+        XCTAssertEqual(result?.performance?.llmAttemptCount, 4)
+        XCTAssertEqual(result?.performance?.repairAttemptCount, 1)
+    }
+
+    func testLightRetryAndCancelKeepFirstFailureMetricsWithoutCountingRetryAsRepair() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        let source = "请先核对链接。"
+        let transcript = RecognitionTranscript(confirmedSegments: [source], partialText: "",
+                                              authoritativeText: source, isFinal: true)
+        for shouldRetry in [true, false] {
+            let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["invalid-json", #"{"edits":[]}"#])
+            let recorder = RecognitionEventRecorder()
+            let session = RecognitionSession(
+                historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
+                llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") }
+            )
+            await session.setOnASREvent { recorder.record($0) }
+            let vocabulary = fixture.context
+            let pending = Task {
+                await session.postProcessForTesting(
+                    rawText: source, transcript: transcript, mode: .lightPolish,
+                    vocabularyContext: vocabulary, allowsVoicePolishUserChoice: true
+                )
+            }
+            let waiting = await AsyncTimeout.asyncValue(.seconds(10)) {
+                while !recorder.values.contains("voicePolishUnavailable:validationFailed"), !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(1))
+                }
+                return true
+            }
+            XCTAssertFalse(waiting.timedOut)
+            // 留出真实选择等待，核对 Session 确实记录并剔除这段时间。
+            try await Task.sleep(for: .milliseconds(50))
+            if shouldRetry {
+                let accepted = await session.retryVoicePolishResult()
+                XCTAssertTrue(accepted)
+                let result = await pending.value
+                let measurement = try XCTUnwrap(result?.performance)
+                XCTAssertEqual(result?.processedText, source)
+                XCTAssertEqual(measurement.firstAutomaticOutcome, .fallback)
+                XCTAssertEqual(measurement.outcome, .success)
+                XCTAssertEqual(measurement.userRetryCount, 1)
+                XCTAssertEqual(measurement.llmAttemptCount, 2)
+                XCTAssertEqual(measurement.repairAttemptCount, 0)
+                XCTAssertGreaterThanOrEqual(measurement.decisionWaitMilliseconds, 40)
+                XCTAssertNotNil(measurement.asrReadyLatencyMilliseconds)
+            } else {
+                await session.abortCurrentSession()
+                let result = await pending.value
+                XCTAssertNil(result)
+                let sample = try XCTUnwrap(VoicePolishPerformanceStore.samples(defaults: vocabulary.userDefaults).last)
+                XCTAssertEqual(sample.qualityMode, .light)
+                XCTAssertEqual(sample.firstAutomaticOutcome, .fallback)
+                XCTAssertEqual(sample.resolvedOutcome, .cancelled)
+                XCTAssertEqual(sample.userRetryCount, 0)
+                XCTAssertEqual(sample.llmAttemptCount, 1)
+                XCTAssertEqual(sample.repairAttemptCount, 0)
+                XCTAssertGreaterThanOrEqual(try XCTUnwrap(sample.decisionWaitMilliseconds), 40)
+                XCTAssertFalse(recorder.values.contains("processing:\(source)"))
+            }
+        }
     }
 
     private static func voicePolishPayload(from request: LLMRequest) throws -> [String: Any] {

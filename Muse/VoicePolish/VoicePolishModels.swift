@@ -219,6 +219,8 @@ struct VoicePolishResult: Sendable, Equatable {
     /// 仅供显式质量跑测诊断校验拒绝原因；普通成功与请求失败均为空，且不会
     /// 写入用户历史或性能统计。
     let rejectedDraft: String?
+    /// 实际尝试应用的管线局部修复；旧路径未提供时保持未知。
+    let repairAttemptCount: Int?
 
     init(
         text: String,
@@ -229,7 +231,8 @@ struct VoicePolishResult: Sendable, Equatable {
         usedFallback: Bool,
         failureReason: VoicePolishFailureReason?,
         plannerValidationTrace: VoicePolishPlannerValidationTrace? = nil,
-        rejectedDraft: String? = nil
+        rejectedDraft: String? = nil,
+        repairAttemptCount: Int? = nil
     ) {
         self.text = text
         self.detectedRoute = detectedRoute
@@ -240,6 +243,7 @@ struct VoicePolishResult: Sendable, Equatable {
         self.failureReason = failureReason
         self.plannerValidationTrace = plannerValidationTrace
         self.rejectedDraft = rejectedDraft
+        self.repairAttemptCount = repairAttemptCount
     }
 }
 

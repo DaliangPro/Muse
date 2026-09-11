@@ -30,6 +30,7 @@ struct VoicePolishEditingPipeline: Sendable {
         let route: VoicePolishRoute = isLight ? .fast : .structured
         let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? (isLight ? .seconds(20) : .seconds(60)))
         var attempts = 0
+        var repairAttempts = 0
         var draft: String?
         func result(_ text: String?, codes: [VoicePolishValidationCode] = [],
                     reason: VoicePolishFailureReason? = nil) -> VoicePolishResult {
@@ -41,7 +42,8 @@ struct VoicePolishEditingPipeline: Sendable {
                 validationCodes: codes,
                 usedFallback: text == nil,
                 failureReason: text == nil ? (reason ?? .validationFailed) : nil,
-                rejectedDraft: text == nil ? draft : nil
+                rejectedDraft: text == nil ? draft : nil,
+                repairAttemptCount: repairAttempts
             )
         }
         guard request.qualityMode == .light || request.qualityMode == .standard else {
@@ -91,6 +93,7 @@ struct VoicePolishEditingPipeline: Sendable {
             if edits.isEmpty {
                 return initialCodes.isEmpty ? result(initialDraft) : result(nil, codes: initialCodes)
             }
+            repairAttempts += 1
             let repaired = try VoicePolishTextEditor.apply(
                 edits, to: initialDraft, source: request.fallbackText, mode: .standard
             )
