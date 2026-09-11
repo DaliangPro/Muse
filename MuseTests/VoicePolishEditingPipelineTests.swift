@@ -7,14 +7,16 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     func testLightAppliesOnlyAnchoredEditsAndKeepsUntouchedReason() async {
         let source = "我我今天按装软件。小李下午有别的事，所以请小周接手。"
         let client = EditingTestClient([
-            .text(#"{"edits":[{"before":"我我今天","after":"我今天","kind":"stutter"},{"before":"按装","after":"安装","kind":"word"}]}"#)
+            .text(#"{"edits":[{"before":"我我今天","after":"我今天","kind":"stutter"},{"before":"按装","after":"安装","kind":"word"}]}"#),
+            .text(#"{"edits":[]}"#)
         ])
         let result = await pipeline(client).process(request(source, .light))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, "我今天安装软件。小李下午有别的事，所以请小周接手。")
-        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishFast])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze])
+        XCTAssertEqual(calls.first?.context, .structuredTask)
         XCTAssertEqual(calls.first?.options.reasoningPolicy, .disabled)
         XCTAssertTrue(calls.first?.user.contains("\"mode\":\"light\"") == true)
     }
@@ -161,10 +163,102 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
 
     func testLightAllowsExplicitLocalSelfCorrection() async {
         let source = "预算一万六，不对，一万五，周五交付。"
-        let client = EditingTestClient([.text(#"{"edits":[{"before":"一万六，不对，一万五","after":"一万五","kind":"correction"}]}"#)])
+        let client = EditingTestClient([.text(#"{"edits":[{"before":"一万六，不对，一万五","after":"一万五","kind":"correction"}]}"#), .text(#"{"edits":[]}"#)])
         let result = await pipeline(client).process(request(source, .light))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, "预算一万五，周五交付。")
+    }
+
+    func testLightAcceptsClockCorrectionAttachedToNearestDate() async {
+        let source = "会议改到周三上午十点不对周四上午十点哎十点半才对地点还是三号会议室"
+        let client = EditingTestClient([.text(#"{"edits":[{"before":"周三上午十点不对周四上午十点哎十点半才对","after":"周四上午十点半","kind":"correction"}]}"#), .text(#"{"edits":[]}"#)])
+        let result = await pipeline(client).process(request(source, .light))
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "会议改到周四上午十点半地点还是三号会议室")
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
+    func testLightInlineEditingInstructionMustPassReviewOfActualDraft() async throws {
+        let source = "给客户回一下，我们会尽快核实。别先答应赔偿，费用还没确认。"
+        let patch = #"{"edits":[{"before":"给客户回一下，","after":"","kind":"directive"},{"before":"别先答应赔偿，","after":"","kind":"directive"}]}"#
+        let client = EditingTestClient([.text(patch), .text(#"{"edits":[]}"#)])
+        let result = await pipeline(client).process(request(source, .light))
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "我们会尽快核实。费用还没确认。")
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.repairAttemptCount, 0)
+        let calls = await client.requests
+        XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze])
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["canonical_text"] as? String, source)
+        XCTAssertEqual(payload["draft_text"] as? String, result.text)
+        XCTAssertNotNil(payload["changes"] as? [[String: String]])
+        XCTAssertEqual(payload["mode"] as? String, "light")
+    }
+
+    func testLightCannotDeliverUnconfirmedDeletionOrExecuteReviewRepair() async {
+        let source = "给同事的任务：别先答应赔偿，费用还没确认。"
+        let patch = #"{"edits":[{"before":"别先答应赔偿，","after":"","kind":"directive"}]}"#
+        let refusal = #"{"edits":[{"before":"费用还没确认。","after":"别先答应赔偿，费用还没确认。","kind":"content","evidence":"别先答应赔偿，费用还没确认。"}]}"#
+        let scenarios: [[EditingTestClient.Step]] = [[.text(patch)], [.text(patch), .text(refusal)]]
+        for steps in scenarios {
+            let client = EditingTestClient(steps)
+            let result = await pipeline(client).process(request(source, .light))
+            XCTAssertTrue(result.usedFallback)
+            XCTAssertEqual(result.text, source)
+            XCTAssertEqual(result.llmAttemptCount, 2)
+            XCTAssertEqual(result.repairAttemptCount, 0)
+            let calls = await client.requests
+            XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze])
+        }
+    }
+
+    func testLightSemanticReviewUsesRemainingSharedTimeout() async {
+        let patch = #"{"edits":[{"before":"按装","after":"安装","kind":"word"}]}"#
+        let client = EditingTestClient([.text(patch), .delay(.seconds(5), #"{"edits":[]}"#)])
+        let result = await VoicePolishPipeline(client: client, config: config, totalTimeout: .milliseconds(50))
+            .process(request("请按装软件。", .light))
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .timeout)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.executedRoute, .fast)
+    }
+
+    func testImmediateClockCorrectionCannotBorrowOtherDateOrCrossSubject() {
+        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
+            in: "周三上午十点不对周四上午十点哎十点半才对"
+        ), ["周四|10:30"])
+        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
+            in: "周五下午三点，不对，三点半。"
+        ), ["周五|15:30"])
+        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
+            in: "周五晚上八点，不对，上午九点半。"
+        ), ["周五|09:30"])
+        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
+            in: "会议周三上午十点。培训改成十点半。"
+        ), [])
+        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
+            sourceText: "周四上午十点哎十点半才对", outputText: "周三上午十点半", scene: .workChat
+        ).isEmpty)
+    }
+
+    func testClockCorrectionCanInheritPeriodWithoutCalendarDate() async {
+        let source = "会议下午三点，不对，三点半。"
+        let output = "会议下午三点半。"
+        let patch = #"{"edits":[{"before":"下午三点，不对，三点半","after":"下午三点半","kind":"correction"}]}"#
+        for mode in [VoicePolishQualityMode.light, .standard] {
+            let client = EditingTestClient([.text(mode == .light ? patch : output), .text(#"{"edits":[]}"#)])
+            let result = await pipeline(client).process(request(source, mode))
+            XCTAssertFalse(result.usedFallback, "\(mode)")
+            XCTAssertEqual(result.text, output)
+        }
+        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(in: source), ["15:30"])
+        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
+            in: "会议下午三点。培训改成三点半。"
+        ), [])
+        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
+            sourceText: "会议下午三点。培训改成三点半。", outputText: "培训下午三点半。", scene: .workChat
+        ).isEmpty)
     }
 
     func testLightRejectsContentDeletionDisguisedAsPunctuation() throws {

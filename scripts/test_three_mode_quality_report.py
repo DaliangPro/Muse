@@ -247,6 +247,224 @@ class ThreeModeEvidenceTests(unittest.TestCase):
                 {"before": "甲乙", "after": "甲"}, {"before": "乙丙", "after": "丙"}
             ]}))
 
+    def test_patch_replay_separates_shared_context_and_multiple_insertions(self):
+        source = "先按装再启动最后检查"
+        edits = [{"before": source, "after": "先按装，再启动，最后检查"},
+                 {"before": "按装再启动", "after": "安装再启动"}]
+        for ordered in [edits, list(reversed(edits))]:
+            self.assertEqual(e.apply_recorded_edits(source, json.dumps({"edits": ordered})), "先安装，再启动，最后检查")
+        self.assertEqual(e.apply_recorded_edits("甲乙丙", json.dumps({"edits": [
+            {"before": "甲乙", "after": "甲，乙"}, {"before": "乙丙", "after": "，乙丙"}
+        ]})), "甲，乙丙")
+
+    def test_patch_replay_rejects_conflicting_insertions_and_overlapping_occurrences(self):
+        cases = [
+            ("甲乙丙", [{"before": "甲乙", "after": "甲，乙"}, {"before": "乙丙", "after": "。乙丙"}]),
+            ("甲乙", [{"before": "甲乙", "after": "丙丁"}, {"before": "甲乙", "after": "甲，乙"}]),
+            ("哈哈哈", [{"before": "哈哈", "after": "哈"}]),
+            ("甲乙丙", [{"before": "甲", "after": "丁"}, {"before": "缺失", "after": "戊"}]),
+        ]
+        for source, edits in cases:
+            with self.subTest(source=source, edits=edits), self.assertRaises(ValueError):
+                e.apply_recorded_edits(source, json.dumps({"edits": edits}))
+
+    def test_patch_replay_unicode_and_boundary_order_match_swift(self):
+        source = "👨‍👩‍👧‍👦嗯我今天用e\u0301看结果👍🏽再发送"
+        self.assertEqual(e.apply_recorded_edits(source, json.dumps({"edits": [
+            {"before": "嗯我今天", "after": "我今天"},
+            {"before": "今天用e\u0301看结果👍🏽再发送", "after": "今天用e\u0301，看结果👍🏽，再发送。"}
+        ]})), "👨‍👩‍👧‍👦我今天用e\u0301，看结果👍🏽，再发送。")
+        self.assertEqual(e.apply_recorded_edits("前e\u0301后", json.dumps({"edits": [
+            {"before": "e\u0301", "after": "é"}
+        ]})).encode(), "前é后".encode())
+        edits = [{"before": "甲乙", "after": "丙丁"}, {"before": "前甲", "after": "前，甲"},
+                 {"before": "乙后", "after": "乙。后"}]
+        for ordered in [edits, list(reversed(edits))]:
+            self.assertEqual(e.apply_recorded_edits("前甲乙后", json.dumps({"edits": ordered})), "前，丙丁。后")
+
+    def test_patch_replay_real_chat_and_code_anchors(self):
+        source = "嗯我今天大概七点半到你们不用等我吃饭先吃就行"
+        self.assertEqual(e.apply_recorded_edits(source, json.dumps({"edits": [
+            {"before": "嗯我今天", "after": "我今天", "kind": "filler"}
+        ]})), "我今天大概七点半到你们不用等我吃饭先吃就行")
+        source = "部署要做三步第一跑swift test第二跑swift build短横线c release第三执行scripts斜杠package短横线app点sh等一下还有一步要检查codesign所以一共四步最后再启动应用"
+        changes = [("三步第一跑", "三步，第一跑"), ("swift test第二跑", "swift test，第二跑"),
+                   ("swift build短横线c release", "swift build -c release"),
+                   ("第三执行scripts斜杠package短横线app点sh", "第三执行scripts/package-app.sh"),
+                   ("等一下还有一步", "等一下，还有一步"), ("codesign所以一共四步", "codesign，所以一共四步"),
+                   ("四步最后再启动应用", "四步，最后再启动应用")]
+        self.assertEqual(e.apply_recorded_edits(source, json.dumps({"edits": [
+            {"before": before, "after": after} for before, after in changes
+        ]})), "部署要做三步，第一跑swift test，第二跑swift build -c release第三执行scripts/package-app.sh等一下，还有一步要检查codesign，所以一共四步，最后再启动应用")
+
+    def test_actual_modification_reconstruction_keeps_all_requested_changes(self):
+        from itertools import product
+        values = [""] + ["".join(chars) for size in range(1, 4) for chars in product("甲乙", repeat=size)]
+        for before in values:
+            for after in values:
+                output = before
+                for start, end, inserted in reversed(e.actual_modifications(before, after, 0)):
+                    output = output[:start] + inserted + output[end:]
+                self.assertEqual(output, after, (before, after))
+
+    def test_editing_protocol_version_is_frozen_in_report_and_payload(self):
+        report, receipts = self.report("light")
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.expected["editing_prompt_version"] = 2
+        report["editing_prompt_version"] = 2
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        payload = json.loads(report["cases"][0]["stage_responses"][0]["request_payload"])
+        payload["schema_version"] = 2
+        report["cases"][0]["stage_responses"][0]["request_payload"] = json.dumps(payload)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        report["editing_prompt_version"] = 1
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def reviewed_light_report(self, kind="correction", with_review=True):
+        source, before, after = {
+            "word": ("周五按装软件。", "按装", "安装"),
+            "correction": ("预算一万六，不对，一万五。", "一万六，不对，一万五", "一万五"),
+            "directive": ("给客户回一下，周五发送第一版。", "给客户回一下，", ""),
+            "punctuation": ("周五发送第一版", "第一版", "第一版。"),
+        }[kind]
+        self.text = source
+        self.inputs[0].update(spoken_input=source, segment_texts=[source])
+        self.expected["editing_prompt_version"] = 2
+        report, receipts = self.report("light")
+        report["editing_prompt_version"] = 2
+        row = report["cases"][0]
+        initial = row["stage_responses"][0]
+        initial["response_text"] = json.dumps({"edits": [{"before": before, "after": after, "kind": kind}]}, ensure_ascii=False)
+        initial_payload = json.loads(initial["request_payload"])
+        initial_payload["schema_version"] = 2
+        initial["request_payload"] = json.dumps(initial_payload, ensure_ascii=False)
+        row["model_output"] = e.apply_recorded_edits(source, initial["response_text"])
+        receipts[0]["response_text_sha256"] = e.legacy.sha256_text(initial["response_text"])
+        if with_review:
+            review = copy.deepcopy(initial)
+            review.update(task="voicePolishAnalyze", response_text='{"edits":[]}', attempt_ordinal=2)
+            payload = json.loads(self.payload("light", row["model_output"]))
+            payload.update(schema_version=2, changes=[
+                {"removed": source[start:end], "inserted": inserted}
+                for start, end, inserted in e.actual_modifications(source, row["model_output"], 0)
+            ])
+            review["request_payload"] = json.dumps(payload, ensure_ascii=False)
+            row["stage_responses"].append(review)
+            row.update(llm_call_count=2, llm_attempt_count=2)
+            receipt = copy.deepcopy(receipts[0])
+            receipt.update(request_ordinal=2, llm_task="voicePolishAnalyze", provider_response_id="unit-test-only-review-2",
+                           response_text_sha256=e.legacy.sha256_text(review["response_text"]))
+            receipt["request_binding_sha256"] = e.legacy.provider_request_binding_sha256(self.nonce, "fixture-01", 2, "e" * 64)
+            receipts.append(receipt)
+        return report, receipts
+
+    def test_v2_word_correction_and_directive_require_one_light_confirmation(self):
+        for kind in ["word", "correction", "directive"]:
+            report, receipts = self.reviewed_light_report(kind)
+            self.assertEqual(self.check(report, receipts, "light"), ([], []), kind)
+            report, receipts = self.reviewed_light_report(kind, with_review=False)
+            self.assertTrue(self.check(report, receipts, "light")[0], kind)
+
+    def test_v2_mechanical_edits_remain_one_call_and_v1_remains_compatible(self):
+        report, receipts = self.reviewed_light_report("punctuation", with_review=False)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        report, receipts = self.reviewed_light_report("punctuation")
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        report, receipts = self.reviewed_light_report("word", with_review=False)
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 1
+        payload = json.loads(report["cases"][0]["stage_responses"][0]["request_payload"])
+        payload["schema_version"] = 1
+        report["cases"][0]["stage_responses"][0]["request_payload"] = json.dumps(payload)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        report, receipts = self.reviewed_light_report()
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 1
+        for stage in report["cases"][0]["stage_responses"]:
+            payload = json.loads(stage["request_payload"]); payload["schema_version"] = 1
+            stage["request_payload"] = json.dumps(payload)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v2_nonempty_confirmation_cannot_be_applied_or_called_success(self):
+        for resulting_output in ["预算一万五。", "预算一万四。"]:
+            report, receipts = self.reviewed_light_report()
+            row = report["cases"][0]
+            review = row["stage_responses"][1]
+            review["response_text"] = json.dumps({"edits": [{"before": "一万五", "after": "一万四", "kind": "content", "evidence": self.text}]})
+            receipts[1]["response_text_sha256"] = e.legacy.sha256_text(review["response_text"])
+            row["model_output"] = resulting_output
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v2_confirmation_payload_is_bound_to_original_actual_draft_and_changes(self):
+        for field, value in [("canonical_text", "偷偷更换原文"), ("draft_text", "另一份稿"),
+                             ("changes", []), ("changes", [{"removed": "六", "inserted": "五"}]),
+                             ("changes", [{"removed": "不存在", "inserted": ""}]),
+                             ("changes", None)]:
+            report, receipts = self.reviewed_light_report()
+            review = report["cases"][0]["stage_responses"][1]
+            payload = json.loads(review["request_payload"]); payload[field] = value
+            review["request_payload"] = json.dumps(payload)
+            self.assertTrue(self.check(report, receipts, "light")[0], field)
+        report, receipts = self.reviewed_light_report()
+        stage = report["cases"][0]["stage_responses"][0]
+        payload = json.loads(stage["request_payload"]); payload["draft_text"] = "预先提供的成稿"
+        stage["request_payload"] = json.dumps(payload)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v2_extra_wrong_or_missing_audited_stages_cannot_pass(self):
+        for task in ["voicePolishRender", "voicePolishRepair", "voicePolishFast"]:
+            report, receipts = self.reviewed_light_report()
+            report["cases"][0]["stage_responses"][1]["task"] = receipts[1]["llm_task"] = task
+            self.assertTrue(self.check(report, receipts, "light")[0], task)
+        report, receipts = self.reviewed_light_report()
+        self.assertTrue(self.check(report, receipts[:1], "light")[0])
+        row = report["cases"][0]
+        row["stage_responses"].append(copy.deepcopy(row["stage_responses"][1]))
+        row.update(llm_call_count=3, llm_attempt_count=3)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v2_hard_gate_fallback_may_stop_before_review_but_not_claim_success(self):
+        report, receipts = self.reviewed_light_report(with_review=False)
+        row = report["cases"][0]
+        row.update(fallback_used=True, model_output=self.text, hard_validation_codes=["missingProtectedFact"], failure_reason="validationFailed")
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, [])
+        self.assertTrue(quality)
+        row["llm_attempt_count"] = 3
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v2_failed_review_keeps_real_attempt_and_successful_first_receipt(self):
+        report, receipts = self.reviewed_light_report()
+        row = report["cases"][0]
+        row.update(fallback_used=True, model_output=self.text, llm_call_count=1, failure_reason="timeout")
+        row["stage_responses"][1].update(status="failed", response_text="", failure_reason="请求超时", latency_milliseconds=400)
+        failures, quality = self.check(report, receipts[:1], "light")
+        self.assertEqual(failures, [])
+        self.assertTrue(quality)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        del row["stage_responses"][1]["latency_milliseconds"]
+        self.assertTrue(self.check(report, receipts[:1], "light")[0])
+
+    def test_v2_review_rejection_is_auditable_fallback_not_partial_delivery(self):
+        report, receipts = self.reviewed_light_report()
+        row = report["cases"][0]
+        row.update(fallback_used=True, model_output=self.text, failure_reason="validationFailed", hard_validation_codes=["planIntegrityFailure"])
+        review = row["stage_responses"][1]
+        review["response_text"] = json.dumps({"edits": [{"before": "一万五", "after": "一万六", "kind": "content", "evidence": self.text}]})
+        receipts[1]["response_text_sha256"] = e.legacy.sha256_text(review["response_text"])
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, [])
+        self.assertTrue(quality)
+        row["model_output"] = "预算一万五。"
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_changes_must_explain_all_deletions_insertions_and_original_order(self):
+        source, draft = "甲甲乙丙丁", "甲乙，丁"
+        changes = [{"removed": "甲", "inserted": ""}, {"removed": "丙", "inserted": "，"}]
+        self.assertTrue(e.complete_change_evidence(source, draft, changes))
+        self.assertFalse(e.complete_change_evidence(source, draft, changes[:1]))
+        self.assertFalse(e.complete_change_evidence(source, draft, list(reversed(changes))))
+        self.assertFalse(e.complete_change_evidence(source, draft, [{"removed": "", "inserted": ""}]))
+        self.assertTrue(e.complete_change_evidence("e\u0301", "é", []))
+
     def test_stage_order_and_full_review_cannot_be_skipped(self):
         report, receipts = self.report("standard")
         report["cases"][0]["stage_responses"].reverse()

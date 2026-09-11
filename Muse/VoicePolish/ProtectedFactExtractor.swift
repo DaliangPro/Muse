@@ -91,6 +91,46 @@ enum ProtectedFactExtractor {
         }
     }
 
+    /// 连续口误中的裸时钟只承接紧邻的完整时间；中间出现另一个事项便不推断日期。
+    /// 例如“周四上午十点，哎，十点半才对”，来源中确实包含周四上午十点半。
+    static func immediateTimeCorrectionValues(in text: String) -> Set<String> {
+        let segment = RecognitionSegment(
+            id: "time-correction", text: text, startTimeMs: 0, endTimeMs: 0,
+            confidence: nil, isFinal: true
+        )
+        let times = extractedLocations(from: [segment]).filter { $0.candidate.kind == .time }
+            .sorted { $0.offset < $1.offset }
+        let characters = Array(text)
+        var values: Set<String> = []
+        for pair in zip(times, times.dropFirst()) {
+            let previous = pair.0
+            let current = pair.1
+            guard let previousValue = previous.candidate.canonicalValue,
+                  current.candidate.canonicalValue?.contains("|") == false,
+                  let clockRange = previous.candidate.sourceText.range(
+                    of: #"(?:[0-9]|[零〇一二两三四五六七八九十])+(?:\s*点|:)"#,
+                    options: .regularExpression
+                  ) else { continue }
+            let start = previous.offset + previous.length
+            guard start <= current.offset, current.offset - start <= 12 else { continue }
+            let bridge = String(characters[start..<current.offset])
+            guard bridge.range(
+                of: #"^[\s，,、]*(?:不对|说错了|应该是|改成|改为|哎)[\s，,、]*$"#,
+                options: .regularExpression
+            ) != nil else { continue }
+            let carriesPeriod = current.candidate.sourceText.range(
+                of: #"凌晨|早上|上午|中午|下午|晚上|晚间"#, options: .regularExpression
+            ) != nil
+            let prefix = carriesPeriod
+                ? (previousValue.contains("|") ? String(previousValue.prefix { $0 != "|" }) : "")
+                : String(previous.candidate.sourceText[..<clockRange.lowerBound])
+            if let value = canonicalTime(prefix + current.candidate.sourceText) {
+                values.insert(value)
+            }
+        }
+        return values
+    }
+
     static func locations(
         of candidates: [SourceFactCandidate],
         in segments: [RecognitionSegment]

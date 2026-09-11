@@ -1853,6 +1853,7 @@ enum VoicePolishLedgerIntegrityValidator {
         let sourceKeys = facts(in: normalizedSource)
         let sourceTimes = protectedFactCandidates(in: normalizedSource)
             .filter { $0.kind == .time }.compactMap(\.canonicalValue)
+        let immediateTimeCorrections = ProtectedFactExtractor.immediateTimeCorrectionValues(in: normalizedSource)
         let compactSource = whitespaceInsensitive(normalizedSource)
         // 口述符号只补充技术字符的匹配来源，不得改写时间、小数或普通词语里的“点”。
         let compactTechnicalSource = whitespaceInsensitive(
@@ -1861,6 +1862,8 @@ enum VoicePolishLedgerIntegrityValidator {
         let unbacked = protectedFactCandidates(in: output).contains { candidate in
             if candidate.kind == .quotedPhrase { return false }
             if sourceKeys.contains(protectedFactKey(candidate, in: output)) { return false }
+            if candidate.kind == .time, let value = candidate.canonicalValue,
+               immediateTimeCorrections.contains(value) { return false }
             if allowsPartialTimeReview, candidate.kind == .time,
                let value = candidate.canonicalValue, let separator = value.firstIndex(of: "|") {
                 let day = String(value[...separator])

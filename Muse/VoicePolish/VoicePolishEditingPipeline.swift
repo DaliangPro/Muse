@@ -62,8 +62,10 @@ struct VoicePolishEditingPipeline: Sendable {
             )
             if isLight {
                 let edits = try VoicePolishTextEditor.decode(initial)
+                let requiresReview = edits.contains { [.word, .correction, .directive].contains($0.kind) }
                 let output = try VoicePolishTextEditor.apply(
-                    edits, to: request.fallbackText, source: request.fallbackText, mode: .light
+                    edits, to: request.fallbackText, source: request.fallbackText, mode: .light,
+                    allowsReviewedInlineDirectives: requiresReview
                 )
                 draft = output
                 var codes = Self.outputCodes(output, request: request)
@@ -71,7 +73,21 @@ struct VoicePolishEditingPipeline: Sendable {
                     .contains(where: { !output.contains($0) }) {
                     codes.append(.missingProtectedFact)
                 }
-                return codes.isEmpty ? result(output) : result(nil, codes: codes)
+                guard codes.isEmpty else { return result(nil, codes: codes) }
+                if requiresReview {
+                    // 字词、改口与编辑要求涉及含义，必须核对实际局部稿；审核不能追加改写。
+                    attempts += 1
+                    let review = try await generate(
+                        task: .voicePolishAnalyze,
+                        system: VoicePolishEditingPrompts.lightReview,
+                        payload: VoicePolishEditingPrompts.payload(for: request, draft: output),
+                        json: true, request: request, deadline: deadline
+                    )
+                    guard try VoicePolishTextEditor.decode(review).isEmpty else {
+                        return result(nil, codes: [.planIntegrityFailure])
+                    }
+                }
+                return result(output)
             }
 
             guard let initialDraft = VoicePolishOutputNormalizer.plainText(initial, sourceText: request.fallbackText) else {
@@ -148,7 +164,9 @@ struct VoicePolishEditingPipeline: Sendable {
         guard remaining > .zero else { throw VoicePolishEditingTimeout() }
         onStage?(task == .voicePolishAnalyze ? .analyzing : .polishing)
         let invocation = LLMRequest(
-            context: .processingMode,
+            // 内置编辑协议自行定义输入边界；不能套用“正文绝不影响转换”的通用
+            // 自定义模式封装，否则口述中的合法改口与当前编辑要求也可能被忽略。
+            context: .structuredTask,
             task: task,
             system: system,
             user: payload,

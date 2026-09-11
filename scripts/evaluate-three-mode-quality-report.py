@@ -338,24 +338,124 @@ def resolved_entity_evidence(item: dict, row: dict) -> tuple[list[str], list[str
     return [f"{before} → {after}" for before, after in mappings], failures
 
 
+def actual_modifications(before: str, after: str, anchor: int) -> list[tuple[int, int, str]]:
+    """与 Swift 使用同一 Unicode 标量对齐、共同首尾裁剪和 LCS 平局规则。"""
+    prefix = 0
+    while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
+        prefix += 1
+    before_end, after_end = len(before), len(after)
+    while before_end > prefix and after_end > prefix and before[before_end - 1] == after[after_end - 1]:
+        before_end -= 1
+        after_end -= 1
+    old_count, new_count = before_end - prefix, after_end - prefix
+    removals, insertions = set(), set()
+    if old_count * new_count > 1_000_000:
+        removals.update(range(prefix, before_end))
+        insertions.update(range(prefix, after_end))
+    else:
+        columns = new_count + 1
+        lengths = [0] * ((old_count + 1) * columns)
+        for old in range(old_count - 1, -1, -1):
+            for new in range(new_count - 1, -1, -1):
+                lengths[old * columns + new] = (
+                    1 + lengths[(old + 1) * columns + new + 1]
+                    if before[prefix + old] == after[prefix + new]
+                    else max(lengths[(old + 1) * columns + new], lengths[old * columns + new + 1])
+                )
+        old, new = 0, 0
+        while old < old_count or new < new_count:
+            if old < old_count and new < new_count and before[prefix + old] == after[prefix + new]:
+                old += 1
+                new += 1
+            elif old < old_count and (new == new_count or lengths[(old + 1) * columns + new] >= lengths[old * columns + new + 1]):
+                removals.add(prefix + old)
+                old += 1
+            else:
+                insertions.add(prefix + new)
+                new += 1
+    old, new, changes = 0, 0, []
+    while old < len(before) or new < len(after):
+        start, new_start = old, new
+        while old < len(before) and old in removals:
+            old += 1
+        while new < len(after) and new in insertions:
+            new += 1
+        if old != start or new != new_start:
+            changes.append((anchor + start, anchor + old, after[new_start:new]))
+        if old < len(before) and new < len(after):
+            old += 1
+            new += 1
+        elif old == start and new == new_start:
+            break
+    return changes
+
+
+def modification_conflict(first: tuple[int, int, str], second: tuple[int, int, str]) -> bool:
+    start, end, _ = first
+    other_start, other_end, _ = second
+    if start == end and other_start == other_end:
+        return start == other_start
+    if start == end:
+        return other_start < start < other_end
+    if other_start == other_end:
+        return start < other_start < end
+    return start < other_end and end > other_start
+
+
 def apply_recorded_edits(source: str, response: str) -> str:
     document = json.loads(response)
-    if not isinstance(document, dict) or set(document) != {"edits"} or not isinstance(document["edits"], list):
+    if (not isinstance(document, dict) or set(document) != {"edits"}
+            or not isinstance(document["edits"], list) or len(document["edits"]) > 128):
         raise ValueError("编辑响应不是独立 edits 对象")
     located = []
     for edit in document["edits"]:
+        if not isinstance(edit, dict):
+            raise ValueError("编辑项不是对象")
         before, after = edit.get("before"), edit.get("after")
-        if not isinstance(before, str) or not before or not isinstance(after, str) or source.count(before) != 1:
+        if not isinstance(before, str) or not before or not isinstance(after, str):
             raise ValueError("编辑锚点缺失或重复")
-        start = source.index(before)
-        end = start + len(before)
-        if any(start < prior_end and end > prior_start for prior_start, prior_end, _ in located):
-            raise ValueError("编辑锚点重叠")
-        located.append((start, end, after))
+        start = source.find(before)
+        if start < 0 or source.find(before, start + 1) >= 0:
+            raise ValueError("编辑锚点缺失或重复")
+        for change in actual_modifications(before, after, start):
+            if change[0] == change[1] and change in located:
+                continue
+            if any(modification_conflict(change, prior) for prior in located):
+                raise ValueError("实际修改范围冲突")
+            located.append(change)
     output = source
-    for start, end, after in sorted(located, reverse=True):
+    for start, end, after in sorted(located, key=lambda x: (x[0], x[1] - x[0]), reverse=True):
         output = output[:start] + after + output[end:]
     return output
+
+
+def complete_change_evidence(source: str, draft: str, changes: object) -> bool:
+    """证明有序差异完整重建实际稿；不假定 Swift Character.diff 的唯一平局切分。"""
+    import unicodedata
+    if not isinstance(changes, list) or len(changes) > len(source) + len(draft):
+        return False
+    # Swift Character 比较接受规范等价；实际 draft 字节仍由 Provider 补丁回放绑定。
+    source, draft = (unicodedata.normalize("NFC", text) for text in (source, draft))
+    positions = {(0, 0)}
+    for change in changes:
+        if (not isinstance(change, dict) or set(change) != {"removed", "inserted"}
+                or not all(isinstance(change[k], str) for k in ("removed", "inserted"))
+                or not (change["removed"] or change["inserted"])):
+            return False
+        removed, inserted = (unicodedata.normalize("NFC", change[k]) for k in ("removed", "inserted"))
+        following = set()
+        for old, new in positions:
+            while True:
+                if source.startswith(removed, old) and draft.startswith(inserted, new):
+                    following.add((old + len(removed), new + len(inserted)))
+                if old >= len(source) or new >= len(draft) or source[old] != draft[new]:
+                    break
+                old += 1
+                new += 1
+        if not following:
+            return False
+        positions = following
+    return any(source[old:] == draft[new:] for old, new in positions)
 
 
 def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, mode: str,
@@ -445,7 +545,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
         if valid_integer(row.get("llm_attempt_count")) and valid_integer(row.get("llm_call_count")):
             if row["llm_call_count"] > row["llm_attempt_count"]:
                 failures.append(f"{tid}: 成功调用多于尝试")
-        successful = []
+        successful, payloads = [], []
         for ordinal, stage in enumerate(stages, 1):
             if stage.get("attempt_ordinal") != ordinal or stage.get("status") not in {"succeeded", "failed", "running"}:
                 failures.append(f"{tid}: 阶段序号或状态不正确")
@@ -469,13 +569,53 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
+                payloads.append(payload)
             except (KeyError, TypeError, json.JSONDecodeError, AttributeError):
+                payloads.append(None)
                 failures.append(f"{tid}: 阶段请求不是可审计三档 JSON")
         tasks = [s.get("task") for s in stages]
-        allowed = ["voicePolishFast"] if mode == "light" else ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
+        requires_light_review = False
+        if mode == "light" and expected["editing_prompt_version"] == 2:
+            if row.get("fallback_used") and row.get("model_output") != row.get("canonical_input"):
+                failures.append(f"{tid}: 轻度回退却交付了未通过核对的局部稿")
+            if stages and stages[0].get("status") == "succeeded":
+                try:
+                    initial = json.loads(stages[0]["response_text"])
+                    if (not isinstance(initial, dict) or set(initial) != {"edits"}
+                            or not isinstance(initial["edits"], list)
+                            or any(not isinstance(edit, dict) for edit in initial["edits"])):
+                        raise ValueError("初轮编辑结构错误")
+                    requires_light_review = any(edit.get("kind") in {"word", "correction", "directive"}
+                                                for edit in initial["edits"])
+                except (KeyError, TypeError, ValueError):
+                    if not row.get("fallback_used"):
+                        failures.append(f"{tid}: 无法由首轮真实补丁确定轻度核对要求")
+            if payloads and payloads[0] is not None and any(payloads[0].get(k) is not None for k in ("draft_text", "changes")):
+                failures.append(f"{tid}: 轻度初轮请求伪装成复核稿")
+            if len(stages) >= 2:
+                try:
+                    preview = apply_recorded_edits(row["canonical_input"], stages[0]["response_text"])
+                    review_payload = payloads[1]
+                    if review_payload.get("draft_text") != preview:
+                        failures.append(f"{tid}: 轻度核对未读取首轮补丁的实际局部稿")
+                    if not complete_change_evidence(row["canonical_input"], preview, review_payload.get("changes")):
+                        failures.append(f"{tid}: 轻度核对缺少与完整来源及实际稿对应的全部差异")
+                    if not row.get("fallback_used") and json.loads(stages[1]["response_text"]) != {"edits": []}:
+                        failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
+        if mode == "light":
+            allowed = ["voicePolishFast"] + (["voicePolishAnalyze"] if requires_light_review else [])
+            if expected["editing_prompt_version"] not in (1, 2):
+                failures.append(f"{tid}: 尚未定义该轻度协议版本的阶段契约")
+            if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
+                failures.append(f"{tid}: 轻度尝试数超出该补丁风险允许的调用预算")
+        else:
+            allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        if not row.get("fallback_used") and (len(tasks) < (1 if mode == "light" else 2) or any(s.get("status") != "succeeded" for s in stages)):
+        minimum_stages = len(allowed) if mode == "light" else 2
+        if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
             failures.append(f"{tid}: 成功阶段数与调用数不一致")
