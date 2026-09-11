@@ -1421,7 +1421,11 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
             if request.task == .voicePolishAnalyze,
                ["light", "standard"].contains(payload["mode"] as? String ?? "") {
-                var review: [String: Any] = ["delivery": "other_or_uncertain", "editor_spans": [], "edits": []]
+                var review: [String: Any] = ["edits": []]
+                if payload["mode"] as? String == "standard" {
+                    review["delivery"] = "other_or_uncertain"
+                    review["editor_spans"] = []
+                }
                 if let segments = payload["layout_segments"] as? [[String: String]] {
                     review["layout"] = [["style": "paragraph", "segment_ids": segments.compactMap { $0["id"] }]]
                 }

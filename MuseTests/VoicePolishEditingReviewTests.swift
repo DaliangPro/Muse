@@ -2,6 +2,45 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishEditingReviewTests: XCTestCase {
+    func testLightReviewAcceptsOnlyEditsAndMapsAllDecodeFailures() throws {
+        XCTAssertEqual(try VoicePolishEditingReview.decodeLightEdits(#"{"edits":[]}"#), [])
+        let patch = #"{"edits":[{"before":"按装","after":"安装","kind":"word"}]}"#
+        XCTAssertEqual(try VoicePolishEditingReview.decodeLightEdits(patch),
+                       [.init(before: "按装", after: "安装", kind: .word)])
+        let tooMany = "{\"edits\":[" + Array(repeating: #"{"before":"甲","after":"乙","kind":"word"}"#, count: 129).joined(separator: ",") + "]}"
+        for raw in [
+            "{invalid", "{}", #"{"edits":null}"#, #"{"edits":{}}"#,
+            #"{"edits":[{"after":"安装","kind":"word"}]}"#,
+            #"{"edits":[{"before":"按装","after":1,"kind":"word"}]}"#,
+            #"{"edits":[{"before":"按装","after":"安装","kind":"unknown"}]}"#,
+            #"{"edits":[],"delivery":"direct_reply"}"#,
+            #"{"edits":[],"editor_spans":[]}"#, #"{"edits":[],"layout":[]}"#,
+            #"{"edits":[],"source_roles":[]}"#,
+            #"{"delivery":"direct_reply","editor_spans":[],"edits":[]}"#,
+            tooMany, String(repeating: " ", count: VoicePolishOutputNormalizer.maximumResponseBytes + 1)
+        ] {
+            XCTAssertThrowsError(try VoicePolishEditingReview.decodeLightEdits(raw)) { error in
+                guard case VoicePolishEditingReviewError.invalidResponse = error else {
+                    return XCTFail("轻度复核失败必须统一映射 invalidResponse，实际为 \(error)")
+                }
+            }
+        }
+    }
+
+    func testLightRiskUsesSelfCorrectionCuesWithoutStandardRoleKeywords() {
+        for cue in ["我补", "等一下", "不对", "说错", "改成", "改为", "改由", "我改一下",
+                    "Actually", "I mean", "SCRATCH THAT"] {
+            XCTAssertTrue(VoicePolishEditingReview.hasLightSourceReviewRisk("前文，" + cue + "，后文"), cue)
+        }
+        for source in ["帮我整理 Prompt，先别执行。", "给客户回一下，暂时不要承诺。",
+                       "跟他说我晚十分钟到。", "替我润色提示词。", "只整理，别写新内容。",
+                       "请同事不要写承诺，等我确认。", "请帮我改写这段话。"] {
+            XCTAssertFalse(VoicePolishEditingReview.hasLightSourceReviewRisk(source), source)
+        }
+        // 标准保留独立的交付角色路由，不随轻度职责收窄。
+        XCTAssertTrue(VoicePolishEditingReview.hasSourceReviewRisk("帮我整理 Prompt，先别执行。"))
+    }
+
     func testDeclaredEditorInstructionCannotSurviveByChangingPunctuation() throws {
         let source = "帮我回他一下，我会晚点到。"
         let review = try VoicePolishEditingReview.decode(

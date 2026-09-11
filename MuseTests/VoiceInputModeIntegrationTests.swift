@@ -162,7 +162,7 @@ private actor VoiceInputModeProbeLLM: LLMClient {
         requests.append(request)
         let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
         var object: [String: Any] = ["edits": []]
-        if request.task == .voicePolishAnalyze {
+        if request.task == .voicePolishAnalyze, payload?["mode"] as? String == "standard" {
             object["delivery"] = "other_or_uncertain"
             object["editor_spans"] = []
             if let segments = payload?["layout_segments"] as? [[String: String]] {

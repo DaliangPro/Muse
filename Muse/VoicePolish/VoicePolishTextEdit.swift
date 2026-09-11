@@ -182,7 +182,12 @@ enum VoicePolishTextEditor {
     ) throws -> String {
         let policy: EditPolicy
         switch mode {
-        case .light: policy = .localContent
+        case .light:
+            // 轻度保留任务原话。即使被标成机械变化或已经复核，也不授予代写删除权限。
+            guard !edits.contains(where: { $0.kind == .directive || $0.kind == .content }) else {
+                throw VoicePolishTextEditError.editOutsideMode
+            }
+            policy = .localContent
         case .standard: policy = .legacyStandardContent
         case .automatic, .fast, .balanced, .quality: policy = .disabled
         }

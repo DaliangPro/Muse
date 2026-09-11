@@ -20,6 +20,23 @@ struct VoicePolishEditingReview: Sendable {
     let edits: [VoicePolishTextEdit]
     let layout: [VoicePolishStructurePlan.Block]?
 
+    /// 轻度只复核局部纠错，不接收标准模式的交付类型、编辑摘录或布局字段。
+    static func decodeLightEdits(_ raw: String) throws -> [VoicePolishTextEdit] {
+        do {
+            return try VoicePolishTextEditor.decode(raw)
+        } catch {
+            throw VoicePolishEditingReviewError.invalidResponse
+        }
+    }
+
+    /// 自我纠错线索只触发复核，不授予删除任务原话、禁令或其他正文的权限。
+    static func hasLightSourceReviewRisk(_ source: String) -> Bool {
+        let lowered = source.lowercased()
+        let cues = ["我补", "等一下", "不对", "说错", "改成", "改为", "改由", "我改一下",
+                    "actually", "i mean", "scratch that"]
+        return cues.contains(where: lowered.contains)
+    }
+
     static func decode(
         _ raw: String, source: String,
         structureSegments: [VoicePolishStructurePlan.Segment]? = nil

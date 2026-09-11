@@ -82,11 +82,10 @@ struct VoicePolishEditingPipeline: Sendable {
             )
             if isLight {
                 let edits = try VoicePolishTextEditor.decode(initial)
-                let requiresReview = VoicePolishEditingReview.hasSourceReviewRisk(request.fallbackText)
+                let requiresReview = VoicePolishEditingReview.hasLightSourceReviewRisk(request.fallbackText)
                     || VoicePolishTextEditor.requiresSemanticReview(edits, in: request.fallbackText)
                 let output = try VoicePolishTextEditor.apply(
                     edits, to: request.fallbackText, source: request.fallbackText, mode: .light,
-                    allowsReviewedInlineDirectives: requiresReview,
                     allowsReviewedSourceCorrections: requiresReview
                 )
                 draft = output
@@ -104,22 +103,16 @@ struct VoicePolishEditingPipeline: Sendable {
                         payload: VoicePolishEditingPrompts.payload(for: request, draft: output),
                         json: true, request: request, deadline: deadline, attempts: attempts
                     )
-                    let assessment = try VoicePolishEditingReview.decode(review, source: request.fallbackText)
-                    if assessment.edits.isEmpty {
-                        return assessment.containsUnappliedEditorInstruction(in: output)
-                            ? result(nil, codes: [.planIntegrityFailure]) : result(output)
-                    }
+                    let reviewEdits = try VoicePolishEditingReview.decodeLightEdits(review)
+                    if reviewEdits.isEmpty { return result(output) }
                     // 只修一次实际稿上的局部问题，继续使用轻度权限；不得转入标准重写。
                     repairAttempts += 1
                     let repaired = try VoicePolishTextEditor.apply(
-                        assessment.edits, to: output, source: request.fallbackText, mode: .light,
-                        allowsReviewedInlineDirectives: true, allowsReviewedSourceCorrections: true
+                        reviewEdits, to: output, source: request.fallbackText, mode: .light,
+                        allowsReviewedSourceCorrections: true
                     )
                     draft = repaired
                     var repairedCodes = Self.outputCodes(repaired, request: request)
-                    if assessment.containsUnappliedEditorInstruction(in: repaired) {
-                        repairedCodes.append(.planIntegrityFailure)
-                    }
                     if VoicePolishValidator.deliberateRepetitionPhrases(in: request.fallbackText)
                         .contains(where: { !repaired.contains($0) }) {
                         repairedCodes.append(.missingProtectedFact)
@@ -130,9 +123,8 @@ struct VoicePolishEditingPipeline: Sendable {
                         payload: VoicePolishEditingPrompts.payload(for: request, draft: repaired),
                         json: true, request: request, deadline: deadline, attempts: attempts
                     )
-                    let finalAssessment = try VoicePolishEditingReview.decode(confirmation, source: request.fallbackText)
-                    guard finalAssessment.edits.isEmpty,
-                          !finalAssessment.containsUnappliedEditorInstruction(in: repaired) else {
+                    let finalEdits = try VoicePolishEditingReview.decodeLightEdits(confirmation)
+                    guard finalEdits.isEmpty else {
                         return result(nil, codes: [.planIntegrityFailure])
                     }
                     return result(repaired)

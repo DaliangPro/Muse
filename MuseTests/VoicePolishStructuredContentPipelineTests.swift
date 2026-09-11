@@ -99,7 +99,7 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
     }
 
     func testLightCannotAcceptStandardLayoutField() async throws {
-        let source = "先别发送，等我确认。"
+        let source = "等一下，先别发送，等我确认。"
         let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
         let (result, calls) = await run(source, [#"{"edits":[]}"#, review], mode: .light)
         XCTAssertTrue(result.usedFallback)
@@ -123,7 +123,7 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         for mode in [VoicePolishQualityMode.light, .standard] {
             let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
             let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-            let (result, _) = await run(source, mode == .light ? [patch, review] : [patch, review, layout], mode: mode)
+            let (result, _) = await run(source, mode == .light ? [patch, #"{"edits":[]}"#] : [patch, review, layout], mode: mode)
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, "会议10:45开始。")
             XCTAssertEqual(result.llmAttemptCount, mode == .light ? 2 : 3)

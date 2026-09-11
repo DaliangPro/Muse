@@ -1485,7 +1485,7 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         report, receipts = self.v4_report(source, mode=mode, reviews=[{"source_roles": [], "edits": []}])
         row = report["cases"][0]
         self.expected["editing_prompt_version"] = report["editing_prompt_version"] = version
-        separate = version == 8 and mode == "standard" and e.v4_source_review_risk(source)
+        separate = version in (8, 9) and mode == "standard" and e.v4_source_review_risk(source)
         _, canonical_segments = e.frozen_input_envelope(self.inputs[0])
         row["canonical_segments"] = canonical_segments
         draft = e.apply_recorded_edits(source, json.dumps({"edits": list(initial_edits)}, ensure_ascii=False),
@@ -1521,6 +1521,8 @@ class ThreeModeEvidenceTests(unittest.TestCase):
                 payload.update(self.focus_payload(source, current, located, order))
                 response = {"delivery": "other_or_uncertain", "editor_spans": [],
                             "edits": list(repair_edits) if i == 1 else []}
+                if version == 9 and mode == "light":
+                    response = {"edits": response["edits"]}
                 if mode == "standard" and not (separate and i == 1):
                     payload["layout_segments"] = e.v7_structure_segments(current)
                     response["layout"] = [] if response["edits"] else layout
@@ -2101,6 +2103,107 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         report["editing_prompt_version"] = self.expected["editing_prompt_version"] = 8
         for i in range(2): self.v7_payload(report, i, schema_version=8)
         self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v9_light_preserves_request_words_without_extra_review(self):
+        for source in ["帮我回客户，先别答应赔偿。", "帮我整理成Prompt，预算100元。", "润色这段话，不要写解释。"]:
+            report, receipts = self.v7_report(source, version=9, mode="light", review=False)
+            self.assertEqual(self.check(report, receipts, "light"), ([], []))
+            self.assertEqual(report["cases"][0]["llm_attempt_count"], 1)
+            self.assertEqual(report["cases"][0]["model_output"], source)
+            # 同样的额外空复核即使有真实格式回执，也不能伪装成当前路由。
+            report, receipts = self.v7_report(source, version=9, mode="light", review=True)
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v9_light_mechanical_edits_do_not_turn_requests_into_actions(self):
+        source = "帮我回客户先别答应赔偿"
+        output = "帮我回客户，先别答应赔偿。"
+        report, receipts = self.v7_report(source, version=9, mode="light", review=False,
+            initial_edits=[{"before": source, "after": output, "kind": "punctuation"}])
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.assertEqual(report["cases"][0]["model_output"], output)
+
+    def test_v9_light_actual_word_change_and_source_correction_still_review(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        for source, initial, repair, count in [
+            ("帮我按装软件。", [edit], [], 2),
+            ("我说错了，按装软件。", [], [], 2),
+            ("我说错了，按装软件。", [], [edit], 3)]:
+            report, receipts = self.v7_report(source, version=9, mode="light", initial_edits=initial, repair_edits=repair)
+            self.assertEqual(self.check(report, receipts, "light"), ([], []))
+            self.assertEqual(report["cases"][0]["llm_attempt_count"], count)
+            for stage in report["cases"][0]["stage_responses"][1:]:
+                self.assertEqual(set(json.loads(stage["response_text"])), {"edits"})
+
+    def test_v9_light_directive_and_content_are_forbidden_even_with_review_permission(self):
+        for kind in ["directive", "content"]:
+            raw = json.dumps({"edits": [{"before": "帮我回他：", "after": "", "kind": kind, "evidence": "帮我回他："}]})
+            with self.assertRaises(e.V7ContractError):
+                e.apply_recorded_edits("帮我回他：晚点到。", raw, editing_prompt_version=9,
+                    allows_reviewed_directives=True, allows_reviewed_source_corrections=True,
+                    allows_directive_edits=False)
+        # 不能把错误类型伪装成无害标点，再绕过入口的档位权限。
+        with self.assertRaises(e.V7ContractError):
+            e.apply_recorded_edits("甲", '{"edits":[{"before":"甲","after":"甲。","kind":"directive"}]}',
+                editing_prompt_version=9, allows_reviewed_directives=True, allows_directive_edits=False)
+
+    def test_v9_light_rejected_initial_directive_keeps_one_attempt_and_source(self):
+        report, receipts = self.v7_report("帮我回他：晚点到。", version=9, mode="light", review=False)
+        self.v7_response(report, receipts, 0, {"edits": [{"before": "帮我回他：", "after": "", "kind": "directive"}]})
+        row = report["cases"][0]
+        row.update(fallback_used=True, failure_reason="validationFailed", hard_validation_codes=["planIntegrityFailure"])
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+        row["model_output"] = "晚点到。"
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v9_light_review_rejects_old_role_fields_before_any_repair(self):
+        for response in [
+            {"delivery": "direct_reply", "editor_spans": [], "edits": []},
+            {"edits": [], "layout": []}, {"edits": "错误类型"}, {"edits": [] , "unexpected": 1}]:
+            report, receipts = self.v7_report("我说错了，明天发。", version=9, mode="light")
+            self.v7_response(report, receipts, 1, response)
+            row = report["cases"][0]
+            row.update(fallback_used=True, failure_reason="validationFailed", hard_validation_codes=["invalidStructuredResponse"])
+            failures, quality = self.check(report, receipts, "light")
+            self.assertEqual(failures, []); self.assertTrue(quality)
+            row["repair_attempt_count"] = 1
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v9_light_rejected_review_directive_counts_attempted_repair_once(self):
+        report, receipts = self.v7_report("我说错了，帮我回他：晚点到。", version=9, mode="light")
+        self.v7_response(report, receipts, 1, {"edits": [{"before": "帮我回他：", "after": "", "kind": "directive"}]})
+        row = report["cases"][0]
+        row.update(fallback_used=True, repair_attempt_count=1, failure_reason="validationFailed", hard_validation_codes=["planIntegrityFailure"])
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+        row["repair_attempt_count"] = 0
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v9_light_final_review_requires_empty_edits_and_current_draft(self):
+        report, receipts = self.v7_report("我说错了，按装软件。", version=9, mode="light",
+            repair_edits=[{"before": "按装", "after": "安装", "kind": "word"}])
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        changed = copy.deepcopy(report)
+        self.v7_payload(changed, 2, draft_text=self.text)
+        self.assertTrue(self.check(changed, receipts, "light")[0])
+        self.v7_response(report, receipts, 2, {"edits": [{"before": "软件", "after": "硬件", "kind": "word"}]})
+        row = report["cases"][0]
+        row.update(fallback_used=True, model_output=self.text, failure_reason="validationFailed", hard_validation_codes=["planIntegrityFailure"])
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+
+    def test_v9_standard_keeps_v8_route_and_layout_contract(self):
+        for source, count in [("甲。乙。", 2), ("帮我整理甲。乙。", 3)]:
+            report, receipts = self.v7_report(source, version=9)
+            self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+            self.assertEqual(report["cases"][0]["llm_attempt_count"], count)
+
+    def test_v9_light_scope_does_not_regrade_v8_evidence(self):
+        report, receipts = self.v7_report("帮我回他：晚点到。", version=8, mode="light")
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        report["editing_prompt_version"] = self.expected["editing_prompt_version"] = 9
+        for index in range(2): self.v7_payload(report, index, schema_version=9)
+        self.assertTrue(self.check(report, receipts, "light")[0])
 
     def test_input_limit_checks_both_sources_and_rejects_answers(self):
         for source_length, segment_length, valid in [(1000, 1000, True), (1001, 1, False), (1, 1001, False)]:

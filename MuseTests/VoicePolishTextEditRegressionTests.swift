@@ -53,20 +53,20 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
         ]))
     }
 
-    func test无标点编辑要求需显式核对且未变后缀只负责定位() throws {
+    func test标准无标点编辑要求需显式核对且未变后缀只负责定位() throws {
         let prefix = "帮我整理一下"
         let suffix = "明天小李负责发材料。"
         let source = prefix + suffix
         let edits: [VoicePolishTextEdit] = [.init(before: source, after: suffix, kind: .directive)]
         XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits))
-        XCTAssertThrowsError(try apply(edits, to: source))
-        XCTAssertEqual(try VoicePolishTextEditor.apply(
-            edits, to: source, source: source, mode: .light, allowsReviewedInlineDirectives: true
+        XCTAssertThrowsError(try VoicePolishTextEditor.applyContentEdits(edits, to: source, source: source))
+        XCTAssertEqual(try VoicePolishTextEditor.applyContentEdits(
+            edits, to: source, source: source, allowsReviewedInlineDirectives: true
         ), suffix)
         let longSuffix = String(repeating: "原文正文和事实保持原位。", count: 12)
-        XCTAssertEqual(try VoicePolishTextEditor.apply(
+        XCTAssertEqual(try VoicePolishTextEditor.applyContentEdits(
             [.init(before: prefix + longSuffix, after: longSuffix, kind: .directive)],
-            to: prefix + longSuffix, source: prefix + longSuffix, mode: .light,
+            to: prefix + longSuffix, source: prefix + longSuffix,
             allowsReviewedInlineDirectives: true
         ), longSuffix)
     }
@@ -81,9 +81,9 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
             ("帮我整理。", "帮我整理", ""),
             ("甲\n帮我整理乙", "甲\n帮我整理乙", "甲乙")
         ] {
-            XCTAssertThrowsError(try VoicePolishTextEditor.apply(
+            XCTAssertThrowsError(try VoicePolishTextEditor.applyContentEdits(
                 [.init(before: before, after: after, kind: .directive)], to: source, source: source,
-                mode: .light, allowsReviewedInlineDirectives: true
+                allowsReviewedInlineDirectives: true
             ), source)
         }
     }
@@ -357,19 +357,19 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
         ], to: source)) { XCTAssertEqual($0 as? VoicePolishTextEditError, .editOutsideMode) }
     }
 
-    func test当前编辑前缀可用口述逗号句号或多句结束() throws {
+    func test标准当前编辑前缀可用口述逗号句号或多句结束() throws {
         for ending in ["：", ":", "，", ",", "。", "."] {
             let prefix = "给客户回一下" + ending
             let source = prefix + "我们已收到材料。"
-            XCTAssertEqual(try apply([
+            XCTAssertEqual(try VoicePolishTextEditor.applyContentEdits([
                 .init(before: prefix, after: "", kind: .directive)
-            ], to: source), "我们已收到材料。")
+            ], to: source, source: source), "我们已收到材料。")
         }
         let prefix = "帮我整理成 Prompt。先别开始研究，只整理任务，"
         let source = prefix + "请比较两款产品，保留价格来源。"
-        XCTAssertEqual(try apply([
+        XCTAssertEqual(try VoicePolishTextEditor.applyContentEdits([
             .init(before: prefix, after: "", kind: .directive)
-        ], to: source), "请比较两款产品，保留价格来源。")
+        ], to: source, source: source), "请比较两款产品，保留价格来源。")
     }
 
     func test编辑前缀仍受位置长度及非全文限制() {
@@ -380,9 +380,9 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
             ("给同事的任务是，给客户回一下，材料已收到。", "给客户回一下，"),
             ("帮我整理成 Prompt。", "帮我整理成 Prompt。")
         ] {
-            XCTAssertThrowsError(try apply([
+            XCTAssertThrowsError(try VoicePolishTextEditor.applyContentEdits([
                 .init(before: anchor, after: "", kind: .directive)
-            ], to: source)) { XCTAssertEqual($0 as? VoicePolishTextEditError, .editOutsideMode) }
+            ], to: source, source: source)) { XCTAssertEqual($0 as? VoicePolishTextEditError, .editOutsideMode) }
         }
     }
 

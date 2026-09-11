@@ -996,17 +996,22 @@ def validate_v7_local_edit(edit: dict, source: str, allows_reviewed_directives: 
 
 def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: int | None = None,
                          allows_reviewed_directives: bool = False, original_source: str | None = None,
-                         allows_reviewed_source_corrections: bool = False) -> str:
+                         allows_reviewed_source_corrections: bool = False,
+                         allows_directive_edits: bool = True) -> str:
     # v5 改复核响应、v6 加优先差异；局部补丁权限均完整沿用 v4。
     if editing_prompt_version in (5, 6):
         editing_prompt_version = 4
-    # v8 只分离标准风险输入的内容复核，局部内容权限完整沿用 v7。
-    if editing_prompt_version == 8:
+    # v8/v9 标准局部权限沿用 v7；v9 轻度在入口单独禁止代写删除。
+    if editing_prompt_version in (8, 9):
         editing_prompt_version = 7
     document = decode_v7_initial(response) if editing_prompt_version == 7 else json.loads(response)
     if (not isinstance(document, dict) or set(document) != {"edits"}
             or not isinstance(document["edits"], list) or len(document["edits"]) > 128):
         raise ValueError("编辑响应不是独立 edits 对象")
+    if not allows_directive_edits and any(
+        isinstance(edit, dict) and edit.get("kind") in {"directive", "content"} for edit in document["edits"]
+    ):
+        raise V7ContractError("v9 轻度不授予代写指令删除或正文重写权限")
     located, projected_edits = [], []
     for edit in document["edits"]:
         if not isinstance(edit, dict):
@@ -1157,6 +1162,13 @@ def v4_source_review_risk(source: str) -> bool:
             "只整理", "actually", "i mean", "scratch that"]
     lowered = source.lower()
     return any(cue in lowered for cue in cues) or re.search(r"(?:给|跟)[^。！？\n]{0,16}(?:回|说)(?:一下|一条|一声)", lowered) is not None
+
+
+def v9_light_source_review_risk(source: str) -> bool:
+    # 只决定是否核对自我纠错；任务字眼不再自动增加轻度调用。
+    cues = ["我补", "等一下", "不对", "说错", "改成", "改为", "改由", "我改一下",
+            "actually", "i mean", "scratch that"]
+    return any(cue in source.lower() for cue in cues)
 
 
 def decode_v4_edits(value: object) -> list[dict]:
@@ -1460,6 +1472,15 @@ def decode_v7_review(raw: str, source: str, segments: list[dict] | None) -> dict
         raise V7ContractError(str(error), "invalidStructuredResponse") from error
 
 
+def decode_v9_light_review(raw: str) -> dict:
+    try:
+        response = decode_v7_initial(raw)
+        # 仅在审计内部适配公共流程；实际响应不允许角色或编辑摘录字段。
+        return {"edits": response["edits"], "editor_spans": []}
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        raise V7ContractError(str(error), "invalidStructuredResponse") from error
+
+
 def v7_payload_field_failures(payload: dict, mode: str, stage_index: int, *,
                               separates_content_review: bool = False) -> list[str]:
     """按当前 Payload 构造闭合字段；本 Runner 的 nil 可选值必须省略。"""
@@ -1488,9 +1509,10 @@ def v7_payload_field_failures(payload: dict, mode: str, stage_index: int, *,
 
 
 def v7_stage_contract(row: dict, payloads: list, mode: str, version: int = 7) -> tuple[list[str], list[str]]:
-    """回放 v7/v8 共同协议；v8 标准风险输入先专职复核内容，再完整布局。"""
+    """保留 v7/v8 历史协议；v9 轻度只纠错，标准继续先核内容再布局。"""
     source, stages, fallback = row["canonical_input"], row["stage_responses"], row.get("fallback_used")
-    separates_content_review = version == 8 and mode == "standard" and v4_source_review_risk(source)
+    light_scope = version == 9 and mode == "light"
+    separates_content_review = version in (8, 9) and mode == "standard" and v4_source_review_risk(source)
     allowed = ["voicePolishFast" if mode == "light" else "voicePolishRender"]
     failures, repairs, output = [], 0, None
 
@@ -1519,9 +1541,11 @@ def v7_stage_contract(row: dict, payloads: list, mode: str, version: int = 7) ->
     try:
         if stages and stages[0].get("status") == "succeeded":
             initial = decode_v7_initial(stages[0]["response_text"])
-            requires = mode == "standard" or v4_source_review_risk(source) or v4_requires_semantic_review(initial["edits"], source)
+            source_risk = v9_light_source_review_risk(source) if light_scope else v4_source_review_risk(source)
+            requires = mode == "standard" or source_risk or v4_requires_semantic_review(initial["edits"], source)
             draft = apply_recorded_edits(source, stages[0]["response_text"], editing_prompt_version=version,
-                allows_reviewed_directives=requires, allows_reviewed_source_corrections=requires)
+                allows_reviewed_directives=requires, allows_reviewed_source_corrections=requires,
+                allows_directive_edits=not light_scope)
             output = draft
             # 生产标准在生成复核请求前验证实际片段；失败不得伪报二次请求。
             if mode == "standard": v7_structure_segments(draft)
@@ -1529,13 +1553,15 @@ def v7_stage_contract(row: dict, payloads: list, mode: str, version: int = 7) ->
             if requires and len(stages) >= 2:
                 segments = bind_draft(1, draft)
                 if stages[1].get("status") == "succeeded":
-                    assessment = decode_v7_review(stages[1]["response_text"], source, segments)
+                    assessment = (decode_v9_light_review(stages[1]["response_text"]) if light_scope
+                                  else decode_v7_review(stages[1]["response_text"], source, segments))
                     if assessment["edits"] or separates_content_review:
                         if assessment["edits"]:
                             repairs = 1
                             draft = apply_recorded_edits(draft, json.dumps({"edits": assessment["edits"]}, ensure_ascii=False),
                                 editing_prompt_version=version, allows_reviewed_directives=True,
-                                allows_reviewed_source_corrections=True, original_source=source)
+                                allows_reviewed_source_corrections=True, original_source=source,
+                                allows_directive_edits=not light_scope)
                         if v4_contains_editor_instruction(assessment, draft, 5):
                             raise V7ContractError("v7 当前编辑要求仍留在修复稿")
                         if mode == "standard": v7_structure_segments(draft)
@@ -1544,7 +1570,8 @@ def v7_stage_contract(row: dict, payloads: list, mode: str, version: int = 7) ->
                         if len(stages) >= 3:
                             segments = bind_draft(2, draft)
                             if stages[2].get("status") == "succeeded":
-                                final = decode_v7_review(stages[2]["response_text"], source, segments)
+                                final = (decode_v9_light_review(stages[2]["response_text"]) if light_scope
+                                         else decode_v7_review(stages[2]["response_text"], source, segments))
                                 if final["edits"] or v4_contains_editor_instruction(final, draft, 5):
                                     raise V7ContractError("v7 第三轮未空补丁确认实际稿")
                                 output = v7_render_layout(final["layout"], segments) if mode == "standard" else draft
@@ -1708,7 +1735,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
-            if expected["editing_prompt_version"] in (4, 5, 6, 7, 8) and (
+            if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9) and (
                 not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
             ):
                 failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
@@ -1723,7 +1750,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -1735,7 +1762,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -1773,11 +1800,11 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
-                if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8) and (
+                if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9) and (
                     expected_segments is None or payload.get("source_segments") != expected_segments
                 ):
                     failures.append(f"{tid}: v3 阶段 source_segments 未逐项保留 canonical 段的 ID、正文和顺序")
-                if expected["editing_prompt_version"] in (6, 7, 8) and ordinal == 1 and any(
+                if expected["editing_prompt_version"] in (6, 7, 8, 9) and ordinal == 1 and any(
                     payload.get(k) is not None for k in ("review_focus", "review_focus_total")
                 ):
                     failures.append(f"{tid}: v6 首轮请求不得携带复核优先差异")
@@ -1817,8 +1844,8 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if expected["editing_prompt_version"] in (4, 5, 6, 7, 8):
-            allowed, stage_failures = (v7_stage_contract(row, payloads, mode, expected["editing_prompt_version"]) if expected["editing_prompt_version"] in (7, 8)
+        if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9):
+            allowed, stage_failures = (v7_stage_contract(row, payloads, mode, expected["editing_prompt_version"]) if expected["editing_prompt_version"] in (7, 8, 9)
                                        else v4_stage_contract(row, payloads, mode, expected["editing_prompt_version"]))
             failures.extend(f"{tid}: {failure}" for failure in stage_failures)
             if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
@@ -1833,7 +1860,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8) else 2
+        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9) else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -1845,7 +1872,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8):
+        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9):
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],

@@ -152,12 +152,11 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
         assertFallback(result, calls: calls, source: source, attempts: 2, repairs: 0, code: .planIntegrityFailure)
     }
 
-    func testLightRiskReviewRemainsTwoCallsWithoutLayoutPayload() async throws {
+    func testLightPreservesProhibitionWithoutRoleReviewOrLayout() async throws {
         let source = "先别发送，等我确认。"
-        let review = #"{"delivery":"direct_reply","editor_spans":[],"edits":[]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, review], mode: .light)
-        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze])
+        let (result, calls) = await run(source, [#"{"edits":[]}"#], mode: .light)
+        assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
+        XCTAssertEqual(calls.map(\.task), [.voicePolishFast])
         for call in calls { XCTAssertNil(try payload(call)["layout_segments"]) }
     }
 
