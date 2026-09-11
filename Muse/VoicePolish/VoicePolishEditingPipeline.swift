@@ -199,6 +199,8 @@ struct VoicePolishEditingPipeline: Sendable {
             default:
                 return result(nil, codes: [.emptyOutput], reason: .requestFailed)
             }
+        } catch is VoicePolishEditingReviewError {
+            return result(nil, codes: [.invalidStructuredResponse])
         } catch is VoicePolishTextEditError {
             return result(nil, codes: [.planIntegrityFailure])
         } catch is DecodingError {
@@ -222,7 +224,7 @@ struct VoicePolishEditingPipeline: Sendable {
         guard remaining > .zero else { throw VoicePolishEditingTimeout() }
         onStage?(task == .voicePolishAnalyze ? .analyzing : .polishing)
         let sourceTokens = EstimatedTokenCounter.count(in: request.fallbackText)
-        // 复核同时返回角色证据和局部补丁，为 JSON 字段开销留出容量；总时限不增加。
+        // 复核返回短编辑摘录与局部补丁，沿用受控输出容量与总时限。
         let outputBudget = task == .voicePolishAnalyze
             ? min(8_192, max(4_096, sourceTokens * 4 + 1_024))
             : min(8_192, max(2_048, sourceTokens * 3 + 512))

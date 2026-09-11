@@ -163,7 +163,7 @@ private actor VoiceInputModeProbeLLM: LLMClient {
         let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
         return LLMResponse(
             text: request.task == .voicePolishAnalyze
-                ? #"{"source_roles":[],"edits":[]}"#
+                ? #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
                 : (request.options.responseFormat == .jsonObject
                     ? #"{"edits":[]}"# : (payload?["canonical_text"] as? String ?? "")),
             model: config.model

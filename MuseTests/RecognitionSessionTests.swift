@@ -947,7 +947,7 @@ final class RecognitionSessionTests: XCTestCase {
             with: "邮件里说明周五一定不会对外发布"
         )
         // 复核给出无法定位的补丁，程序必须拒绝，不能把未经确认的初稿交付。
-        let invalidReview = #"{"source_roles":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
+        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [wrong, invalidReview])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1027,9 +1027,9 @@ final class RecognitionSessionTests: XCTestCase {
             with: "邮件里说明周五一定不会对外发布"
         )
         let polished = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。\n\n邮件里不要承诺周五对外发布。"
-        let invalidReview = #"{"source_roles":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
+        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            wrong, invalidReview, polished, #"{"source_roles":[],"edits":[]}"#,
+            wrong, invalidReview, polished, #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#,
         ])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1427,7 +1427,7 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
             if request.task == .voicePolishAnalyze,
                ["light", "standard"].contains(payload["mode"] as? String ?? "") {
-                return LLMResponse(text: #"{"source_roles":[],"edits":[]}"#, model: config.model)
+                return LLMResponse(text: #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#, model: config.model)
             }
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase

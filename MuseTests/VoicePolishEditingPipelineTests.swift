@@ -442,7 +442,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(calls.count, 3)
         for (index, call) in calls.enumerated() {
             let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: Any])
-            XCTAssertEqual(payload["schema_version"] as? Int, 4)
+            XCTAssertEqual(payload["schema_version"] as? Int, 5)
             XCTAssertEqual(payload["canonical_text"] as? String, canonical)
             XCTAssertEqual(payload["source_segments"] as? [[String: String]],
                            [["id": "s1", "text": first], ["id": "s2", "text": second]])
@@ -513,9 +513,9 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
 
     func testLightEmptyPlanStillReviewsSourceAndCanRepairUnpunctuatedPrefix() async throws {
         let source = "帮我回他一下我晚点到，你们先吃。"
-        let roles = #"[{"quote":"帮我回他一下","role":"current_editor","target_evidence":"帮我回他一下"}]"#
-        let repair = #"{"source_roles":\#(roles),"edits":[{"before":"帮我回他一下我晚点到","after":"我晚点到","kind":"directive"}]}"#
-        let confirmation = #"{"source_roles":\#(roles),"edits":[]}"#
+        let spans = #"["帮我回他一下"]"#
+        let repair = #"{"delivery":"direct_reply","editor_spans":\#(spans),"edits":[{"before":"帮我回他一下我晚点到","after":"我晚点到","kind":"directive"}]}"#
+        let confirmation = #"{"delivery":"direct_reply","editor_spans":\#(spans),"edits":[]}"#
         let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(repair), .text(confirmation)])
         let result = await pipeline(client).process(request(source, .light))
         XCTAssertFalse(result.usedFallback)
@@ -531,7 +531,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
 
     func testEmptyEditsCannotApproveDeclaredButUnappliedEditorInstruction() async {
         let source = "替我回他一句：时间还没确定。"
-        let assessment = #"{"source_roles":[{"quote":"替我回他一句：","role":"current_editor","target_evidence":"替我回他一句"}],"edits":[]}"#
+        let assessment = #"{"delivery":"direct_reply","editor_spans":["替我回他一句："],"edits":[]}"#
         for mode in [VoicePolishQualityMode.light, .standard] {
             let client = EditingTestClient([.text(mode == .light ? #"{"edits":[]}"# : source), .text(assessment)])
             let result = await pipeline(client).process(request(source, mode))
@@ -544,7 +544,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
 
     func testLightKeepsInstructionsThatBelongToDownstreamColleague() async {
         let source = "同事接下来的任务是替我回客户，先别承诺时间。"
-        let assessment = #"{"source_roles":[{"quote":"替我回客户","role":"recipient_content","target_evidence":"同事接下来的任务"},{"quote":"先别承诺时间","role":"recipient_content","target_evidence":"同事接下来的任务"}],"edits":[]}"#
+        let assessment = #"{"delivery":"delegated_task","editor_spans":[],"edits":[]}"#
         let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(assessment)])
         let result = await pipeline(client).process(request(source, .light))
         XCTAssertFalse(result.usedFallback)
@@ -552,12 +552,42 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 2)
     }
 
+    func testMalformedReviewIsReportedBeforeAnyRepairAttempt() async {
+        let source = "帮我回他：日期还没有确定。"
+        for assessment in [
+            #"{"source_roles":[{"quote":"帮我回他：","role":"current_editor","target_evidence":"用户要求输入法代写"}],"edits":[]}"#,
+            #"{"delivery":"direct_reply","editor_spans":["用户要求输入法代写"],"edits":[]}"#,
+            #"{"delivery":"direct_reply","editor_spans":[],"edits":[{"after":"正文","kind":"content"}]}"#
+        ] {
+            for mode in [VoicePolishQualityMode.light, .standard] {
+                let client = EditingTestClient([.text(mode == .light ? #"{"edits":[]}"# : source), .text(assessment)])
+                let result = await pipeline(client).process(request(source, mode))
+                XCTAssertTrue(result.usedFallback)
+                XCTAssertEqual(result.text, source)
+                XCTAssertEqual(result.llmAttemptCount, 2)
+                XCTAssertEqual(result.repairAttemptCount, 0)
+                XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
+                XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
+            }
+        }
+    }
+
+    func testDeliveryLabelCannotOverrideUnappliedEditorInstruction() async {
+        let source = "替我回他一句：时间还没确定。"
+        let assessment = #"{"delivery":"delegated_task","editor_spans":["替我回他一句："],"edits":[]}"#
+        let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(assessment)])
+        let result = await pipeline(client).process(request(source, .light))
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.repairAttemptCount, 0)
+        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+    }
+
     func testLightReviewCannotUseStandardContentRewriteOrStartFourthCall() async {
         let source = "帮我写一句：资料还没核对。"
-        let roles = #"[{"quote":"帮我写一句：","role":"current_editor","target_evidence":"帮我写一句"}]"#
+        let spans = #"["帮我写一句："]"#
         for kind in ["content", "directive"] {
-            let repair = #"{"source_roles":\#(roles),"edits":[{"before":"帮我写一句：","after":"","kind":"\#(kind)","evidence":"帮我写一句："}]}"#
-            let more = #"{"source_roles":[],"edits":[{"before":"还没","after":"已经","kind":"word"}]}"#
+            let repair = #"{"delivery":"direct_reply","editor_spans":\#(spans),"edits":[{"before":"帮我写一句：","after":"","kind":"\#(kind)","evidence":"帮我写一句："}]}"#
+            let more = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"还没","after":"已经","kind":"word"}]}"#
             let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(repair), .text(more)])
             let result = await pipeline(client).process(request(source, .light))
             XCTAssertTrue(result.usedFallback)
@@ -604,9 +634,10 @@ private actor EditingTestClient: LLMClient {
         switch steps.removeFirst() {
         case .text(let text): return LLMResponse(text: text, model: config.model)
         case .review(let edits):
-            // 这些旧回归只考察补丁、事实和调用流程；显式构造没有指令角色的 v4 核对夹具。
+            // 这些旧回归只考察补丁、事实和调用流程；显式构造无当前编辑指令的 v5 核对夹具。
             var object = try JSONSerialization.jsonObject(with: Data(edits.utf8)) as! [String: Any]
-            object["source_roles"] = []
+            object["delivery"] = "other_or_uncertain"
+            object["editor_spans"] = []
             return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self), model: config.model)
         case .delay(let duration, let text):
             try await Task.sleep(for: duration)

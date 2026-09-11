@@ -1074,6 +1074,166 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         row["stage_responses"][2]["request_payload"] = json.dumps(payload)
         self.assertTrue(self.check(report, receipts[:2], "light")[0])
 
+    def upgrade_report_to_v5(self, report, receipts, delivery="direct_reply"):
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 5
+        for index, stage in enumerate(report["cases"][0]["stage_responses"]):
+            payload = json.loads(stage["request_payload"])
+            payload["schema_version"] = 5
+            stage["request_payload"] = json.dumps(payload, ensure_ascii=False)
+            if index:
+                old = json.loads(stage["response_text"])
+                value = {"delivery": delivery, "editor_spans": [r["quote"] for r in old["source_roles"]
+                            if r["role"] == "current_editor"], "edits": old["edits"]}
+                stage["response_text"] = json.dumps(value, ensure_ascii=False)
+                receipts[index]["response_text_sha256"] = e.legacy.sha256_text(stage["response_text"])
+
+    def test_v5_minimal_editor_spans_do_not_require_listing_recipient_tasks(self):
+        source = "帮我整理成 Prompt。先别开始研究，只整理任务，预算100元。报告要写建议，不能自行增加预算。"
+        value = {"delivery": "ai_prompt", "editor_spans": ["帮我整理成 Prompt。", "先别开始研究，只整理任务，"], "edits": []}
+        self.assertEqual(e.decode_v5_review(json.dumps(value), source), value)
+        self.assertEqual(len(value["editor_spans"]), 2)
+        for delivery in ["direct_reply", "ai_prompt", "delegated_task", "other_or_uncertain"]:
+            empty = {"delivery": delivery, "editor_spans": [], "edits": []}
+            self.assertEqual(e.decode_v5_review(json.dumps(empty), source), empty)
+
+    def test_v5_rejects_real_v4_explanation_schema_and_explanations_as_spans(self):
+        source = "帮我整理成 Prompt。先别开始研究，只整理任务，预算100元。报告要写建议，不能自行增加预算。"
+        # ec6b2cd / core-sem-11 的真实第二轮解释字段，保持原文作协议反例。
+        explanation = "用户此刻要求输入法把本次文字整理成 Prompt，属于写作过程指令。"
+        old = {"source_roles": [{"quote": "帮我整理成 Prompt。", "role": "current_editor", "target_evidence": explanation}], "edits": []}
+        with self.assertRaises(e.InvalidV5Review):
+            e.decode_v5_review(json.dumps(old), source)
+        with self.assertRaises(e.InvalidV5Review):
+            e.decode_v5_review(json.dumps({"delivery": "ai_prompt", "editor_spans": [explanation], "edits": []}), source)
+        for old_field, old_value in [("source_roles", old["source_roles"]), ("target_evidence", explanation)]:
+            with self.assertRaises(e.InvalidV5Review):
+                e.decode_v5_review(json.dumps({"delivery": "ai_prompt", "editor_spans": [], "edits": [], old_field: old_value}), source)
+
+    def test_v5_requires_exact_top_keys_delivery_and_typed_spans(self):
+        valid = {"delivery": "direct_reply", "editor_spans": ["帮我整理"], "edits": []}
+        for key in valid:
+            bad = dict(valid); del bad[key]
+            with self.assertRaises(e.InvalidV5Review): e.decode_v5_review(json.dumps(bad), "帮我整理正文")
+        for delivery in ["recipient_content", "", None, 1, [], {}]:
+            with self.assertRaises(e.InvalidV5Review):
+                e.decode_v5_review(json.dumps({**valid, "delivery": delivery}), "帮我整理正文")
+        for spans in [None, "帮我整理", {}, [1], [None], [{"quote": "帮我整理"}]]:
+            with self.assertRaises(e.InvalidV5Review):
+                e.decode_v5_review(json.dumps({**valid, "editor_spans": spans}), "帮我整理正文")
+
+    def test_v5_spans_require_literal_unique_substantive_source_and_no_duplicates(self):
+        for source, spans in [("帮我整理正文", ["不存在"]), ("帮我整理正文", [""]),
+                              ("， \t。正文", ["， \t。"]), ("哈哈哈", ["哈哈"]),
+                              ("帮我整理正文", ["帮我整理", "帮我整理"]),
+                              ("e\u0301é正文", ["e\u0301", "é"]),
+                              ("帮我整理正文", ["帮我，整理"])]:
+            with self.assertRaises(e.InvalidV5Review, msg=(source, spans)):
+                e.decode_v5_review(json.dumps({"delivery": "other_or_uncertain", "editor_spans": spans, "edits": []}), source)
+
+    def test_v5_span_limits_follow_swift_composed_characters_and_64_items(self):
+        span = "👨‍👩‍👧‍👦" + "甲" * 191
+        self.assertEqual(len(e.composed_characters(span)), 192)
+        valid = {"delivery": "other_or_uncertain", "editor_spans": [span], "edits": []}
+        self.assertEqual(e.decode_v5_review(json.dumps(valid), span), valid)
+        with self.assertRaises(e.InvalidV5Review):
+            e.decode_v5_review(json.dumps({**valid, "editor_spans": [span + "乙"]}), span + "乙")
+        spans = [f"标记{i:03d}。" for i in range(65)]
+        source = "".join(spans)
+        valid["editor_spans"] = spans[:64]
+        self.assertEqual(e.decode_v5_review(json.dumps(valid), source), valid)
+        with self.assertRaises(e.InvalidV5Review):
+            e.decode_v5_review(json.dumps({**valid, "editor_spans": spans}), source)
+
+    def test_v5_editor_spans_remain_unapplied_after_punctuation_or_whitespace_changes(self):
+        value = e.decode_v5_review(json.dumps({"delivery": "direct_reply", "editor_spans": ["帮我整理一下"], "edits": []}),
+                                   "帮我整理一下明天发材料。")
+        self.assertTrue(e.v4_contains_editor_instruction(value, "帮我，整理一下。明天发材料。", 5))
+        self.assertTrue(e.v4_contains_editor_instruction(value, "帮 我整理\n一下。明天发材料。", 5))
+        self.assertFalse(e.v4_contains_editor_instruction(value, "明天发材料。", 5))
+        for mode in ["light", "standard"]:
+            report, receipts = self.v4_report("帮我整理一下明天发材料。", mode=mode, reviews=[{"source_roles": [], "edits": []}])
+            self.upgrade_report_to_v5(report, receipts)
+            stage = report["cases"][0]["stage_responses"][1]
+            stage["response_text"] = json.dumps(value)
+            receipts[1]["response_text_sha256"] = e.legacy.sha256_text(stage["response_text"])
+            self.assertTrue(self.check(report, receipts, mode)[0])
+            row = report["cases"][0]
+            row.update(fallback_used=True, model_output=self.text, hard_validation_codes=["planIntegrityFailure"], failure_reason="validationFailed")
+            self.assertEqual(self.check(report, receipts, mode)[0], [])
+
+    def test_v5_two_modes_keep_same_repair_then_confirmation_chain(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.repaired_v4_report(mode)
+            self.upgrade_report_to_v5(report, receipts)
+            self.assertEqual(self.check(report, receipts, mode), ([], []), mode)
+            row = report["cases"][0]
+            self.assertEqual((row["repair_attempt_count"], row["llm_attempt_count"]), (1, 3))
+            for field, value in [("model_output", "不是补丁实际稿"), ("repair_attempt_count", 0)]:
+                changed = copy.deepcopy(report); changed["cases"][0][field] = value
+                self.assertTrue(self.check(changed, receipts, mode)[0])
+            self.assertTrue(self.check(report, receipts[:2], mode)[0])
+
+    def test_v5_source_risk_empty_initial_edits_still_requires_review_and_mechanical_does_not(self):
+        report, receipts = self.v4_report("帮我整理一下明天发材料。")
+        self.upgrade_report_to_v5(report, receipts)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        source = "嗯我今天到"
+        report, receipts = self.v4_report(source, initial_edits=[{"before": source, "after": "我今天到。", "kind": "punctuation"}])
+        self.upgrade_report_to_v5(report, receipts)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+
+    def test_v5_no_extra_repairs_or_permission_expansion_and_third_must_be_empty(self):
+        source = "运行swift test"
+        with self.assertRaises(ValueError):
+            e.apply_recorded_edits(source, json.dumps({"edits": [{"before": " ", "after": "", "kind": "punctuation"}]}), editing_prompt_version=5)
+        for mode in ["light", "standard"]:
+            for mutation in ["missing_third", "nonempty_third", "old_third", "fourth"]:
+                report, receipts = self.repaired_v4_report(mode); self.upgrade_report_to_v5(report, receipts)
+                row = report["cases"][0]
+                if mutation == "missing_third":
+                    row["stage_responses"].pop(); receipts.pop(); row.update(llm_call_count=2, llm_attempt_count=2)
+                elif mutation == "fourth":
+                    row["stage_responses"].append(copy.deepcopy(row["stage_responses"][-1])); row.update(llm_call_count=4, llm_attempt_count=4)
+                else:
+                    value = ({"source_roles": [], "edits": []} if mutation == "old_third" else
+                             {"delivery": "direct_reply", "editor_spans": [], "edits": [{"before": "明天", "after": "后天", "kind": "word"}]})
+                    row["stage_responses"][2]["response_text"] = json.dumps(value)
+                    receipts[2]["response_text_sha256"] = e.legacy.sha256_text(json.dumps(value))
+                self.assertTrue(self.check(report, receipts, mode)[0], (mode, mutation))
+
+    def test_v5_review_parse_failure_uses_invalid_structured_response_not_legacy_plan_failure(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.v4_report("帮我整理一下明天发。", mode=mode, reviews=[{"source_roles": [], "edits": []}])
+            self.upgrade_report_to_v5(report, receipts)
+            row = report["cases"][0]
+            row["stage_responses"][1]["response_text"] = '{"source_roles":[],"edits":[]}'
+            receipts[1]["response_text_sha256"] = e.legacy.sha256_text(row["stage_responses"][1]["response_text"])
+            row.update(fallback_used=True, model_output=self.text, failure_reason="validationFailed", hard_validation_codes=["invalidStructuredResponse"])
+            failures, quality = self.check(report, receipts, mode)
+            self.assertEqual(failures, []); self.assertTrue(quality)
+            row["hard_validation_codes"] = ["planIntegrityFailure"]
+            self.assertTrue(self.check(report, receipts, mode)[0])
+
+    def test_v5_every_review_keeps_canonical_segments_and_actual_draft_binding(self):
+        for index in [1, 2]:
+            for field, value in [("canonical_text", "伪造来源"), ("draft_text", "伪造实际稿"),
+                                 ("source_segments", [{"id": "other", "text": "改写原分段"}]),
+                                 ("changes", [{"removed": "不存在", "inserted": ""}])]:
+                report, receipts = self.repaired_v4_report(); self.upgrade_report_to_v5(report, receipts)
+                stage = report["cases"][0]["stage_responses"][index]
+                payload = json.loads(stage["request_payload"]); payload[field] = value
+                stage["request_payload"] = json.dumps(payload)
+                self.assertTrue(self.check(report, receipts, "light")[0], (index, field))
+
+    def test_v5_direct_keeps_zero_repair_audit_without_review_protocol_fields(self):
+        self.expected["editing_prompt_version"] = 5
+        report, receipts = self.report("direct")
+        row = report["cases"][0]; row["repair_attempt_count"] = 0
+        self.assertEqual(self.check(report, receipts, "direct"), ([], []))
+        for value in [None, "0", 1, False, 0.0]:
+            row["repair_attempt_count"] = value
+            self.assertTrue(self.check(report, receipts, "direct")[0])
+
     def test_input_limit_checks_both_sources_and_rejects_answers(self):
         for source_length, segment_length, valid in [(1000, 1000, True), (1001, 1, False), (1, 1001, False)]:
             inputs = copy.deepcopy(self.inputs)
