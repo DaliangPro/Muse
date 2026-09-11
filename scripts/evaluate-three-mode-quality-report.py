@@ -889,12 +889,118 @@ def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version
         raise ValueError("远处改口字词超界或新增内容不能由连续证据解释")
 
 
+def swift_character_is_whitespace(character: str) -> bool:
+    whitespace = set("\t\n\v\f\r \u0085\u00a0\u1680\u2028\u2029\u202f\u205f\u3000") | set(chr(c) for c in range(0x2000, 0x200B))
+    return bool(character) and character[0] in whitespace
+
+
+def v7_unsafe_characters(text: str) -> bool:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return any(ord(c) not in (9, 10) and (ord(c) <= 31 or 127 <= ord(c) <= 159
+               or 0xFDD0 <= ord(c) <= 0xFDEF or ord(c) & 0xFFFF in (0xFFFE, 0xFFFF)) for c in normalized)
+
+
+def v7_lexical_characters(text: str) -> str:
+    characters = composed_characters(text)
+    return "".join(c for i, c in enumerate(characters) if c in set("-_/\\`@#%")
+        or (c in ".:" and 0 < i < len(characters) - 1
+            and all(x.isascii() and x.isalnum() for x in (characters[i - 1], characters[i + 1])))
+        or not (swift_character_is_whitespace(c) or unicodedata.category(c[0]).startswith("P")))
+
+
+@lru_cache(maxsize=1)
+def v7_icu_han_script():
+    # 与 NSRegularExpression 的 \p{Han} 使用同一 macOS ICU，不依赖近似的汉字范围表。
+    library = ctypes.CDLL("/usr/lib/libicucore.A.dylib")
+    library.u_getIntPropertyValue.argtypes = [ctypes.c_int32, ctypes.c_int32]
+    library.u_getIntPropertyValue.restype = ctypes.c_int32
+    library.u_getPropertyValueEnum.argtypes = [ctypes.c_int32, ctypes.c_char_p]
+    library.u_getPropertyValueEnum.restype = ctypes.c_int32
+    han = library.u_getPropertyValueEnum(0x100A, b"Han")  # SDK uchar.h: UCHAR_SCRIPT = 0x100A。
+    if han < 0: raise ValueError("无法确定生产 ICU 的 Han 脚本属性")
+    return library, han
+
+
+def v7_removes_complete_clocks(before: str, after: str, draft: str) -> bool:
+    library, han = v7_icu_han_script()
+    def boundary(c):
+        return (swift_character_is_whitespace(c) or c in "，。！？；、（）“”‘’(),;!?'\""
+                or (len(c) == 1 and library.u_getIntPropertyValue(ord(c), 0x100A) == han))
+    def parts(text):
+        characters = composed_characters(text)
+        offsets, offset = {}, 0
+        for index, c in enumerate(characters):
+            offsets[offset] = index
+            offset += len(c)
+        offsets[offset] = len(characters)
+        matches = []
+        for match in re.finditer(r"(?:[01]?[0-9]|2[0-3]):[0-5][0-9]", text):
+            start, end = offsets.get(match.start()), offsets.get(match.end())
+            if (start is not None and end is not None
+                    and (start == 0 or boundary(characters[start - 1]))
+                    and (end == len(characters) or boundary(characters[end]))):
+                matches.append(match)
+        remainder = text
+        for match in reversed(matches): remainder = remainder[:match.start()] + remainder[match.end():]
+        return [match[0] for match in matches], v7_lexical_characters(remainder)
+    start = draft.find(before)
+    if start < 0 or draft.find(before, start + 1) >= 0: return False
+    old, old_rest = parts(draft)
+    new, new_rest = parts(draft[:start] + after + draft[start + len(before):])
+    technical = lambda text: "".join(c for c in text if unicodedata.category(c)[0] not in "LN")
+    normalize = lambda text: tuple(unicodedata.normalize("NFC", c) for c in composed_characters(text))
+    return (bool(new) and len(new) < len(old) and is_subsequence(new, old)
+            and is_subsequence(normalize(new_rest), normalize(old_rest)) and technical(old_rest) == technical(new_rest))
+
+
+def validate_v7_local_edit(edit: dict, source: str, allows_reviewed_directives: bool,
+                           allows_reviewed_source_corrections: bool, draft: str) -> None:
+    """只在 v7 收紧近邻改口；v1–v6 的权限回放保持原样。"""
+    before, after, kind = edit["before"], edit["after"], edit.get("kind")
+    if v7_unsafe_characters(after):
+        raise ValueError("v7 编辑含不安全字符")
+    if kind != "correction":
+        return validate_v4_light_edit(edit, source, allows_reviewed_directives, draft)
+    changes = actual_modifications(before, after, 0)
+    if (re.findall(NEWLINE_PATTERN, before) != re.findall(NEWLINE_PATTERN, after)
+            or any(re.search(NEWLINE_PATTERN, before[a:b] + inserted) for a, b, inserted in changes)):
+        raise ValueError("v7 局部改口不得改变原段落")
+    if is_v4_mechanical_edit(edit, draft, allow_reviewed_changes=True):
+        return
+    if len(composed_characters(before)) > 96:
+        raise ValueError("v7 实质修改锚点超界")
+    old, new = v7_lexical_characters(before), v7_lexical_characters(after)
+    changes = actual_modifications(old, new, 0)
+    technical = lambda text: "".join(c for c in text if unicodedata.category(c)[0] not in "LN")
+    if sum(b - a for a, b, _ in changes) > 32 or sum(len(s) for _, _, s in changes) > 8:
+        raise ValueError("v7 改口实质修改累计超出 32/8")
+    preserves_technical = technical(old) == technical(new)
+    pairs = list(zip([v7_lexical_characters(p) for p in re.split(NEWLINE_PATTERN, before)],
+                     [v7_lexical_characters(p) for p in re.split(NEWLINE_PATTERN, after)]))
+    cues = ["不对", "说错", "改成", "改为", "改由", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
+    # Swift 近邻子序列按 Character 规范等价比较，预算仍按真实标量差异计数。
+    subsequence = lambda a, b: is_subsequence(tuple(unicodedata.normalize("NFC", c) for c in composed_characters(a)),
+                                              tuple(unicodedata.normalize("NFC", c) for c in composed_characters(b)))
+    if any(cue in before.lower() for cue in cues) and subsequence(new, old) and all(subsequence(b, a) for a, b in pairs):
+        if not preserves_technical and not v7_removes_complete_clocks(before, after, draft):
+            raise ValueError("v7 近邻改口损坏技术字符且不能由完整旧钟面删除解释")
+        return
+    evidence = edit.get("evidence")
+    if (not preserves_technical or not allows_reviewed_source_corrections or not isinstance(evidence, str) or not evidence or len(evidence) > 192
+            or evidence not in source or not source_contains_punctuation_equivalent_anchor(before, source)
+            or not any(cue in evidence.lower() for cue in cues) or len(before) > 96
+            or sum(unicodedata.normalize("NFC", a) != unicodedata.normalize("NFC", b) for a, b in pairs) != 1
+            or len(changes) != 1 or (changes[0][2] and changes[0][2] not in evidence)):
+        raise ValueError("v7 远处改口未满足来源、显式权限或单块连续证据限制")
+
+
 def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: int | None = None,
-                         allows_reviewed_directives: bool = False, original_source: str | None = None) -> str:
+                         allows_reviewed_directives: bool = False, original_source: str | None = None,
+                         allows_reviewed_source_corrections: bool = False) -> str:
     # v5 改复核响应、v6 加优先差异；局部补丁权限均完整沿用 v4。
     if editing_prompt_version in (5, 6):
         editing_prompt_version = 4
-    document = json.loads(response)
+    document = decode_v7_initial(response) if editing_prompt_version == 7 else json.loads(response)
     if (not isinstance(document, dict) or set(document) != {"edits"}
             or not isinstance(document["edits"], list) or len(document["edits"]) > 128):
         raise ValueError("编辑响应不是独立 edits 对象")
@@ -905,10 +1011,13 @@ def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: 
         before, after = edit.get("before"), edit.get("after")
         if not isinstance(before, str) or not before or not isinstance(after, str):
             raise ValueError("编辑锚点缺失或重复")
-        if editing_prompt_version is not None:
+        if editing_prompt_version == 7:
+            validate_v7_local_edit(edit, original_source if original_source is not None else source,
+                                   allows_reviewed_directives, allows_reviewed_source_corrections, source)
+        elif editing_prompt_version is not None:
             validate_recorded_light_edit(edit, original_source if original_source is not None else source,
                                          editing_prompt_version, allows_reviewed_directives, draft=source)
-        if editing_prompt_version == 4:
+        if editing_prompt_version in (4, 7):
             projected = v4_mechanical_projection(edit, source, allow_reviewed_changes=True)
             projected_edits.append({**edit, "after": after if projected is None else projected})
         start = source.find(before)
@@ -923,11 +1032,11 @@ def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: 
     output = source
     for start, end, after in sorted(located, key=lambda x: (x[0], x[1] - x[0]), reverse=True):
         output = output[:start] + after + output[end:]
-    if editing_prompt_version == 4:
+    if editing_prompt_version in (4, 7):
         expected = apply_recorded_edits(source, json.dumps({"edits": projected_edits}))
         if not v4_punctuation_preserves_tokens(expected, output):
             raise ValueError("v4 合批修改破坏技术 token 边界")
-    if editing_prompt_version == 4 and any(edit.get("kind") == "directive" for edit in document["edits"]) and not lexical_characters(output):
+    if editing_prompt_version in (4, 7) and any(edit.get("kind") == "directive" for edit in document["edits"]) and not lexical_characters(output):
         raise ValueError("v4 编辑要求删除不能清空全文实质内容")
     return output
 
@@ -1150,6 +1259,306 @@ def v4_plain_text(response: str, source: str) -> str:
     return text
 
 
+class V7ContractError(ValueError):
+    def __init__(self, message: str, code: str = "planIntegrityFailure"):
+        super().__init__(message)
+        self.code = code
+
+
+def v7_structure_segments(draft: str) -> list[dict]:
+    """镜像生产 Character 句末切分，保留片段中的原始字节及全部尾部。"""
+    text = composed_characters(draft)
+    if (not text or len(draft.encode()) > 1_048_576 or all(swift_character_is_whitespace(c) for c in text)
+            or v7_unsafe_characters(draft)):
+        raise V7ContractError("v7 结构来源无效")
+    brackets_by_open = {"(": ")", "[": "]", "{": "}", "（": "）", "【": "】", "《": "》", "〈": "〉"}
+    quotes = {"“": "”", "‘": "’", "「": "」", "『": "』", '"': '"', "'": "'"}
+    brackets, quote, code, code_count = [], None, None, 0
+    indented, parts, start, index = False, [], 0, 0
+
+    def escaped(i):
+        cursor = i
+        while cursor > 0 and text[cursor - 1] == "\\": cursor -= 1
+        return (i - cursor) % 2 == 1
+
+    def sentence_end(i):
+        character = text[i]
+        if character in "。！？": return True
+        if (character not in ".!?" or i == 0 or swift_character_is_whitespace(text[i - 1])
+                or (i + 1 < len(text) and not swift_character_is_whitespace(text[i + 1]))):
+            return False
+        token_start = i
+        while token_start > 0 and not swift_character_is_whitespace(text[token_start - 1]): token_start -= 1
+        token = "".join(text[token_start:i])
+        if any(c in ".:/\\_=@#<>|&*+{}[]" for c in token): return False
+        if character == "." and (i - token_start == 1 or token.lower() in {"mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc", "st", "no"}):
+            return False
+        if character != "." and i + 1 < len(text):
+            following = i + 1
+            while following < len(text) and swift_character_is_whitespace(text[following]): following += 1
+            if following < len(text) and text[following].isascii() and text[following].islower(): return False
+        return True
+
+    while index < len(text) and len(parts) < 127:
+        character = text[index]
+        if index == 0 or text[index - 1][0] in "\r\n\v\f\x85\u2028\u2029":
+            cursor, spaces, has_tab = index, 0, False
+            while cursor < len(text) and text[cursor] in (" ", "\t"):
+                spaces += text[cursor] == " "
+                has_tab |= text[cursor] == "\t"
+                cursor += 1
+            indented = has_tab or spaces >= 4
+        if character in ("`", "~"):
+            end = index + 1
+            while end < len(text) and text[end] == character: end += 1
+            count = end - index
+            if code is not None:
+                if code == character and (count >= code_count if code_count >= 3 else count == code_count):
+                    code, code_count = None, 0
+            elif character == "`" or count >= 3:
+                code, code_count = character, count
+            index = end
+            continue
+        if code is not None or indented:
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote and not escaped(index): quote = None
+            index += 1
+            continue
+        if (character in quotes and not escaped(index)
+                and not (character == "'" and 0 < index < len(text) - 1
+                         and all(unicodedata.category(c[0]).startswith("L") for c in (text[index - 1], text[index + 1])))):
+            quote = quotes[character]
+            index += 1
+            continue
+        if brackets and character == brackets[-1]: brackets.pop()
+        elif character in brackets_by_open: brackets.append(brackets_by_open[character])
+        if not brackets and sentence_end(index):
+            end = index + 1
+            while end < len(text) and text[end] in "。！？!?": end += 1
+            parts.append("".join(text[start:end]))
+            start, index = end, end
+        else:
+            index += 1
+    if start < len(text):
+        tail = "".join(text[start:])
+        if parts and all(swift_character_is_whitespace(c) for c in text[start:]): parts[-1] += tail
+        else: parts.append(tail)
+    return [{"id": f"c{i + 1}", "text": part} for i, part in enumerate(parts)]
+
+
+def v7_validate_segments(segments: object) -> None:
+    if (not isinstance(segments, list) or not 1 <= len(segments) <= 128
+            or any(not isinstance(s, dict) or set(s) != {"id", "text"} or s.get("id") != f"c{i + 1}"
+                   or not isinstance(s.get("text"), str) or not s["text"] for i, s in enumerate(segments))):
+        raise V7ContractError("v7 结构片段无效")
+    # 只验证生产 validateSegments 的输入约束，不把调用方片段重新切一遍。
+    if (sum(len(s["text"].encode()) for s in segments) > 1_048_576
+            or any(v7_unsafe_characters(s["text"]) for s in segments)
+            or not any(not swift_character_is_whitespace(c) for s in segments for c in composed_characters(s["text"]))):
+        raise V7ContractError("v7 结构片段正文无效")
+
+
+def v7_code_block(text: str) -> bool:
+    for line in re.split(NEWLINE_PATTERN, text):
+        leading = re.match(r"[ \t]*", line)[0]
+        if "\t" in leading or len(leading) >= 4 or line[len(leading):].startswith(("```", "~~~")):
+            return True
+    return False
+
+
+def v7_validate_layout(layout: object, segments: list[dict]) -> list[dict]:
+    v7_validate_segments(segments)
+    if not isinstance(layout, list) or not 1 <= len(layout) <= 128:
+        raise V7ContractError("v7 布局必须为 1–128 个完整分组")
+    known, seen = {s["id"] for s in segments}, set()
+    by_id = {s["id"]: s["text"] for s in segments}
+    for block in layout:
+        if (not isinstance(block, dict) or set(block) != {"style", "segment_ids"}
+                or block["style"] not in ("paragraph", "bullet", "numbered")
+                or not isinstance(block["segment_ids"], list) or not 1 <= len(block["segment_ids"]) <= 128):
+            raise V7ContractError("v7 布局字段或分组无效")
+        for sid in block["segment_ids"]:
+            if not isinstance(sid, str) or sid not in known or sid in seen:
+                raise V7ContractError("v7 布局包含未知或重复片段")
+            if (block["style"] != "paragraph" or len(block["segment_ids"]) != 1) and v7_code_block(by_id[sid]):
+                raise V7ContractError("v7 围栏或缩进代码片段必须独占 paragraph 分组")
+            seen.add(sid)
+    if seen != known: raise V7ContractError("v7 布局遗漏实际片段")
+    return layout
+
+
+def v7_render_layout(layout: object, segments: list[dict]) -> str:
+    blocks = v7_validate_layout(layout, segments)
+    by_id, output, number, previous = {s["id"]: s["text"] for s in segments}, "", 0, None
+    for block in blocks:
+        body = "".join(by_id[sid] for sid in block["segment_ids"])
+        characters = composed_characters(body)
+        leading_count = 0
+        while leading_count < len(characters) and swift_character_is_whitespace(characters[leading_count]): leading_count += 1
+        leading = "".join(characters[:leading_count])
+        if previous is not None:
+            prior = composed_characters(previous)
+            trailing_start = len(prior)
+            while trailing_start > 0 and swift_character_is_whitespace(prior[trailing_start - 1]): trailing_start -= 1
+            trailing = "".join(prior[trailing_start:])
+            for count in range(3):
+                separator = "\n" * count
+                # 先组合再遍历 Character；CR+LF 可跨边界组成单个 CRLF，中间有空格则不会。
+                if sum(c[0] in "\r\n\v\f\x85\u2028\u2029" for c in composed_characters(trailing + separator + leading)) >= 2:
+                    break
+            output += separator
+        if block["style"] == "numbered":
+            number += 1
+            marker = f"{number}. "
+        else:
+            number = 0
+            marker = "- " if block["style"] == "bullet" else ""
+        output += leading + marker + "".join(characters[leading_count:])
+        previous = body
+    if len(output.encode()) > 1_048_576: raise V7ContractError("v7 结构输出超界")
+    return output
+
+
+def decode_v7_initial(raw: str) -> dict:
+    try:
+        if len(raw.encode()) > 1_048_576: raise ValueError("v7 首轮响应超界")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != {"edits"}: raise ValueError("v7 首轮只能包含 edits")
+    except (ValueError, TypeError) as error:
+        raise V7ContractError(str(error)) from error
+    try:
+        # Swift Codable 类型错误属于 DecodingError，而合法数组过长是 TextEditError。
+        if isinstance(value["edits"], list) and len(value["edits"]) > 128:
+            raise V7ContractError("v7 补丁数量超界")
+        decode_v4_edits(value["edits"])
+    except V7ContractError:
+        raise
+    except ValueError as error:
+        raise V7ContractError(str(error), "invalidStructuredResponse") from error
+    return value
+
+
+def decode_v7_review(raw: str, source: str, segments: list[dict] | None) -> dict:
+    try:
+        if segments is None: return decode_v5_review(raw, source)
+        if len(raw.encode()) > 1_048_576: raise ValueError("v7 复核响应超界")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != {"delivery", "editor_spans", "edits", "layout"}:
+            raise ValueError("v7 标准复核必须且只能含四个协议字段")
+        decode_v5_review(json.dumps({k: value[k] for k in ("delivery", "editor_spans", "edits")}, ensure_ascii=False), source)
+        if value["edits"]:
+            if value["layout"] != []: raise ValueError("v7 内容待修复时布局必须为空数组")
+        else:
+            v7_validate_layout(value["layout"], segments)
+        return value
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        raise V7ContractError(str(error), "invalidStructuredResponse") from error
+
+
+def v7_payload_field_failures(payload: dict, mode: str, stage_index: int) -> list[str]:
+    """按当前 Payload 构造闭合字段；本 Runner 的 nil 可选值必须省略。"""
+    required = {"schema_version", "mode", "canonical_text", "source_segments", "writing_scene",
+                "authorized_context", "user_preferences"}
+    if stage_index:
+        required |= {"draft_text", "changes", "review_focus", "review_focus_total"}
+        if mode == "standard": required.add("layout_segments")
+    optional = {"validation_codes"} if mode == "standard" and stage_index == 1 else set()
+    fields = set(payload)
+    failures = []
+    if fields - required - optional:
+        failures.append("v7 请求含当前阶段不会生成的额外字段：" + ", ".join(sorted(fields - required - optional)))
+    if required - fields:
+        failures.append("v7 请求缺少当前阶段必须生成的字段：" + ", ".join(sorted(required - fields)))
+    if "validation_codes" in fields and "validation_codes" in optional:
+        # contentCodes 的实际生成路径只有这五种，按 outputCodes 顺序后追加重复保护。
+        # 其他 VoicePolishValidationCode 虽是合法枚举，也不属于本阶段可生成的提示。
+        possible = ["emptyOutput", "unsafeCharacters", "abnormalLength", "planIntegrityFailure", "missingProtectedFact"]
+        codes = payload["validation_codes"]
+        if (not isinstance(codes, list) or not codes or any(not isinstance(c, str) or c not in possible for c in codes)
+                or len(set(codes)) != len(codes) or codes != sorted(codes, key=possible.index)):
+            failures.append("v7 validation_codes 不符合当前 contentCodes 的非空枚举数组与生成顺序")
+    return failures
+
+
+def v7_stage_contract(row: dict, payloads: list, mode: str) -> tuple[list[str], list[str]]:
+    """独立回放 v7 内容补丁→实际片段→完整布局，不改变历史版本来源判定。"""
+    source, stages, fallback = row["canonical_input"], row["stage_responses"], row.get("fallback_used")
+    allowed = ["voicePolishFast" if mode == "light" else "voicePolishRender"]
+    failures, repairs, output = [], 0, None
+
+    def bind_draft(index, draft):
+        payload = payloads[index]
+        if not isinstance(payload, dict) or payload.get("draft_text") != draft:
+            failures.append("v7 复核请求未绑定实际内容稿")
+        if not isinstance(payload, dict) or not complete_v6_review_focus(source, draft, payload):
+            failures.append("v7 复核请求未绑定完整差异和实际上下文")
+        segments = v7_structure_segments(draft) if mode == "standard" else None
+        if mode == "standard" and (not isinstance(payload, dict) or payload.get("layout_segments") != segments):
+            failures.append("v7 layout_segments 未逐字绑定程序从实际稿重建的全部片段")
+        return segments
+
+    for index, payload in enumerate(payloads):
+        if not isinstance(payload, dict):
+            failures.append("v7 请求载荷不可审计")
+            continue
+        failures.extend(v7_payload_field_failures(payload, mode, index))
+        if index == 0 and any(k in payload for k in ("draft_text", "changes", "review_focus", "review_focus_total", "layout_segments")):
+            failures.append("v7 首轮不得携带稿件、差异、焦点或结构片段")
+        if mode == "light" and "layout_segments" in payload:
+            failures.append("v7 轻度请求不得携带结构片段")
+    try:
+        if stages and stages[0].get("status") == "succeeded":
+            initial = decode_v7_initial(stages[0]["response_text"])
+            requires = mode == "standard" or v4_source_review_risk(source) or v4_requires_semantic_review(initial["edits"], source)
+            draft = apply_recorded_edits(source, stages[0]["response_text"], editing_prompt_version=7,
+                allows_reviewed_directives=requires, allows_reviewed_source_corrections=requires)
+            output = draft
+            # 生产标准在生成复核请求前验证实际片段；失败不得伪报二次请求。
+            if mode == "standard": v7_structure_segments(draft)
+            if requires: allowed.append("voicePolishAnalyze")
+            if requires and len(stages) >= 2:
+                segments = bind_draft(1, draft)
+                if stages[1].get("status") == "succeeded":
+                    assessment = decode_v7_review(stages[1]["response_text"], source, segments)
+                    if assessment["edits"]:
+                        repairs = 1
+                        draft = apply_recorded_edits(draft, json.dumps({"edits": assessment["edits"]}, ensure_ascii=False),
+                            editing_prompt_version=7, allows_reviewed_directives=True,
+                            allows_reviewed_source_corrections=True, original_source=source)
+                        if v4_contains_editor_instruction(assessment, draft, 5):
+                            raise V7ContractError("v7 当前编辑要求仍留在修复稿")
+                        if mode == "standard": v7_structure_segments(draft)
+                        output = draft
+                        allowed.append("voicePolishAnalyze")
+                        if len(stages) >= 3:
+                            segments = bind_draft(2, draft)
+                            if stages[2].get("status") == "succeeded":
+                                final = decode_v7_review(stages[2]["response_text"], source, segments)
+                                if final["edits"] or v4_contains_editor_instruction(final, draft, 5):
+                                    raise V7ContractError("v7 第三轮未空补丁确认实际稿")
+                                output = v7_render_layout(final["layout"], segments) if mode == "standard" else draft
+                    else:
+                        if v4_contains_editor_instruction(assessment, draft, 5):
+                            raise V7ContractError("v7 当前编辑要求残留却空补丁放行")
+                        output = v7_render_layout(assessment["layout"], segments) if mode == "standard" else draft
+            if not fallback and row.get("model_output") != output:
+                raise V7ContractError("v7 最终输出不等于真实局部补丁及完整布局逐字拼装结果")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        if not fallback:
+            failures.append(f"v7 阶段证据不成立：{error}")
+        else:
+            code = error.code if isinstance(error, V7ContractError) else "planIntegrityFailure"
+            if code not in row.get("hard_validation_codes", []):
+                failures.append(f"v7 失败未如实记录 {code}：{error}")
+    if not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != repairs:
+        failures.append("v7 repair_attempt_count 未如实记录成功或失败的本地修复尝试")
+    if fallback and row.get("model_output") != source:
+        failures.append("v7 回退必须交付完整 canonical 原文")
+    return allowed, failures
+
+
 def v4_stage_contract(row: dict, payloads: list, mode: str, version: int = 4) -> tuple[list[str], list[str]]:
     """回放候选真实请求链；模型质量失败保留为 fallback，不伪造为来源证据成功。"""
     source, stages = row["canonical_input"], row["stage_responses"]
@@ -1290,7 +1699,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
-            if expected["editing_prompt_version"] in (4, 5, 6) and (
+            if expected["editing_prompt_version"] in (4, 5, 6, 7) and (
                 not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
             ):
                 failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
@@ -1305,7 +1714,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if expected["editing_prompt_version"] in (3, 4, 5, 6):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -1317,7 +1726,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if expected["editing_prompt_version"] in (3, 4, 5, 6):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -1355,11 +1764,11 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
-                if expected["editing_prompt_version"] in (3, 4, 5, 6) and (
+                if expected["editing_prompt_version"] in (3, 4, 5, 6, 7) and (
                     expected_segments is None or payload.get("source_segments") != expected_segments
                 ):
                     failures.append(f"{tid}: v3 阶段 source_segments 未逐项保留 canonical 段的 ID、正文和顺序")
-                if expected["editing_prompt_version"] == 6 and ordinal == 1 and any(
+                if expected["editing_prompt_version"] in (6, 7) and ordinal == 1 and any(
                     payload.get(k) is not None for k in ("review_focus", "review_focus_total")
                 ):
                     failures.append(f"{tid}: v6 首轮请求不得携带复核优先差异")
@@ -1399,8 +1808,9 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if expected["editing_prompt_version"] in (4, 5, 6):
-            allowed, stage_failures = v4_stage_contract(row, payloads, mode, expected["editing_prompt_version"])
+        if expected["editing_prompt_version"] in (4, 5, 6, 7):
+            allowed, stage_failures = (v7_stage_contract(row, payloads, mode) if expected["editing_prompt_version"] == 7
+                                       else v4_stage_contract(row, payloads, mode, expected["editing_prompt_version"]))
             failures.extend(f"{tid}: {failure}" for failure in stage_failures)
             if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
                 failures.append(f"{tid}: v4 尝试数超出真实补丁和原文风险允许的调用预算")
@@ -1414,7 +1824,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6) else 2
+        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7) else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -1426,7 +1836,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6):
+        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7):
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],

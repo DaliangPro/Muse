@@ -161,13 +161,16 @@ private actor VoiceInputModeProbeLLM: LLMClient {
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
         requests.append(request)
         let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
-        return LLMResponse(
-            text: request.task == .voicePolishAnalyze
-                ? #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
-                : (request.options.responseFormat == .jsonObject
-                    ? #"{"edits":[]}"# : (payload?["canonical_text"] as? String ?? "")),
-            model: config.model
-        )
+        var object: [String: Any] = ["edits": []]
+        if request.task == .voicePolishAnalyze {
+            object["delivery"] = "other_or_uncertain"
+            object["editor_spans"] = []
+            if let segments = payload?["layout_segments"] as? [[String: String]] {
+                object["layout"] = [["style": "paragraph", "segment_ids": segments.compactMap { $0["id"] }]]
+            }
+        }
+        return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self),
+                           model: config.model)
     }
 
     func process(text: String, prompt: String, context: LLMRequestContext, config: LLMConfig) async throws -> String {

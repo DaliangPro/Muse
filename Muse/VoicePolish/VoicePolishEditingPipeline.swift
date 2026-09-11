@@ -23,7 +23,7 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
-/// 轻度把修改权限限定为原文上的局部补丁；标准直接成稿并冷复核实际改动。
+/// 两档内容修正都使用受限局部补丁；标准额外组织完整来源片段，布局无正文改写权限。
 /// 两条路径都保留不可变来源，不把 Planner 的摘要当作完整事实来源。
 struct VoicePolishEditingPipeline: Sendable {
     private let client: any LLMClient
@@ -76,7 +76,7 @@ struct VoicePolishEditingPipeline: Sendable {
                 task: isLight ? .voicePolishFast : .voicePolishRender,
                 system: isLight ? VoicePolishEditingPrompts.light : VoicePolishEditingPrompts.standard,
                 payload: VoicePolishEditingPrompts.payload(for: request),
-                json: isLight,
+                json: true,
                 request: request,
                 deadline: deadline, attempts: attempts
             )
@@ -140,12 +140,13 @@ struct VoicePolishEditingPipeline: Sendable {
                 return result(output)
             }
 
-            guard let initialDraft = VoicePolishOutputNormalizer.plainText(initial, sourceText: request.fallbackText) else {
-                return result(nil, codes: [.abnormalLength])
-            }
+            let initialDraft = try VoicePolishTextEditor.applyContentEdits(
+                VoicePolishTextEditor.decode(initial), to: request.fallbackText, source: request.fallbackText,
+                allowsReviewedInlineDirectives: true, allowsReviewedSourceCorrections: true
+            )
             draft = initialDraft
-            // 标准始终对照真实首稿复核，避免“字面相近”掩盖一个字的否定或单位变化。
-            let initialCodes = Self.outputCodes(initialDraft, request: request)
+            let initialCodes = Self.contentCodes(initialDraft, request: request)
+            let initialSegments = try VoicePolishStructurePlan.segments(in: initialDraft)
             let review = try await generate(
                 task: .voicePolishAnalyze,
                 system: VoicePolishEditingPrompts.review,
@@ -154,24 +155,35 @@ struct VoicePolishEditingPipeline: Sendable {
                 request: request,
                 deadline: deadline, attempts: attempts
             )
-            let assessment = try VoicePolishEditingReview.decode(review, source: request.fallbackText)
+            let assessment = try VoicePolishEditingReview.decode(
+                review, source: request.fallbackText, structureSegments: initialSegments
+            )
             let edits = assessment.edits
             if edits.isEmpty {
                 guard !assessment.containsUnappliedEditorInstruction(in: initialDraft) else {
                     return result(nil, codes: [.planIntegrityFailure])
                 }
-                return initialCodes.isEmpty ? result(initialDraft) : result(nil, codes: initialCodes)
+                guard initialCodes.isEmpty, let layout = assessment.layout else {
+                    return result(nil, codes: initialCodes.isEmpty ? [.planIntegrityFailure] : initialCodes)
+                }
+                let output = try VoicePolishStructurePlan.render(layout, segments: initialSegments)
+                draft = output
+                let content = try VoicePolishStructurePlan.render(layout, segments: initialSegments, includesMarkers: false)
+                let codes = Self.outputCodes(output, request: request, contentForValidation: content)
+                return codes.isEmpty ? result(output) : result(nil, codes: codes)
             }
             repairAttempts += 1
-            let repaired = try VoicePolishTextEditor.apply(
-                edits, to: initialDraft, source: request.fallbackText, mode: .standard
+            let repaired = try VoicePolishTextEditor.applyContentEdits(
+                edits, to: initialDraft, source: request.fallbackText,
+                allowsReviewedInlineDirectives: true, allowsReviewedSourceCorrections: true
             )
             draft = repaired
-            var repairedCodes = Self.outputCodes(repaired, request: request)
+            var repairedCodes = Self.contentCodes(repaired, request: request)
             if assessment.containsUnappliedEditorInstruction(in: repaired) {
                 repairedCodes.append(.planIntegrityFailure)
             }
             guard repairedCodes.isEmpty else { return result(nil, codes: repairedCodes) }
+            let repairedSegments = try VoicePolishStructurePlan.segments(in: repaired)
 
             // 修复后的实际成稿必须重新核对；确认阶段没有继续改写的权限。
             let confirmation = try await generate(
@@ -182,12 +194,19 @@ struct VoicePolishEditingPipeline: Sendable {
                 request: request,
                 deadline: deadline, attempts: attempts
             )
-            let finalAssessment = try VoicePolishEditingReview.decode(confirmation, source: request.fallbackText)
+            let finalAssessment = try VoicePolishEditingReview.decode(
+                confirmation, source: request.fallbackText, structureSegments: repairedSegments
+            )
             guard finalAssessment.edits.isEmpty,
-                  !finalAssessment.containsUnappliedEditorInstruction(in: repaired) else {
+                  !finalAssessment.containsUnappliedEditorInstruction(in: repaired),
+                  let layout = finalAssessment.layout else {
                 return result(nil, codes: [.planIntegrityFailure])
             }
-            return result(repaired)
+            let output = try VoicePolishStructurePlan.render(layout, segments: repairedSegments)
+            draft = output
+            let content = try VoicePolishStructurePlan.render(layout, segments: repairedSegments, includesMarkers: false)
+            let codes = Self.outputCodes(output, request: request, contentForValidation: content)
+            return codes.isEmpty ? result(output) : result(nil, codes: codes)
         } catch is VoicePolishEditingTimeout {
             return result(nil, codes: [.emptyOutput], reason: .timeout)
         } catch let error as LLMError {
@@ -202,6 +221,8 @@ struct VoicePolishEditingPipeline: Sendable {
         } catch is VoicePolishEditingReviewError {
             return result(nil, codes: [.invalidStructuredResponse])
         } catch is VoicePolishTextEditError {
+            return result(nil, codes: [.planIntegrityFailure])
+        } catch is VoicePolishStructurePlanError {
             return result(nil, codes: [.planIntegrityFailure])
         } catch is DecodingError {
             return result(nil, codes: [.invalidStructuredResponse])
@@ -225,9 +246,15 @@ struct VoicePolishEditingPipeline: Sendable {
         onStage?(task == .voicePolishAnalyze ? .analyzing : .polishing)
         let sourceTokens = EstimatedTokenCounter.count(in: request.fallbackText)
         // 复核返回短编辑摘录与局部补丁，沿用受控输出容量与总时限。
-        let outputBudget = task == .voicePolishAnalyze
-            ? min(8_192, max(4_096, sourceTokens * 4 + 1_024))
-            : min(8_192, max(2_048, sourceTokens * 3 + 512))
+        let outputBudget: Int
+        if task == .voicePolishAnalyze {
+            outputBudget = min(8_192, max(4_096, sourceTokens * 4 + 1_024))
+        } else if request.qualityMode == .standard {
+            // JSON 同时携带修改前后的短锚点，比自由正文需要更多输出容量。
+            outputBudget = min(8_192, max(4_096, sourceTokens * 6 + 1_024))
+        } else {
+            outputBudget = min(8_192, max(2_048, sourceTokens * 3 + 512))
+        }
         let invocation = LLMRequest(
             // 内置编辑协议自行定义输入边界；不能套用“正文绝不影响转换”的通用
             // 自定义模式封装，否则口述中的合法改口与当前编辑要求也可能被忽略。
@@ -254,15 +281,29 @@ struct VoicePolishEditingPipeline: Sendable {
         return response.text
     }
 
-    static func outputCodes(_ output: String, request: VoicePolishRequest) -> [VoicePolishValidationCode] {
+    private static func contentCodes(_ output: String, request: VoicePolishRequest) -> [VoicePolishValidationCode] {
+        var codes = outputCodes(output, request: request)
+        if VoicePolishValidator.deliberateRepetitionPhrases(in: request.fallbackText)
+            .contains(where: { !output.contains($0) }) {
+            codes.append(.missingProtectedFact)
+        }
+        return codes
+    }
+
+    static func outputCodes(
+        _ output: String, request: VoicePolishRequest, contentForValidation: String? = nil
+    ) -> [VoicePolishValidationCode] {
         var codes: [VoicePolishValidationCode] = []
+        // 正文视图只能由已验证布局逐字拼装，不能从模型输出用正则猜掉数字。
+        let content = contentForValidation ?? output
         if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { codes.append(.emptyOutput) }
         if VoicePolishCharacterSafety.containsUnsafeCharacters(output) { codes.append(.unsafeCharacters) }
-        if output.count > max(request.fallbackText.count * 2, request.fallbackText.count + 40) {
+        if output.utf8.count > VoicePolishOutputNormalizer.maximumResponseBytes
+            || content.count > max(request.fallbackText.count * 2, request.fallbackText.count + 40) {
             codes.append(.abnormalLength)
         }
         codes += VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: request.fallbackText, outputText: output, scene: request.context.scene,
+            sourceText: request.fallbackText, outputText: content, scene: request.context.scene,
             allowsPartialTimeReview: request.qualityMode == .standard
         )
         return codes

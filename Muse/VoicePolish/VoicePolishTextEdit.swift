@@ -135,12 +135,17 @@ enum VoicePolishTextEditError: Error, Equatable {
 
 enum VoicePolishTextEditor {
     private struct Response: Decodable { let edits: [VoicePolishTextEdit] }
+    /// 编辑权限与用户选择的产品档位分离；标准的新内容阶段只能使用局部编辑。
+    private enum EditPolicy {
+        case localContent, legacyStandardContent, disabled
+    }
     private struct Modification {
         let range: NSRange
         let removed: String
         let inserted: String
     }
     private static let technicalMarks = Set("-_/\\`@#%")
+    private static let clockExpression = try? NSRegularExpression(pattern: #"(?:[01]?[0-9]|2[0-3]):[0-5][0-9]"#)
 
     /// 是否免于语义核对取决于完整实际变化，模型自报 kind 不授予免审权限。
     static func requiresSemanticReview(_ edits: [VoicePolishTextEdit], in draft: String? = nil) -> Bool {
@@ -175,6 +180,38 @@ enum VoicePolishTextEditor {
         allowsReviewedInlineDirectives: Bool = false,
         allowsReviewedSourceCorrections: Bool = false
     ) throws -> String {
+        let policy: EditPolicy
+        switch mode {
+        case .light: policy = .localContent
+        case .standard: policy = .legacyStandardContent
+        case .automatic, .fast, .balanced, .quality: policy = .disabled
+        }
+        return try apply(edits, to: draft, source: source, policy: policy,
+                         allowsReviewedInlineDirectives: allowsReviewedInlineDirectives,
+                         allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
+    }
+
+    /// 标准润色的内容修正入口：局部纠错后另做完整片段拼装，不授予自由正文重写权限。
+    static func applyContentEdits(
+        _ edits: [VoicePolishTextEdit],
+        to draft: String,
+        source: String,
+        allowsReviewedInlineDirectives: Bool = false,
+        allowsReviewedSourceCorrections: Bool = false
+    ) throws -> String {
+        try apply(edits, to: draft, source: source, policy: .localContent,
+                  allowsReviewedInlineDirectives: allowsReviewedInlineDirectives,
+                  allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
+    }
+
+    private static func apply(
+        _ edits: [VoicePolishTextEdit],
+        to draft: String,
+        source: String,
+        policy: EditPolicy,
+        allowsReviewedInlineDirectives: Bool,
+        allowsReviewedSourceCorrections: Bool
+    ) throws -> String {
         var located: [Modification] = []
         var projectedEdits: [VoicePolishTextEdit] = []
         for edit in edits {
@@ -189,24 +226,24 @@ enum VoicePolishTextEditor {
             guard !VoicePolishCharacterSafety.containsUnsafeCharacters(edit.after) else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
-            if mode == .light {
-                try validateLight(edit, modifications: modifications, source: source,
-                                  draft: draft,
-                                  allowsReviewedDirectives: allowsReviewedInlineDirectives,
-                                  allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
+            if policy == .localContent {
+                try validateLocalContent(edit, modifications: modifications, source: source,
+                                         draft: draft,
+                                         allowsReviewedDirectives: allowsReviewedInlineDirectives,
+                                         allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
                 if edit.kind == .directive, !isMechanicalEdit(edit, in: draft, allowsReviewedChanges: true),
                    ((!allowsReviewedInlineDirectives && nsRange.location != 0)
                         || (!allowsReviewedInlineDirectives && nsRange.length == (draft as NSString).length)) {
                     throw VoicePolishTextEditError.editOutsideMode
                 }
             } else {
-                guard mode == .standard, edit.kind == .content,
+                guard policy == .legacyStandardContent, edit.kind == .content,
                       let evidence = edit.evidence, !evidence.isEmpty,
                       source.range(of: evidence, options: .literal) != nil else {
                     throw VoicePolishTextEditError.missingEvidence
                 }
             }
-            if mode == .light {
+            if policy == .localContent {
                 projectedEdits.append(.init(before: edit.before,
                     after: mechanicalProjection(edit, in: draft, allowsReviewedChanges: true) ?? edit.after, kind: edit.kind))
             }
@@ -230,13 +267,13 @@ enum VoicePolishTextEditor {
         }) {
             result.replaceCharacters(in: item.range, with: item.inserted)
         }
-        if mode == .light {
+        if policy == .localContent {
             guard let expected = applyingProjections(projectedEdits, to: draft),
                   punctuationPreservesTechnicalTokens(expected, result as String) else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
         }
-        if mode == .light, edits.contains(where: { $0.kind == .directive }),
+        if policy == .localContent, edits.contains(where: { $0.kind == .directive }),
            lexicalCharacters(result as String).isEmpty {
             throw VoicePolishTextEditError.editOutsideMode
         }
@@ -358,7 +395,7 @@ enum VoicePolishTextEditor {
         return output as String
     }
 
-    private static func validateLight(
+    private static func validateLocalContent(
         _ edit: VoicePolishTextEdit,
         modifications: [Modification],
         source: String = "",
@@ -407,27 +444,34 @@ enum VoicePolishTextEditor {
             throw VoicePolishTextEditError.editOutsideMode
         case .correction:
             let cues = ["不对", "说错", "改成", "改为", "改由", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
+            let changes = Self.modifications(
+                for: .init(before: String(before), after: String(after), kind: .correction),
+                anchorLocation: 0
+            )
+            // 近邻改口和远处有据改口共享实际修改预算；子序列关系不授予整段删减权限。
+            // 预算只约束编辑幅度，不能据此证明被删内容在语义上无效。
+            guard changes.reduce(0, { $0 + $1.removed.unicodeScalars.count }) <= 32,
+                  changes.reduce(0, { $0 + $1.inserted.unicodeScalars.count }) <= 8 else {
+                throw VoicePolishTextEditError.editOutsideMode
+            }
+            let preservesTechnicalContent = technicalContent(in: before) == technicalContent(in: after)
             if cues.contains(where: edit.before.lowercased().contains), isSubsequence(after, of: before),
                paragraphPairs.allSatisfy({ isSubsequence($0.1, of: $0.0) }) {
+                guard preservesTechnicalContent || preservesTechnicalContentByRemovingClocks(edit, in: draft) else {
+                    throw VoicePolishTextEditError.editOutsideMode
+                }
                 break
             }
-            guard allowsReviewedSourceCorrections,
+            guard preservesTechnicalContent, allowsReviewedSourceCorrections,
                   let evidence = edit.evidence, !evidence.isEmpty, evidence.unicodeScalars.count <= 192,
                   source.range(of: evidence, options: .literal) != nil,
                   sourceContainsPunctuationEquivalentAnchor(edit.before, in: source),
                   cues.contains(where: evidence.lowercased().contains),
                   edit.before.unicodeScalars.count <= 96,
-                  paragraphPairs.filter({ $0.0 != $0.1 }).count == 1,
-                  technicalContent(in: before) == technicalContent(in: after) else {
+                  paragraphPairs.filter({ $0.0 != $0.1 }).count == 1 else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
-            let changes = Self.modifications(
-                for: .init(before: String(before), after: String(after), kind: .correction),
-                anchorLocation: 0
-            )
             guard changes.count == 1, let change = changes.first,
-                  change.removed.unicodeScalars.count <= 32,
-                  change.inserted.unicodeScalars.count <= 8,
                   change.inserted.isEmpty || evidence.range(of: change.inserted, options: .literal) != nil else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
@@ -635,6 +679,43 @@ enum VoicePolishTextEditor {
                 return true
             }
         }))
+    }
+
+    /// 仅为近邻改口豁免完整旧钟面的冒号；不允许拼出新时间、拆掉技术 token 或清空全部钟面。
+    private static func preservesTechnicalContentByRemovingClocks(_ edit: VoicePolishTextEdit, in draft: String?) -> Bool {
+        func isBoundary(_ character: Character) -> Bool {
+            character.isWhitespace || "，。！？；、（）“”‘’(),;!?'\"".contains(character)
+                || String(character).range(of: #"^\p{Han}$"#, options: .regularExpression) != nil
+        }
+        func parts(_ text: String) -> (clocks: [String], remainder: String)? {
+            guard let clockExpression else { return nil }
+            let boundaries = Set(text.indices).union([text.endIndex])
+            let matches = clockExpression.matches(in: text, range: NSRange(text.startIndex..., in: text)).filter { match in
+                guard let range = Range(match.range, in: text), boundaries.contains(range.lowerBound),
+                      boundaries.contains(range.upperBound) else { return false }
+                let left = range.lowerBound == text.startIndex || isBoundary(text[text.index(before: range.lowerBound)])
+                let right = range.upperBound == text.endIndex || isBoundary(text[range.upperBound])
+                return left && right
+            }
+            let original = text as NSString
+            let remainder = NSMutableString(string: text)
+            for match in matches.reversed() { remainder.replaceCharacters(in: match.range, with: "") }
+            return (matches.map { original.substring(with: $0.range) }, remainder as String)
+        }
+        // 使用真实稿邻接，不能通过把锚点裁到冒号或路径中间来伪造完整时间边界。
+        guard let draft, let range = draft.range(of: edit.before, options: .literal),
+              draft.range(of: edit.before, options: .literal,
+                          range: draft.unicodeScalars.index(after: range.lowerBound)..<draft.endIndex) == nil,
+              let old = parts(draft), let new = parts(draft.replacingCharacters(in: range, with: edit.after)), !new.clocks.isEmpty,
+              new.clocks.count < old.clocks.count else { return false }
+        var index = 0
+        for clock in old.clocks where index < new.clocks.count {
+            if clock == new.clocks[index] { index += 1 }
+        }
+        let oldRemainder = lexicalCharacters(old.remainder)
+        let newRemainder = lexicalCharacters(new.remainder)
+        return index == new.clocks.count && isSubsequence(newRemainder, of: oldRemainder)
+            && technicalContent(in: oldRemainder) == technicalContent(in: newRemainder)
     }
 
     private static func lexicalCharacters(_ text: String) -> [Character] {

@@ -1481,6 +1481,448 @@ class ThreeModeEvidenceTests(unittest.TestCase):
             row["hard_validation_codes"] = ["planIntegrityFailure"]
             self.assertTrue(self.check(report, receipts, mode)[0])
 
+    def v7_report(self, source="甲。乙。", *, mode="standard", initial_edits=(), repair_edits=(), layout=None, review=True):
+        report, receipts = self.v4_report(source, mode=mode, reviews=[{"source_roles": [], "edits": []}])
+        row = report["cases"][0]
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 7
+        _, canonical_segments = e.frozen_input_envelope(self.inputs[0])
+        row["canonical_segments"] = canonical_segments
+        draft = e.apply_recorded_edits(source, json.dumps({"edits": list(initial_edits)}, ensure_ascii=False),
+            editing_prompt_version=7, allows_reviewed_directives=True, allows_reviewed_source_corrections=True)
+        drafts = [source, draft]
+        if repair_edits:
+            draft = e.apply_recorded_edits(draft, json.dumps({"edits": list(repair_edits)}, ensure_ascii=False),
+                editing_prompt_version=7, allows_reviewed_directives=True, allows_reviewed_source_corrections=True, original_source=source)
+            drafts.append(draft)
+            row["stage_responses"].append(copy.deepcopy(row["stage_responses"][-1]))
+            receipts.append(copy.deepcopy(receipts[-1]))
+        if not review:
+            row["stage_responses"] = row["stage_responses"][:1]
+            receipts = receipts[:1]
+        if layout is None:
+            layout = [{"style": "paragraph", "segment_ids": [s["id"] for s in e.v7_structure_segments(draft)]}]
+        for i, stage in enumerate(row["stage_responses"]):
+            payload = json.loads(stage["request_payload"])
+            payload.update(schema_version=7, source_segments=canonical_segments)
+            response = {"edits": list(initial_edits)}
+            if i:
+                current = drafts[i]
+                payload["draft_text"] = current
+                located, offset = [], 0
+                for start, end, inserted in e.actual_modifications(source, current, 0):
+                    current_start = start + offset
+                    located.append((source[start:end], inserted, start, end, current_start, current_start + len(inserted)))
+                    offset += len(inserted) - (end - start)
+                order = [j for j, change in enumerate(located) if e.v6_content_character_count(change[0] + change[1])]
+                order.sort(key=lambda j: (not bool(e.v6_content_character_count(located[j][0])),
+                    -e.v6_content_character_count(located[j][0] + located[j][1]), j))
+                payload.update(self.focus_payload(source, current, located, order))
+                response = {"delivery": "other_or_uncertain", "editor_spans": [],
+                            "edits": list(repair_edits) if i == 1 else []}
+                if mode == "standard":
+                    payload["layout_segments"] = e.v7_structure_segments(current)
+                    response["layout"] = [] if response["edits"] else layout
+            stage.update(attempt_ordinal=i + 1, request_payload=json.dumps(payload, ensure_ascii=False),
+                         response_text=json.dumps(response, ensure_ascii=False))
+            receipts[i].update(request_ordinal=i + 1, provider_response_id=f"unit-test-only-v7-{i + 1}",
+                request_binding_sha256=e.legacy.provider_request_binding_sha256(self.nonce, "fixture-01", i + 1, "e" * 64),
+                response_text_sha256=e.legacy.sha256_text(stage["response_text"]))
+        row.update(repair_attempt_count=1 if repair_edits else 0, llm_call_count=len(receipts), llm_attempt_count=len(receipts),
+                   model_output=e.v7_render_layout(layout, e.v7_structure_segments(draft)) if mode == "standard" else draft)
+        return report, receipts
+
+    def v7_response(self, report, receipts, index, value):
+        raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        report["cases"][0]["stage_responses"][index]["response_text"] = raw
+        receipts[index]["response_text_sha256"] = e.legacy.sha256_text(raw)
+
+    def v7_payload(self, report, index, **changes):
+        stage = report["cases"][0]["stage_responses"][index]
+        payload = json.loads(stage["request_payload"])
+        payload.update(changes)
+        stage["request_payload"] = json.dumps(payload, ensure_ascii=False)
+
+    def test_v7_sentence_segments_preserve_exact_text_and_known_boundaries(self):
+        cases = [
+            ("甲。乙！？丙。  \r\n", ["甲。", "乙！？", "丙。  \r\n"]),
+            ("甲，乙\n丙", ["甲，乙\n丙"]),
+            ("先说“甲。乙”。再做丙。", ["先说“甲。乙”。", "再做丙。"]),
+            ("检查（甲。乙）完成。再走。", ["检查（甲。乙）完成。", "再走。"]),
+            ("Dr. Smith visits api.test. Next sentence. Done!", ["Dr. Smith visits api.test. Next sentence.", " Done!"]),
+            ("Run `echo 甲。乙` now. Done.", ["Run `echo 甲。乙` now.", " Done."]),
+            ("正文。\n```text\n甲。乙\n```\n后续。", ["正文。", "\n```text\n甲。乙\n```\n后续。"]),
+            ("    a。b\n后续。末尾。", ["    a。b\n后续。", "末尾。"]),
+            ("don't split. Next.", ["don't split.", " Next."]),
+            ("e\u0301 与 👨‍👩‍👧‍👦。尾部。", ["e\u0301 与 👨‍👩‍👧‍👦。", "尾部。"]),
+        ]
+        for source, expected_parts in cases:
+            result = e.v7_structure_segments(source)
+            self.assertEqual([s["text"] for s in result], expected_parts, source)
+            self.assertEqual("".join(s["text"] for s in result).encode(), source.encode())
+            self.assertEqual([s["id"] for s in result], [f"c{i + 1}" for i in range(len(expected_parts))])
+
+    def test_v7_segment_cap_keeps_all_remaining_text_without_model_calls(self):
+        source = "甲。" * 130
+        result = e.v7_structure_segments(source)
+        self.assertEqual(len(result), 128)
+        self.assertEqual(result[-1], {"id": "c128", "text": "甲。甲。甲。"})
+        self.assertEqual("".join(s["text"] for s in result), source)
+
+    def test_v7_segments_reject_empty_unsafe_or_oversized_input(self):
+        for source in ["", " \n\t", "甲\x00乙", "甲\u0085乙", "甲\ufdd0乙", "甲" * 349526]:
+            with self.assertRaises(ValueError): e.v7_structure_segments(source)
+
+    def test_v7_layout_reorders_all_ids_preserves_bytes_and_resets_numbering(self):
+        segments = [{"id": f"c{i + 1}", "text": text} for i, text in enumerate(["甲。", " 乙。", "丙。", "丁。", "戊。", "己。"])]
+        layout = [{"style": style, "segment_ids": ids} for style, ids in [
+            ("numbered", ["c2"]), ("numbered", ["c1"]), ("bullet", ["c3"]),
+            ("numbered", ["c4"]), ("paragraph", ["c6", "c5"])]]
+        self.assertEqual(e.v7_render_layout(layout, segments), " 1. 乙。\n\n2. 甲。\n\n- 丙。\n\n1. 丁。\n\n己。戊。")
+
+    def test_v7_layout_rejects_missing_duplicate_unknown_or_free_text(self):
+        segments = e.v7_structure_segments("甲。乙。")
+        for layout in [[], None, {}, [{"style": "paragraph", "segment_ids": ["c1"]}],
+            [{"style": "paragraph", "segment_ids": ["c1", "c1", "c2"]}],
+            [{"style": "paragraph", "segment_ids": ["c1", "c3"]}],
+            [{"style": "paragraph", "segment_ids": ["c1", "c2"], "text": "新正文"}],
+            [{"style": "heading", "segment_ids": ["c1", "c2"]}],
+            [{"style": "paragraph", "segment_ids": ["c1", 2]}],
+            [{"style": "paragraph", "segment_ids": []}]]:
+            with self.subTest(layout=layout), self.assertRaises(ValueError): e.v7_render_layout(layout, segments)
+
+    def test_v7_fenced_code_rejects_added_list_prefix_but_inline_code_can_be_listed(self):
+        for fence in ["```", "~~~~"]:
+            segments = e.v7_structure_segments("  " + fence + "text\r\n内容。\r\n" + fence)
+            for style in ["bullet", "numbered"]:
+                with self.assertRaises(ValueError):
+                    e.v7_render_layout([{"style": style, "segment_ids": ["c1"]}], segments)
+            self.assertEqual(e.v7_render_layout([{"style": "paragraph", "segment_ids": ["c1"]}], segments), "".join(s["text"] for s in segments))
+        self.assertEqual(e.v7_render_layout([{"style": "bullet", "segment_ids": ["c1"]}], e.v7_structure_segments("运行 `swift test`。")), "- 运行 `swift test`。")
+        segments = [{"id": "c1", "text": "正文。"}, {"id": "c2", "text": "```text\n代码\n```"}]
+        for ids in [["c1", "c2"], ["c2", "c1"]]:
+            with self.assertRaises(ValueError): e.v7_render_layout([{"style": "paragraph", "segment_ids": ids}], segments)
+
+    def test_v7_layout_and_render_limits_apply_even_after_valid_segments(self):
+        segments = [{"id": "c1", "text": "a" * 1_048_576}]
+        with self.assertRaises(ValueError): e.v7_render_layout([{"style": "bullet", "segment_ids": ["c1"]}], segments)
+        for segments in [[{"id": "wrong", "text": "甲"}], [{"id": "c1", "text": ""}],
+                         [{"id": "c1", "text": "甲", "secret": "答案"}]]:
+            with self.assertRaises(ValueError): e.v7_render_layout([{"style": "paragraph", "segment_ids": ["c1"]}], segments)
+
+    def test_v7_standard_output_is_layout_render_not_content_draft(self):
+        report, receipts = self.v7_report(layout=[{"style": "bullet", "segment_ids": ["c2", "c1"]}])
+        self.assertEqual(report["cases"][0]["model_output"], "- 乙。甲。")
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+        report["cases"][0]["model_output"] = "甲。乙。"
+        self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v7_initial_cannot_be_free_text_or_content_even_with_source_evidence(self):
+        for response, code in [("甲。乙。", "planIntegrityFailure"),
+            ({"edits": [{"before": "甲。乙。", "after": "乙。", "kind": "content", "evidence": "甲。乙。"}]}, "planIntegrityFailure"),
+            ({"edits": [{"before": "甲", "after": "乙", "kind": "unknown"}]}, "invalidStructuredResponse")]:
+            report, receipts = self.v7_report()
+            row = report["cases"][0]
+            row.update(stage_responses=row["stage_responses"][:1], llm_call_count=1, llm_attempt_count=1,
+                       model_output=self.text, fallback_used=True, failure_reason="validationFailed", hard_validation_codes=[code])
+            receipts = receipts[:1]
+            self.v7_response(report, receipts, 0, response)
+            failures, quality = self.check(report, receipts, "standard")
+            self.assertEqual(failures, [], response); self.assertTrue(quality)
+            row["hard_validation_codes"] = ["emptyOutput"]
+            self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v7_initial_payload_bans_review_and_layout_fields_even_on_failed_request(self):
+        for key, value in [("draft_text", "甲。乙。"), ("changes", []), ("review_focus", []),
+                           ("review_focus_total", 0), ("layout_segments", []), ("layout_segments", None),
+                           ("review_focus", None), ("draft_text", None)]:
+            report, receipts = self.v7_report()
+            self.v7_payload(report, 0, **{key: value})
+            self.assertTrue(self.check(report, receipts, "standard")[0], key)
+            row = report["cases"][0]
+            row.update(stage_responses=row["stage_responses"][:1], fallback_used=True, model_output=self.text,
+                       llm_call_count=0, llm_attempt_count=1, failure_reason="timeout")
+            row["stage_responses"][0].update(status="failed", response_text="", failure_reason="超时")
+            self.assertTrue(self.check(report, [], "standard")[0], key)
+
+    def test_v7_light_keeps_local_mode_and_never_accepts_layout_protocol(self):
+        report, receipts = self.v7_report("今天发。", mode="light", review=False)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.v7_payload(report, 0, layout_segments=[])
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        report, receipts = self.v7_report("帮我整理今天发。", mode="light")
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.v7_payload(report, 1, layout_segments=[{"id": "c1", "text": self.text}])
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        report, receipts = self.v7_report("帮我整理今天发。", mode="light")
+        value = json.loads(report["cases"][0]["stage_responses"][1]["response_text"])
+        value["layout"] = []
+        self.v7_response(report, receipts, 1, value)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v7_standard_review_segments_bind_exact_order_ids_text_and_boundaries(self):
+        mutations = [[{"id": "c1", "text": "甲。乙。"}], [{"id": "c1", "text": "甲。"}],
+            [{"id": "c2", "text": "甲。"}, {"id": "c1", "text": "乙。"}],
+            [{"id": "c1", "text": "甲。"}, {"id": "c2", "text": "丙。"}], None]
+        for segments in mutations:
+            report, receipts = self.v7_report()
+            self.v7_payload(report, 1, layout_segments=segments)
+            self.assertTrue(self.check(report, receipts, "standard")[0], segments)
+
+    def test_v7_failed_review_still_binds_segments_and_focus(self):
+        report, receipts = self.v7_report()
+        row = report["cases"][0]
+        row.update(fallback_used=True, model_output=self.text, llm_call_count=1, failure_reason="timeout")
+        row["stage_responses"][1].update(status="failed", response_text="", failure_reason="超时")
+        self.assertEqual(self.check(report, receipts[:1], "standard")[0], [])
+        self.v7_payload(report, 1, layout_segments=[{"id": "c1", "text": "甲。乙。"}])
+        self.assertTrue(self.check(report, receipts[:1], "standard")[0])
+
+    def test_v7_review_schema_and_bad_layout_use_invalid_structured_response(self):
+        for mutation in ["unknown", "missing", "duplicate", "omitted", "free_text"]:
+            report, receipts = self.v7_report()
+            row = report["cases"][0]
+            value = json.loads(row["stage_responses"][1]["response_text"])
+            if mutation == "unknown": value["summary"] = "新内容"
+            elif mutation == "missing": del value["layout"]
+            elif mutation == "duplicate": value["layout"][0]["segment_ids"] = ["c1", "c1", "c2"]
+            elif mutation == "omitted": value["layout"][0]["segment_ids"] = ["c1"]
+            else: value["layout"][0]["text"] = "新内容"
+            self.v7_response(report, receipts, 1, value)
+            row.update(fallback_used=True, model_output=self.text, failure_reason="validationFailed", hard_validation_codes=["invalidStructuredResponse"])
+            self.assertEqual(self.check(report, receipts, "standard")[0], [], mutation)
+            row["hard_validation_codes"] = ["planIntegrityFailure"]
+            self.assertTrue(self.check(report, receipts, "standard")[0], mutation)
+
+    def test_v7_repair_rebuilds_segments_and_requires_layout_of_actual_new_draft(self):
+        source = "检查小李。不对，改由小赵。原因保留。"
+        edit = {"before": "检查小李。不对，改由小赵。", "after": "检查小赵。", "kind": "correction"}
+        report, receipts = self.v7_report(source, repair_edits=[edit])
+        self.assertEqual(report["cases"][0]["model_output"], "检查小赵。原因保留。")
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+        row = report["cases"][0]
+        old = json.loads(row["stage_responses"][1]["request_payload"])
+        new = json.loads(row["stage_responses"][2]["request_payload"])
+        self.assertEqual(len(old["layout_segments"]), 3)
+        self.assertEqual(len(new["layout_segments"]), 2)
+        for key in ["layout_segments", "draft_text", "changes", "review_focus", "review_focus_total"]:
+            changed = copy.deepcopy(report)
+            self.v7_payload(changed, 2, **{key: old[key]})
+            self.assertTrue(self.check(changed, receipts, "standard")[0], key)
+        final = json.loads(row["stage_responses"][2]["response_text"])
+        final["layout"][0]["segment_ids"] = ["c1", "c2", "c3"]
+        self.v7_response(report, receipts, 2, final)
+        self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v7_pending_repair_cannot_simultaneously_claim_old_layout(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        report, receipts = self.v7_report("按装软件。", repair_edits=[edit])
+        row = report["cases"][0]
+        row.update(stage_responses=row["stage_responses"][:2], llm_call_count=2, llm_attempt_count=2,
+                   repair_attempt_count=0, fallback_used=True, model_output=self.text,
+                   failure_reason="validationFailed", hard_validation_codes=["invalidStructuredResponse"])
+        receipts = receipts[:2]
+        value = json.loads(row["stage_responses"][1]["response_text"])
+        value["layout"] = [{"style": "paragraph", "segment_ids": ["c1"]}]
+        self.v7_response(report, receipts, 1, value)
+        self.assertEqual(self.check(report, receipts, "standard")[0], [])
+        row["repair_attempt_count"] = 1
+        self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v7_failed_local_repair_counts_attempt_and_never_delivers_partial_draft(self):
+        report, receipts = self.v7_report()
+        value = {"delivery": "other_or_uncertain", "editor_spans": [], "layout": [],
+                 "edits": [{"before": self.text, "after": "乙。", "kind": "content", "evidence": self.text}]}
+        self.v7_response(report, receipts, 1, value)
+        row = report["cases"][0]
+        row.update(repair_attempt_count=1, fallback_used=True, model_output=self.text,
+                   failure_reason="validationFailed", hard_validation_codes=["planIntegrityFailure"])
+        failures, quality = self.check(report, receipts, "standard")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+        row["model_output"] = "乙。"
+        self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v7_confirmation_must_be_empty_and_never_start_a_fourth_call(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        for mutation in ["missing", "nonempty", "fourth"]:
+            report, receipts = self.v7_report("按装软件。", repair_edits=[edit])
+            row = report["cases"][0]
+            if mutation == "missing":
+                row["stage_responses"].pop(); receipts.pop(); row.update(llm_call_count=2, llm_attempt_count=2)
+            elif mutation == "nonempty":
+                self.v7_response(report, receipts, 2, {"delivery": "other_or_uncertain", "editor_spans": [], "layout": [],
+                    "edits": [{"before": "软件", "after": "应用", "kind": "word"}]})
+            else:
+                row["stage_responses"].append(copy.deepcopy(row["stage_responses"][-1])); row["llm_attempt_count"] = 4
+            self.assertTrue(self.check(report, receipts, "standard")[0], mutation)
+
+    def test_v7_permission_budget_changes_do_not_rewrite_v6_history(self):
+        before = "不对" + "甲" * 31 + "乙"
+        response = json.dumps({"edits": [{"before": before, "after": "乙", "kind": "correction"}]})
+        self.assertEqual(e.apply_recorded_edits(before, response, editing_prompt_version=6), "乙")
+        with self.assertRaises(ValueError): e.apply_recorded_edits(before, response, editing_prompt_version=7)
+        before = "不对" + "甲" * 30 + "乙"
+        response = json.dumps({"edits": [{"before": before, "after": "乙", "kind": "correction"}]})
+        self.assertEqual(e.apply_recorded_edits(before, response, editing_prompt_version=7), "乙")
+
+    def test_v7_correction_multiple_blocks_use_total_scalar_budget_and_technical_guard(self):
+        for before, after, valid in [("不对" + "甲" * 14 + "乙" + "丙" * 16 + "丁", "乙丁", True),
+            ("不对" + "甲" * 14 + "乙" + "丙" * 17 + "丁", "乙丁", False),
+            ("周三上午十点不对周四上午十点哎十点半才对", "周四上午十点半", True),
+            ("不对foo_bar，保留正文", "保留正文", False),
+            ("不对" + "\u1100\u1161" * 16 + "结果", "结果", False)]:
+            response = json.dumps({"edits": [{"before": before, "after": after, "kind": "correction"}]})
+            if valid: self.assertEqual(e.apply_recorded_edits(before, response, editing_prompt_version=7), after)
+            else:
+                with self.assertRaises(ValueError): e.apply_recorded_edits(before, response, editing_prompt_version=7)
+
+    def test_v7_distant_correction_keeps_explicit_permission_and_source_evidence(self):
+        edit = {"before": "阿文负责", "after": "阿宁负责", "kind": "correction", "evidence": "改由阿宁负责"}
+        response = json.dumps({"edits": [edit]})
+        source = "阿文负责。改由阿宁负责。"
+        with self.assertRaises(ValueError): e.apply_recorded_edits(source, response, editing_prompt_version=7)
+        self.assertEqual(e.apply_recorded_edits(source, response, editing_prompt_version=7, allows_reviewed_source_corrections=True), "阿宁负责。改由阿宁负责。")
+        with self.assertRaises(ValueError): e.apply_recorded_edits("阿文负责。", response, editing_prompt_version=7, allows_reviewed_source_corrections=True)
+
+    def test_v7_complete_ascii_clock_correction_keeps_exact_final_values(self):
+        for before, after in [("会议10:30，不对，10:45开始。", "会议10:45开始。"),
+            ("会议9:05，不对，09:15开始。", "会议09:15开始。"),
+            ("会议9:05不对9:15不对9:25开始。", "会议9:25开始。"),
+            ("第一场10:30，不对，10:45，第二场12:00。", "第一场10:45，第二场12:00。")]:
+            response = json.dumps({"edits": [{"before": before, "after": after, "kind": "correction"}]})
+            self.assertEqual(e.apply_recorded_edits(before, response, editing_prompt_version=7), after)
+
+    def test_v7_clock_exception_rejects_invented_time_removed_colons_and_all_clocks(self):
+        before = "会议10:30，不对，10:45开始，后续12:00继续。"
+        for after in ["会议10:55开始，后续12:00继续。", "会议1045开始，后续12:00继续。",
+                      "会议开始，后续继续。", "会议10:45开始，后续1200继续。"]:
+            with self.assertRaises(ValueError): e.apply_recorded_edits(before, json.dumps({"edits": [
+                {"before": before, "after": after, "kind": "correction"}]}), editing_prompt_version=7)
+        before = "会议10:30" + "甲" * 32 + "不对10:45开始。"
+        with self.assertRaises(ValueError): e.apply_recorded_edits(before, json.dumps({"edits": [
+            {"before": before, "after": "会议10:45开始。", "kind": "correction"}]}), editing_prompt_version=7)
+
+    def test_v7_clock_exception_uses_real_anchor_neighbors_and_complete_tokens(self):
+        anchor = "10:30不对10:45"
+        for prefix in ["host:", "foo", "λ", "/tmp/", "`", "_", "110", "["]:
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                e.apply_recorded_edits(prefix + anchor, json.dumps({"edits": [
+                    {"before": anchor, "after": "10:45", "kind": "correction"}]}), editing_prompt_version=7)
+        for before in ["10:30.log不对10:45", "10:30:90不对10:45", "25:30不对10:45", "10:65不对10:45", "10:30\u0301不对10:45"]:
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                e.apply_recorded_edits(before, json.dumps({"edits": [
+                    {"before": before, "after": "10:45", "kind": "correction"}]}), editing_prompt_version=7)
+
+    def test_v7_clock_exception_cannot_remove_other_technical_content_or_authorize_distant_edit(self):
+        before = "运行A+B，会议10:30不对10:45开始。"
+        with self.assertRaises(ValueError): e.apply_recorded_edits(before, json.dumps({"edits": [
+            {"before": before, "after": "运行AB，会议10:45开始。", "kind": "correction"}]}), editing_prompt_version=7)
+        before, evidence = "安排10:30和10:45开始。", "改成10:45开始"
+        with self.assertRaises(ValueError): e.apply_recorded_edits(before, json.dumps({"edits": [
+            {"before": before, "after": "安排10:45开始。", "kind": "correction", "evidence": evidence}]}),
+            editing_prompt_version=7, original_source=before + evidence, allows_reviewed_source_corrections=True)
+
+    def test_v7_indented_code_requires_standalone_paragraph(self):
+        for text in ["    print('hello')", "\tprint('hello')", "  \tprint('hello')", "前文\n    代码"]:
+            segments = [{"id": "c1", "text": text}, {"id": "c2", "text": "后续"}]
+            for layout in [[{"style": "bullet", "segment_ids": ["c1"]}, {"style": "paragraph", "segment_ids": ["c2"]}],
+                           [{"style": "paragraph", "segment_ids": ["c1", "c2"]}]]:
+                with self.assertRaises(ValueError): e.v7_render_layout(layout, segments)
+            layout = [{"style": "paragraph", "segment_ids": ["c1"]}, {"style": "paragraph", "segment_ids": ["c2"]}]
+            self.assertEqual(e.v7_render_layout(layout, segments), text + "\n\n后续")
+
+    def test_v7_markers_follow_preserved_leading_whitespace_instead_of_occupying_empty_line(self):
+        segments = [{"id": "c1", "text": "甲。"}, {"id": "c2", "text": "\n\n  乙。"}]
+        for style, expected in [("numbered", "1. 甲。\n\n  2. 乙。"), ("bullet", "- 甲。\n\n  - 乙。")]:
+            layout = [{"style": style, "segment_ids": ["c1"]}, {"style": style, "segment_ids": ["c2"]}]
+            self.assertEqual(e.v7_render_layout(layout, segments), expected)
+
+    def test_v7_paragraph_separator_counts_actual_combined_characters_and_preserves_original_bytes(self):
+        for previous, following, expected in [
+            ("甲", "乙", "甲\n\n乙"), ("甲\n", "乙", "甲\n\n乙"),
+            ("甲\n\n", "乙", "甲\n\n乙"), ("甲", "\n\n乙", "甲\n\n乙"),
+            ("甲\r", "\n乙", "甲\r\n\n乙"), ("甲\r ", " \n乙", "甲\r  \n乙"),
+            ("甲\r\n", "\r\n乙", "甲\r\n\r\n乙"), ("甲\n\n\n", "乙", "甲\n\n\n乙"),
+            ("甲 \n", " \n乙", "甲 \n \n乙"), ("甲\u2028", "\u2029乙", "甲\u2028\u2029乙")]:
+            segments = [{"id": "c1", "text": previous}, {"id": "c2", "text": following}]
+            layout = [{"style": "paragraph", "segment_ids": ["c1"]}, {"style": "paragraph", "segment_ids": ["c2"]}]
+            self.assertEqual(e.v7_render_layout(layout, segments).encode(), expected.encode(), (previous, following))
+
+    def test_v7_direct_requires_integer_zero_repairs_and_zero_model_activity(self):
+        self.expected["editing_prompt_version"] = 7
+        report, receipts = self.report("direct")
+        report["cases"][0]["repair_attempt_count"] = 0
+        self.assertEqual(self.check(report, receipts, "direct"), ([], []))
+        report["cases"][0]["repair_attempt_count"] = False
+        self.assertTrue(self.check(report, receipts, "direct")[0])
+
+    def test_v7_every_recorded_payload_rejects_unfrozen_extra_answer_fields(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        for mode in ["light", "standard"]:
+            for index in range(3):
+                report, receipts = self.v7_report("帮我整理按装软件。", mode=mode, repair_edits=[edit])
+                self.assertEqual(self.check(report, receipts, mode), ([], []))
+                self.v7_payload(report, index, unfrozen_reference_answer="来源没有说：预算五万元。")
+                self.assertTrue(self.check(report, receipts, mode)[0], (mode, index))
+
+    def test_v7_failed_payloads_reject_unknown_fields_without_hiding_existing_failure(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        for mode in ["light", "standard"]:
+            for index in range(3):
+                report, receipts = self.v7_report("帮我整理按装软件。", mode=mode, repair_edits=[edit])
+                row = report["cases"][0]
+                row.update(stage_responses=row["stage_responses"][:index + 1], llm_call_count=index,
+                    llm_attempt_count=index + 1, repair_attempt_count=int(index == 2), fallback_used=True,
+                    model_output=self.text, failure_reason="timeout")
+                row["stage_responses"][index].update(status="failed", response_text="", failure_reason="超时")
+                receipts = receipts[:index]
+                failures, quality = self.check(report, receipts, mode)
+                self.assertEqual(failures, [], (mode, index)); self.assertTrue(quality)
+                self.v7_payload(report, index, unfrozen_reference_answer={"budget": "五万元"})
+                self.assertTrue(self.check(report, receipts, mode)[0], (mode, index))
+
+    def test_v7_payload_requires_all_nonoptional_keys_and_omits_nil_preferences(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        for mode in ["light", "standard"]:
+            for index in range(3):
+                report, receipts = self.v7_report("帮我整理按装软件。", mode=mode, repair_edits=[edit])
+                payload = json.loads(report["cases"][0]["stage_responses"][index]["request_payload"])
+                for key in payload:
+                    changed = copy.deepcopy(report)
+                    missing = {k: v for k, v in payload.items() if k != key}
+                    changed["cases"][0]["stage_responses"][index]["request_payload"] = json.dumps(missing)
+                    self.assertTrue(self.check(changed, receipts, mode)[0], (mode, index, key))
+                self.v7_payload(report, index, style_profile=None)
+                self.assertTrue(self.check(report, receipts, mode)[0], (mode, index, "nil style_profile must be omitted"))
+
+    def test_v7_validation_codes_only_exist_in_standard_initial_draft_review(self):
+        edit = {"before": "按装", "after": "安装", "kind": "word"}
+        for mode in ["light", "standard"]:
+            for index in range(3):
+                if mode == "standard" and index == 1: continue
+                for value in [["missingProtectedFact"], [], None]:
+                    report, receipts = self.v7_report("帮我整理按装软件。", mode=mode, repair_edits=[edit])
+                    self.v7_payload(report, index, validation_codes=value)
+                    self.assertTrue(self.check(report, receipts, mode)[0], (mode, index, value))
+
+    def test_v7_validation_codes_reject_free_text_nonemitted_enum_empty_duplicates_and_wrong_order(self):
+        for value in [["来源没有说的事实：预算五万元。"], ["layoutRequirementUnmet"], ["unchangedDraft"],
+            ["invalidStructuredResponse"], [], None, "missingProtectedFact", [True], [["missingProtectedFact"]],
+            ["missingProtectedFact", "missingProtectedFact"], ["missingProtectedFact", "planIntegrityFailure"]]:
+            report, receipts = self.v7_report()
+            self.v7_payload(report, 1, validation_codes=value)
+            self.assertTrue(self.check(report, receipts, "standard")[0], value)
+        # 确实删掉受保护的双词强调时，contentCodes 会在首次标准复核附带此提示。
+        report, receipts = self.v7_report("确实确实好。",
+            initial_edits=[{"before": "确实确实", "after": "确实", "kind": "stutter"}],
+            repair_edits=[{"before": "确实好", "after": "确实确实好", "kind": "word"}])
+        self.v7_payload(report, 1, validation_codes=["missingProtectedFact"])
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+
+    def test_v7_payload_closure_does_not_reinterpret_v6_historical_contract(self):
+        report, receipts = self.repaired_v6_report("standard")
+        self.v7_payload(report, 0, unfrozen_reference_answer="历史审计未检查该字段")
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+
     def test_input_limit_checks_both_sources_and_rejects_answers(self):
         for source_length, segment_length, valid in [(1000, 1000, True), (1001, 1, False), (1, 1001, False)]:
             inputs = copy.deepcopy(self.inputs)

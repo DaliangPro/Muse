@@ -36,10 +36,11 @@ extension ProcessingMode {
     }
 
     func applyingFinalInsertionCleanup(to result: String) -> String {
-        var cleaned = result.strippingThinkTags()
         if kind == .voicePolish {
-            return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            // 润色管线已验证并拼装实际正文；二次清洗会删掉来源中的标签和代码缩进。
+            return result
         }
+        var cleaned = result.strippingThinkTags()
         if !isPromptOptimizeMode {
             cleaned = Self.stripLikelyPromptLeakage(from: cleaned)
         }

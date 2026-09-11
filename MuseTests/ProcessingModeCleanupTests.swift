@@ -149,6 +149,13 @@ final class ProcessingModeCleanupTests: XCTestCase {
         XCTAssertEqual(finalized, polished)
     }
 
+    func testVoicePolishFinalizationPreservesSourceTagsAndBoundaryWhitespace() {
+        let text = "    请保留字面标签 <think>这也是正文</think>。\r\n    command --flag\n"
+        for mode in [ProcessingMode.lightPolish, .formalWriting] {
+            XCTAssertEqual(RecognitionSession.finalizeInsertionText(text, mode: mode, isLLMOutput: true), text)
+        }
+    }
+
     func testPromptOptimizerKeepsGeneratedPromptHeadings() {
         let generated = """
         # 角色

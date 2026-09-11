@@ -18,12 +18,18 @@ struct VoicePolishEditingReview: Sendable {
     let delivery: Delivery
     let editorSpans: [String]
     let edits: [VoicePolishTextEdit]
+    let layout: [VoicePolishStructurePlan.Block]?
 
-    static func decode(_ raw: String, source: String) throws -> Self {
+    static func decode(
+        _ raw: String, source: String,
+        structureSegments: [VoicePolishStructurePlan.Segment]? = nil
+    ) throws -> Self {
+        let expectedKeys: Set<String> = structureSegments == nil
+            ? ["delivery", "editor_spans", "edits"] : ["delivery", "editor_spans", "edits", "layout"]
         guard raw.utf8.count <= VoicePolishOutputNormalizer.maximumResponseBytes,
               let data = raw.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              Set(object.keys) == ["delivery", "editor_spans", "edits"],
+              Set(object.keys) == expectedKeys,
               let rawDelivery = object["delivery"] as? String,
               let delivery = Delivery(rawValue: rawDelivery),
               let spans = object["editor_spans"] as? [String], spans.count <= 64 else {
@@ -42,8 +48,21 @@ struct VoicePolishEditingReview: Sendable {
         }
         let editData = try JSONSerialization.data(withJSONObject: ["edits": object["edits"] as Any])
         do {
-            return Self(delivery: delivery, editorSpans: spans,
-                        edits: try VoicePolishTextEditor.decode(String(decoding: editData, as: UTF8.self)))
+            let edits = try VoicePolishTextEditor.decode(String(decoding: editData, as: UTF8.self))
+            var layout: [VoicePolishStructurePlan.Block]?
+            if let structureSegments {
+                if edits.isEmpty {
+                    layout = try VoicePolishStructurePlan.decodeLayout(
+                        from: object["layout"] as Any, segments: structureSegments
+                    )
+                } else {
+                    // 内容修复改变片段边界，旧稿布局不能沿用到修复稿。
+                    guard let pending = object["layout"] as? [Any], pending.isEmpty else {
+                        throw VoicePolishEditingReviewError.invalidResponse
+                    }
+                }
+            }
+            return Self(delivery: delivery, editorSpans: spans, edits: edits, layout: layout)
         } catch {
             throw VoicePolishEditingReviewError.invalidResponse
         }

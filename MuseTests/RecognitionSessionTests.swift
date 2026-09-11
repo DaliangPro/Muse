@@ -886,7 +886,7 @@ final class RecognitionSessionTests: XCTestCase {
             }
         )
         await session.setOnASREvent { recorder.record($0) }
-        let raw = "这是需要润色的原始口述。"
+        let raw = "这是已经提交的润色结杲。"
         let transcript = RecognitionTranscript(
             confirmedSegments: [raw],
             partialText: "",
@@ -942,13 +942,9 @@ final class RecognitionSessionTests: XCTestCase {
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
         let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
-        let wrong = source.replacingOccurrences(
-            of: "邮件里不要承诺周五对外发布",
-            with: "邮件里说明周五一定不会对外发布"
-        )
-        // 复核给出无法定位的补丁，程序必须拒绝，不能把未经确认的初稿交付。
-        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
-        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [wrong, invalidReview])
+        // 复核给出无法定位的局部补丁，必须等待用户选择，不能静默交付原稿。
+        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"word"}],"layout":[]}"#
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [#"{"edits":[]}"#, invalidReview])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
             historyStore: HistoryStore(path: ":memory:"),
@@ -1022,14 +1018,12 @@ final class RecognitionSessionTests: XCTestCase {
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
         let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
-        let wrong = source.replacingOccurrences(
-            of: "邮件里不要承诺周五对外发布",
-            with: "邮件里说明周五一定不会对外发布"
-        )
         let polished = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。\n\n邮件里不要承诺周五对外发布。"
-        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
+        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"word"}],"layout":[]}"#
+        let punctuation = #"{"edits":[{"before":"内部试看，先让","after":"内部试看。先让","kind":"punctuation"},{"before":"再发邮件，邮件里","after":"再发邮件。邮件里","kind":"punctuation"}]}"#
+        let approved = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1","c2"]},{"style":"paragraph","segment_ids":["c3"]}]}"#
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            wrong, invalidReview, polished, #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#,
+            #"{"edits":[]}"#, invalidReview, punctuation, approved,
         ])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1427,7 +1421,16 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
             if request.task == .voicePolishAnalyze,
                ["light", "standard"].contains(payload["mode"] as? String ?? "") {
-                return LLMResponse(text: #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#, model: config.model)
+                var review: [String: Any] = ["delivery": "other_or_uncertain", "editor_spans": [], "edits": []]
+                if let segments = payload["layout_segments"] as? [[String: String]] {
+                    review["layout"] = [["style": "paragraph", "segment_ids": segments.compactMap { $0["id"] }]]
+                }
+                return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: review), as: UTF8.self), model: config.model)
+            }
+            if payload["mode"] as? String == "standard", request.task == .voicePolishRender,
+               let source = payload["canonical_text"] as? String {
+                let edits: [[String: String]] = source == response ? [] : [["before": source, "after": response, "kind": "word"]]
+                return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: ["edits": edits]), as: UTF8.self), model: config.model)
             }
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase
