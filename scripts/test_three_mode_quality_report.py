@@ -1234,6 +1234,253 @@ class ThreeModeEvidenceTests(unittest.TestCase):
             row["repair_attempt_count"] = value
             self.assertTrue(self.check(report, receipts, "direct")[0])
 
+    def focus_payload(self, source, draft, located, order):
+        """测试作者给定变化、范围与优先顺序；不调用被测排序或另做 diff。"""
+        old, new = e.composed_characters(source), e.composed_characters(draft)
+        focus = []
+        for index in order:
+            _, _, a, b, c, d = located[index]
+            focus.append({"change_index": index, "source_start": a, "source_end": b,
+                          "draft_start": c, "draft_end": d,
+                          "source_context": "".join(old[max(0, a - 20):b + 20]),
+                          "draft_context": "".join(new[max(0, c - 20):d + 20])})
+        return {"changes": [{"removed": row[0], "inserted": row[1]} for row in located],
+                "review_focus": focus, "review_focus_total": len(order)}
+
+    def repaired_v6_report(self, mode="light"):
+        report, receipts = self.repaired_v4_report(mode)
+        self.upgrade_report_to_v5(report, receipts)
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 6
+        for index, stage in enumerate(report["cases"][0]["stage_responses"]):
+            payload = json.loads(stage["request_payload"])
+            payload["schema_version"] = 6
+            if index:
+                located = [] if index == 1 else [("帮我整理一下", "", 0, 6, 0, 0)]
+                payload.update(self.focus_payload(self.text, payload["draft_text"], located, [] if index == 1 else [0]))
+            stage["request_payload"] = json.dumps(payload, ensure_ascii=False)
+        return report, receipts
+
+    def test_v6_unicode_whitespace_and_ascii_technical_symbols_stay_distinct(self):
+        # 2026-09-11 root 实际 Swift Character probe：首标量为空白的组合字仍为空白。
+        self.assertEqual(e.v6_content_character_count(" \u0301\r\n\u0085\u00a0\u2028\u2000，。！？；：、"), 0)
+        for text in ["\u001c", "\u001d", "\u001e", "\u001f", "\u200b", ".", ":", "/", "+", "=", "!", "😀", "e\u0301"]:
+            self.assertEqual(e.v6_content_character_count(text), 1, repr(text))
+
+    def test_v6_focus_prioritizes_substantive_removal_then_size_then_original_index(self):
+        source, draft = "aKbbLcccM", "KXXXLYYM非常长新增"
+        located = [("a", "", 0, 1, 0, 0), ("bb", "XXX", 2, 4, 1, 4),
+                   ("ccc", "YY", 5, 8, 5, 7), ("", "非常长新增", 9, 9, 8, 13)]
+        payload = self.focus_payload(source, draft, located, [1, 2, 0, 3])
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        for order in [[2, 1, 0, 3], [3, 1, 2, 0], [0, 1, 2, 3]]:
+            bad = self.focus_payload(source, draft, located, order)
+            self.assertFalse(e.complete_v6_review_focus(source, draft, bad), order)
+
+    def test_v6_chinese_layout_changes_excluded_but_ascii_and_emoji_removals_kept(self):
+        source, draft = "甲，乙:丙/丁😀戊", "甲乙丙丁戊"
+        located = [("，", "", 1, 2, 1, 1), (":", "", 3, 4, 2, 2),
+                   ("/", "", 5, 6, 3, 3), ("😀", "", 7, 8, 4, 4)]
+        payload = self.focus_payload(source, draft, located, [1, 2, 3])
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        for order in [[0, 1, 2, 3], [1, 2], []]:
+            self.assertFalse(e.complete_v6_review_focus(source, draft, self.focus_payload(source, draft, located, order)))
+
+    def test_v6_same_text_has_empty_focus_but_requires_explicit_array_and_zero(self):
+        payload = self.focus_payload("原文", "原文", [], [])
+        self.assertTrue(e.complete_v6_review_focus("原文", "原文", payload))
+        for field in ["changes", "review_focus", "review_focus_total"]:
+            bad = dict(payload); del bad[field]
+            self.assertFalse(e.complete_v6_review_focus("原文", "原文", bad), field)
+            bad[field] = None
+            self.assertFalse(e.complete_v6_review_focus("原文", "原文", bad), field)
+        for total in [True, False, 0.0, "0", -1, 1]:
+            self.assertFalse(e.complete_v6_review_focus("原文", "原文", {**payload, "review_focus_total": total}))
+
+    def test_v6_focus_is_not_permission_to_omit_unfocused_layout_changes(self):
+        source, draft = "甲 乙", "甲乙，"
+        located = [(" ", "", 1, 2, 1, 1), ("", "，", 3, 3, 2, 3)]
+        payload = self.focus_payload(source, draft, located, [])
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        for changes in [[], payload["changes"][:1], list(reversed(payload["changes"]))]:
+            self.assertFalse(e.complete_v6_review_focus(source, draft, {**payload, "changes": changes}))
+
+    def test_v6_many_ambiguous_unfocused_blocks_still_explain_whole_tail(self):
+        payload = {"changes": [{"removed": " ", "inserted": ""}] * 200,
+                   "review_focus": [], "review_focus_total": 0}
+        self.assertTrue(e.complete_v6_review_focus(" " * 400, " " * 200, payload))
+        self.assertFalse(e.complete_v6_review_focus(" " * 400 + "甲", " " * 200, payload))
+
+    def test_v6_repeated_text_accepts_valid_tie_positions_but_not_mixed_paths(self):
+        source, draft = "甲甲甲", "甲"
+        left = self.focus_payload(source, draft, [("甲", "", 0, 1, 0, 0), ("甲", "", 1, 2, 0, 0)], [0, 1])
+        right = self.focus_payload(source, draft, [("甲", "", 1, 2, 1, 1), ("甲", "", 2, 3, 1, 1)], [0, 1])
+        self.assertTrue(e.complete_v6_review_focus(source, draft, left))
+        self.assertTrue(e.complete_v6_review_focus(source, draft, right))
+        # 两个引用分别来自可成立的整条路径；组合后顺序、稿件落点不能共同成立。
+        mixed = copy.deepcopy(left); mixed["review_focus"][0] = right["review_focus"][0]
+        self.assertFalse(e.complete_v6_review_focus(source, draft, mixed))
+        duplicate = copy.deepcopy(left); duplicate["review_focus"][1].update(source_start=0, source_end=1)
+        self.assertFalse(e.complete_v6_review_focus(source, draft, duplicate))
+
+    def test_v6_repeated_sentence_cannot_bind_another_occurrence_with_wrong_draft_position(self):
+        source, draft = "甲请保留。乙请保留。丙", "甲请保留。乙丙"
+        payload = self.focus_payload(source, draft, [("请保留。", "", 6, 10, 6, 6)], [0])
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        wrong = copy.deepcopy(payload); wrong["review_focus"][0].update(source_start=1, source_end=5)
+        self.assertFalse(e.complete_v6_review_focus(source, draft, wrong))
+
+    def test_v6_ranges_use_characters_and_context_keeps_exact_source_bytes(self):
+        source, draft = "e\u0301👍🏽\r\n甲乙", "é👍🏽\r\n乙"
+        payload = self.focus_payload(source, draft, [("甲", "", 3, 4, 3, 3)], [0])
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        self.assertEqual(payload["review_focus"][0]["source_context"], source)
+        for values in [{"source_start": 5, "source_end": 6}, {"draft_start": 4, "draft_end": 4},
+                       {"source_context": source.replace("e\u0301", "é")}, {"draft_context": source}]:
+            bad = copy.deepcopy(payload); bad["review_focus"][0].update(values)
+            self.assertFalse(e.complete_v6_review_focus(source, draft, bad), values)
+        equivalent = self.focus_payload("e\u0301甲", "甲", [("é", "", 0, 1, 0, 0)], [0])
+        self.assertTrue(e.complete_v6_review_focus("e\u0301甲", "甲", equivalent))
+
+    def test_v6_context_has_whole_changed_span_and_exact_twenty_character_sides(self):
+        removed = "应完整保留差异正文" * 8
+        source, draft = "甲" * 25 + removed + "乙" * 25, "甲" * 25 + "乙" * 25
+        payload = self.focus_payload(source, draft, [(removed, "", 25, 25 + len(removed), 25, 25)], [0])
+        item = payload["review_focus"][0]
+        self.assertEqual(item["source_context"], "甲" * 20 + removed + "乙" * 20)
+        self.assertEqual(item["draft_context"], "甲" * 20 + "乙" * 20)
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        for key in ["source_context", "draft_context"]:
+            for value in [item[key][1:], "甲" + item[key], "只保留解释", None, 1]:
+                bad = copy.deepcopy(payload); bad["review_focus"][0][key] = value
+                self.assertFalse(e.complete_v6_review_focus(source, draft, bad), (key, value))
+
+    def test_v6_focus_range_fields_reject_wrong_types_reversed_ranges_and_extra_keys(self):
+        source, draft = "甲乙", "乙"
+        payload = self.focus_payload(source, draft, [("甲", "", 0, 1, 0, 0)], [0])
+        for key in ["change_index", "source_start", "source_end", "draft_start", "draft_end"]:
+            for value in [False, True, 0.0, "0", None, -1, 3]:
+                bad = copy.deepcopy(payload); bad["review_focus"][0][key] = value
+                self.assertFalse(e.complete_v6_review_focus(source, draft, bad), (key, value))
+        for item in [None, [], {}, {**payload["review_focus"][0], "role": "current_editor"}]:
+            self.assertFalse(e.complete_v6_review_focus(source, draft, {**payload, "review_focus": [item]}))
+
+    def test_v6_cap_preserves_total_ranking_and_all_unselected_changes(self):
+        source, draft, located = "", "", []
+        for i in range(17):
+            located.append(("甲", "乙", len(source), len(source) + 1, len(draft), len(draft) + 1))
+            source += "甲" + chr(0x4E10 + i); draft += "乙" + chr(0x4E10 + i)
+        payload = self.focus_payload(source, draft, located, list(range(16)))
+        payload["review_focus_total"] = 17
+        self.assertTrue(e.complete_v6_review_focus(source, draft, payload))
+        for mutation in ["total", "missing_focus", "seventeenth", "missing_change", "swap_last"]:
+            bad = copy.deepcopy(payload)
+            if mutation == "total": bad["review_focus_total"] = 16
+            elif mutation == "missing_focus": bad["review_focus"].pop()
+            elif mutation == "seventeenth": bad["review_focus"] = self.focus_payload(source, draft, located, list(range(17)))["review_focus"]
+            elif mutation == "missing_change": bad["changes"].pop()
+            else: bad["review_focus"][-1] = self.focus_payload(source, draft, located, [16])["review_focus"][0]
+            self.assertFalse(e.complete_v6_review_focus(source, draft, bad), mutation)
+
+    def test_v6_full_changes_keep_original_schema_order_and_nonempty_difference(self):
+        payload = self.focus_payload("甲乙", "乙", [("甲", "", 0, 1, 0, 0)], [0])
+        for changes in [None, {}, [None], [{"removed": "甲"}], [{"removed": 1, "inserted": ""}],
+                        [{"removed": "甲", "inserted": "", "source_start": 0}], [{"removed": "", "inserted": ""}]]:
+            self.assertFalse(e.complete_v6_review_focus("甲乙", "乙", {**payload, "changes": changes}))
+
+    def test_v6_each_mode_keeps_original_stage_budget_and_v5_response_schema(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.repaired_v6_report(mode)
+            self.assertEqual(self.check(report, receipts, mode), ([], []), mode)
+            row = report["cases"][0]
+            self.assertEqual((row["repair_attempt_count"], row["llm_attempt_count"]), (1, 3))
+            self.assertTrue(self.check(report, receipts[:2], mode)[0])
+            stage = row["stage_responses"][2]
+            stage["response_text"] = '{"delivery":"direct_reply","editor_spans":[],"edits":[],"review_focus":[]}'
+            receipts[2]["response_text_sha256"] = e.legacy.sha256_text(stage["response_text"])
+            self.assertTrue(self.check(report, receipts, mode)[0])
+        report, receipts = self.report("direct")
+        report["cases"][0]["repair_attempt_count"] = 0
+        self.assertEqual(self.check(report, receipts, "direct"), ([], []))
+
+    def test_v6_initial_focus_fields_must_be_absent_or_null_even_when_request_fails(self):
+        report, receipts = self.repaired_v6_report()
+        for key in ["review_focus", "review_focus_total"]:
+            for value in [[], 0, {}, False]:
+                changed = copy.deepcopy(report); stage = changed["cases"][0]["stage_responses"][0]
+                payload = json.loads(stage["request_payload"]); payload[key] = value
+                stage["request_payload"] = json.dumps(payload)
+                self.assertTrue(self.check(changed, receipts, "light")[0])
+        stage = report["cases"][0]["stage_responses"][0]
+        payload = json.loads(stage["request_payload"]); payload.update(review_focus=None, review_focus_total=None)
+        stage["request_payload"] = json.dumps(payload)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        row = report["cases"][0]; row.update(stage_responses=[stage], fallback_used=True, model_output=self.text,
+                                           llm_call_count=0, llm_attempt_count=1, repair_attempt_count=0, failure_reason="timeout")
+        stage.update(status="failed", response_text="", failure_reason="请求超时")
+        payload.update(review_focus=[], review_focus_total=0); stage["request_payload"] = json.dumps(payload)
+        self.assertTrue(self.check(report, [], "light")[0])
+
+    def test_v6_confirmation_recomputes_focus_from_original_and_actual_repaired_draft(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.repaired_v6_report(mode)
+            original = json.loads(report["cases"][0]["stage_responses"][1]["request_payload"])
+            for mutation in ["old_focus", "canonical", "draft", "segments", "changes"]:
+                changed = copy.deepcopy(report); stage = changed["cases"][0]["stage_responses"][2]
+                payload = json.loads(stage["request_payload"])
+                if mutation == "old_focus": payload.update(review_focus=original["review_focus"], review_focus_total=original["review_focus_total"])
+                elif mutation == "canonical": payload["canonical_text"] = "别的原文"
+                elif mutation == "draft": payload["draft_text"] = self.text
+                elif mutation == "segments": payload["source_segments"] = [{"id": "s1", "text": "改过的分段"}]
+                else: payload["changes"] = []
+                stage["request_payload"] = json.dumps(payload)
+                self.assertTrue(self.check(changed, receipts, mode)[0], (mode, mutation))
+            row = report["cases"][0]; row.update(fallback_used=True, model_output=self.text, llm_call_count=2, failure_reason="timeout")
+            stage = row["stage_responses"][2]; stage.update(status="failed", response_text="", failure_reason="请求超时")
+            self.assertEqual(self.check(report, receipts[:2], mode)[0], [])
+            payload = json.loads(stage["request_payload"]); payload["review_focus"] = []
+            stage["request_payload"] = json.dumps(payload)
+            self.assertTrue(self.check(report, receipts[:2], mode)[0])
+
+    def test_v6_focus_does_not_change_source_risk_or_grant_technical_token_deletion(self):
+        report, receipts = self.v4_report("帮我整理一下明天发材料。")
+        self.upgrade_report_to_v5(report, receipts)
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 6
+        stage = report["cases"][0]["stage_responses"][0]
+        payload = json.loads(stage["request_payload"]); payload["schema_version"] = 6
+        stage["request_payload"] = json.dumps(payload)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        with self.assertRaises(ValueError):
+            e.apply_recorded_edits("运行swift test", '{"edits":[{"before":" ","after":"","kind":"punctuation"}]}', editing_prompt_version=6)
+
+    def test_v6_keeps_single_mechanical_call_and_two_call_standard_without_repair(self):
+        for mode in ["light", "standard"]:
+            source = "嗯我今天到"
+            report, receipts = self.v4_report(source, mode=mode,
+                initial_edits=[{"before": source, "after": "我今天到。", "kind": "punctuation"}],
+                reviews=[] if mode == "light" else [{"source_roles": [], "edits": []}])
+            self.upgrade_report_to_v5(report, receipts)
+            self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 6
+            for index, stage in enumerate(report["cases"][0]["stage_responses"]):
+                payload = json.loads(stage["request_payload"]); payload["schema_version"] = 6
+                if index: payload.update(review_focus=[], review_focus_total=0)
+                stage["request_payload"] = json.dumps(payload)
+            self.assertEqual(self.check(report, receipts, mode), ([], []), mode)
+            self.assertEqual(report["cases"][0]["llm_attempt_count"], 1 if mode == "light" else 2)
+
+    def test_v6_invalid_review_keeps_v5_fallback_classification(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.repaired_v6_report(mode)
+            row = report["cases"][0]
+            row.update(stage_responses=row["stage_responses"][:2], fallback_used=True, model_output=self.text,
+                       llm_call_count=2, llm_attempt_count=2, repair_attempt_count=0,
+                       hard_validation_codes=["invalidStructuredResponse"], failure_reason="validationFailed")
+            stage = row["stage_responses"][1]; stage["response_text"] = '{"source_roles":[],"edits":[]}'
+            receipts = receipts[:2]; receipts[1]["response_text_sha256"] = e.legacy.sha256_text(stage["response_text"])
+            failures, quality = self.check(report, receipts, mode)
+            self.assertEqual(failures, []); self.assertTrue(quality)
+            row["hard_validation_codes"] = ["planIntegrityFailure"]
+            self.assertTrue(self.check(report, receipts, mode)[0])
+
     def test_input_limit_checks_both_sources_and_rejects_answers(self):
         for source_length, segment_length, valid in [(1000, 1000, True), (1001, 1, False), (1, 1001, False)]:
             inputs = copy.deepcopy(self.inputs)

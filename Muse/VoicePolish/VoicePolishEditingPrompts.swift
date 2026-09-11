@@ -2,7 +2,7 @@ import Foundation
 
 /// 三档产品的编辑协议，与旧 Planner/Ledger schema 分开版本化。
 enum VoicePolishEditingPrompts {
-    static let version = 5
+    static let version = 6
 
     private static let sourceBoundary = """
     canonical_text 是本次完整正文；source_segments 是保留 ASR 分段边界的来源片段及顺序。用它辅助判断话题、主语和修改所指对象，不能把下一片段的主语误当作上一句的宾语。ASR 也会在半句中切块，片段边界不必然是句号或段落；结合全文判断。词语以 canonical_text 中已应用的 authorized_context 映射为准，来源片段不能用来撤回已验证词语纠正。轻度首轮补丁定位 canonical_text，复核补丁定位实际 draft_text。
@@ -26,6 +26,12 @@ enum VoicePolishEditingPrompts {
     然后对照实际 draft_text 给出必要 edits。当前编辑要求已落实就从正文去除；还没落实则先补齐相关修改，不能留下要求读者继续改稿的过程。给收件人的任务、否定、原因与条件保留。当前稿有明确问题就给补丁，不要只说明问题或仅摘出指令后返回空 edits。
     editor_spans 只填写当前编辑过程的短小原文摘录，不抄正文任务清单、不写判断理由。每项是 canonical_text 中不超过192字、逐字唯一的字符串；同句含预算、原因、条件时只摘编辑短语，不能把有效事实整句放入数组。例如“我改一下”“不能再保留旧数字”可分别摘录，最终数值属于正文，不是编辑指令。没有当前编辑要求时数组为空。
     只输出 delivery、edits、editor_spans 三个字段。editor_spans 的每项如果仍出现在 draft_text 中，edits 必须包含相应的合法修正；已经从稿中移除的当前指令可以作为来源摘录保留。不要仅为语序偏好改动已准确的词组，也不能用改写一小部分指令来冒充已经清理整个过程。摘录不是自动删除权限，实际修改仍以补丁和完整来源为准。
+    """
+
+    static let reviewFocusBoundary = """
+    先核对 review_focus 中有内容的实际删改，再读完整 changes 和全文。每项 change_index 指向 changes 的原始下标；source_start/source_end、draft_start/draft_end 是按 Character 计数的半开范围，source_context/draft_context 是对应位置的邻近原话和实际稿，不是模型摘要。
+    对每个优先项，检查删改片段中仍有效的事实、原因、条件和独立要求，在实际稿里是否确实保留。合并一段改口过程时，不能把夹在其中的有效解释一起当作废话；只需恢复漏掉的内容，不恢复已废弃的安排。内容已在别处准确表达则无需重复。
+    优先项只决定检查顺序，不意味着修改错误，也不授予删除或恢复权限。review_focus_total 是全部有内容的变化数，数组最多列16项；其余变化和排版仍在完整 changes 中，必须继续核对。发现问题时仍用原来的合法局部 edits 修正，不输出优先项的编号或额外检查清单。
     """
 
     static let light = """
@@ -55,6 +61,7 @@ enum VoicePolishEditingPrompts {
     canonical_text 是完整原口述，draft_text 是实际稿，changes 是程序计算的真实差异。首稿完全没改也可能漏掉明确口误或当前编辑要求，必须检查。
     \(deliveryBoundary)
     \(reviewContract)
+    \(reviewFocusBoundary)
     只修明确错词、口误、非自愿口吃、短停顿声、必要标点和当前编辑要求。保留原句与段落顺序、个人语气、有效原因、责任人、日期、数值单位、条件、否定和独立动作。不能从另一事项借用时间或负责人，原文无币种不能补单位，有意强调要保留。
     明确的晚说改口要在原位置修正旧值，保留改口旁仍有效的原因和动作；不能只在结尾留一句更正。当前写作约束应用后移除，给下游收件人的禁令和任务保留。
     edits 使用轻度局部协议，每项 {"before":"draft_text中的唯一连续片段","after":"局部替换结果","kind":"punctuation|stutter|word|symbol|correction|filler|directive","evidence":"需要改口时的原文依据"}。定位当前实际稿，不定位原稿，不重写全文；所有定位同时生效，不依赖另一补丁的结果。无需 evidence 的类型可以省略该字段。
@@ -82,6 +89,7 @@ enum VoicePolishEditingPrompts {
     \(sourceBoundary)
     \(deliveryBoundary)
     \(reviewContract)
+    \(reviewFocusBoundary)
     changes 是程序从原文与实际成稿计算的差异，不是模型对自己正确性的声明。逐项检查被删或改写的信息是否仍在全文中，以及新增内容有无来源；再通读全文核对原因、条件、数字单位、责任主体、否定、最终改口和当前编辑指令/交付正文的区别。来源片段存在不代表该含义已在成稿中保留。
     标准润色允许调整顺序、分段和合并冗余，但不能删有效原因、限制、待确认状态或收件人的行动要求。原文不含币种时不能补“元”。当前“只整理、此刻先不要执行”的编辑要求应应用，不混入交给未来 AI 的任务；明确给未来执行者的禁令必须保留。
     必须同时检查“该保留的是否保留”和“该应用的编辑是否应用”：草稿即使没有新增或删词，也可能照抄了已经废弃的安排、当前编辑要求和修改过程。当前编辑要求应用后应从交付正文移除，晚说的改口要合回对应事项，并保留仍有效的原因。必要句界缺失也需要修正。不因为个人排版偏好修改已经合格的内容。不重写正确部分，不确定时不删除原有信息。
@@ -103,6 +111,8 @@ enum VoicePolishEditingPrompts {
         let styleProfile: StyleProfile?
         let draftText: String?
         let changes: [VoicePolishTextChange]?
+        let reviewFocus: [VoicePolishTextChange.ReviewFocus]?
+        let reviewFocusTotal: Int?
         let validationCodes: [VoicePolishValidationCode]?
     }
 
@@ -117,6 +127,7 @@ enum VoicePolishEditingPrompts {
         codes: [VoicePolishValidationCode] = []
     ) throws -> String {
         let context = request.context
+        let comparison = draft.map { VoicePolishTextChange.comparisonEvidence(request.fallbackText, $0) }
         let payload = Payload(
             mode: request.qualityMode.rawValue,
             canonicalText: request.fallbackText,
@@ -127,7 +138,9 @@ enum VoicePolishEditingPrompts {
             userPreferences: request.preferences.additionalRequirements,
             styleProfile: request.preferences.styleProfile,
             draftText: draft,
-            changes: draft.map { VoicePolishTextChange.between(request.fallbackText, $0) },
+            changes: comparison?.changes,
+            reviewFocus: comparison?.reviewFocus,
+            reviewFocusTotal: comparison?.contentChangeCount,
             validationCodes: codes.isEmpty ? nil : codes
         )
         let encoder = JSONEncoder()

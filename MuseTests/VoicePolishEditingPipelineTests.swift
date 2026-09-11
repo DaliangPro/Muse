@@ -442,12 +442,29 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(calls.count, 3)
         for (index, call) in calls.enumerated() {
             let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: Any])
-            XCTAssertEqual(payload["schema_version"] as? Int, 5)
+            XCTAssertEqual(payload["schema_version"] as? Int, 6)
             XCTAssertEqual(payload["canonical_text"] as? String, canonical)
             XCTAssertEqual(payload["source_segments"] as? [[String: String]],
                            [["id": "s1", "text": first], ["id": "s2", "text": second]])
             XCTAssertEqual(payload["authorized_context"] as? [String], ["灵建 → 灵简"])
             XCTAssertEqual(payload["draft_text"] as? String, index == 0 ? nil : (index == 1 ? initial : repaired))
+            if index == 0 {
+                XCTAssertNil(payload["review_focus"])
+                XCTAssertNil(payload["review_focus_total"])
+            } else {
+                let focus = try XCTUnwrap(payload["review_focus"] as? [[String: Any]])
+                XCTAssertNotNil(payload["changes"])
+                if index == 1 {
+                    XCTAssertEqual(focus.count, 1)
+                    XCTAssertEqual(payload["review_focus_total"] as? Int, 1)
+                    XCTAssertTrue(try XCTUnwrap(focus.first?["source_context"] as? String)
+                        .contains("这部分单独交代"))
+                } else {
+                    // 修后只多一个句号，终审不能沿用首稿的内容删除焦点。
+                    XCTAssertTrue(focus.isEmpty)
+                    XCTAssertEqual(payload["review_focus_total"] as? Int, 0)
+                }
+            }
         }
     }
 

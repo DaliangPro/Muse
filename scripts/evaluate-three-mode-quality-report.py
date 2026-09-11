@@ -891,8 +891,8 @@ def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version
 
 def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: int | None = None,
                          allows_reviewed_directives: bool = False, original_source: str | None = None) -> str:
-    # v5 仅改变复核 JSON，局部补丁权限完整沿用 v4。
-    if editing_prompt_version == 5:
+    # v5 改复核响应、v6 加优先差异；局部补丁权限均完整沿用 v4。
+    if editing_prompt_version in (5, 6):
         editing_prompt_version = 4
     document = json.loads(response)
     if (not isinstance(document, dict) or set(document) != {"edits"}
@@ -959,6 +959,79 @@ def complete_change_evidence(source: str, draft: str, changes: object) -> bool:
             return False
         positions = following
     return any(source[old:] == draft[new:] for old, new in positions)
+
+
+def v6_content_character_count(text: str) -> int:
+    # Swift Character 按首标量的 Unicode White_Space 判断；不能用 str.isspace 或全标量判断。
+    whitespace = set("\t\n\v\f\r \u0085\u00a0\u1680\u2028\u2029\u202f\u205f\u3000") | set(chr(c) for c in range(0x2000, 0x200B))
+    return sum(character not in set("，。！？；：、") and character[0] not in whitespace
+               for character in composed_characters(text))
+
+
+def complete_v6_review_focus(source: str, draft: str, payload: dict) -> bool:
+    """校验优先差异及其共同完整对齐路径；不另造 diff，也不从重点引用推断编辑权限。"""
+    source_raw, draft_raw = composed_characters(source), composed_characters(draft)
+    old = tuple(unicodedata.normalize("NFC", c) for c in source_raw)
+    new = tuple(unicodedata.normalize("NFC", c) for c in draft_raw)
+    changes, focus, total = (payload.get(k) for k in ("changes", "review_focus", "review_focus_total"))
+    if (not isinstance(changes, list) or len(changes) > len(old) + len(new)
+            or not isinstance(focus, list) or len(focus) > 16 or not valid_integer(total)):
+        return False
+    normalized, priorities = [], []
+    for index, change in enumerate(changes):
+        if (not isinstance(change, dict) or set(change) != {"removed", "inserted"}
+                or not all(isinstance(change[k], str) for k in ("removed", "inserted"))
+                or not (change["removed"] or change["inserted"])):
+            return False
+        removed, inserted = (tuple(unicodedata.normalize("NFC", c) for c in composed_characters(change[k]))
+                             for k in ("removed", "inserted"))
+        normalized.append((removed, inserted))
+        removed_count, inserted_count = (v6_content_character_count(change[k]) for k in ("removed", "inserted"))
+        if removed_count or inserted_count:
+            priorities.append((0 if removed_count else 1, -removed_count - inserted_count, index))
+    expected_indices = [key[2] for key in sorted(priorities)[:16]]
+    if total != len(priorities) or len(focus) != len(expected_indices):
+        return False
+    bounds = {}
+    for item, index in zip(focus, expected_indices):
+        if (not isinstance(item, dict) or set(item) != {
+                "change_index", "source_start", "source_end", "draft_start", "draft_end", "source_context", "draft_context"}
+                or any(not valid_integer(item[k]) for k in ("change_index", "source_start", "source_end", "draft_start", "draft_end"))
+                or item["change_index"] != index):
+            return False
+        a, b, c, d = (item[k] for k in ("source_start", "source_end", "draft_start", "draft_end"))
+        removed, inserted = normalized[index]
+        if (not a <= b <= len(old) or not c <= d <= len(new)
+                or old[a:b] != removed or new[c:d] != inserted
+                or item["source_context"] != "".join(source_raw[max(0, a - 20):min(len(old), b + 20)])
+                or item["draft_context"] != "".join(draft_raw[max(0, c - 20):min(len(new), d + 20)])):
+            return False
+        bounds[index] = (a, b, c, d)
+    positions = {(0, 0)}
+    for index, (removed, inserted) in enumerate(normalized):
+        following, scanned = set(), set()
+        for a, c in positions:
+            if index in bounds:
+                start, end, draft_start, draft_end = bounds[index]
+                if (start >= a and draft_start >= c and old[a:start] == new[c:draft_start]):
+                    following.add((end, draft_end))
+                continue
+            # 未入选块也必须按原顺序解释全部差异，不能借 cap 掩盖删改。
+            while True:
+                # 重复文本的多条前缀路径可能在同一坐标汇合；后续搜索只做一次。
+                if (a, c) in scanned:
+                    break
+                scanned.add((a, c))
+                if old[a:a + len(removed)] == removed and new[c:c + len(inserted)] == inserted:
+                    following.add((a + len(removed), c + len(inserted)))
+                if a >= len(old) or c >= len(new) or old[a] != new[c]:
+                    break
+                a += 1
+                c += 1
+        if not following:
+            return False
+        positions = following
+    return any(old[a:] == new[c:] for a, c in positions)
 
 
 def v4_role_comparison(text: str) -> str:
@@ -1045,12 +1118,12 @@ def decode_v5_review(raw: str, source: str) -> dict:
 
 
 def decode_versioned_review(raw: str, source: str, version: int) -> dict:
-    return decode_v5_review(raw, source) if version == 5 else decode_v4_review(raw, source)
+    return decode_v5_review(raw, source) if version in (5, 6) else decode_v4_review(raw, source)
 
 
 def v4_contains_editor_instruction(assessment: dict, draft: str, version: int = 4) -> bool:
     text = v4_role_comparison(draft)
-    if version == 5:
+    if version in (5, 6):
         return any(v4_role_comparison(span) in text for span in assessment["editor_spans"])
     return any(item["role"] == "current_editor" and v4_role_comparison(item["quote"]) in text
                for item in assessment["source_roles"])
@@ -1091,6 +1164,8 @@ def v4_stage_contract(row: dict, payloads: list, mode: str, version: int = 4) ->
             failures.append("v4 复核请求未绑定实际稿")
         if not isinstance(payload, dict) or not complete_change_evidence(source, current, payload.get("changes")):
             failures.append("v4 复核请求未完整绑定原文与实际稿差异")
+        if version == 6 and (not isinstance(payload, dict) or not complete_v6_review_focus(source, current, payload)):
+            failures.append("v6 优先差异未绑定完整有序变化、实质排序、范围或逐字上下文")
 
     try:
         if stages and stages[0].get("status") == "succeeded":
@@ -1215,7 +1290,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
-            if expected["editing_prompt_version"] in (4, 5) and (
+            if expected["editing_prompt_version"] in (4, 5, 6) and (
                 not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
             ):
                 failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
@@ -1230,7 +1305,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if expected["editing_prompt_version"] in (3, 4, 5):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -1242,7 +1317,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if expected["editing_prompt_version"] in (3, 4, 5):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -1280,10 +1355,14 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
-                if expected["editing_prompt_version"] in (3, 4, 5) and (
+                if expected["editing_prompt_version"] in (3, 4, 5, 6) and (
                     expected_segments is None or payload.get("source_segments") != expected_segments
                 ):
                     failures.append(f"{tid}: v3 阶段 source_segments 未逐项保留 canonical 段的 ID、正文和顺序")
+                if expected["editing_prompt_version"] == 6 and ordinal == 1 and any(
+                    payload.get(k) is not None for k in ("review_focus", "review_focus_total")
+                ):
+                    failures.append(f"{tid}: v6 首轮请求不得携带复核优先差异")
                 payloads.append(payload)
             except (KeyError, TypeError, json.JSONDecodeError, AttributeError):
                 payloads.append(None)
@@ -1320,7 +1399,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if expected["editing_prompt_version"] in (4, 5):
+        if expected["editing_prompt_version"] in (4, 5, 6):
             allowed, stage_failures = v4_stage_contract(row, payloads, mode, expected["editing_prompt_version"])
             failures.extend(f"{tid}: {failure}" for failure in stage_failures)
             if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
@@ -1335,7 +1414,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5) else 2
+        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6) else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -1347,7 +1426,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5):
+        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6):
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],

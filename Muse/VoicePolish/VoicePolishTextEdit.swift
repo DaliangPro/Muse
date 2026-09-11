@@ -22,10 +22,75 @@ struct VoicePolishTextChange: Encodable, Sendable, Equatable {
     let removed: String
     let inserted: String
 
+    struct ReviewFocus: Encodable, Sendable, Equatable {
+        let changeIndex: Int
+        let sourceStart: Int
+        let sourceEnd: Int
+        let draftStart: Int
+        let draftEnd: Int
+        let sourceContext: String
+        let draftContext: String
+    }
+
+    struct ComparisonEvidence: Sendable, Equatable {
+        let changes: [VoicePolishTextChange]
+        let reviewFocus: [ReviewFocus]
+        let contentChangeCount: Int
+    }
+
+    private struct LocatedChange {
+        let change: VoicePolishTextChange
+        let sourceRange: Range<Int>
+        let draftRange: Range<Int>
+    }
+
+    // 仅用于组织复核注意力；保守保留技术符号和 emoji，不据此授予编辑权限。
+    private static let layoutCharacters = Set("，。！？；：、")
+
     /// 差异来自实际字符序列，逐块呈现给复核器；不让 Planner 先筛选有效信息。
     static func between(_ source: String, _ draft: String) -> [Self] {
+        locatedChanges(Array(source), Array(draft)).map(\.change)
+    }
+
+    /// 只运行一次 diff；保留所有变化，额外突出最多 16 处含内容变化的实际位置。
+    static func comparisonEvidence(_ source: String, _ draft: String) -> ComparisonEvidence {
         let old = Array(source)
         let new = Array(draft)
+        let located = locatedChanges(old, new)
+        let priorities = located.enumerated().compactMap { index, item -> (index: Int, group: Int, amount: Int)? in
+            let removedCount = contentCount(item.change.removed)
+            let insertedCount = contentCount(item.change.inserted)
+            guard removedCount + insertedCount > 0 else { return nil }
+            return (index, removedCount > 0 ? 0 : 1, removedCount + insertedCount)
+        }.sorted {
+            if $0.group != $1.group { return $0.group < $1.group }
+            if $0.amount != $1.amount { return $0.amount > $1.amount }
+            return $0.index < $1.index
+        }
+        let focus = priorities.prefix(16).map { priority in
+            let item = located[priority.index]
+            return ReviewFocus(
+                changeIndex: priority.index,
+                sourceStart: item.sourceRange.lowerBound, sourceEnd: item.sourceRange.upperBound,
+                draftStart: item.draftRange.lowerBound, draftEnd: item.draftRange.upperBound,
+                sourceContext: context(old, around: item.sourceRange),
+                draftContext: context(new, around: item.draftRange)
+            )
+        }
+        return ComparisonEvidence(changes: located.map(\.change), reviewFocus: focus,
+                                  contentChangeCount: priorities.count)
+    }
+
+    private static func contentCount(_ text: String) -> Int {
+        text.filter { !$0.isWhitespace && !layoutCharacters.contains($0) }.count
+    }
+
+    private static func context(_ text: [Character], around range: Range<Int>) -> String {
+        String(text[max(0, range.lowerBound - 20)..<min(text.count, range.upperBound + 20)])
+    }
+
+    /// 沿用旧差异与消费顺序，只记录消费前后的 Character 半开范围。
+    private static func locatedChanges(_ old: [Character], _ new: [Character]) -> [LocatedChange] {
         let difference = new.difference(from: old)
         let removedIndices = Set(difference.removals.map { change -> Int in
             if case .remove(let offset, _, _) = change { return offset }
@@ -35,10 +100,12 @@ struct VoicePolishTextChange: Encodable, Sendable, Equatable {
             if case .insert(let offset, _, _) = change { return offset }
             return -1
         })
-        var result: [Self] = []
+        var result: [LocatedChange] = []
         var oldIndex = 0
         var newIndex = 0
         while oldIndex < old.count || newIndex < new.count {
+            let sourceStart = oldIndex
+            let draftStart = newIndex
             var removed = ""
             var inserted = ""
             while oldIndex < old.count && removedIndices.contains(oldIndex) {
@@ -48,7 +115,9 @@ struct VoicePolishTextChange: Encodable, Sendable, Equatable {
                 inserted.append(new[newIndex]); newIndex += 1
             }
             if !removed.isEmpty || !inserted.isEmpty {
-                result.append(Self(removed: removed, inserted: inserted))
+                result.append(LocatedChange(change: Self(removed: removed, inserted: inserted),
+                                            sourceRange: sourceStart..<oldIndex,
+                                            draftRange: draftStart..<newIndex))
             }
             if oldIndex < old.count && newIndex < new.count {
                 oldIndex += 1; newIndex += 1
