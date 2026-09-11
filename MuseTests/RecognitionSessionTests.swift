@@ -1105,7 +1105,7 @@ final class RecognitionSessionTests: XCTestCase {
         let transcript = RecognitionTranscript(confirmedSegments: [source], partialText: "",
                                               authoritativeText: source, isFinal: true)
         for shouldRetry in [true, false] {
-            let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["invalid-json", #"{"edits":[]}"#])
+            let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["invalid-json", #"{"text":"请先核对链接。"}"#])
             let recorder = RecognitionEventRecorder()
             let session = RecognitionSession(
                 historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },

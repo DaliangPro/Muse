@@ -104,6 +104,26 @@ final class VoicePolishRequestProbeTests: XCTestCase {
         }
     }
 
+    func testSharedDuplicateScannerKeepsOriginalDepthLimit() throws {
+        func raw(_ depth: Int) -> Data {
+            Data((String(repeating: "[", count: depth) + "0" + String(repeating: "]", count: depth)).utf8)
+        }
+        var accepted = VoicePolishJSONUniqueKeys(data: raw(64))
+        XCTAssertNoThrow(try accepted.check())
+        var rejected = VoicePolishJSONUniqueKeys(data: raw(65))
+        XCTAssertThrowsError(try rejected.check())
+    }
+
+    func testSharedDuplicateScannerPreservesProbeInvalidInputClassification() throws {
+        var value = try object()
+        value["user"] = #"{"canonical_text":"资料已备齐。","metadata":{"key":1,"k\u0065y":2}}"#
+        XCTAssertThrowsError(try VoicePolishRequestProbe.decodeInput(json(value))) {
+            XCTAssertEqual($0 as? VoicePolishRequestProbe.ProbeError, .invalidInput)
+        }
+        let input = try VoicePolishRequestProbe.decodeInput(data())
+        XCTAssertEqual(input.canonicalText, "资料已备齐。")
+    }
+
     func testRequestOptionsAreFixedExceptTwoExplicitExperimentFields() throws {
         for format in ["text", "json_object"] {
             var value = try object(); value["response_format"] = format

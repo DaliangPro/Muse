@@ -159,6 +159,20 @@ enum VoicePolishTextEditor {
         return !punctuationPreservesTechnicalTokens(expected, actual)
     }
 
+    /// 完整候选只作为唯一锚点；严格免审证明不授予口吃、唔/呃等待核对删除权限。
+    /// 不推断 kind 或 evidence，也不挑选部分修改交付。
+    static func applyingUnreviewedMechanicalChanges(from source: String, to target: String) throws -> String {
+        let edit = VoicePolishTextEdit(before: source, after: target, kind: .punctuation)
+        guard !requiresSemanticReview([edit], in: source) else {
+            throw VoicePolishTextEditError.editOutsideMode
+        }
+        let output = try apply([edit], to: source, source: source, mode: .light)
+        guard output.utf8.elementsEqual(target.utf8) else {
+            throw VoicePolishTextEditError.editOutsideMode
+        }
+        return output
+    }
+
     static func decode(_ raw: String) throws -> [VoicePolishTextEdit] {
         guard raw.utf8.count <= VoicePolishOutputNormalizer.maximumResponseBytes,
               let data = raw.data(using: .utf8),
@@ -591,6 +605,8 @@ enum VoicePolishTextEditor {
         let indices = lexicalIndices(characters)
         let old = indices.map { characters[$0] }
         let new = lexicalCharacters(after)
+        // 首条匹配路径已完整相等；保留原标点，仍由外层检查目标的段落和技术字符。
+        if old == new { return before }
         let fillerCharacters = Set("嗯呃额啊唔")
         var allowedFillers: Set<Int> = []
         var ordinal = 0
@@ -599,22 +615,36 @@ enum VoicePolishTextEditor {
             ordinal += 1
         }
         let numberCharacters = Set("零〇一二三四五六七八九十百千万亿两")
-        var failed: Set<String> = []
-        func match(_ i: Int, _ j: Int, _ used: Int) -> (kept: [Int], fillers: Int)? {
-            if i == old.count && j == new.count { return ([], used) }
-            let key = "\(i):\(j):\(used)"
-            guard !failed.contains(key) else { return nil }
-            if i < old.count, j < new.count, old[i] == new[j],
-               let rest = match(i + 1, j + 1, used) {
-                return ([i] + rest.kept, rest.fillers)
+        let allowsStutter = allowsReviewedChanges && before.count <= 96
+        struct State: Hashable {
+            let i: Int
+            let j: Int
+            let used: Int
+        }
+        struct Step {
+            let state: State
+            let kept: Range<Int>
+        }
+        struct Frame {
+            let state: State
+            let kept: Range<Int>
+            let steps: [Step]
+            var next = 0
+        }
+        func steps(from state: State) -> [Step] {
+            let (i, j, used) = (state.i, state.j, state.used)
+            var result: [Step] = []
+            if i < old.count, j < new.count, old[i] == new[j] {
+                result.append(Step(state: State(i: i + 1, j: j + 1, used: used), kept: i..<(i + 1)))
             }
             // 唔、呃也能承载否定或实词义；只允许形成待核对稿，不能据停顿声形状免审。
             if i < old.count, used < 6, fillerCharacters.contains(old[i]), allowedFillers.contains(indices[i]),
-               (allowsReviewedChanges || !Set("唔呃").contains(old[i])),
-               let rest = match(i + 1, j, used + 1) { return rest }
+               (allowsReviewedChanges || !Set("唔呃").contains(old[i])) {
+                result.append(Step(state: State(i: i + 1, j: j, used: used + 1), kept: i..<i))
+            }
             // 数字、英文技术词及标点隔开的有意重复不自动解释为口吃。
             let maximumWidth = min((old.count - i) / 2, new.count - j)
-            if allowsReviewedChanges, before.count <= 96, maximumWidth > 0 {
+            if allowsStutter, maximumWidth > 0 {
                 for width in 1...maximumWidth {
                     let unit = Array(old[i..<(i + width)])
                     guard unit == Array(new[j..<(j + width)]),
@@ -624,18 +654,36 @@ enum VoicePolishTextEditor {
                         end += width
                         let raw = characters[indices[i]...indices[end - 1]]
                         guard raw.allSatisfy({ !$0.isPunctuation }) else { break }
-                        if let rest = match(end, j + width, used) {
-                            return (Array(i..<(i + width)) + rest.kept, rest.fillers)
-                        }
+                        result.append(Step(state: State(i: end, j: j + width, used: used), kept: i..<(i + width)))
                     }
                 }
             }
-            failed.insert(key)
-            return nil
+            return result
         }
-        guard let result = match(0, 0, fillers) else { return nil }
-        fillers = result.fillers
-        let kept = Set(result.kept.map { indices[$0] })
+        // 显式深度优先栈保持原先“保留、停顿声、口吃”的分支顺序和失败缓存。
+        // 长稿的逐字保留不再占用调用栈；成功后一次重建保留位置，避免逐层复制。
+        let initial = State(i: 0, j: 0, used: fillers)
+        var stack = [Frame(state: initial, kept: 0..<0, steps: steps(from: initial))]
+        var failed: Set<State> = []
+        var keptIndices: [Int]?
+        while let frame = stack.last {
+            if frame.state.i == old.count && frame.state.j == new.count {
+                keptIndices = stack.flatMap { Array($0.kept) }
+                fillers = frame.state.used
+                break
+            }
+            guard frame.next < frame.steps.count else {
+                failed.insert(frame.state)
+                stack.removeLast()
+                continue
+            }
+            let step = frame.steps[frame.next]
+            stack[stack.count - 1].next += 1
+            guard !failed.contains(step.state) else { continue }
+            stack.append(Frame(state: step.state, kept: step.kept, steps: steps(from: step.state)))
+        }
+        guard let keptIndices else { return nil }
+        let kept = Set(keptIndices.map { indices[$0] })
         let lexical = Set(indices)
         return String(characters.enumerated().compactMap { lexical.contains($0.offset) && !kept.contains($0.offset) ? nil : $0.element })
     }

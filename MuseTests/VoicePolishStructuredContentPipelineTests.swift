@@ -101,7 +101,7 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
     func testLightCannotAcceptStandardLayoutField() async throws {
         let source = "等一下，先别发送，等我确认。"
         let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, review], mode: .light)
+        let (result, calls) = await run(source, [#"{"text":"等一下，先别发送，等我确认。"}"#, review], mode: .light)
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 2)
         for call in calls { XCTAssertNil(try payload(call)["layout_segments"]) }
@@ -117,13 +117,16 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         XCTAssertTrue(result.validationCodes.contains(.missingProtectedFact))
     }
 
-    func testClockCorrectionKeepsFinalWholeASCIIClockInBothModes() async {
+    func testClockCorrectionKeepsFinalWholeASCIIClockInBothModes() async throws {
         let source = "会议10:30，不对，10:45开始。"
         let patch = #"{"edits":[{"before":"会议10:30，不对，10:45开始。","after":"会议10:45开始。","kind":"correction"}]}"#
+        var lightReview = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(patch.utf8)) as? [String: Any])
+        lightReview["text"] = "会议10:45开始。"
+        let lightResponses = [try json(["text": "会议10:45开始。"]), try json(lightReview)]
         for mode in [VoicePolishQualityMode.light, .standard] {
             let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
             let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-            let (result, _) = await run(source, mode == .light ? [patch, #"{"edits":[]}"#] : [patch, review, layout], mode: mode)
+            let (result, _) = await run(source, mode == .light ? lightResponses : [patch, review, layout], mode: mode)
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, "会议10:45开始。")
             XCTAssertEqual(result.llmAttemptCount, mode == .light ? 2 : 3)

@@ -166,10 +166,12 @@ enum VoicePolishRequestProbe {
               let canonical = user["canonical_text"] as? String,
               canonical.utf8.elementsEqual(input.canonicalText.utf8),
               !containsCredentialFields(user) else { throw ProbeError.invalidInput }
-        var outerScanner = UniqueKeys(data: data)
-        var userScanner = UniqueKeys(data: Data(input.user.utf8))
-        try outerScanner.check()
-        try userScanner.check()
+        var outerScanner = VoicePolishJSONUniqueKeys(data: data)
+        var userScanner = VoicePolishJSONUniqueKeys(data: Data(input.user.utf8))
+        do {
+            try outerScanner.check()
+            try userScanner.check()
+        } catch { throw ProbeError.invalidInput }
         return input
     }
 
@@ -420,54 +422,4 @@ enum VoicePolishRequestProbe {
         return (value as? [Any])?.contains(where: containsCredentialFields) == true
     }
 
-    /// Foundation 完成语法解析后，再拒绝任何层级的重复 key，避免原字节与解码对象含义不唯一。
-    private struct UniqueKeys {
-        let bytes: [UInt8]
-        var index = 0
-        init(data: Data) { bytes = Array(data) }
-        mutating func check() throws { try value(depth: 0); whitespace(); guard index == bytes.count else { throw ProbeError.invalidInput } }
-        mutating func whitespace() { while index < bytes.count && [9, 10, 13, 32].contains(bytes[index]) { index += 1 } }
-        mutating func string() throws -> String {
-            let start = index; index += 1
-            while index < bytes.count {
-                if bytes[index] == 92 { index += 2; continue }
-                if bytes[index] == 34 {
-                    index += 1
-                    return try JSONDecoder().decode(String.self, from: Data(bytes[start..<index]))
-                }
-                index += 1
-            }
-            throw ProbeError.invalidInput
-        }
-        mutating func value(depth: Int) throws {
-            guard depth <= 64 else { throw ProbeError.invalidInput }
-            whitespace(); guard index < bytes.count else { throw ProbeError.invalidInput }
-            if bytes[index] == 34 { _ = try string(); return }
-            if bytes[index] == 123 {
-                index += 1; whitespace(); var keys = Set<String>()
-                if index < bytes.count && bytes[index] == 125 { index += 1; return }
-                while index < bytes.count {
-                    whitespace(); guard bytes[index] == 34 else { throw ProbeError.invalidInput }
-                    let key = try string(); guard keys.insert(key).inserted else { throw ProbeError.invalidInput }
-                    whitespace(); guard index < bytes.count && bytes[index] == 58 else { throw ProbeError.invalidInput }
-                    index += 1; try value(depth: depth + 1); whitespace()
-                    guard index < bytes.count else { throw ProbeError.invalidInput }
-                    if bytes[index] == 125 { index += 1; return }
-                    guard bytes[index] == 44 else { throw ProbeError.invalidInput }; index += 1
-                }
-            } else if bytes[index] == 91 {
-                index += 1; whitespace()
-                if index < bytes.count && bytes[index] == 93 { index += 1; return }
-                while index < bytes.count {
-                    try value(depth: depth + 1); whitespace(); guard index < bytes.count else { throw ProbeError.invalidInput }
-                    if bytes[index] == 93 { index += 1; return }
-                    guard bytes[index] == 44 else { throw ProbeError.invalidInput }; index += 1
-                }
-            } else {
-                while index < bytes.count && ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index]) { index += 1 }
-                return
-            }
-            throw ProbeError.invalidInput
-        }
-    }
 }

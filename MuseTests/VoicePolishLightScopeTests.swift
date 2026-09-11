@@ -5,12 +5,12 @@ import XCTest
 final class VoicePolishLightScopeTests: XCTestCase {
     func testTaskSpeechOnlyNeedsPunctuationAndOneCall() async {
         let cases = [
-            ("帮我整理Prompt先别执行", #"{"edits":[{"before":"帮我整理Prompt先别执行","after":"帮我整理 Prompt，先别执行。","kind":"punctuation"}]}"#, "帮我整理 Prompt，先别执行。"),
-            ("给客户回一下材料还没核对不要承诺日期", #"{"edits":[{"before":"给客户回一下材料还没核对不要承诺日期","after":"给客户回一下，材料还没核对，不要承诺日期。","kind":"punctuation"}]}"#, "给客户回一下，材料还没核对，不要承诺日期。"),
-            ("跟他说我晚十分钟到", #"{"edits":[{"before":"跟他说我晚十分钟到","after":"跟他说，我晚十分钟到。","kind":"punctuation"}]}"#, "跟他说，我晚十分钟到。")
+            ("帮我整理Prompt先别执行", "帮我整理 Prompt，先别执行。"),
+            ("给客户回一下材料还没核对不要承诺日期", "给客户回一下，材料还没核对，不要承诺日期。"),
+            ("跟他说我晚十分钟到", "跟他说，我晚十分钟到。")
         ]
-        for (source, response, expected) in cases {
-            let (result, calls) = await run(source, [response])
+        for (source, expected) in cases {
+            let (result, calls) = await run(source, [text(expected)])
             XCTAssertFalse(result.usedFallback, source)
             XCTAssertEqual(result.text, expected)
             XCTAssertEqual(result.llmAttemptCount, 1)
@@ -21,7 +21,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
 
     func testSameDraftKeepsTaskPrefixAndBothLevelsOfProhibition() async {
         let source = "帮我整理成 Prompt。先别执行，给同事写清楚：先别发布，等确认。"
-        let (result, calls) = await run(source, [#"{"edits":[]}"#])
+        let (result, calls) = await run(source, [text(source)])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(calls.count, 1)
@@ -43,7 +43,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
         }
     }
 
-    func testFirstDirectiveCannotBeDeliveredOrPartiallyApplied() async {
+    func testOldFirstEditsProtocolCannotBeDeliveredOrPartiallyApplied() async {
         let source = "给客户回一下：请按装软件。"
         let response = #"{"edits":[{"before":"按装","after":"安装","kind":"word"},{"before":"给客户回一下：","after":"","kind":"directive"}]}"#
         let (result, calls) = await run(source, [response, #"{"edits":[]}"#])
@@ -51,13 +51,14 @@ final class VoicePolishLightScopeTests: XCTestCase {
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(calls.count, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+        XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
     }
 
     func testWordCorrectionStillReviewsActualDraftAndKeepsTaskSpeech() async throws {
         let source = "帮我整理 Prompt：请按装软件，先别执行。"
         let patch = #"{"edits":[{"before":"按装","after":"安装","kind":"word"}]}"#
-        let (result, calls) = await run(source, [patch, #"{"edits":[]}"#])
+        let target = "帮我整理 Prompt：请安装软件，先别执行。"
+        let (result, calls) = await run(source, [text(target), reviewJSON(target, edits: patch)])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, "帮我整理 Prompt：请安装软件，先别执行。")
         XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze])
@@ -66,14 +67,15 @@ final class VoicePolishLightScopeTests: XCTestCase {
         XCTAssertEqual(review["canonical_text"] as? String, source)
         XCTAssertEqual(review["draft_text"] as? String, result.text)
         XCTAssertEqual(review["mode"] as? String, "light")
-        XCTAssertEqual(review["schema_version"] as? Int, 9)
+        XCTAssertEqual(review["schema_version"] as? Int, 10)
         XCTAssertNil(review["layout_segments"])
     }
 
-    func testEmptyFirstPlanStillRepairsLateCorrectionAndConfirmsActualDraft() async throws {
+    func testUnchangedFirstCandidateStillRepairsLateCorrectionAndConfirmsActualDraft() async throws {
         let source = "帮我整理 Prompt：阿文负责复查。\n其余资料先保留。\n复查改由阿宁，阿文要出差。"
         let repair = #"{"edits":[{"before":"阿文负责复查。","after":"阿宁负责复查。","kind":"correction","evidence":"复查改由阿宁，阿文要出差。"},{"before":"复查改由阿宁，","after":"","kind":"correction"}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, repair, #"{"edits":[]}"#])
+        let target = "帮我整理 Prompt：阿宁负责复查。\n其余资料先保留。\n阿文要出差。"
+        let (result, calls) = await run(source, [text(source), reviewJSON(target, edits: repair), #"{"approved":true}"#])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, "帮我整理 Prompt：阿宁负责复查。\n其余资料先保留。\n阿文要出差。")
         XCTAssertEqual(result.llmAttemptCount, 3)
@@ -93,7 +95,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
             #"{"edits":[{"before":"帮我整理 Prompt：","after":"","kind":"directive"}]}"#,
             #"{"edits":[{"before":"请保留原因。","after":"原因：请保留。","kind":"content","evidence":"请保留原因。"}]}"#
         ] {
-            let (result, calls) = await run(source, [#"{"edits":[]}"#, response, #"{"edits":[]}"#])
+            let (result, calls) = await run(source, [text(source), reviewJSON("等一下，请保留原因。", edits: response)])
             XCTAssertTrue(result.usedFallback)
             XCTAssertEqual(result.text, source)
             XCTAssertEqual(calls.count, 2)
@@ -112,7 +114,8 @@ final class VoicePolishLightScopeTests: XCTestCase {
             #"{"edits":[],"source_roles":[]}"#
         ] {
             for repairs in [0, 1] {
-                let responses = repairs == 0 ? [patch, invalid] : [#"{"edits":[]}"#, patch, invalid]
+                let target = "我补一句，请安装软件。"
+                let responses = repairs == 0 ? [text(source), invalid] : [text(source), reviewJSON(target, edits: patch), invalid]
                 let (result, calls) = await run(source, responses)
                 XCTAssertTrue(result.usedFallback)
                 XCTAssertEqual(result.text, source)
@@ -128,23 +131,33 @@ final class VoicePolishLightScopeTests: XCTestCase {
         let source = "我补一句，请按装软件。"
         let repair = #"{"edits":[{"before":"按装","after":"安装","kind":"word"}]}"#
         let furtherRepair = #"{"edits":[{"before":"安装","after":"卸载","kind":"word"}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, repair, furtherRepair, #"{"edits":[]}"#])
+        let (result, calls) = await run(source, [text(source), reviewJSON("我补一句，请安装软件。", edits: repair), furtherRepair, #"{"approved":true}"#])
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(calls.count, 3)
         XCTAssertEqual(result.repairAttemptCount, 1)
-        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+        XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
     }
 
     func testPublicCorrectionAndDownstreamProhibitionMayRemainAfterReview() async {
         for source in ["请发布更正：上次说错了，原来写成周三，实际是周四。",
                        "请同事保留这条禁令：不要改由阿宁，等确认再安排。"] {
-            let (result, calls) = await run(source, [#"{"edits":[]}"#, #"{"edits":[]}"#])
+            let (result, calls) = await run(source, [text(source), reviewJSON(source)])
             XCTAssertFalse(result.usedFallback, source)
             XCTAssertEqual(result.text, source)
             XCTAssertEqual(calls.count, 2)
             XCTAssertEqual(result.repairAttemptCount, 0)
         }
+    }
+
+    private func text(_ value: String) -> String {
+        String(decoding: try! JSONEncoder().encode(["text": value]), as: UTF8.self)
+    }
+
+    private func reviewJSON(_ value: String, edits: String = #"{"edits":[]}"#) -> String {
+        var object = try! JSONSerialization.jsonObject(with: Data(edits.utf8)) as! [String: Any]
+        object["text"] = value
+        return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
     }
 
     private func run(_ source: String, _ responses: [String]) async -> (VoicePolishResult, [LLMRequest]) {

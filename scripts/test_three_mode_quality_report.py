@@ -1485,7 +1485,7 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         report, receipts = self.v4_report(source, mode=mode, reviews=[{"source_roles": [], "edits": []}])
         row = report["cases"][0]
         self.expected["editing_prompt_version"] = report["editing_prompt_version"] = version
-        separate = version in (8, 9) and mode == "standard" and e.v4_source_review_risk(source)
+        separate = version in (8, 9, 10) and mode == "standard" and e.v4_source_review_risk(source)
         _, canonical_segments = e.frozen_input_envelope(self.inputs[0])
         row["canonical_segments"] = canonical_segments
         draft = e.apply_recorded_edits(source, json.dumps({"edits": list(initial_edits)}, ensure_ascii=False),
@@ -2204,6 +2204,231 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         report["editing_prompt_version"] = self.expected["editing_prompt_version"] = 9
         for index in range(2): self.v7_payload(report, index, schema_version=9)
         self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def v10_report(self, source, candidate, *, review=None, confirmation=True):
+        report, receipts = self.v7_report(source, mode="light", version=9, review=False)
+        row = report["cases"][0]
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 10
+        responses, drafts = [{"text": candidate}], [None]
+        target = candidate
+        changed = False
+        if review is not None:
+            responses.append(review)
+            drafts.append(candidate)
+            target = review.get("text")
+            changed = isinstance(target, str) and target != candidate
+            if changed and confirmation is not None:
+                responses.append({"approved": confirmation})
+                drafts.append(target)
+        template = row["stage_responses"][0]
+        receipt_template = receipts[0]
+        payload_template = json.loads(template["request_payload"])
+        stages, receipts = [], []
+        for i, response in enumerate(responses):
+            task = "voicePolishFast" if i == 0 else "voicePolishAnalyze"
+            payload = copy.deepcopy(payload_template)
+            payload["schema_version"] = 10
+            if i:
+                current = drafts[i]
+                payload["draft_text"] = current
+                located, offset = [], 0
+                for start, end, inserted in e.actual_modifications(source, current, 0):
+                    current_start = start + offset
+                    located.append((source[start:end], inserted, start, end, current_start, current_start + len(inserted)))
+                    offset += len(inserted) - (end - start)
+                order = [j for j, change in enumerate(located) if e.v6_content_character_count(change[0] + change[1])]
+                order.sort(key=lambda j: (not bool(e.v6_content_character_count(located[j][0])),
+                    -e.v6_content_character_count(located[j][0] + located[j][1]), j))
+                payload.update(self.focus_payload(source, current, located, order))
+            raw = json.dumps(response, ensure_ascii=False)
+            stage = copy.deepcopy(template)
+            stage.update(task=task, attempt_ordinal=i + 1, request_payload=json.dumps(payload, ensure_ascii=False), response_text=raw)
+            stages.append(stage)
+            receipt = copy.deepcopy(receipt_template)
+            receipt.update(llm_task=task, request_ordinal=i + 1, provider_response_id=f"unit-test-only-v10-{i + 1}",
+                request_binding_sha256=e.legacy.provider_request_binding_sha256(self.nonce, "fixture-01", i + 1, "e" * 64),
+                response_text_sha256=e.legacy.sha256_text(raw))
+            receipts.append(receipt)
+        row.update(stage_responses=stages, llm_call_count=len(stages), llm_attempt_count=len(stages),
+                   repair_attempt_count=int(changed), model_output=target if isinstance(target, str) else source)
+        return report, receipts
+
+    def v10_fallback(self, report, code, *, repairs=None):
+        row = report["cases"][0]
+        row.update(fallback_used=True, model_output=self.text, failure_reason="validationFailed", hard_validation_codes=[code])
+        if repairs is not None: row["repair_attempt_count"] = repairs
+
+    def test_v10_complete_text_mechanical_path_and_request_scope(self):
+        for source, target in [("嗯帮我回他先别承诺", "帮我回他，先别承诺。"), ("不", "不"),
+                               ("运行scripts斜杠check点sh", "运行 scripts/check.sh。")]:
+            report, receipts = self.v10_report(source, target)
+            self.assertEqual(self.check(report, receipts, "light"), ([], []))
+            self.assertEqual(report["cases"][0]["repair_attempt_count"], 0)
+            # 有真实回执也不能编造额外空审核。
+            report, receipts = self.v10_report(source, target, review={"text": target, "edits": []})
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v10_original_risk_still_requires_review_for_unchanged_or_mechanical_draft(self):
+        for source, target in [("原定周二，改为周三。", "原定周二，改为周三。"),
+                               ("等一下明天再说", "等一下，明天再说。")]:
+            report, receipts = self.v10_report(source, target, review={"text": target, "edits": []})
+            self.assertEqual(self.check(report, receipts, "light"), ([], []))
+            report, receipts = self.v10_report(source, target)
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v10_semantic_changes_are_source_bound_not_candidate_bound(self):
+        source, candidate = "帮我按装软件", "帮我安装软件。"
+        review = {"text": candidate, "edits": [{"before": "按装", "after": "安装", "kind": "word"}]}
+        report, receipts = self.v10_report(source, candidate, review=review)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.v7_response(report, receipts, 1, {"text": candidate,
+            "edits": [{"before": "安装", "after": "安装", "kind": "word"}]})
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        self.v10_fallback(report, "planIntegrityFailure")
+        self.assertEqual(self.check(report, receipts, "light")[0], [])
+
+    def test_v10_no_reviewed_mechanical_permission_for_undeclared_stutter(self):
+        for source, target, approved in [
+            ("我我到了", "我到了", {"before": "我我", "after": "我", "kind": "stutter"}),
+            ("唔我到了", "我到了", {"before": "唔我到了", "after": "我到了", "kind": "filler"})]:
+            report, receipts = self.v10_report(source, target, review={"text": target, "edits": []})
+            self.assertTrue(self.check(report, receipts, "light")[0])
+            self.v10_fallback(report, "planIntegrityFailure")
+            self.assertEqual(self.check(report, receipts, "light")[0], [])
+            report, receipts = self.v10_report(source, target, review={"text": target, "edits": [approved]})
+            self.assertEqual(self.check(report, receipts, "light"), ([], []))
+
+    def test_v10_repair_is_actual_candidate_change_and_requires_cold_confirmation(self):
+        source, target = "我说错了，按装软件", "我说错了，安装软件。"
+        review = {"text": target, "edits": [{"before": "按装", "after": "安装", "kind": "word"}]}
+        report, receipts = self.v10_report(source, source, review=review)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.assertEqual(report["cases"][0]["repair_attempt_count"], 1)
+        changed = copy.deepcopy(report)
+        self.v7_payload(changed, 2, draft_text=source)
+        self.assertTrue(self.check(changed, receipts, "light")[0])
+        changed = copy.deepcopy(report)
+        self.v7_payload(changed, 2, changes=[], review_focus=[], review_focus_total=0)
+        self.assertTrue(self.check(changed, receipts, "light")[0])
+        missing, short_receipts = self.v10_report(source, source, review=review, confirmation=None)
+        self.assertTrue(self.check(missing, short_receipts, "light")[0])
+        self.v7_response(report, receipts, 2, {"approved": False})
+        self.v10_fallback(report, "semanticDecisionUnverified")
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+
+    def test_v10_null_reject_is_not_repair_and_cannot_deliver_candidate(self):
+        report, receipts = self.v10_report("我我到了", "我到了", review={"text": None, "edits": []})
+        self.v10_fallback(report, "semanticDecisionUnverified")
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+        report["cases"][0]["repair_attempt_count"] = 1
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        report["cases"][0].update(repair_attempt_count=0, model_output="我到了")
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v10_failed_repair_permission_is_counted_without_third_call(self):
+        for kind in ("directive", "content"):
+            report, receipts = self.v10_report("我说错了，帮我回他。", "我说错了，帮我回他。",
+                review={"text": "我说错了，他。", "edits": [{"before": "帮我回", "after": "", "kind": kind}]}, confirmation=None)
+            self.v10_fallback(report, "planIntegrityFailure")
+            self.assertEqual(self.check(report, receipts, "light")[0], [])
+            report["cases"][0]["repair_attempt_count"] = 0
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v10_repair_does_not_override_reviewed_punctuation_or_submit_partial_edits(self):
+        source, initial, target = "等一下明天再说", "等一下。明天，再说。", "等一下，明天再说。"
+        report, receipts = self.v10_report(source, initial, review={"text": target, "edits": []})
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        self.assertEqual(report["cases"][0]["repair_attempt_count"], 1)
+        report["cases"][0]["model_output"] = initial
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        for output in ("等一下，后天再说。", "等一下明天再说"):
+            report["cases"][0]["model_output"] = output
+            self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v10_protocol_type_failures_are_not_semantic_rejections(self):
+        for raw in [{"edits": []}, {"text": ""}, {"text": None}, {"text": 1}, {"text": "甲", "edits": []}]:
+            with self.assertRaises(e.V7ContractError) as caught:
+                e.decode_v10_light(json.dumps(raw), "initial")
+            self.assertEqual(caught.exception.code, "invalidStructuredResponse")
+        for raw in [{"text": None, "edits": "错"}, {"text": "甲", "edits": [], "approved": True},
+                    {"text": "甲"}, {"text": "甲", "edits": [{"before": "甲", "after": "乙", "kind": "guess"}]}]:
+            with self.assertRaises(e.V7ContractError) as caught:
+                e.decode_v10_light(json.dumps(raw), "review")
+            self.assertEqual(caught.exception.code, "invalidStructuredResponse")
+        for raw in [{"approved": 1}, {"approved": "true"}, {"approved": None}, {"edits": []}, {"approved": True, "text": "甲"}]:
+            with self.assertRaises(e.V7ContractError) as caught:
+                e.decode_v10_light(json.dumps(raw), "confirmation")
+            self.assertEqual(caught.exception.code, "invalidStructuredResponse")
+
+    def test_v10_residual_preserves_paragraphs_technical_tokens_and_exact_unicode(self):
+        for source, target in [("运行 swift test", "运行 swifttest"), ("甲\n\n乙", "甲。乙"),
+                               ("运行 --dry-run", "运行 dryrun")]:
+            with self.assertRaises(ValueError): e.v10_strict_mechanical_candidate(source, target)
+        for source, target in [("甲\n\n乙", "甲。\n\n乙。"), ("👨‍👩‍👧‍👦到了", "👨‍👩‍👧‍👦到了。"), ("e\u0301到了", "e\u0301到了。")]:
+            self.assertEqual(e.v10_strict_mechanical_candidate(source, target).encode(), target.encode())
+
+    def test_v10_standard_keeps_v8_routes_and_v9_light_evidence_remains_valid(self):
+        for source, count in [("甲。乙。", 2), ("帮我整理甲。乙。", 3)]:
+            report, receipts = self.v7_report(source, version=10)
+            self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+            self.assertEqual(len(receipts), count)
+        report, receipts = self.v7_report("帮我回他，先别承诺。", version=9, mode="light", review=False)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+
+    def test_v10_output_shape_cannot_forge_success_with_only_punctuation_growth(self):
+        source, target = "甲", "甲" + "。" * 41
+        report, receipts = self.v10_report(source, target)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        self.v10_fallback(report, "abnormalLength")
+        self.assertEqual(self.check(report, receipts, "light")[0], [])
+        for output, code in [(" \t\n", "emptyOutput"), ("甲\u0000", "unsafeCharacters")]:
+            with self.assertRaises(e.V7ContractError) as caught:
+                e.v10_output_shape_check(source, output)
+            self.assertEqual(caught.exception.code, code)
+        # 组合 emoji 和 CRLF 都按真实字符边界计数，不能用码点数误判长度。
+        e.v10_output_shape_check("👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦" + "。" * 40)
+
+    def test_v10_whitespace_delivery_cannot_be_disguised_as_mechanical_success(self):
+        for source, output in [("嗯", " "), ("嗯啊", "\t")]:
+            report, receipts = self.v10_report(source, output)
+            self.assertTrue(self.check(report, receipts, "light")[0])
+            self.v10_fallback(report, "emptyOutput")
+            failures, blockers = self.check(report, receipts, "light")
+            self.assertEqual(failures, []); self.assertTrue(blockers)
+
+    def test_v10_duplicate_keys_cannot_replace_rejection_or_semantic_evidence(self):
+        cases = [
+            ("initial", '{"text":"甲","text":"乙"}'),
+            ("review", '{"text":null,"text":"甲","edits":[]}'),
+            ("confirmation", '{"approved":false,"approved":true}'),
+            ("initial", '{"text":"甲","\\u0074ext":"乙"}'),
+            ("review", '{"text":"乙","edits":[{"before":"甲","before":"乙","after":"乙","kind":"word"}]}'),
+        ]
+        for stage, raw in cases:
+            with self.assertRaises(e.V7ContractError) as caught:
+                e.decode_v10_light(raw, stage)
+            self.assertEqual(caught.exception.code, "invalidStructuredResponse")
+        report, receipts = self.v10_report("我我到了", "我到了", review={"text": "我到了", "edits": []})
+        self.v7_response(report, receipts, 1, '{"text":null,"text":"我到了","edits":[]}')
+        self.v10_fallback(report, "invalidStructuredResponse")
+        self.assertEqual(self.check(report, receipts, "light")[0], [])
+
+    def test_v10_unpaired_surrogates_are_protocol_errors_including_nested_evidence(self):
+        for stage, raw in [
+            ("initial", r'{"text":"\ud800"}'),
+            ("review", r'{"text":"\udfff","edits":[]}'),
+            ("review", r'{"text":"甲","edits":[{"before":"\ud800","after":"甲","kind":"word"}]}'),
+        ]:
+            with self.assertRaises(e.V7ContractError) as caught:
+                e.decode_v10_light(raw, stage)
+            self.assertEqual(caught.exception.code, "invalidStructuredResponse")
+        self.assertEqual(e.decode_v10_light(r'{"text":"\ud83d\ude00"}', "initial")["text"], "😀")
+        report, receipts = self.v10_report("甲", "甲")
+        self.v7_response(report, receipts, 0, r'{"text":"\ud800"}')
+        self.v10_fallback(report, "invalidStructuredResponse")
+        self.assertEqual(self.check(report, receipts, "light")[0], [])
 
     def test_input_limit_checks_both_sources_and_rejects_answers(self):
         for source_length, segment_length, valid in [(1000, 1000, True), (1001, 1, False), (1, 1001, False)]:

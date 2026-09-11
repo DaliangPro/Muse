@@ -29,6 +29,50 @@ struct VoicePolishEditingReview: Sendable {
         }
     }
 
+    struct LightCandidateReview: Decodable, Sendable {
+        let text: String?
+        let edits: [VoicePolishTextEdit]
+    }
+
+    static func decodeLightCandidate(_ raw: String) throws -> String {
+        struct Candidate: Decodable { let text: String }
+        do {
+            let data = try lightResponseData(raw, keys: ["text"])
+            let value = try JSONDecoder().decode(Candidate.self, from: data)
+            guard !value.text.isEmpty else { throw VoicePolishEditingReviewError.invalidResponse }
+            return value.text
+        } catch { throw VoicePolishEditingReviewError.invalidResponse }
+    }
+
+    static func decodeLightCandidateReview(_ raw: String) throws -> LightCandidateReview {
+        do {
+            let data = try lightResponseData(raw, keys: ["text", "edits"])
+            let value = try JSONDecoder().decode(LightCandidateReview.self, from: data)
+            guard value.edits.count <= 128, value.text?.isEmpty != true else {
+                throw VoicePolishEditingReviewError.invalidResponse
+            }
+            return value
+        } catch { throw VoicePolishEditingReviewError.invalidResponse }
+    }
+
+    static func decodeLightConfirmation(_ raw: String) throws -> Bool {
+        struct Confirmation: Decodable { let approved: Bool }
+        do {
+            let data = try lightResponseData(raw, keys: ["approved"])
+            return try JSONDecoder().decode(Confirmation.self, from: data).approved
+        } catch { throw VoicePolishEditingReviewError.invalidResponse }
+    }
+
+    private static func lightResponseData(_ raw: String, keys: Set<String>) throws -> Data {
+        let data = Data(raw.utf8)
+        guard data.count <= VoicePolishOutputNormalizer.maximumResponseBytes,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              Set(object.keys) == keys else { throw VoicePolishEditingReviewError.invalidResponse }
+        var scanner = VoicePolishJSONUniqueKeys(data: data)
+        try scanner.check()
+        return data
+    }
+
     /// 自我纠错线索只触发复核，不授予删除任务原话、禁令或其他正文的权限。
     static func hasLightSourceReviewRisk(_ source: String) -> Bool {
         let lowered = source.lowercased()

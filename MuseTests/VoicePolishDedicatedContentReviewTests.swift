@@ -154,7 +154,7 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
 
     func testLightPreservesProhibitionWithoutRoleReviewOrLayout() async throws {
         let source = "先别发送，等我确认。"
-        let (result, calls) = await run(source, [#"{"edits":[]}"#], mode: .light)
+        let (result, calls) = await run(source, [#"{"text":"先别发送，等我确认。"}"#], mode: .light)
         assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
         XCTAssertEqual(calls.map(\.task), [.voicePolishFast])
         for call in calls { XCTAssertNil(try payload(call)["layout_segments"]) }

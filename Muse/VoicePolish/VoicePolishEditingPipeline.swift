@@ -23,7 +23,7 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
-/// 两档内容修正都使用受限局部补丁；标准额外组织完整来源片段，布局无正文改写权限。
+/// 轻度完整稿经严格机械证明或来源补丁核对；标准以局部修正和完整片段组织成稿。
 /// 两条路径都保留不可变来源，不把 Planner 的摘要当作完整事实来源。
 struct VoicePolishEditingPipeline: Sendable {
     private let client: any LLMClient
@@ -81,53 +81,50 @@ struct VoicePolishEditingPipeline: Sendable {
                 deadline: deadline, attempts: attempts
             )
             if isLight {
-                let edits = try VoicePolishTextEditor.decode(initial)
-                let requiresReview = VoicePolishEditingReview.hasLightSourceReviewRisk(request.fallbackText)
-                    || VoicePolishTextEditor.requiresSemanticReview(edits, in: request.fallbackText)
-                let output = try VoicePolishTextEditor.apply(
-                    edits, to: request.fallbackText, source: request.fallbackText, mode: .light,
-                    allowsReviewedSourceCorrections: requiresReview
-                )
-                draft = output
-                var codes = Self.outputCodes(output, request: request)
-                if VoicePolishValidator.deliberateRepetitionPhrases(in: request.fallbackText)
-                    .contains(where: { !output.contains($0) }) {
-                    codes.append(.missingProtectedFact)
+                let source = request.fallbackText
+                let candidate = try VoicePolishEditingReview.decodeLightCandidate(initial)
+                draft = candidate
+                let wholeEdit = VoicePolishTextEdit(before: source, after: candidate, kind: .punctuation)
+                let requiresReview = VoicePolishEditingReview.hasLightSourceReviewRisk(source)
+                    || VoicePolishTextEditor.requiresSemanticReview([wholeEdit], in: source)
+                if !requiresReview {
+                    let output = try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: source, to: candidate)
+                    let codes = Self.contentCodes(output, request: request)
+                    return codes.isEmpty ? result(output) : result(nil, codes: codes)
                 }
+                // 冷核完整候选；证据补丁始终定位不可变来源，不定位首稿。
+                let review = try await generate(
+                    task: .voicePolishAnalyze, system: VoicePolishEditingPrompts.lightReview,
+                    payload: VoicePolishEditingPrompts.payload(for: request, draft: candidate),
+                    json: true, request: request, deadline: deadline, attempts: attempts
+                )
+                let assessment = try VoicePolishEditingReview.decodeLightCandidateReview(review)
+                guard let target = assessment.text else {
+                    return result(nil, codes: [.semanticDecisionUnverified])
+                }
+                // 先记录修复目标；权限或后续验证失败同样保留这次真实修复尝试。
+                let didRepair = !target.utf8.elementsEqual(candidate.utf8)
+                if didRepair { repairAttempts += 1 }
+                draft = target
+                let semanticDraft = try VoicePolishTextEditor.apply(
+                    assessment.edits, to: source, source: source, mode: .light,
+                    allowsReviewedSourceCorrections: true
+                )
+                let output = try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(
+                    from: semanticDraft, to: target
+                )
+                let codes = Self.contentCodes(output, request: request)
                 guard codes.isEmpty else { return result(nil, codes: codes) }
-                if requiresReview {
-                    // 原文有风险时，空补丁也须核对；模型不能同时决定漏改和免审。
-                    let review = try await generate(
-                        task: .voicePolishAnalyze,
-                        system: VoicePolishEditingPrompts.lightReview,
+                if didRepair {
+                    // 核对稿确实变化才确认一次；终审只能接受或拒绝，不能继续改写。
+                    let confirmation = try await generate(
+                        task: .voicePolishAnalyze, system: VoicePolishEditingPrompts.lightConfirmation,
                         payload: VoicePolishEditingPrompts.payload(for: request, draft: output),
                         json: true, request: request, deadline: deadline, attempts: attempts
                     )
-                    let reviewEdits = try VoicePolishEditingReview.decodeLightEdits(review)
-                    if reviewEdits.isEmpty { return result(output) }
-                    // 只修一次实际稿上的局部问题，继续使用轻度权限；不得转入标准重写。
-                    repairAttempts += 1
-                    let repaired = try VoicePolishTextEditor.apply(
-                        reviewEdits, to: output, source: request.fallbackText, mode: .light,
-                        allowsReviewedSourceCorrections: true
-                    )
-                    draft = repaired
-                    var repairedCodes = Self.outputCodes(repaired, request: request)
-                    if VoicePolishValidator.deliberateRepetitionPhrases(in: request.fallbackText)
-                        .contains(where: { !repaired.contains($0) }) {
-                        repairedCodes.append(.missingProtectedFact)
+                    guard try VoicePolishEditingReview.decodeLightConfirmation(confirmation) else {
+                        return result(nil, codes: [.semanticDecisionUnverified])
                     }
-                    guard repairedCodes.isEmpty else { return result(nil, codes: repairedCodes) }
-                    let confirmation = try await generate(
-                        task: .voicePolishAnalyze, system: VoicePolishEditingPrompts.lightReview,
-                        payload: VoicePolishEditingPrompts.payload(for: request, draft: repaired),
-                        json: true, request: request, deadline: deadline, attempts: attempts
-                    )
-                    let finalEdits = try VoicePolishEditingReview.decodeLightEdits(confirmation)
-                    guard finalEdits.isEmpty else {
-                        return result(nil, codes: [.planIntegrityFailure])
-                    }
-                    return result(repaired)
                 }
                 return result(output)
             }
@@ -242,7 +239,7 @@ struct VoicePolishEditingPipeline: Sendable {
         guard remaining > .zero else { throw VoicePolishEditingTimeout() }
         onStage?(task == .voicePolishAnalyze ? .analyzing : .polishing)
         let sourceTokens = EstimatedTokenCounter.count(in: request.fallbackText)
-        // 复核返回短编辑摘录与局部补丁，沿用受控输出容量与总时限。
+        // 复核可能返回完整轻度稿与局部证据；沿用受控输出容量与总时限。
         let outputBudget: Int
         if task == .voicePolishAnalyze {
             outputBudget = min(8_192, max(4_096, sourceTokens * 4 + 1_024))

@@ -17,7 +17,9 @@
 
 当前实验进度：请求探针已通过1565项全量测试（8跳过、0失败）及Release。第一轮A局部补丁/B完整内容修正稿共12次，各0直接/2轻改/4重大/0不可用；第二轮B原边界/C两句范围澄清共20次，各2直接/4轻改/4重大/0不可用。两轮均先冻结独立评级再解盲，完整请求证据核实了模型、输入和参数，两种改动仍未改善目标，不能据此推定模型能力是唯一问题，也不能将首稿实验当生产质量通过。见[第一轮对照](../build/2026-09-10-three-mode-implementation/request-form-experiment-01/unblinded-comparison.md)、[第二轮对照](../build/2026-09-10-three-mode-implementation/request-boundary-experiment-02/unblinded-comparison.md)。
 
-第三轮[完整标准产品基线](../build/2026-09-10-three-mode-implementation/standard-product-baseline-03/registration.md)正在独立执行，明确长例、内部同事提醒、Swift任务各2次，共6次，尚无结果。现有生产路由和v8提示词未因实验而替换；麦克风、ASR、跨应用上屏仍未验证，未部署。
+第三轮[完整标准产品基线](../build/2026-09-10-three-mode-implementation/standard-product-baseline-03/unblinded-comparison.md)已完成6次，独立评定2直接/4轻改，无重大或不可用；有效内容保留，但长例仍有旧安排过程和编辑要求。第四轮[段落修正](../build/2026-09-10-three-mode-implementation/standard-paragraph-repair-04/unblinded-comparison.md)再运行6次，全部空edits，最终稿与首稿逐字相同，没有实际收益。现有标准生产路由和v8提示词未因实验而替换。
+
+v9轻度候选c01c219已完成20条真实运行及独立盲评：原13为8直接/5轻改，额外7为5直接/2轻改，均无重大或不可用；27次请求均成功，无回退或修复。7条仍有口误、停顿声或必要句界残留，尚未扩172；新轻度范围政策不同于旧政策，不把历史分数变化直接当作代码收益。原13条运行延迟P50为1018ms、P95为1420ms，仅从ASR终稿夹具至输出。见[独立轻度评分](../build/2026-09-10-three-mode-implementation/candidate-c01c219/independent-light20-blind-ratings.md)与[阶段归因](../build/2026-09-10-three-mode-implementation/candidate-c01c219/light20-stage-attribution.md)。麦克风、ASR、跨应用上屏仍未验证，未部署。
 
 需求依据仍有待确认项：无收件人上下文的core-sem-10/11含未确认的用途默认；prompt-02历史契约的“恰好五编号”没有明确原话依据，不能把这种格式本身当成事实缺失。旧契约和评级保持不变，后续结论须标明这些边界，不把含歧义的样本结果泛化为唯一系统原因。
 
@@ -538,6 +540,10 @@ Pro 的一次成稿率为 92%，`direct_send + minor_edit` 为 96%；Flash 分�
 5. 独立 Agent 未明确通过时，L15 保持进行中，不安装候选，也不声称完成。
 
 
-当前v9只纠正轻度职责范围，标准生成及两类复核提示保持与v8逐字相同。新的轻度范围补充独立保存，历史契约与评级不变；v9已通过179定向、1577全量（8跳过0失败）、Debug/Release与独立审查，新的真实轻度效果尚未验收。标准完整成稿基线6次已独立判2直接/4轻改，长例的负责人和原因归属改善但仍留旧时间过程，正在旧9a37ab3隔离探针上验证段落局部修正，不混作v9生产结果。
+v9只纠正轻度职责范围，标准生成及两类复核提示保持与v8逐字相同。新的轻度范围补充独立保存，历史契约与评级不变；v9已通过179定向、1577全量（8跳过0失败）、Debug/Release与独立审查，但真实轻度20条仍有7条轻改，产品质量未通过。标准完整成稿基线6次为2直接/4轻改；后续6次段落修正均空补丁，没有收益。
+
+同一c01c219隔离探针完成[轻度完整文本请求实验](../build/2026-09-10-three-mode-implementation/light-fulltext-experiment-05/unblinded-comparison.md)，20次请求后独立判读为原13条11直接/2轻改、额外7条全直接。初始盲包遗漏实际source_segments，在初始评分冻结后追加完整来源并另存判读；长例的四处指代连属仍未决。它同时改变任务表达与输出方式等条件，不能当纯格式因果结论或正式管线验收。
+
+v10据此接入轻度完整候选：低风险且严格机械变化可直接输出；其他情况须用原文局部证据核对完整目标稿，并证明剩余差异只含机械变化。目标稿有修复时第三次确认实际修后稿。编辑权限不放宽，不由通用diff猜语义证据，继续20秒/最多三调用。运行检查发现并修复700字递归匹配栈溢出；1609全量（8条件跳过、0失败）、Debug/Release、183项Python、33份旧报告202条回放及独立复核通过。随后须重新跑同组20条正式生产链路；标准提示与路由保持，完整验收及真实录音尚未完成。
 
 轻度后续真实评分采用已独立批准的[范围补充](../build/2026-09-10-three-mode-implementation/light-scope-v2/2026-09-11-Muse-轻度范围验收补充.md)，绑定JSON SHA `f7d6ebf7f941d5f842a7bdf3d5078a0c03fa35c28ec170d966e33719467f2fbf`；[独立批准记录](../build/2026-09-10-three-mode-implementation/light-scope-v2/independent-light-scope-review-2026-09-11.md)说明依据与不变的事实门槛。原13与补充7分开报告，不能重评旧结果后声称代码改善。

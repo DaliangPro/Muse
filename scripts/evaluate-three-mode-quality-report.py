@@ -1001,8 +1001,8 @@ def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: 
     # v5 改复核响应、v6 加优先差异；局部补丁权限均完整沿用 v4。
     if editing_prompt_version in (5, 6):
         editing_prompt_version = 4
-    # v8/v9 标准局部权限沿用 v7；v9 轻度在入口单独禁止代写删除。
-    if editing_prompt_version in (8, 9):
+    # v8及后续标准局部权限沿用v7；新轻度在入口单独禁止代写删除。
+    if editing_prompt_version in (8, 9, 10):
         editing_prompt_version = 7
     document = decode_v7_initial(response) if editing_prompt_version == 7 else json.loads(response)
     if (not isinstance(document, dict) or set(document) != {"edits"}
@@ -1481,6 +1481,138 @@ def decode_v9_light_review(raw: str) -> dict:
         raise V7ContractError(str(error), "invalidStructuredResponse") from error
 
 
+def decode_v10_light(raw: str, stage: str) -> dict:
+    """v10 的明确拒绝和修后确认独立于局部编辑权限；语法失败不算修复。"""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("v10 JSON 对象不允许重复字段")
+            result[key] = value
+        return result
+
+    def validate_strings(value):
+        # Python JSON 可保留未配对 surrogate；Swift String 解码会拒绝，须在协议层同样拒绝。
+        if isinstance(value, str):
+            value.encode("utf-8")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                validate_strings(key)
+                validate_strings(item)
+        elif isinstance(value, list):
+            for item in value:
+                validate_strings(item)
+
+    try:
+        if len(raw.encode()) > 1_048_576:
+            raise ValueError("v10 响应超界")
+        value = json.loads(raw, object_pairs_hook=unique_object)
+        validate_strings(value)
+        fields = {"text", "edits"} if stage == "review" else {"approved"} if stage == "confirmation" else {"text"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError("v10 响应字段不符合当前阶段")
+        if stage == "confirmation":
+            if not isinstance(value["approved"], bool):
+                raise ValueError("v10 approved 必须是真正布尔值")
+        else:
+            target = value["text"]
+            if not (stage == "review" and target is None) and (not isinstance(target, str) or not target):
+                raise ValueError("v10 text 必须是非空字符串或复核的明确 null 拒绝")
+            if stage == "review":
+                decode_v4_edits(value["edits"])
+        return value
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        raise V7ContractError(str(error), "invalidStructuredResponse") from error
+
+
+def v10_strict_mechanical_candidate(source: str, target: str) -> str:
+    """先证明整个变化无需语义审核，再应用；不能用宽权限 apply 成功替代证明。"""
+    edits = [{"before": source, "after": target, "kind": "punctuation"}]
+    if v4_requires_semantic_review(edits, source):
+        raise V7ContractError("v10 候选仍有未声明、需要语义复核的实际变化")
+    result = apply_recorded_edits(source, json.dumps({"edits": edits}, ensure_ascii=False),
+        editing_prompt_version=10, allows_directive_edits=False)
+    if result.encode() != target.encode():
+        raise V7ContractError("v10 最终应用结果未逐字等于核对目标")
+    return result
+
+
+def v10_output_shape_check(source: str, output: str) -> None:
+    # 仅复现可确定的输出形状门。事实语义另由真实独立评分负责，不能从通过来源审计推定。
+    if not output.strip():
+        raise V7ContractError("v10 不能把空白稿冒充成功", "emptyOutput")
+    if v7_unsafe_characters(output):
+        raise V7ContractError("v10 输出含不允许的控制字符", "unsafeCharacters")
+    source_count = len(composed_characters(source))
+    if (len(output.encode()) > 1_048_576
+            or len(composed_characters(output)) > max(source_count * 2, source_count + 40)):
+        raise V7ContractError("v10 输出超出实际长度门限", "abnormalLength")
+
+
+def v10_light_stage_contract(row: dict, payloads: list) -> tuple[list[str], list[str]]:
+    source, stages, fallback = row["canonical_input"], row["stage_responses"], row.get("fallback_used")
+    allowed, failures, repairs, output = ["voicePolishFast"], [], 0, None
+
+    def bind_draft(index: int, current: str) -> None:
+        payload = payloads[index]
+        if not isinstance(payload, dict) or payload.get("draft_text") != current:
+            failures.append("v10 复核或确认未绑定实际候选全文")
+        if not isinstance(payload, dict) or not complete_v6_review_focus(source, current, payload):
+            failures.append("v10 复核或确认未绑定完整来源差异和实际上下文")
+
+    for index, payload in enumerate(payloads):
+        if not isinstance(payload, dict):
+            failures.append("v10 请求载荷不可审计")
+        else:
+            failures.extend(v7_payload_field_failures(payload, "light", index))
+    try:
+        if stages and stages[0].get("status") == "succeeded":
+            initial = decode_v10_light(stages[0]["response_text"], "initial")["text"]
+            proposed = [{"before": source, "after": initial, "kind": "punctuation"}]
+            requires = v9_light_source_review_risk(source) or v4_requires_semantic_review(proposed, source)
+            if not requires:
+                output = v10_strict_mechanical_candidate(source, initial)
+                v10_output_shape_check(source, output)
+            else:
+                allowed.append("voicePolishAnalyze")
+                if len(stages) >= 2:
+                    bind_draft(1, initial)
+                    if stages[1].get("status") == "succeeded":
+                        assessment = decode_v10_light(stages[1]["response_text"], "review")
+                        target = assessment["text"]
+                        if target is None:
+                            raise V7ContractError("v10 复核明确拒绝候选", "semanticDecisionUnverified")
+                        repairs = int(target.encode() != initial.encode())
+                        semantic_draft = apply_recorded_edits(source,
+                            json.dumps({"edits": assessment["edits"]}, ensure_ascii=False),
+                            editing_prompt_version=10, original_source=source,
+                            allows_reviewed_source_corrections=True, allows_directive_edits=False)
+                        output = v10_strict_mechanical_candidate(semantic_draft, target)
+                        v10_output_shape_check(source, output)
+                        if repairs:
+                            allowed.append("voicePolishAnalyze")
+                            if len(stages) >= 3:
+                                bind_draft(2, output)
+                                if stages[2].get("status") == "succeeded":
+                                    final = decode_v10_light(stages[2]["response_text"], "confirmation")
+                                    if not final["approved"]:
+                                        raise V7ContractError("v10 修后稿未通过最终确认", "semanticDecisionUnverified")
+            if not fallback and row.get("model_output") != output:
+                raise V7ContractError("v10 交付不是经过权限证明及实际核对的完整候选")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        if not fallback:
+            failures.append(f"v10 阶段证据不成立：{error}")
+        else:
+            code = error.code if isinstance(error, V7ContractError) else "planIntegrityFailure"
+            if code not in row.get("hard_validation_codes", []):
+                failures.append(f"v10 失败未如实记录 {code}：{error}")
+    if not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != repairs:
+        failures.append("v10 修复次数不等于已解码核对稿对首稿的实际变更尝试")
+    if fallback and row.get("model_output") != source:
+        failures.append("v10 回退必须交付完整 canonical 原文，不能提交部分候选")
+    return allowed, failures
+
+
 def v7_payload_field_failures(payload: dict, mode: str, stage_index: int, *,
                               separates_content_review: bool = False) -> list[str]:
     """按当前 Payload 构造闭合字段；本 Runner 的 nil 可选值必须省略。"""
@@ -1510,9 +1642,11 @@ def v7_payload_field_failures(payload: dict, mode: str, stage_index: int, *,
 
 def v7_stage_contract(row: dict, payloads: list, mode: str, version: int = 7) -> tuple[list[str], list[str]]:
     """保留 v7/v8 历史协议；v9 轻度只纠错，标准继续先核内容再布局。"""
+    if version == 10 and mode == "light":
+        return v10_light_stage_contract(row, payloads)
     source, stages, fallback = row["canonical_input"], row["stage_responses"], row.get("fallback_used")
     light_scope = version == 9 and mode == "light"
-    separates_content_review = version in (8, 9) and mode == "standard" and v4_source_review_risk(source)
+    separates_content_review = version in (8, 9, 10) and mode == "standard" and v4_source_review_risk(source)
     allowed = ["voicePolishFast" if mode == "light" else "voicePolishRender"]
     failures, repairs, output = [], 0, None
 
@@ -1735,7 +1869,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
-            if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9) and (
+            if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10) and (
                 not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
             ):
                 failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
@@ -1750,7 +1884,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -1762,7 +1896,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9):
+        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -1800,11 +1934,11 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
-                if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9) and (
+                if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10) and (
                     expected_segments is None or payload.get("source_segments") != expected_segments
                 ):
                     failures.append(f"{tid}: v3 阶段 source_segments 未逐项保留 canonical 段的 ID、正文和顺序")
-                if expected["editing_prompt_version"] in (6, 7, 8, 9) and ordinal == 1 and any(
+                if expected["editing_prompt_version"] in (6, 7, 8, 9, 10) and ordinal == 1 and any(
                     payload.get(k) is not None for k in ("review_focus", "review_focus_total")
                 ):
                     failures.append(f"{tid}: v6 首轮请求不得携带复核优先差异")
@@ -1844,8 +1978,8 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9):
-            allowed, stage_failures = (v7_stage_contract(row, payloads, mode, expected["editing_prompt_version"]) if expected["editing_prompt_version"] in (7, 8, 9)
+        if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10):
+            allowed, stage_failures = (v7_stage_contract(row, payloads, mode, expected["editing_prompt_version"]) if expected["editing_prompt_version"] in (7, 8, 9, 10)
                                        else v4_stage_contract(row, payloads, mode, expected["editing_prompt_version"]))
             failures.extend(f"{tid}: {failure}" for failure in stage_failures)
             if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
@@ -1860,7 +1994,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9) else 2
+        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10) else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -1872,7 +2006,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9):
+        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9, 10):
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],
