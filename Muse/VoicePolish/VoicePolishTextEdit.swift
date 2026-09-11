@@ -91,7 +91,8 @@ enum VoicePolishTextEditor {
         to draft: String,
         source: String,
         mode: VoicePolishQualityMode,
-        allowsReviewedInlineDirectives: Bool = false
+        allowsReviewedInlineDirectives: Bool = false,
+        allowsReviewedSourceCorrections: Bool = false
     ) throws -> String {
         var located: [Modification] = []
         for edit in edits {
@@ -107,7 +108,8 @@ enum VoicePolishTextEditor {
                 throw VoicePolishTextEditError.editOutsideMode
             }
             if mode == .light {
-                try validateLight(edit, modifications: modifications)
+                try validateLight(edit, modifications: modifications, source: source,
+                                  allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
                 if edit.kind == .directive,
                    ((!allowsReviewedInlineDirectives && nsRange.location != 0)
                         || nsRange.length == (draft as NSString).length) {
@@ -238,11 +240,26 @@ enum VoicePolishTextEditor {
         return NSIntersectionRange(first, second).length > 0
     }
 
-    private static func validateLight(_ edit: VoicePolishTextEdit, modifications: [Modification]) throws {
+    private static func validateLight(
+        _ edit: VoicePolishTextEdit,
+        modifications: [Modification],
+        source: String = "",
+        allowsReviewedSourceCorrections: Bool = false
+    ) throws {
         let before = lexicalCharacters(edit.before)
         let after = lexicalCharacters(edit.after)
+        let beforeParagraphs = edit.before.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .map { lexicalCharacters(String($0)) }
+        let afterParagraphs = edit.after.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .map { lexicalCharacters(String($0)) }
+        let paragraphPairs = Array(zip(beforeParagraphs, afterParagraphs))
         guard edit.kind != .content,
               edit.kind == .punctuation || edit.before.count <= 96,
+              edit.before.filter(\.isNewline) == edit.after.filter(\.isNewline),
+              beforeParagraphs.count == afterParagraphs.count,
+              modifications.allSatisfy({
+                  !$0.removed.contains(where: \.isNewline) && !$0.inserted.contains(where: \.isNewline)
+              }),
               edit.after.filter({ $0 == "\n" }).count <= edit.before.filter({ $0 == "\n" }).count else {
             throw VoicePolishTextEditError.editOutsideMode
         }
@@ -256,12 +273,14 @@ enum VoicePolishTextEditor {
                     .map { source.substring(with: $0.range) }
             }
             guard before == after,
+                  beforeParagraphs == afterParagraphs,
                   edit.before.filter({ technicalMarks.contains($0) }) == edit.after.filter({ technicalMarks.contains($0) }),
                   tokens(edit.before) == tokens(edit.after) else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
         case .stutter:
-            guard isAdjacentRepetitionRemoval(before: before, after: after) else {
+            guard isAdjacentRepetitionRemoval(before: before, after: after),
+                  paragraphPairs.allSatisfy({ $0.0 == $0.1 || isAdjacentRepetitionRemoval(before: $0.0, after: $0.1) }) else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
         case .word:
@@ -269,6 +288,7 @@ enum VoicePolishTextEditor {
             let changes = VoicePolishTextChange.between(String(before), String(after))
             guard (0...8).contains(difference.removals.count),
                   (1...8).contains(difference.insertions.count), changes.count == 1,
+                  paragraphPairs.filter({ $0.0 != $0.1 }).count == 1,
                   edit.before.filter({ technicalMarks.contains($0) }) == edit.after.filter({ technicalMarks.contains($0) }) else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
@@ -283,14 +303,37 @@ enum VoicePolishTextEditor {
                 of: #"(?<=[A-Za-z0-9_])点(?=[A-Za-z0-9_])"#,
                 with: ".", options: .regularExpression
             )
-            guard projected != edit.before,
-                  projected.filter({ !$0.isWhitespace }) == edit.after.filter({ !$0.isWhitespace }) else {
+            guard projected != edit.before else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
+            // 模型可以在一次局部编辑中恢复口述符号并补标点；投影后的剩余
+            // 修改仍须通过同一标点权限，不能借此改命令、数字或正文。
+            try validateLight(.init(before: projected, after: edit.after, kind: .punctuation),
+                              modifications: [])
         case .correction:
-            let cues = ["不对", "说错", "改成", "改为", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
-            guard cues.contains(where: edit.before.lowercased().contains),
-                  isSubsequence(after, of: before) else {
+            let cues = ["不对", "说错", "改成", "改为", "改由", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
+            if cues.contains(where: edit.before.lowercased().contains), isSubsequence(after, of: before),
+               paragraphPairs.allSatisfy({ isSubsequence($0.1, of: $0.0) }) {
+                break
+            }
+            guard allowsReviewedSourceCorrections,
+                  let evidence = edit.evidence, !evidence.isEmpty, evidence.unicodeScalars.count <= 192,
+                  source.range(of: evidence, options: .literal) != nil,
+                  source.range(of: edit.before, options: .literal) != nil,
+                  cues.contains(where: evidence.lowercased().contains),
+                  edit.before.unicodeScalars.count <= 96,
+                  paragraphPairs.filter({ $0.0 != $0.1 }).count == 1,
+                  technicalContent(in: before) == technicalContent(in: after) else {
+                throw VoicePolishTextEditError.editOutsideMode
+            }
+            let changes = Self.modifications(
+                for: .init(before: String(before), after: String(after), kind: .correction),
+                anchorLocation: 0
+            )
+            guard changes.count == 1, let change = changes.first,
+                  change.removed.unicodeScalars.count <= 32,
+                  change.inserted.unicodeScalars.count <= 8,
+                  change.inserted.isEmpty || evidence.range(of: change.inserted, options: .literal) != nil else {
                 throw VoicePolishTextEditError.editOutsideMode
             }
         case .filler:
@@ -309,6 +352,18 @@ enum VoicePolishTextEditor {
         case .content:
             throw VoicePolishTextEditError.editOutsideMode
         }
+    }
+
+    private static func technicalContent(in lexical: [Character]) -> String {
+        String(String.UnicodeScalarView(String(lexical).unicodeScalars.filter {
+            switch $0.properties.generalCategory {
+            case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+                 .decimalNumber, .letterNumber, .otherNumber:
+                return false
+            default:
+                return true
+            }
+        }))
     }
 
     private static func lexicalCharacters(_ text: String) -> [Character] {

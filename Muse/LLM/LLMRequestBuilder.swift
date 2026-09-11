@@ -11,11 +11,18 @@ enum LLMRequestContext: Equatable, Sendable {
 enum LLMRequestBuilder {
 
     static func messages(for request: LLMRequest) -> (system: String?, user: String) {
-        messages(
+        var result = messages(
             prompt: request.system ?? "",
             text: request.user,
             context: request.context
         )
+        if request.options.responseFormat == .jsonObject {
+            // JSON 模式的兼容接口要求消息内明确声明 JSON；由请求协议保证，
+            // 不依赖每个业务提示词恰好包含该词，也不依赖用户输入来满足条件。
+            result.system = [result.system, "仅返回有效的 JSON 对象。"]
+                .compactMap { $0 }.joined(separator: "\n\n")
+        }
+        return result
     }
 
     static func messages(

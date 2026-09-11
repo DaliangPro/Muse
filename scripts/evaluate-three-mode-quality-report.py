@@ -5,18 +5,22 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
+from functools import lru_cache
 import json
 import math
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import statistics
 import subprocess
 import sys
+import unicodedata
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
@@ -274,6 +278,175 @@ def sanitized_fallback(text: str) -> str:
     return "".join(c for c in text if allowed(c)).strip()
 
 
+class _CFRange(ctypes.Structure):
+    _fields_ = [("location", ctypes.c_long), ("length", ctypes.c_long)]
+
+
+@lru_cache(maxsize=1)
+def _core_foundation():
+    # 跑测宿主本来就是 macOS。只读取给定字符串的组合字符边界，不访问应用或配置。
+    library = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    library.CFStringCreateWithBytes.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32, ctypes.c_bool]
+    library.CFStringCreateWithBytes.restype = ctypes.c_void_p
+    library.CFStringGetLength.argtypes = [ctypes.c_void_p]
+    library.CFStringGetLength.restype = ctypes.c_long
+    library.CFStringGetRangeOfComposedCharactersAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    library.CFStringGetRangeOfComposedCharactersAtIndex.restype = _CFRange
+    library.CFRelease.argtypes = [ctypes.c_void_p]
+    return library
+
+
+@lru_cache(maxsize=1024)
+def composed_characters(text: str) -> tuple[str, ...]:
+    if text.isascii() and "\r\n" not in text:
+        return tuple(text)
+    try:
+        library = _core_foundation()
+        encoded = text.encode("utf-8")
+        value = library.CFStringCreateWithBytes(None, encoded, len(encoded), 0x08000100, False)
+        if not value:
+            raise ValueError("无法构造原文的 Unicode 字符边界")
+        try:
+            units = text.encode("utf-16-le")
+            length, offset, result = library.CFStringGetLength(value), 0, []
+            while offset < length:
+                span = library.CFStringGetRangeOfComposedCharactersAtIndex(value, offset)
+                if span.location != offset or span.length <= 0 or offset + span.length > length:
+                    raise ValueError("原文 Unicode 字符边界不连续")
+                result.append(units[2 * offset:2 * (offset + span.length)].decode("utf-16-le"))
+                offset += span.length
+            # CoreFoundation 的组合序列接口将 CR/LF 分开；Swift Character 按 GB3 合并。
+            combined = []
+            for character in result:
+                if character == "\n" and combined and combined[-1] == "\r":
+                    combined[-1] = "\r\n"
+                else:
+                    combined.append(character)
+            return tuple(combined)
+        finally:
+            library.CFRelease(value)
+    except (OSError, UnicodeError) as error:
+        raise ValueError("无法可靠复现 macOS 原文分段字符边界") from error
+
+
+def terminology_units(text: str) -> list[tuple[str, int, int]]:
+    units, offset = [], 0
+    for character in composed_characters(text):
+        end = offset + len(character)
+        for folded in composed_characters(unicodedata.normalize("NFKC", character).lower()):
+            if (folded.isspace() and "\n" not in folded and "\r" not in folded) or folded in "-‐‑‒–—﹘﹣－":
+                continue
+            units.append((folded, offset, end))
+        offset = end
+    return units
+
+
+def terminology_key(text: str) -> str:
+    return "".join(unit[0] for unit in terminology_units(text))
+
+
+def terminology_matches(alias: str, text: str) -> list[tuple[int, int, int]]:
+    needle, haystack = [u[0] for u in terminology_units(alias)], terminology_units(text)
+    if len(needle) < 2:
+        return []
+    result = []
+    for index in range(len(haystack) - len(needle) + 1):
+        candidate = haystack[index:index + len(needle)]
+        if [unit[0] for unit in candidate] != needle:
+            continue
+        start, end = candidate[0][1], candidate[-1][2]
+        ascii_word = lambda char: len(char) == 1 and char.isascii() and char.isalnum()
+        if ((ascii_word(needle[0]) and start > 0 and ascii_word(composed_characters(text[:start])[-1]))
+                or (ascii_word(needle[-1]) and end < len(text) and ascii_word(composed_characters(text[end:])[0]))):
+            continue
+        result.append((start, end, len(needle)))
+    return result
+
+
+def select_terminology_matches(matches: list[tuple[int, int, int, str]], text: str,
+                               prefer_normalized_length: bool) -> list[tuple[int, int, int, str]]:
+    grouped = {}
+    for match in matches:
+        grouped.setdefault(match[:2], []).append(match)
+    unambiguous = []
+    for group in grouped.values():
+        if prefer_normalized_length:
+            best_length = max(match[2] for match in group)
+            group = [match for match in group if match[2] == best_length]
+        if len({terminology_key(match[3]) for match in group}) != 1:
+            continue
+        if len({match[3] for match in group}) != 1:
+            raise ValueError("冻结术语规则存在同优先级大小写竞争，不能推定确定结果")
+        unambiguous.append(group[0])
+    selected = []
+    for match in sorted(unambiguous, key=lambda m: (-len(text[m[0]:m[1]].encode("utf-16-le")), m[0])):
+        if not any(match[0] < old[1] and match[1] > old[0] for old in selected):
+            selected.append(match)
+    return selected
+
+
+def applying_fixture_terminology(text: str, preconditions: list[str]) -> str:
+    """只复现冻结夹具的已确认规则；不推断上下文实体或读取个人词库。"""
+    rules = {}
+    for precondition in preconditions:
+        if "→" not in precondition:
+            continue
+        alias, canonical = precondition.split("→", 1)
+        alias, canonical = alias.rsplit("已确认 ", 1)[-1].strip(), canonical.strip()
+        if alias and canonical:
+            rules[alias] = canonical
+    if not rules:
+        return text
+    matches = [(start, end, width, canonical) for alias, canonical in rules.items()
+               for start, end, width in terminology_matches(alias, text)]
+    first = select_terminology_matches(matches, text, True)
+    # applyingKnownCorrections 先选唯一命中，再由 applying 在同一不可变原文定位替换。
+    operations = [(start, end, width, match[3]) for match in first
+                  for start, end, width in terminology_matches(text[match[0]:match[1]], text)]
+    output = text
+    for start, end, _, canonical in sorted(select_terminology_matches(operations, text, False), reverse=True):
+        output = output[:start] + canonical + output[end:]
+    return output
+
+
+def frozen_input_envelope(item: dict) -> tuple[str, list[dict]]:
+    """从冻结输入复现 Runner.makeEnvelope / VoiceInputEnvelope 的确定性来源分段。"""
+    raw = item["spoken_input"].strip()
+    canonical = applying_fixture_terminology(item["spoken_input"], item.get("preconditions", [])).strip()
+    raw_segments = [segment for segment in item["segment_texts"] if segment.strip()]
+    if not raw or not canonical:
+        raise ValueError("冻结完整正文为空")
+    if not raw_segments or "".join(raw_segments).strip() != raw:
+        raw_segments = [raw]
+    preferred = [applying_fixture_terminology(segment, item.get("preconditions", [])) for segment in item["segment_texts"]]
+    if "".join(raw_segments) == canonical:
+        texts = raw_segments
+    elif len(preferred) == len(raw_segments) and "".join(preferred).strip() == canonical:
+        texts = preferred
+    elif len(raw_segments) == 1:
+        texts = [canonical]
+    else:
+        characters = composed_characters(canonical)
+        raw_lengths = [len(composed_characters(segment)) for segment in raw_segments]
+        total = max(1, sum(raw_lengths))
+        nonempty = len(characters) >= len(raw_lengths)
+        previous, cumulative, texts = 0, 0, []
+        for index, length in enumerate(raw_lengths):
+            cumulative += length
+            remaining = len(raw_lengths) - index - 1
+            if remaining == 0:
+                boundary = len(characters)
+            else:
+                ratio = cumulative / total * len(characters)
+                proportional = math.floor(ratio) + int(ratio - math.floor(ratio) >= 0.5)
+                minimum = previous + int(nonempty)
+                maximum = len(characters) - (remaining if nonempty else 0)
+                boundary = min(max(proportional, minimum), max(minimum, maximum))
+            texts.append("".join(characters[previous:boundary]))
+            previous = boundary
+    return canonical, [{"id": f"s{index}", "text": text} for index, text in enumerate(texts, 1)]
+
+
 def explained_by_mappings(source: str, target: str, mappings: list[tuple[str, str]]) -> bool:
     """仅重放已记录的局部字面映射；不复制 Swift 的音近推断、候选排名或语义判断。"""
     if len(source) > 8192 or len(target) > 8192:
@@ -292,13 +465,13 @@ def explained_by_mappings(source: str, target: str, mappings: list[tuple[str, st
     return len(target) in reachable[-1]
 
 
-def resolved_entity_evidence(item: dict, row: dict) -> tuple[list[str], list[str]]:
+def resolved_entity_evidence(item: dict, row: dict, prepared_source: str | None = None) -> tuple[list[str], list[str]]:
     failures, mappings = [], []
     tid = item["test_input_id"]
     entities = row.get("resolved_entities")
     segments = row.get("canonical_segments")
     prepared = row.get("pre_resolution_canonical_input")
-    expected_prepared = sanitized_fallback(legacy.canonical_input(item))
+    expected_prepared = sanitized_fallback(legacy.canonical_input(item) if prepared_source is None else prepared_source)
     if prepared != expected_prepared:
         failures.append(f"{tid}: 实体解析前正文不对应完整原文及夹具明确术语")
     if not isinstance(entities, list) or any(not isinstance(x, dict) for x in entities):
@@ -402,7 +575,113 @@ def modification_conflict(first: tuple[int, int, str], second: tuple[int, int, s
     return start < other_end and end > other_start
 
 
-def apply_recorded_edits(source: str, response: str) -> str:
+def lexical_characters(text: str) -> str:
+    technical = set("-_/\\`@#%")
+    result = []
+    for index, character in enumerate(text):
+        embedded_mark = (character in ".:" and 0 < index < len(text) - 1
+                         and all(c.isascii() and c.isalnum() for c in (text[index - 1], text[index + 1])))
+        if character in technical or embedded_mark or not (
+            character.isspace() or unicodedata.category(character).startswith("P")
+        ):
+            result.append(character)
+    return "".join(result)
+
+
+def is_subsequence(candidate: str, source: str) -> bool:
+    remaining = iter(source)
+    return all(character in remaining for character in candidate)
+
+
+def punctuation_preserves_technical_tokens(before: str, after: str) -> bool:
+    technical = set("-_/\\`@#%")
+    embedded = r"[A-Za-z0-9]+(?:[.:][A-Za-z0-9]+)+"
+    return (lexical_characters(before) == lexical_characters(after)
+            and [c for c in before if c in technical] == [c for c in after if c in technical]
+            and re.findall(embedded, before) == re.findall(embedded, after))
+
+
+def adjacent_repetition_removal(before: str, after: str) -> bool:
+    if not after or len(after) >= len(before):
+        return False
+    pending, seen = [(0, 0)], set()
+    while pending:
+        old, new = pending.pop()
+        if (old, new) in seen:
+            continue
+        seen.add((old, new))
+        if old == len(before) or new == len(after):
+            if old == len(before) and new == len(after):
+                return True
+            continue
+        if before[old] == after[new]:
+            pending.append((old + 1, new + 1))
+        for width in range(1, min((len(before) - old) // 2, len(after) - new) + 1):
+            unit = after[new:new + width]
+            if before[old:old + width] != unit:
+                continue
+            end = old + width
+            while end + width <= len(before) and before[end:end + width] == unit:
+                end += width
+                pending.append((end, new + width))
+    return False
+
+
+def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version: int) -> None:
+    before, after = edit["before"], edit["after"]
+    old_words, new_words = lexical_characters(before), lexical_characters(after)
+    newline_pattern = r"\r\n|[\n\r\v\f\x85\u2028\u2029]"
+    paragraph_pairs = list(zip(
+        [lexical_characters(part) for part in re.split(newline_pattern, before)],
+        [lexical_characters(part) for part in re.split(newline_pattern, after)]
+    ))
+    changed_paragraphs = sum(old != new for old, new in paragraph_pairs)
+    kind = edit.get("kind")
+    if editing_prompt_version == 3:
+        changes = actual_modifications(before, after, 0)
+        if (re.findall(newline_pattern, before) != re.findall(newline_pattern, after)
+                or any(re.search(newline_pattern, before[start:end] + inserted) for start, end, inserted in changes)):
+            raise ValueError("v3 轻度不得新增、删除或移动原有换行")
+        if kind == "punctuation" and (changed_paragraphs or not punctuation_preserves_technical_tokens(before, after)):
+            raise ValueError("v3 标点编辑不能改变技术 token 或把正文搬过原段落边界")
+        if kind == "word" and changed_paragraphs != 1:
+            raise ValueError("v3 字词编辑只能改变一个原段落")
+        if kind == "stutter" and not all(old == new or adjacent_repetition_removal(old, new) for old, new in paragraph_pairs):
+            raise ValueError("v3 口吃删除必须在每个原段落内独立成立")
+        if kind == "symbol":
+            projected = before
+            for spoken, symbol in [("双横线", "--"), ("短横线", "-"), ("反斜杠", "\\"), ("斜杠", "/"), ("下划线", "_")]:
+                projected = projected.replace(spoken, symbol)
+            projected = re.sub(r"(?<=[A-Za-z0-9_])点(?=[A-Za-z0-9_])", ".", projected)
+            if (projected == before or not punctuation_preserves_technical_tokens(projected, after)
+                    or [lexical_characters(p) for p in re.split(newline_pattern, projected)] != [lexical_characters(p) for p in re.split(newline_pattern, after)]):
+                raise ValueError("v3 符号恢复后的正文必须保持在同一原段落")
+    if kind != "correction":
+        return
+    cues = ["不对", "说错", "改成", "改为", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
+    if editing_prompt_version == 3:
+        cues.append("改由")
+    if len(before) > 96 or after.count("\n") > before.count("\n"):
+        raise ValueError("改口锚点超界或新增段落")
+    if (any(cue in before.lower() for cue in cues) and is_subsequence(new_words, old_words)
+            and (editing_prompt_version != 3 or all(is_subsequence(new, old) for old, new in paragraph_pairs))):
+        return
+    evidence = edit.get("evidence")
+    if (editing_prompt_version != 3 or not isinstance(evidence, str) or not evidence or len(evidence) > 192
+            or evidence not in source or before not in source or not any(cue in evidence.lower() for cue in cues)
+            or changed_paragraphs != 1
+            or "".join(c for c in old_words if unicodedata.category(c)[0] not in "LN")
+                != "".join(c for c in new_words if unicodedata.category(c)[0] not in "LN")):
+        raise ValueError("远处改口缺少 v3 已核对权限或完整原文证据，或改变技术字符")
+    changes = actual_modifications(old_words, new_words, 0)
+    if len(changes) != 1:
+        raise ValueError("远处改口必须只有一个实质字词修改块")
+    start, end, inserted = changes[0]
+    if end - start > 32 or len(inserted) > 8 or (inserted and inserted not in evidence):
+        raise ValueError("远处改口字词超界或新增内容不能由连续证据解释")
+
+
+def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: int | None = None) -> str:
     document = json.loads(response)
     if (not isinstance(document, dict) or set(document) != {"edits"}
             or not isinstance(document["edits"], list) or len(document["edits"]) > 128):
@@ -414,6 +693,8 @@ def apply_recorded_edits(source: str, response: str) -> str:
         before, after = edit.get("before"), edit.get("after")
         if not isinstance(before, str) or not before or not isinstance(after, str):
             raise ValueError("编辑锚点缺失或重复")
+        if editing_prompt_version is not None:
+            validate_recorded_light_edit(edit, source, editing_prompt_version)
         start = source.find(before)
         if start < 0 or source.find(before, start + 1) >= 0:
             raise ValueError("编辑锚点缺失或重复")
@@ -535,8 +816,25 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if row.get("pre_resolution_canonical_input") != canonical:
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
-        expected_mappings, mapping_failures = resolved_entity_evidence(item, row)
+        prepared_source, frozen_segments = None, None
+        if expected["editing_prompt_version"] == 3:
+            try:
+                prepared_source, frozen_segments = frozen_input_envelope(item)
+            except (ValueError, KeyError, TypeError) as error:
+                failures.append(f"{tid}: 冻结输入不能可靠重建生产分段：{error}")
+        expected_mappings, mapping_failures = resolved_entity_evidence(item, row, prepared_source=prepared_source)
         failures += mapping_failures
+        canonical_segments = row.get("canonical_segments")
+        reported_segments = ([{"id": segment.get("id"), "text": segment.get("text")}
+                              for segment in canonical_segments]
+                             if isinstance(canonical_segments, list)
+                             and all(isinstance(segment, dict) for segment in canonical_segments) else None)
+        if expected["editing_prompt_version"] == 3:
+            if frozen_segments is None or reported_segments != frozen_segments:
+                failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
+            expected_segments = frozen_segments
+        else:
+            expected_segments = reported_segments
         if (not valid_integer(row.get("llm_attempt_count")) or row["llm_attempt_count"] < len(stages)
                 or (not row.get("fallback_used") and row["llm_attempt_count"] != len(stages))):
             failures.append(f"{tid}: 尝试数与阶段记录不一致")
@@ -569,13 +867,17 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
+                if expected["editing_prompt_version"] == 3 and (
+                    expected_segments is None or payload.get("source_segments") != expected_segments
+                ):
+                    failures.append(f"{tid}: v3 阶段 source_segments 未逐项保留 canonical 段的 ID、正文和顺序")
                 payloads.append(payload)
             except (KeyError, TypeError, json.JSONDecodeError, AttributeError):
                 payloads.append(None)
                 failures.append(f"{tid}: 阶段请求不是可审计三档 JSON")
         tasks = [s.get("task") for s in stages]
         requires_light_review = False
-        if mode == "light" and expected["editing_prompt_version"] == 2:
+        if mode == "light" and expected["editing_prompt_version"] in (2, 3):
             if row.get("fallback_used") and row.get("model_output") != row.get("canonical_input"):
                 failures.append(f"{tid}: 轻度回退却交付了未通过核对的局部稿")
             if stages and stages[0].get("status") == "succeeded":
@@ -594,7 +896,8 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 轻度初轮请求伪装成复核稿")
             if len(stages) >= 2:
                 try:
-                    preview = apply_recorded_edits(row["canonical_input"], stages[0]["response_text"])
+                    preview = apply_recorded_edits(row["canonical_input"], stages[0]["response_text"],
+                                                   editing_prompt_version=expected["editing_prompt_version"])
                     review_payload = payloads[1]
                     if review_payload.get("draft_text") != preview:
                         failures.append(f"{tid}: 轻度核对未读取首轮补丁的实际局部稿")
@@ -606,7 +909,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
         if mode == "light":
             allowed = ["voicePolishFast"] + (["voicePolishAnalyze"] if requires_light_review else [])
-            if expected["editing_prompt_version"] not in (1, 2):
+            if expected["editing_prompt_version"] not in (1, 2, 3):
                 failures.append(f"{tid}: 尚未定义该轻度协议版本的阶段契约")
             if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
                 failures.append(f"{tid}: 轻度尝试数超出该补丁风险允许的调用预算")
@@ -629,7 +932,8 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
         if not row.get("fallback_used") and successful:
             try:
                 if mode == "light":
-                    if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"]) != row["model_output"]:
+                    if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],
+                                            editing_prompt_version=expected["editing_prompt_version"]) != row["model_output"]:
                         failures.append(f"{tid}: 最终轻度输出不是实际Provider补丁的应用结果")
                 else:
                     last = successful[-1]

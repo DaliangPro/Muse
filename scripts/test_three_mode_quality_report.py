@@ -465,6 +465,292 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         self.assertFalse(e.complete_change_evidence(source, draft, [{"removed": "", "inserted": ""}]))
         self.assertTrue(e.complete_change_evidence("e\u0301", "é", []))
 
+    def upgrade_report_to_v3(self, report):
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 3
+        row = report["cases"][0]
+        source = row["pre_resolution_canonical_input"]
+        split = max(1, len(source) // 2)
+        parts = [source[:split], source[split:]]
+        self.inputs[0]["segment_texts"] = parts
+        row.update(segment_texts=parts, segment_count=2, canonical_segments=[
+            {"id": f"s{index}", "text": text, "is_final": True} for index, text in enumerate(parts, 1)
+        ])
+        for stage in row["stage_responses"]:
+            payload = json.loads(stage["request_payload"])
+            payload.update(schema_version=3, source_segments=[
+                {"id": segment["id"], "text": segment["text"]} for segment in row["canonical_segments"]
+            ])
+            stage["request_payload"] = json.dumps(payload, ensure_ascii=False)
+
+    def test_v3_every_polish_stage_preserves_ordered_source_segments(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.report(mode)
+            self.upgrade_report_to_v3(report)
+            self.assertEqual(self.check(report, receipts, mode), ([], []), mode)
+        report, receipts = self.reviewed_light_report("word")
+        self.upgrade_report_to_v3(report)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+
+    def test_v3_segment_omission_reorder_rewrite_and_forged_ids_are_rejected_per_stage(self):
+        for mode in ["light", "standard"]:
+            for index in [0, 1]:
+                report, receipts = self.reviewed_light_report("word") if mode == "light" else self.report(mode)
+                self.upgrade_report_to_v3(report)
+                payload = json.loads(report["cases"][0]["stage_responses"][index]["request_payload"])
+                segments = payload["source_segments"]
+                invalid = [None, [], segments[:1], list(reversed(segments)),
+                           [{**segments[0], "id": "other"}, segments[1]],
+                           [segments[0], {**segments[1], "text": "改写过的下一主题"}],
+                           [segments[0], segments[0]],
+                           [{"id": "s1", "text": "".join(x["text"] for x in segments)}],
+                           [{**segments[0], "summary": "额外摘要"}, segments[1]],
+                           {"s1": segments[0]["text"], "s2": segments[1]["text"]}]
+                for replacement in invalid:
+                    changed = copy.deepcopy(report)
+                    changed_payload = {**payload, "source_segments": replacement}
+                    changed["cases"][0]["stage_responses"][index]["request_payload"] = json.dumps(changed_payload, ensure_ascii=False)
+                    self.assertTrue(self.check(changed, receipts, mode)[0], (mode, index, replacement))
+                del payload["source_segments"]
+                report["cases"][0]["stage_responses"][index]["request_payload"] = json.dumps(payload)
+                self.assertTrue(self.check(report, receipts, mode)[0], (mode, index, "missing"))
+
+    def test_v3_segments_supplement_full_canonical_without_replacing_entity_evidence(self):
+        report, receipts = self.mapped_context_report()
+        self.upgrade_report_to_v3(report)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        stage = report["cases"][0]["stage_responses"][0]
+        payload = json.loads(stage["request_payload"])
+        self.assertTrue(payload["canonical_text"].startswith("Muse"))
+        self.assertTrue(payload["source_segments"][0]["text"].startswith("缪斯"))
+        payload["canonical_text"] = payload["source_segments"][0]["text"]
+        stage["request_payload"] = json.dumps(payload)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v3_word_risk_still_requires_confirmation_and_empty_review(self):
+        report, receipts = self.reviewed_light_report("word", with_review=False)
+        self.upgrade_report_to_v3(report)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+        report, receipts = self.reviewed_light_report("word")
+        self.upgrade_report_to_v3(report)
+        row = report["cases"][0]
+        row["stage_responses"][1]["response_text"] = '{"edits":[{"before":"软件","after":"工具","kind":"content","evidence":"软件"}]}'
+        receipts[1]["response_text_sha256"] = e.legacy.sha256_text(row["stage_responses"][1]["response_text"])
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_v1_and_v2_do_not_require_new_v3_source_segment_field(self):
+        report, receipts = self.report("standard")
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+        report, receipts = self.reviewed_light_report("word")
+        for stage in report["cases"][0]["stage_responses"]:
+            self.assertNotIn("source_segments", json.loads(stage["request_payload"]))
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+
+    def test_v3_source_correction_replays_local_change_with_distant_literal_evidence(self):
+        before, after, evidence = "小李负责看是否有重复报名", "小赵负责看是否有重复报名", "重复报名的检查改由小赵来做"
+        middle = "其他事项逐项记录，当前负责人安排不要遗漏。" * 20
+        source = before + "。\n\n" + middle + "\n\n" + evidence
+        self.assertLessEqual(len(source), 1000)
+        response = json.dumps({"edits": [{"before": before, "after": after, "kind": "correction", "evidence": evidence}]})
+        self.assertEqual(e.apply_recorded_edits(source, response, editing_prompt_version=3), after + "。\n\n" + middle + "\n\n" + evidence)
+        for version in (1, 2):
+            with self.assertRaises(ValueError):
+                e.apply_recorded_edits(source, response, editing_prompt_version=version)
+
+    def test_v3_source_correction_rejects_missing_foreign_long_or_non_correction_evidence(self):
+        long_evidence = "改由小赵" + "说明" * 96
+        for tail, evidence in [("检查改由小赵来做。", None), ("检查改由小赵来做。", "不存在的检查改由小赵来做"),
+                               ("检查交给小赵来做。", "检查交给小赵来做。"), (long_evidence, long_evidence)]:
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                e.apply_recorded_edits("小李负责检查。" + tail, json.dumps({"edits": [
+                    {"before": "小李负责检查", "after": "小赵负责检查", "kind": "correction", "evidence": evidence}
+                ]}), editing_prompt_version=3)
+
+    def test_v3_source_correction_cannot_stitch_evidence_or_exceed_one_local_word_change(self):
+        cases = [("阿文负责检查", "赵敏负责检查", "改由赵老师处理，敏同学协助确认"),
+                 ("甲检查乙发送", "乙发送甲检查", "改成乙发送甲检查"),
+                 ("小李检查小王发送", "小赵检查小刘发送", "改成小赵检查小刘发送"),
+                 ("甲" * 33, "乙", "改成乙"), ("甲", "乙" * 9, "改成" + "乙" * 9),
+                 ("说明" * 48 + "甲", "说明" * 48 + "乙", "改成" + "说明" * 48 + "乙")]
+        for before, after, evidence in cases:
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                e.apply_recorded_edits(before + "。" + evidence, json.dumps({"edits": [
+                    {"before": before, "after": after, "kind": "correction", "evidence": evidence}
+                ]}), editing_prompt_version=3)
+
+    def test_v3_source_correction_cannot_damage_technical_characters(self):
+        for before, after in [("foo_bar", "foobar"), ("git --hard", "git hard"), ("/tmp/file", "tmp/file"),
+                              ("main.swift", "mainswift"), ("10:30", "1030"), ("A+B", "AB")]:
+            evidence = "改成" + after
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                e.apply_recorded_edits(before + "。" + evidence, json.dumps({"edits": [
+                    {"before": before, "after": after, "kind": "correction", "evidence": evidence}
+                ]}), editing_prompt_version=3)
+
+    def test_v3_newlines_and_paragraph_word_membership_cannot_be_changed(self):
+        for newline in ["\n", "\r", "\r\n", "\v", "\f", "\x85", "\u2028", "\u2029"]:
+            for before, after in [("甲" + newline + "乙丙", "甲乙丙"), ("甲" + newline + "乙丙", "甲乙" + newline + "丙"),
+                                  ("甲乙丙", "甲" + newline + "乙丙")]:
+                with self.subTest(newline=repr(newline), before=before), self.assertRaises(ValueError):
+                    e.apply_recorded_edits(before, json.dumps({"edits": [
+                        {"before": before, "after": after, "kind": "punctuation"}
+                    ]}), editing_prompt_version=3)
+        for before, after, kind in [("我\r\n我我今天", "我我\r\n今天", "stutter"),
+                                   ("甲\r\n乙丙，不对", "甲乙\r\n丙", "correction"),
+                                   ("小李\r\n负责检查", "小赵负责\r\n检查", "correction"),
+                                   ("按装\r\n软件", "安\r\n装软件", "word")]:
+            evidence = "改由小赵负责检查"
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                e.apply_recorded_edits(before + "。" + evidence, json.dumps({"edits": [
+                    {"before": before, "after": after, "kind": kind, "evidence": evidence}
+                ]}), editing_prompt_version=3)
+
+    def test_v3_preserves_paragraphs_and_symbol_punctuation_support_without_rewriting_old_versions(self):
+        before, after, evidence = "小李负责\n检查重复报名", "小赵负责\n检查重复报名", "重复报名检查改由小赵来做"
+        self.assertEqual(e.apply_recorded_edits(before + "。\n\n" + evidence, json.dumps({"edits": [
+            {"before": before, "after": after, "kind": "correction", "evidence": evidence}
+        ]}), editing_prompt_version=3), after + "。\n\n" + evidence)
+        command = "swift build短横线c release第三执行"
+        self.assertEqual(e.apply_recorded_edits(command, json.dumps({"edits": [
+            {"before": command, "after": "swift build -c release，第三执行", "kind": "symbol"}
+        ]}), editing_prompt_version=3), "swift build -c release，第三执行")
+        for version in (1, 2):
+            before, after = "甲\r\n乙丙", "甲乙\r\n丙"
+            self.assertEqual(e.apply_recorded_edits(before, json.dumps({"edits": [
+                {"before": before, "after": after, "kind": "punctuation"}
+            ]}), editing_prompt_version=version), after)
+            source = "预算一万六，不对，一万五。"
+            self.assertEqual(e.apply_recorded_edits(source, json.dumps({"edits": [
+                {"before": source, "after": "预算一万五。", "kind": "correction"}
+            ]}), editing_prompt_version=version), "预算一万五。")
+
+    def test_v3_source_correction_report_requires_real_empty_confirmation_and_valid_evidence(self):
+        report, receipts = self.reviewed_light_report("correction")
+        self.text = "小李负责检查。" + "其他事项保持。" * 40 + "检查改由小赵来做。"
+        self.inputs[0].update(spoken_input=self.text, segment_texts=[self.text])
+        row = report["cases"][0]
+        row.update(spoken_input=self.text, pre_resolution_canonical_input=self.text, canonical_input=self.text)
+        edit = {"before": "小李负责检查", "after": "小赵负责检查", "kind": "correction", "evidence": "检查改由小赵来做"}
+        row["stage_responses"][0]["response_text"] = json.dumps({"edits": [edit]})
+        row["model_output"] = e.apply_recorded_edits(self.text, row["stage_responses"][0]["response_text"], editing_prompt_version=3)
+        row["stage_responses"][0]["request_payload"] = self.payload("light")
+        payload = json.loads(self.payload("light", row["model_output"]))
+        payload["changes"] = [{"removed": "李", "inserted": "赵"}]
+        row["stage_responses"][1]["request_payload"] = json.dumps(payload)
+        receipts[0]["response_text_sha256"] = e.legacy.sha256_text(row["stage_responses"][0]["response_text"])
+        self.upgrade_report_to_v3(report)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        bad = copy.deepcopy(report)
+        bad["cases"][0]["stage_responses"] = bad["cases"][0]["stage_responses"][:1]
+        bad["cases"][0].update(llm_call_count=1, llm_attempt_count=1)
+        self.assertTrue(self.check(bad, receipts[:1], "light")[0])
+        edit["evidence"] = "源文没有的改由小赵"
+        row["stage_responses"][0]["response_text"] = json.dumps({"edits": [edit]})
+        receipts[0]["response_text_sha256"] = e.legacy.sha256_text(row["stage_responses"][0]["response_text"])
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_independent_six_joint_segment_forgery_counterexamples_are_rejected(self):
+        for mode in ["light", "standard"]:
+            report, receipts = self.report(mode)
+            self.upgrade_report_to_v3(report)
+            variants = [
+                [{"id": "forged-only", "text": self.text}],
+                [{"id": "s1", "text": self.text[:1]}, {"id": "s2", "text": self.text[1:]}],
+                [{"id": "forged-0", "text": self.inputs[0]["segment_texts"][0]},
+                 {"id": "forged-1", "text": self.inputs[0]["segment_texts"][1]}],
+            ]
+            self.assertEqual(self.check(report, receipts, mode), ([], []))
+            for replacement in variants:
+                changed = copy.deepcopy(report)
+                changed["cases"][0]["canonical_segments"] = replacement
+                for stage in changed["cases"][0]["stage_responses"]:
+                    payload = json.loads(stage["request_payload"])
+                    payload["source_segments"] = replacement
+                    stage["request_payload"] = json.dumps(payload)
+                failures, _ = self.check(changed, receipts, mode)
+                self.assertTrue(any("冻结输入的确定性构造" in failure for failure in failures), (mode, replacement))
+
+    def test_frozen_envelope_preserves_real_boundaries_and_final_paragraph_fallback(self):
+        item = copy.deepcopy(self.inputs[0])
+        item.update(spoken_input="第一段。\n\n目标用户是老师。", segment_texts=["第一段。", "目标用户是老师。"])
+        canonical, segments = e.frozen_input_envelope(item)
+        self.assertEqual(canonical, item["spoken_input"])
+        self.assertEqual(segments, [{"id": "s1", "text": item["spoken_input"]}])
+        item["segment_texts"] = ["第一段。\n\n", "目标用户是老师。"]
+        self.assertEqual(e.frozen_input_envelope(item)[1], [
+            {"id": "s1", "text": "第一段。\n\n"}, {"id": "s2", "text": "目标用户是老师。"}
+        ])
+
+    def test_frozen_terminology_mapping_and_cross_segment_partition_follow_production(self):
+        cases = [
+            (["试用 Type less。", "再确认。"], ["试用 Typeless。", "再确认。"]),
+            (["试用 TYPE-LESS。", "再确认。"], ["试用 Typeless。", "再确认。"]),
+            (["Type ", "less"], ["Type", "less"]),
+            (["👨‍👩‍👧‍👦Type ", "less"], ["👨‍👩‍👧‍👦Type", "less"]),
+        ]
+        for raw, canonical in cases:
+            item = copy.deepcopy(self.inputs[0])
+            item.update(spoken_input="".join(raw), segment_texts=raw,
+                        preconditions=["术语库中已确认 Type less → Typeless"])
+            self.assertEqual(e.frozen_input_envelope(item), ("".join(canonical), [
+                {"id": f"s{index}", "text": text} for index, text in enumerate(canonical, 1)
+            ]), raw)
+        self.assertEqual(e.composed_characters("e\u0301👍🏽\r\n甲"), ("e\u0301", "👍🏽", "\r\n", "甲"))
+        self.assertEqual(e.applying_fixture_terminology("A B", ["已确认 A B → B C", "已确认 B C → D E"]), "B C")
+
+    def test_v3_full_report_accepts_frozen_terminology_and_final_text_fallback(self):
+        for raw, spoken, preconditions, canonical, segments in [
+            (["試用 TYPE-LESS。", "再确认。"], "試用 TYPE-LESS。再确认。", ["已确认 Type less → Typeless"],
+             "試用 Typeless。再确认。", [{"id": "s1", "text": "試用 Typeless。"}, {"id": "s2", "text": "再确认。"}]),
+            (["第一段。", "目标用户是老师。"], "第一段。\n\n目标用户是老师。", [],
+             "第一段。\n\n目标用户是老师。", [{"id": "s1", "text": "第一段。\n\n目标用户是老师。"}]),
+        ]:
+            self.text = spoken
+            self.inputs[0].update(spoken_input=spoken, segment_texts=raw, preconditions=preconditions)
+            report, receipts = self.report("standard")
+            self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 3
+            row = report["cases"][0]
+            row.update(segment_count=len(raw), canonical_input=canonical, pre_resolution_canonical_input=canonical,
+                       canonical_segments=segments, model_output=canonical)
+            row["stage_responses"][0]["response_text"] = canonical
+            receipts[0]["response_text_sha256"] = e.legacy.sha256_text(canonical)
+            for index, stage in enumerate(row["stage_responses"]):
+                payload = json.loads(stage["request_payload"])
+                payload.update(schema_version=3, canonical_text=canonical, source_segments=segments)
+                if index:
+                    payload["draft_text"] = canonical
+                stage["request_payload"] = json.dumps(payload)
+            self.assertEqual(self.check(report, receipts, "standard"), ([], []), raw)
+
+    def test_context_mapping_cannot_justify_jointly_renamed_original_segment_ids(self):
+        report, receipts = self.mapped_context_report()
+        self.upgrade_report_to_v3(report)
+        self.assertEqual(self.check(report, receipts, "light"), ([], []))
+        row = report["cases"][0]
+        replacement = [{"id": "forged-1", "text": row["canonical_segments"][0]["text"]},
+                       {"id": "forged-2", "text": row["canonical_segments"][1]["text"]}]
+        row["canonical_segments"] = replacement
+        row["resolved_entities"][0]["source_segment_ids"] = ["forged-1"]
+        payload = json.loads(row["stage_responses"][0]["request_payload"])
+        payload["source_segments"] = replacement
+        row["stage_responses"][0]["request_payload"] = json.dumps(payload)
+        self.assertTrue(self.check(report, receipts, "light")[0])
+
+    def test_independent_symbol_token_join_counterexamples_and_valid_punctuation(self):
+        for before, after in [("a点b c", "a.bc"), ("v点2 api", "v.2api")]:
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                e.apply_recorded_edits(before, json.dumps({"edits": [
+                    {"before": before, "after": after, "kind": "symbol"}
+                ]}), editing_prompt_version=3)
+        for before, after, kind in [("a.b c", "a.bc", "punctuation"), ("v.2 api", "v.2api", "punctuation")]:
+            with self.assertRaises(ValueError):
+                e.apply_recorded_edits(before, json.dumps({"edits": [
+                    {"before": before, "after": after, "kind": kind}
+                ]}), editing_prompt_version=3)
+        for before, after in [("a点b c", "a.b，c"), ("v点2 api", "v.2，api")]:
+            self.assertEqual(e.apply_recorded_edits(before, json.dumps({"edits": [
+                {"before": before, "after": after, "kind": "symbol"}
+            ]}), editing_prompt_version=3), after)
+
     def test_stage_order_and_full_review_cannot_be_skipped(self):
         report, receipts = self.report("standard")
         report["cases"][0]["stage_responses"].reverse()

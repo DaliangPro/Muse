@@ -65,7 +65,8 @@ struct VoicePolishEditingPipeline: Sendable {
                 let requiresReview = edits.contains { [.word, .correction, .directive].contains($0.kind) }
                 let output = try VoicePolishTextEditor.apply(
                     edits, to: request.fallbackText, source: request.fallbackText, mode: .light,
-                    allowsReviewedInlineDirectives: requiresReview
+                    allowsReviewedInlineDirectives: requiresReview,
+                    allowsReviewedSourceCorrections: requiresReview
                 )
                 draft = output
                 var codes = Self.outputCodes(output, request: request)

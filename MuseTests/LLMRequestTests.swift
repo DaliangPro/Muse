@@ -3,6 +3,24 @@ import XCTest
 
 final class LLMRequestTests: XCTestCase {
 
+    func testJSONFormatIsDeclaredOnWireEvenWhenBusinessPromptOmitsKeyword() {
+        for context in [LLMRequestContext.structuredTask, .processingMode] {
+            let request = LLMRequest(
+                context: context, task: .voicePolishAnalyze, system: "核对改动，只返回对象。",
+                user: "待核对内容", options: LLMGenerationOptions(responseFormat: .jsonObject)
+            )
+            let messages = LLMRequestBuilder.messages(for: request)
+            XCTAssertTrue(messages.system?.contains("JSON") == true)
+            XCTAssertTrue(messages.system?.contains("核对改动，只返回对象。") == true)
+            XCTAssertFalse(messages.system?.contains("待核对内容") == true)
+        }
+        let textRequest = LLMRequest(
+            context: .structuredTask, task: .voicePolishRender, system: "润色正文。", user: "你好",
+            options: LLMGenerationOptions()
+        )
+        XCTAssertEqual(LLMRequestBuilder.messages(for: textRequest).system, "润色正文。")
+    }
+
     func testCapabilityKeyIncludesProviderModelAndEndpoint() {
         let configA = LLMConfig(
             apiKey: "test",

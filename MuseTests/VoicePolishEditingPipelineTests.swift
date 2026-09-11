@@ -411,6 +411,67 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertFalse(payload.contains("已授权的同应用近期输入"))
     }
 
+    func testEveryEditingStageKeepsSourceBoundariesAndCanonicalEntityMapping() async throws {
+        let first = "请核对灵建的资料，这部分单独交代"
+        let second = "文件权限，由运营组负责。"
+        let source = first + second
+        let canonical = source.replacingOccurrences(of: "灵建", with: "灵简")
+        let sourceSegments = [first, second].enumerated().map { index, text in
+            RecognitionSegment(id: "s\(index + 1)", text: text, startTimeMs: nil,
+                               endTimeMs: nil, confidence: nil, isFinal: true)
+        }
+        let input = VoiceInputEnvelope(providerFinalText: source, segments: sourceSegments,
+                                       durationMs: 1_000, provider: .volcano)
+        let originalRequest = VoicePolishRequest(
+            input: input, context: WritingContext(scene: .document),
+            preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: .standard,
+            resolvedEntities: [.init(surfaceText: "灵建", canonical: "灵简", sourceSegmentIDs: ["s1"],
+                                     candidateSource: .authorizedContext, confidence: 1)]
+        )
+        let initial = "请核对灵简的资料。文件权限，由运营组负责。"
+        let repaired = "请核对灵简的资料，这部分单独交代。文件权限，由运营组负责。"
+        let edit = VoicePolishTextEdit(before: "请核对灵简的资料。",
+                                       after: "请核对灵简的资料，这部分单独交代。", kind: .content,
+                                       evidence: "请核对灵简的资料，这部分单独交代")
+        let repairJSON = String(decoding: try JSONEncoder().encode(["edits": [edit]]), as: UTF8.self)
+        let client = EditingTestClient([.text(initial), .text(repairJSON), .text(#"{"edits":[]}"#)])
+        let result = await VoicePolishEditingPipeline(client: client, config: config).process(originalRequest)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        let calls = await client.requests
+        XCTAssertEqual(calls.count, 3)
+        for (index, call) in calls.enumerated() {
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: Any])
+            XCTAssertEqual(payload["schema_version"] as? Int, 3)
+            XCTAssertEqual(payload["canonical_text"] as? String, canonical)
+            XCTAssertEqual(payload["source_segments"] as? [[String: String]],
+                           [["id": "s1", "text": first], ["id": "s2", "text": second]])
+            XCTAssertEqual(payload["authorized_context"] as? [String], ["灵建 → 灵简"])
+            XCTAssertEqual(payload["draft_text"] as? String, index == 0 ? nil : (index == 1 ? initial : repaired))
+        }
+    }
+
+    func testLightDelayedCorrectionRequiresActualDraftConfirmation() async throws {
+        let unchanged = String(repeating: "文件先保留，等核对以后再处理。", count: 8)
+        let source = "阿文负责复查。" + unchanged + "复查改由阿宁负责，阿文要出差。"
+        XCTAssertLessThanOrEqual(source.count, 1_000)
+        let patch = #"{"edits":[{"before":"阿文负责复查。","after":"阿宁负责复查。","kind":"correction","evidence":"复查改由阿宁负责，阿文要出差。"}]}"#
+        let expected = "阿宁负责复查。" + unchanged + "复查改由阿宁负责，阿文要出差。"
+        for approves in [true, false] {
+            let review = approves ? #"{"edits":[]}"# : #"{"edits":[{"before":"阿宁负责复查。","after":"阿文负责复查。","kind":"content","evidence":"阿文负责复查。"}]}"#
+            let client = EditingTestClient([.text(patch), .text(review)])
+            let result = await pipeline(client).process(request(source, .light))
+            XCTAssertEqual(result.llmAttemptCount, 2)
+            XCTAssertEqual(result.usedFallback, !approves)
+            XCTAssertEqual(result.text, approves ? expected : source)
+            let calls = await client.requests
+            XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze])
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: Any])
+            XCTAssertEqual(payload["draft_text"] as? String, expected)
+            XCTAssertEqual(payload["canonical_text"] as? String, source)
+        }
+    }
+
     func testCancelledAndTimedOutLightCallsNeverStartAnotherRoute() async {
         let client = EditingTestClient([.delay(.seconds(5), #"{"edits":[]}"#)])
         let result = await VoicePolishPipeline(client: client, config: config,

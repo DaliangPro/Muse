@@ -2,9 +2,27 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishTextEditRegressionTests: XCTestCase {
+    func test符号恢复可同时补标点但不能改变正文或技术含义() throws {
+        let source = "swift build短横线c release第三执行"
+        XCTAssertEqual(try apply([
+            .init(before: source, after: "swift build -c release，第三执行", kind: .symbol)
+        ], to: source), "swift build -c release，第三执行")
+        for output in ["swift build -c debug，第三执行", "swift build c release，第三执行",
+                       "swift build -c release。\n第三执行"] {
+            XCTAssertThrowsError(try apply([
+                .init(before: source, after: output, kind: .symbol)
+            ], to: source))
+        }
+        let path = "scripts斜杠package短横线app点sh等一下"
+        XCTAssertEqual(try apply([
+            .init(before: path, after: "scripts/package-app.sh，等一下", kind: .symbol)
+        ], to: path), "scripts/package-app.sh，等一下")
+    }
     private func apply(_ edits: [VoicePolishTextEdit], to source: String,
-                       mode: VoicePolishQualityMode = .light) throws -> String {
-        try VoicePolishTextEditor.apply(edits, to: source, source: source, mode: mode)
+                       mode: VoicePolishQualityMode = .light,
+                       allowsReviewedSourceCorrections: Bool = false) throws -> String {
+        try VoicePolishTextEditor.apply(edits, to: source, source: source, mode: mode,
+                                       allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
     }
 
     func test真实聊天补丁仅删除填充声并保留定位正文() throws {
@@ -165,5 +183,122 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
                 .init(before: anchor, after: "", kind: .directive)
             ], to: source)) { XCTAssertEqual($0 as? VoicePolishTextEditError, .editOutsideMode) }
         }
+    }
+
+    func test有原文证据的远处改口只能经显式核对权限预览() throws {
+        let before = "小李负责看是否有重复报名"
+        let after = "小赵负责看是否有重复报名"
+        let evidence = "重复报名的检查改由小赵来做"
+        let middle = String(repeating: "其他事项逐项记录，当前负责人安排不要遗漏。", count: 20)
+        let source = before + "。\n\n" + middle + "\n\n" + evidence + "。"
+        XCTAssertLessThanOrEqual(source.count, 1_000)
+        let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .correction, evidence: evidence)]
+        XCTAssertThrowsError(try apply(edits, to: source))
+        XCTAssertEqual(try apply(edits, to: source, allowsReviewedSourceCorrections: true),
+                       after + "。\n\n" + middle + "\n\n" + evidence + "。")
+    }
+
+    func test远处改口证据必须存在且不超长并包含明确改口提示() {
+        let longEvidence = "改由小赵" + String(repeating: "说明", count: 96)
+        for (sourceTail, evidence) in [
+            ("检查改由小赵来做。", nil),
+            ("检查改由小赵来做。", "不存在的检查改由小赵来做"),
+            ("检查交给小赵来做。", "检查交给小赵来做。"),
+            (longEvidence, longEvidence)
+        ] as [(String, String?)] {
+            let source = "小李负责检查。" + sourceTail
+            XCTAssertThrowsError(try apply([
+                .init(before: "小李负责检查", after: "小赵负责检查", kind: .correction, evidence: evidence)
+            ], to: source, allowsReviewedSourceCorrections: true))
+        }
+    }
+
+    func test远处改口不能从证据散字拼接新名称() {
+        let evidence = "改由赵老师处理，敏同学协助确认。"
+        let source = "阿文负责检查。" + evidence
+        XCTAssertThrowsError(try apply([
+            .init(before: "阿文负责检查", after: "赵敏负责检查", kind: .correction, evidence: evidence)
+        ], to: source, allowsReviewedSourceCorrections: true))
+    }
+
+    func test远处改口仍限制单个实质修改块和修改长度() {
+        let cases = [
+            ("甲检查乙发送", "乙发送甲检查"),
+            ("小李检查小王发送", "小赵检查小刘发送"),
+            (String(repeating: "甲", count: 33), "乙"),
+            ("甲", String(repeating: "乙", count: 9)),
+            (String(repeating: "说明", count: 48) + "甲", String(repeating: "说明", count: 48) + "乙")
+        ]
+        for (before, after) in cases {
+            let evidence = "改成" + after
+            let source = before + "。" + evidence
+            XCTAssertThrowsError(try apply([
+                .init(before: before, after: after, kind: .correction, evidence: evidence)
+            ], to: source, allowsReviewedSourceCorrections: true), before)
+        }
+    }
+
+    func test远处改口不能损坏路径标识符或技术标点() {
+        for (before, after) in [("foo_bar", "foobar"), ("git --hard", "git hard"),
+                                ("/tmp/file", "tmp/file"), ("main.swift", "mainswift"),
+                                ("10:30", "1030"), ("A+B", "AB")] {
+            let evidence = "改成" + after
+            XCTAssertThrowsError(try apply([
+                .init(before: before, after: after, kind: .correction, evidence: evidence)
+            ], to: before + "。" + evidence, allowsReviewedSourceCorrections: true), before)
+        }
+    }
+
+    func test旧近邻改口仍可用并识别改由() throws {
+        for (source, output) in [("预算一万六，不对，一万五。", "预算一万五。"),
+                                 ("负责人小李，改由小赵。", "负责人小赵。")] {
+            XCTAssertEqual(try apply([
+                .init(before: source, after: output, kind: .correction)
+            ], to: source), output)
+        }
+    }
+
+    func test轻度不能删除移动或新增任何原有换行() {
+        for newline in ["\n", "\r", "\r\n", "\u{000B}", "\u{000C}", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            for (before, after) in [("甲" + newline + "乙丙", "甲乙丙"),
+                                    ("甲" + newline + "乙丙", "甲乙" + newline + "丙"),
+                                    ("甲乙丙", "甲" + newline + "乙丙")] {
+                XCTAssertThrowsError(try apply([
+                    .init(before: before, after: after, kind: .punctuation)
+                ], to: before), "换行=\(newline.unicodeScalars.map(\.value)), before=\(before.debugDescription), after=\(after.debugDescription)")
+            }
+        }
+        let source = "预算一万六，不对，\n一万五。"
+        XCTAssertThrowsError(try apply([
+            .init(before: source, after: "预算一万五。", kind: .correction)
+        ], to: source, allowsReviewedSourceCorrections: true))
+        let command = "swift build短横线c release\n随后检查"
+        XCTAssertThrowsError(try apply([
+            .init(before: command, after: "swift build -c release随后检查", kind: .symbol)
+        ], to: command))
+        for (before, after, kind) in [
+            ("我\r\n我我今天", "我我\r\n今天", VoicePolishTextEdit.Kind.stutter),
+            ("甲\r\n乙丙，不对", "甲乙\r\n丙", .correction),
+            ("小李\r\n负责检查", "小赵负责\r\n检查", .correction),
+            ("按装\r\n软件", "安\r\n装软件", .word)
+        ] {
+            let evidence = "改由小赵负责检查"
+            XCTAssertThrowsError(try apply([
+                .init(before: before, after: after, kind: kind, evidence: evidence)
+            ], to: before + "。" + evidence, allowsReviewedSourceCorrections: true), "\(kind): \(before.debugDescription)")
+        }
+    }
+
+    func test远处改口锚点可以跨段但必须逐字保留换行() throws {
+        let before = "小李负责\n检查重复报名"
+        let after = "小赵负责\n检查重复报名"
+        let evidence = "重复报名检查改由小赵来做"
+        let source = before + "。\n\n" + evidence
+        XCTAssertEqual(try apply([
+            .init(before: before, after: after, kind: .correction, evidence: evidence)
+        ], to: source, allowsReviewedSourceCorrections: true), after + "。\n\n" + evidence)
+        XCTAssertThrowsError(try apply([
+            .init(before: before, after: "小赵负责检查重复报名", kind: .correction, evidence: evidence)
+        ], to: source, allowsReviewedSourceCorrections: true))
     }
 }
