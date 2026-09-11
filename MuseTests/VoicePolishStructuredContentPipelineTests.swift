@@ -121,13 +121,12 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         let source = "会议10:30，不对，10:45开始。"
         let patch = #"{"edits":[{"before":"会议10:30，不对，10:45开始。","after":"会议10:45开始。","kind":"correction"}]}"#
         for mode in [VoicePolishQualityMode.light, .standard] {
-            let review = mode == .light
-                ? #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
-                : #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-            let (result, _) = await run(source, [patch, review], mode: mode)
+            let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
+            let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
+            let (result, _) = await run(source, mode == .light ? [patch, review] : [patch, review, layout], mode: mode)
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, "会议10:45开始。")
-            XCTAssertEqual(result.llmAttemptCount, 2)
+            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 2 : 3)
         }
     }
 

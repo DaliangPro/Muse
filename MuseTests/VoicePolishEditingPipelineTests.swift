@@ -136,11 +136,11 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         let source = "会议原定周三上午十点，培训安排周四上午十点。会议时间改成十点半，日期不变。培训安排也不变。"
         let patch = #"{"edits":[{"before":"会议原定周三上午十点","after":"会议原定周三上午十点半","kind":"correction","evidence":"会议时间改成十点半，日期不变。"}]}"#
         let good = source.replacingOccurrences(of: "会议原定周三上午十点", with: "会议原定周三上午十点半")
-        let client = EditingTestClient([.text(patch), .review(#"{"edits":[]}"#)])
+        let client = EditingTestClient([.text(patch), .review(#"{"edits":[]}"#), .review(#"{"edits":[]}"#)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, good)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 3)
         XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
             sourceText: source, outputText: "会议改为周五上午十点半。", scene: .workChat,
             allowsPartialTimeReview: true
@@ -249,10 +249,13 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         let output = "会议下午三点半。"
         let patch = #"{"edits":[{"before":"下午三点，不对，三点半","after":"下午三点半","kind":"correction"}]}"#
         for mode in [VoicePolishQualityMode.light, .standard] {
-            let client = EditingTestClient([.text(patch), .review(#"{"edits":[]}"#)])
+            var replies: [EditingTestClient.Step] = [.text(patch), .review(#"{"edits":[]}"#)]
+            if mode == .standard { replies.append(.review(#"{"edits":[]}"#)) }
+            let client = EditingTestClient(replies)
             let result = await pipeline(client).process(request(source, mode))
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, output)
+            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 2 : 3)
         }
         XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(in: source), ["15:30"])
         XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
@@ -446,7 +449,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(calls.count, 3)
         for (index, call) in calls.enumerated() {
             let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: Any])
-            XCTAssertEqual(payload["schema_version"] as? Int, 7)
+            XCTAssertEqual(payload["schema_version"] as? Int, 8)
             XCTAssertEqual(payload["canonical_text"] as? String, canonical)
             XCTAssertEqual(payload["source_segments"] as? [[String: String]],
                            [["id": "s1", "text": first], ["id": "s2", "text": second]])
@@ -554,8 +557,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         let source = "替我回他一句：时间还没确定。"
         let assessment = #"{"delivery":"direct_reply","editor_spans":["替我回他一句："],"edits":[]}"#
         for mode in [VoicePolishQualityMode.light, .standard] {
-            let response = mode == .light ? assessment : String(assessment.dropLast()) + #","layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-            let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(String(response))])
+            let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(assessment)])
             let result = await pipeline(client).process(request(source, mode))
             XCTAssertTrue(result.usedFallback)
             XCTAssertEqual(result.llmAttemptCount, 2)

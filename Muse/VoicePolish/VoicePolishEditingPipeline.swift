@@ -147,19 +147,23 @@ struct VoicePolishEditingPipeline: Sendable {
             draft = initialDraft
             let initialCodes = Self.contentCodes(initialDraft, request: request)
             let initialSegments = try VoicePolishStructurePlan.segments(in: initialDraft)
+            let separatesContentReview = VoicePolishEditingReview.hasSourceReviewRisk(request.fallbackText)
             let review = try await generate(
                 task: .voicePolishAnalyze,
-                system: VoicePolishEditingPrompts.review,
-                payload: VoicePolishEditingPrompts.payload(for: request, draft: initialDraft, codes: initialCodes),
+                system: separatesContentReview ? VoicePolishEditingPrompts.standardContentReview : VoicePolishEditingPrompts.review,
+                payload: VoicePolishEditingPrompts.payload(
+                    for: request, draft: initialDraft, codes: initialCodes,
+                    includesLayoutSegments: !separatesContentReview
+                ),
                 json: true,
                 request: request,
                 deadline: deadline, attempts: attempts
             )
             let assessment = try VoicePolishEditingReview.decode(
-                review, source: request.fallbackText, structureSegments: initialSegments
+                review, source: request.fallbackText, structureSegments: separatesContentReview ? nil : initialSegments
             )
             let edits = assessment.edits
-            if edits.isEmpty {
+            if edits.isEmpty && !separatesContentReview {
                 guard !assessment.containsUnappliedEditorInstruction(in: initialDraft) else {
                     return result(nil, codes: [.planIntegrityFailure])
                 }
@@ -172,8 +176,8 @@ struct VoicePolishEditingPipeline: Sendable {
                 let codes = Self.outputCodes(output, request: request, contentForValidation: content)
                 return codes.isEmpty ? result(output) : result(nil, codes: codes)
             }
-            repairAttempts += 1
-            let repaired = try VoicePolishTextEditor.applyContentEdits(
+            if !edits.isEmpty { repairAttempts += 1 }
+            let repaired = edits.isEmpty ? initialDraft : try VoicePolishTextEditor.applyContentEdits(
                 edits, to: initialDraft, source: request.fallbackText,
                 allowsReviewedInlineDirectives: true, allowsReviewedSourceCorrections: true
             )
@@ -185,7 +189,8 @@ struct VoicePolishEditingPipeline: Sendable {
             guard repairedCodes.isEmpty else { return result(nil, codes: repairedCodes) }
             let repairedSegments = try VoicePolishStructurePlan.segments(in: repaired)
 
-            // 修复后的实际成稿必须重新核对；确认阶段没有继续改写的权限。
+            // 风险输入先完成专职内容复核，再用完整实际稿排版；即使复核无修改也不能跳过此步。
+            // 修复最多一次，最终确认没有继续改写的权限。
             let confirmation = try await generate(
                 task: .voicePolishAnalyze,
                 system: VoicePolishEditingPrompts.review,
