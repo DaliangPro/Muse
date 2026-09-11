@@ -627,7 +627,214 @@ def adjacent_repetition_removal(before: str, after: str) -> bool:
     return False
 
 
-def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version: int) -> None:
+NEWLINE_PATTERN = r"\r\n|[\n\r\v\f\x85\u2028\u2029]"
+
+
+def lexical_units(text: str) -> tuple[list[str], list[int]]:
+    characters = list(composed_characters(text))
+    indices = []
+    for i, c in enumerate(characters):
+        embedded = c in ".:" and 0 < i < len(characters) - 1 and all(
+            x.isascii() and x.isalnum() for x in (characters[i - 1], characters[i + 1]))
+        if c in set("-_/\\`@#%") or embedded or not (c.isspace() or unicodedata.category(c[0]).startswith("P")):
+            indices.append(i)
+    return characters, indices
+
+
+def v4_punctuation_preserves_tokens(before: str, after: str) -> bool:
+    return (punctuation_preserves_technical_tokens(unicodedata.normalize("NFC", before), unicodedata.normalize("NFC", after))
+            and re.findall(r"[A-Za-z0-9_]+", before) == re.findall(r"[A-Za-z0-9_]+", after)
+            and re.findall(r"(?<![A-Za-z0-9_])\.[A-Za-z0-9_][A-Za-z0-9_.-]*", before)
+                == re.findall(r"(?<![A-Za-z0-9_])\.[A-Za-z0-9_][A-Za-z0-9_.-]*", after))
+
+
+def mechanical_paragraph(before: str, after: str, fillers: int, permissions: list[bool], allow_reviewed_changes: bool) -> tuple[str, int] | None:
+    characters, indices = lexical_units(before)
+    old = [unicodedata.normalize("NFC", characters[i]) for i in indices]
+    new_chars, new_indices = lexical_units(after)
+    new = [unicodedata.normalize("NFC", new_chars[i]) for i in new_indices]
+    filler_positions = [i for i, c in enumerate(characters) if c in set("嗯呃额啊唔")]
+    allowed_fillers = {i for i, permitted in zip(filler_positions, permissions) if permitted}
+    pending, seen = [(0, 0, fillers, [])], set()
+    while pending:
+        i, j, used, kept = pending.pop()
+        if (i, j, used) in seen:
+            continue
+        seen.add((i, j, used))
+        if i == len(old) and j == len(new):
+            retained = {indices[k] for k in kept}
+            lexical = set(indices)
+            return "".join(c for k, c in enumerate(characters) if k not in lexical or k in retained), used
+        maximum = min((len(old) - i) // 2, len(new) - j)
+        if allow_reviewed_changes and len(characters) <= 96:
+            # 反向入栈，保持 Swift 的相等、填充声、从短到长口吃的确定性优先级。
+            alternatives = []
+            for width in range(1, maximum + 1):
+                unit = old[i:i + width]
+                if (unit != new[j:j + width] or not all(
+                    not c.isascii() and unicodedata.category(c[0]).startswith("L")
+                    and c not in "零〇一二三四五六七八九十百千万亿两" for c in unit)):
+                    continue
+                end = i + width
+                while end + width <= len(old) and old[end:end + width] == unit:
+                    end += width
+                    if any(unicodedata.category(c[0]).startswith("P") for c in characters[indices[i]:indices[end - 1] + 1]):
+                        break
+                    alternatives.append((end, j + width, used, kept + list(range(i, i + width))))
+            pending.extend(reversed(alternatives))
+        # 唔、呃只参与待核对形状证明，不能作为停顿声免于语义复核。
+        if (i < len(old) and used < 6 and old[i] in set("嗯呃额啊唔") and indices[i] in allowed_fillers
+                and (allow_reviewed_changes or old[i] not in set("唔呃"))):
+            pending.append((i + 1, j, used + 1, kept))
+        if i < len(old) and j < len(new) and old[i] == new[j]:
+            pending.append((i + 1, j + 1, used, kept + [i]))
+    return None
+
+
+def filler_permissions(context: str, start: int, end: int) -> list[bool]:
+    characters = list(composed_characters(context))
+    result, position = [], 0
+    def boundary(c):
+        return c.isspace() or unicodedata.category(c[0]).startswith("P")
+    for i, c in enumerate(characters):
+        if c in set("嗯呃额啊唔") and start <= position < end:
+            left, right = i, i + 1
+            while left > 0 and characters[left - 1] in set("嗯呃额啊唔"):
+                left -= 1
+            while right < len(characters) and characters[right] in set("嗯呃额啊唔"):
+                right += 1
+            left_boundary = left == 0 or boundary(characters[left - 1])
+            right_boundary = right == len(characters) or boundary(characters[right])
+            result.append(left_boundary and ("额" not in characters[left:right] or right_boundary))
+        position += len(c)
+    return result
+
+
+def is_v4_mechanical_edit(edit: dict, draft: str | None = None, *, allow_reviewed_changes: bool = False) -> bool:
+    return v4_mechanical_projection(edit, draft, allow_reviewed_changes=allow_reviewed_changes) is not None
+
+
+def v4_mechanical_projection(edit: dict, draft: str | None = None, *, allow_reviewed_changes: bool = False) -> str | None:
+    before, after = edit.get("before"), edit.get("after")
+    if not isinstance(before, str) or not before or not isinstance(after, str):
+        return None
+    context = before if draft is None else draft
+    start = context.find(before)
+    if start < 0 or context.find(before, start + 1) >= 0:
+        return None
+    permissions = filler_permissions(context, start, start + len(before))
+    if (re.findall(NEWLINE_PATTERN, before) != re.findall(NEWLINE_PATTERN, after)
+            or any(re.search(NEWLINE_PATTERN, before[start:end] + inserted)
+                   for start, end, inserted in actual_modifications(before, after, 0))):
+        return None
+    projected = before
+    for spoken, symbol in [("双横线", "--"), ("短横线", "-"), ("反斜杠", "\\"), ("斜杠", "/"), ("下划线", "_")]:
+        projected = projected.replace(spoken, symbol)
+    projected = re.sub(r"(?<=[A-Za-z0-9_])点(?=[A-Za-z0-9_])", ".", projected)
+    for candidate in (before, projected):
+        old_parts, new_parts = re.split(NEWLINE_PATTERN, candidate), re.split(NEWLINE_PATTERN, after)
+        if len(old_parts) != len(new_parts):
+            continue
+        used, offset, projections = 0, 0, []
+        for old, new, raw in zip(old_parts, new_parts, re.split(NEWLINE_PATTERN, before)):
+            count = sum(c in set("嗯呃额啊唔") for c in composed_characters(raw))
+            result = mechanical_paragraph(old, new, used, permissions[offset:offset + count], allow_reviewed_changes)
+            if result is None or not v4_punctuation_preserves_tokens(result[0], new):
+                break
+            used = result[1]
+            offset += count
+            projections.append(result[0])
+        else:
+            separators = re.findall(NEWLINE_PATTERN, candidate)
+            projection = "".join(p + (separators[i] if i < len(separators) else "") for i, p in enumerate(projections))
+            expected = context[:start] + projection + context[start + len(before):]
+            actual = context[:start] + after + context[start + len(before):]
+            if v4_punctuation_preserves_tokens(expected, actual):
+                return projection
+    return None
+
+
+def v4_requires_semantic_review(edits: list[dict], draft: str | None = None) -> bool:
+    if any(edit.get("kind") == "content" or not is_v4_mechanical_edit(edit, draft) for edit in edits):
+        return True
+    if draft is None:
+        return False
+    projected = [{**edit, "after": v4_mechanical_projection(edit, draft)} for edit in edits]
+    try:
+        expected = apply_recorded_edits(draft, json.dumps({"edits": projected}))
+        actual = apply_recorded_edits(draft, json.dumps({"edits": edits}))
+        return not v4_punctuation_preserves_tokens(expected, actual)
+    except ValueError:
+        return True
+
+
+def source_contains_punctuation_equivalent_anchor(anchor: str, source: str) -> bool:
+    if anchor in source:
+        return True
+    characters, indices = lexical_units(source)
+    words = [unicodedata.normalize("NFC", characters[i]) for i in indices]
+    chars, positions = lexical_units(anchor)
+    wanted = [unicodedata.normalize("NFC", chars[i]) for i in positions]
+    if not wanted:
+        return False
+    for start in range(len(words) - len(wanted) + 1):
+        if words[start:start + len(wanted)] != wanted:
+            continue
+        candidate = "".join(characters[indices[start]:indices[start + len(wanted) - 1] + 1])
+        if (re.findall(NEWLINE_PATTERN, candidate) == re.findall(NEWLINE_PATTERN, anchor)
+                and v4_punctuation_preserves_tokens(candidate, anchor)):
+            return True
+    return False
+
+
+def validate_v4_light_edit(edit: dict, source: str, allows_reviewed_directives: bool, draft: str | None = None) -> None:
+    before, after, kind = edit["before"], edit["after"], edit.get("kind")
+    if kind not in {"punctuation", "filler", "stutter", "symbol", "word", "correction", "directive"}:
+        raise ValueError("v4 轻度类型无权限")
+    changes = actual_modifications(before, after, 0)
+    if (re.findall(NEWLINE_PATTERN, before) != re.findall(NEWLINE_PATTERN, after)
+            or any(re.search(NEWLINE_PATTERN, before[start:end] + inserted) for start, end, inserted in changes)):
+        raise ValueError("v4 轻度不得改变原有换行")
+    if is_v4_mechanical_edit(edit, draft, allow_reviewed_changes=True):
+        return
+    if kind not in {"punctuation", "directive"} and len(composed_characters(before)) > 96:
+        raise ValueError("v4 实质修改锚点超界")
+    old, new = lexical_characters(before), lexical_characters(after)
+    pairs = list(zip([lexical_characters(p) for p in re.split(NEWLINE_PATTERN, before)],
+                     [lexical_characters(p) for p in re.split(NEWLINE_PATTERN, after)]))
+    if kind in {"punctuation", "symbol"}:
+        raise ValueError("v4 完整实际变化不能由机械规则解释")
+    if kind == "stutter":
+        if not adjacent_repetition_removal(old, new) or not all(a == b or adjacent_repetition_removal(a, b) for a, b in pairs):
+            raise ValueError("v4 非相邻口吃删除")
+    elif kind == "word":
+        blocks = actual_modifications(old, new, 0)
+        if (len(blocks) != 1 or blocks[0][1] - blocks[0][0] > 8 or not 1 <= len(blocks[0][2]) <= 8
+                or sum(a != b for a, b in pairs) != 1
+                or [c for c in before if c in "-_/\\`@#%"] != [c for c in after if c in "-_/\\`@#%"]):
+            raise ValueError("v4 字词修改超出轻度局部权限")
+    elif kind == "filler":
+        removed = "".join(before[a:b] for a, b, _ in changes)
+        if any(c for _, _, c in changes) or not removed or len(composed_characters(removed)) > 6 or not set(removed) <= set("嗯呃额啊唔"):
+            raise ValueError("v4 填充声删除夹带其他内容")
+    elif kind == "directive":
+        if allows_reviewed_directives:
+            if (len(changes) != 1 or changes[0][2] or changes[0][0] == changes[0][1]
+                    or len(composed_characters(before[changes[0][0]:changes[0][1]])) > 32):
+                raise ValueError("v4 已核对编辑要求只能连续短删除")
+        elif (len(composed_characters(before)) > 32 or after or before[-1] not in "：:，,。."
+              or not source.startswith(before) or before == source):
+            raise ValueError("v4 无标点或内嵌编辑要求未获显式核对权限")
+    elif kind == "correction":
+        # v4 允许首轮标点变化后的锚点，证据本身仍须逐字来自完整 source。
+        validate_recorded_light_edit(edit, source, 4, _checking_correction=True)
+
+
+def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version: int,
+                                 allows_reviewed_directives: bool = False, _checking_correction: bool = False,
+                                 draft: str | None = None) -> None:
+    if editing_prompt_version == 4 and not _checking_correction:
+        return validate_v4_light_edit(edit, source, allows_reviewed_directives, draft)
     before, after = edit["before"], edit["after"]
     old_words, new_words = lexical_characters(before), lexical_characters(after)
     newline_pattern = r"\r\n|[\n\r\v\f\x85\u2028\u2029]"
@@ -637,7 +844,7 @@ def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version
     ))
     changed_paragraphs = sum(old != new for old, new in paragraph_pairs)
     kind = edit.get("kind")
-    if editing_prompt_version == 3:
+    if editing_prompt_version in (3, 4):
         changes = actual_modifications(before, after, 0)
         if (re.findall(newline_pattern, before) != re.findall(newline_pattern, after)
                 or any(re.search(newline_pattern, before[start:end] + inserted) for start, end, inserted in changes)):
@@ -659,16 +866,17 @@ def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version
     if kind != "correction":
         return
     cues = ["不对", "说错", "改成", "改为", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
-    if editing_prompt_version == 3:
+    if editing_prompt_version in (3, 4):
         cues.append("改由")
     if len(before) > 96 or after.count("\n") > before.count("\n"):
         raise ValueError("改口锚点超界或新增段落")
     if (any(cue in before.lower() for cue in cues) and is_subsequence(new_words, old_words)
-            and (editing_prompt_version != 3 or all(is_subsequence(new, old) for old, new in paragraph_pairs))):
+            and (editing_prompt_version not in (3, 4) or all(is_subsequence(new, old) for old, new in paragraph_pairs))):
         return
     evidence = edit.get("evidence")
-    if (editing_prompt_version != 3 or not isinstance(evidence, str) or not evidence or len(evidence) > 192
-            or evidence not in source or before not in source or not any(cue in evidence.lower() for cue in cues)
+    anchor_exists = source_contains_punctuation_equivalent_anchor(before, source) if editing_prompt_version == 4 else before in source
+    if (editing_prompt_version not in (3, 4) or not isinstance(evidence, str) or not evidence or len(evidence) > 192
+            or evidence not in source or not anchor_exists or not any(cue in evidence.lower() for cue in cues)
             or changed_paragraphs != 1
             or "".join(c for c in old_words if unicodedata.category(c)[0] not in "LN")
                 != "".join(c for c in new_words if unicodedata.category(c)[0] not in "LN")):
@@ -681,12 +889,13 @@ def validate_recorded_light_edit(edit: dict, source: str, editing_prompt_version
         raise ValueError("远处改口字词超界或新增内容不能由连续证据解释")
 
 
-def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: int | None = None) -> str:
+def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: int | None = None,
+                         allows_reviewed_directives: bool = False, original_source: str | None = None) -> str:
     document = json.loads(response)
     if (not isinstance(document, dict) or set(document) != {"edits"}
             or not isinstance(document["edits"], list) or len(document["edits"]) > 128):
         raise ValueError("编辑响应不是独立 edits 对象")
-    located = []
+    located, projected_edits = [], []
     for edit in document["edits"]:
         if not isinstance(edit, dict):
             raise ValueError("编辑项不是对象")
@@ -694,7 +903,11 @@ def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: 
         if not isinstance(before, str) or not before or not isinstance(after, str):
             raise ValueError("编辑锚点缺失或重复")
         if editing_prompt_version is not None:
-            validate_recorded_light_edit(edit, source, editing_prompt_version)
+            validate_recorded_light_edit(edit, original_source if original_source is not None else source,
+                                         editing_prompt_version, allows_reviewed_directives, draft=source)
+        if editing_prompt_version == 4:
+            projected = v4_mechanical_projection(edit, source, allow_reviewed_changes=True)
+            projected_edits.append({**edit, "after": after if projected is None else projected})
         start = source.find(before)
         if start < 0 or source.find(before, start + 1) >= 0:
             raise ValueError("编辑锚点缺失或重复")
@@ -707,6 +920,12 @@ def apply_recorded_edits(source: str, response: str, *, editing_prompt_version: 
     output = source
     for start, end, after in sorted(located, key=lambda x: (x[0], x[1] - x[0]), reverse=True):
         output = output[:start] + after + output[end:]
+    if editing_prompt_version == 4:
+        expected = apply_recorded_edits(source, json.dumps({"edits": projected_edits}))
+        if not v4_punctuation_preserves_tokens(expected, output):
+            raise ValueError("v4 合批修改破坏技术 token 边界")
+    if editing_prompt_version == 4 and any(edit.get("kind") == "directive" for edit in document["edits"]) and not lexical_characters(output):
+        raise ValueError("v4 编辑要求删除不能清空全文实质内容")
     return output
 
 
@@ -737,6 +956,152 @@ def complete_change_evidence(source: str, draft: str, changes: object) -> bool:
             return False
         positions = following
     return any(source[old:] == draft[new:] for old, new in positions)
+
+
+def v4_role_comparison(text: str) -> str:
+    return unicodedata.normalize("NFC", "".join(c for c in composed_characters(text)
+        if not c.isspace() and not unicodedata.category(c[0]).startswith("P")))
+
+
+def v4_source_review_risk(source: str) -> bool:
+    cues = ["帮我", "替我", "你帮", "整理成", "润色", "改写", "提示词", "prompt", "我补", "等一下",
+            "不对", "说错", "改成", "改为", "改由", "我改一下", "不用写", "不要写", "别写", "先别",
+            "只整理", "actually", "i mean", "scratch that"]
+    lowered = source.lower()
+    return any(cue in lowered for cue in cues) or re.search(r"(?:给|跟)[^。！？\n]{0,16}(?:回|说)(?:一下|一条|一声)", lowered) is not None
+
+
+def decode_v4_edits(value: object) -> list[dict]:
+    if not isinstance(value, list) or len(value) > 128:
+        raise ValueError("v4 edits 结构错误")
+    for edit in value:
+        if (not isinstance(edit, dict) or not isinstance(edit.get("before"), str)
+                or not isinstance(edit.get("after"), str)
+                or edit.get("kind") not in {"punctuation", "stutter", "word", "symbol", "correction", "filler", "directive", "content"}
+                or (edit.get("evidence") is not None and not isinstance(edit["evidence"], str))):
+            raise ValueError("v4 编辑项字段错误")
+    return value
+
+
+def decode_v4_review(raw: str, source: str) -> dict:
+    if len(raw.encode()) > 1_048_576:
+        raise ValueError("v4 复核响应超界")
+    value = json.loads(raw)
+    if not isinstance(value, dict) or set(value) != {"source_roles", "edits"}:
+        raise ValueError("v4 复核必须同时包含 source_roles 和 edits")
+    roles = value["source_roles"]
+    if not isinstance(roles, list) or len(roles) > 64:
+        raise ValueError("v4 原文角色结构错误")
+    seen = set()
+    for item in roles:
+        if not isinstance(item, dict) or set(item) != {"quote", "role", "target_evidence"}:
+            raise ValueError("v4 原文角色字段错误")
+        quote, evidence = item["quote"], item["target_evidence"]
+        if (not isinstance(quote, str) or not quote or len(composed_characters(quote)) > 192
+                or not isinstance(evidence, str) or not evidence or len(composed_characters(evidence)) > 192
+                or not v4_role_comparison(quote) or quote not in source
+                or source.find(quote, source.find(quote) + 1) >= 0 or quote in seen
+                or evidence not in source or item["role"] not in {"current_editor", "recipient_content", "uncertain"}):
+            raise ValueError("v4 原文角色缺少唯一原文及目标对象依据")
+        seen.add(quote)
+    decode_v4_edits(value["edits"])
+    return value
+
+
+def v4_contains_editor_instruction(assessment: dict, draft: str) -> bool:
+    text = v4_role_comparison(draft)
+    return any(item["role"] == "current_editor" and v4_role_comparison(item["quote"]) in text
+               for item in assessment["source_roles"])
+
+
+def v4_plain_text(response: str, source: str) -> str:
+    if len(response.encode()) > 1_048_576:
+        raise ValueError("标准首稿超界")
+    text = re.sub(r"<think>[\s\S]*?</think>", "", response)
+    text = re.sub(r"<think>[\s\S]*$", "", text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    for prefix in ["最终文本：", "最终文本:", "润色后：", "润色后:", "Final text:", "Polished text:"]:
+        if text.startswith(prefix) and not source.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    blocks = [part.strip() for part in text.split("\n\n") if part.strip()]
+    for width in range(1, len(blocks) // 2 + 1):
+        if len(blocks) % width or blocks != blocks[:width] * (len(blocks) // width):
+            continue
+        unit = "\n\n".join(blocks[:width])
+        comparable = v4_role_comparison(unit).lower()
+        if (len(composed_characters(unit)) >= 40 and comparable
+                and v4_role_comparison(source).lower().count(comparable) < len(blocks) // width):
+            return unit
+    return text
+
+
+def v4_stage_contract(row: dict, payloads: list, mode: str) -> tuple[list[str], list[str]]:
+    """回放候选真实请求链；模型质量失败保留为 fallback，不伪造为来源证据成功。"""
+    source, stages = row["canonical_input"], row["stage_responses"]
+    fallback = row.get("fallback_used")
+    allowed = ["voicePolishFast" if mode == "light" else "voicePolishRender"]
+    failures, repairs = [], 0
+    draft = None
+
+    def bind_draft(index: int, current: str) -> None:
+        payload = payloads[index]
+        if not isinstance(payload, dict) or payload.get("draft_text") != current:
+            failures.append("v4 复核请求未绑定实际稿")
+        if not isinstance(payload, dict) or not complete_change_evidence(source, current, payload.get("changes")):
+            failures.append("v4 复核请求未完整绑定原文与实际稿差异")
+
+    try:
+        if stages and stages[0].get("status") == "succeeded":
+            if payloads[0] is None or any(payloads[0].get(k) is not None for k in ("draft_text", "changes")):
+                failures.append("v4 首轮请求伪装成复核稿")
+            if mode == "light":
+                initial = json.loads(stages[0]["response_text"])
+                if not isinstance(initial, dict) or set(initial) != {"edits"}:
+                    raise ValueError("初轮 light 必须为独立 edits 对象")
+                edits = decode_v4_edits(initial["edits"])
+                requires = v4_source_review_risk(source) or v4_requires_semantic_review(edits, source)
+                draft = apply_recorded_edits(source, stages[0]["response_text"], editing_prompt_version=4,
+                                              allows_reviewed_directives=requires)
+            else:
+                requires = True
+                draft = v4_plain_text(stages[0]["response_text"], source)
+            if requires:
+                allowed.append("voicePolishAnalyze")
+            if len(stages) >= 2 and requires:
+                bind_draft(1, draft)
+                if stages[1].get("status") == "succeeded":
+                    assessment = decode_v4_review(stages[1]["response_text"], source)
+                    if assessment["edits"]:
+                        repairs = 1
+                        response = json.dumps({"edits": assessment["edits"]}, ensure_ascii=False)
+                        if mode == "standard":
+                            if any(edit["kind"] != "content" or not edit.get("evidence")
+                                   or edit["evidence"] not in source for edit in assessment["edits"]):
+                                raise ValueError("标准修复缺少 content 及原文 evidence")
+                        draft = apply_recorded_edits(draft, response,
+                            editing_prompt_version=4 if mode == "light" else None,
+                            allows_reviewed_directives=True, original_source=source)
+                        if v4_contains_editor_instruction(assessment, draft):
+                            raise ValueError("已识别当前编辑要求仍留在修复稿")
+                        allowed.append("voicePolishAnalyze")
+                        if len(stages) >= 3:
+                            bind_draft(2, draft)
+                            if stages[2].get("status") == "succeeded":
+                                confirmation = decode_v4_review(stages[2]["response_text"], source)
+                                if confirmation["edits"] or v4_contains_editor_instruction(confirmation, draft):
+                                    raise ValueError("第三轮未确认空补丁或仍留当前编辑要求")
+                    elif v4_contains_editor_instruction(assessment, draft):
+                        raise ValueError("当前编辑要求未处理却空编辑通过")
+            if not fallback and row.get("model_output") != draft:
+                raise ValueError("最终输出不等于实际补丁逐级应用结果")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        if not fallback:
+            failures.append(f"v4 实际稿/角色/修复证据不成立：{error}")
+    if row.get("repair_attempt_count") != repairs or not valid_integer(row.get("repair_attempt_count")):
+        failures.append("v4 repair_attempt_count 未如实记录成功或失败的本地修复尝试")
+    if fallback and row.get("model_output") != source:
+        failures.append("v4 回退交付了未经确认的局部稿")
+    return allowed, failures
 
 
 def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, mode: str,
@@ -806,6 +1171,10 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
+            if expected["editing_prompt_version"] == 4 and (
+                not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
+            ):
+                failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
             if stages or any(row.get(k) != 0 for k in ("llm_call_count", "llm_attempt_count", "internal_chunk_count")):
                 failures.append(f"{tid}: 直出必须为零调用、零尝试、零模型切片")
             canonical = legacy.canonical_input(item)
@@ -817,7 +1186,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if expected["editing_prompt_version"] == 3:
+        if expected["editing_prompt_version"] in (3, 4):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -829,7 +1198,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if expected["editing_prompt_version"] == 3:
+        if expected["editing_prompt_version"] in (3, 4):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -867,7 +1236,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         or payload.get("authorized_context") != expected_mappings
                         or payload.get("user_preferences") != "" or payload.get("style_profile") is not None):
                     failures.append(f"{tid}: 阶段请求带入非冻结上下文、个人偏好或错误协议")
-                if expected["editing_prompt_version"] == 3 and (
+                if expected["editing_prompt_version"] in (3, 4) and (
                     expected_segments is None or payload.get("source_segments") != expected_segments
                 ):
                     failures.append(f"{tid}: v3 阶段 source_segments 未逐项保留 canonical 段的 ID、正文和顺序")
@@ -907,7 +1276,12 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if mode == "light":
+        if expected["editing_prompt_version"] == 4:
+            allowed, stage_failures = v4_stage_contract(row, payloads, mode)
+            failures.extend(f"{tid}: {failure}" for failure in stage_failures)
+            if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
+                failures.append(f"{tid}: v4 尝试数超出真实补丁和原文风险允许的调用预算")
+        elif mode == "light":
             allowed = ["voicePolishFast"] + (["voicePolishAnalyze"] if requires_light_review else [])
             if expected["editing_prompt_version"] not in (1, 2, 3):
                 failures.append(f"{tid}: 尚未定义该轻度协议版本的阶段契约")
@@ -917,7 +1291,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if mode == "light" else 2
+        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] == 4 else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -929,7 +1303,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not row.get("fallback_used") and successful:
+        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] != 4:
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],

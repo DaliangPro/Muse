@@ -140,7 +140,10 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
             XCTAssertEqual(result?.finalText, source, mode.name)
             let requests = await client.recordedRequests()
             if let expectedMode = mode.voicePolishQualityMode {
-                XCTAssertFalse(requests.isEmpty, mode.name)
+                XCTAssertEqual(result?.processedText, source, mode.name)
+                XCTAssertFalse(result?.llmFailed ?? true, mode.name)
+                XCTAssertEqual(result?.historyStatus, "voice_polish_success", mode.name)
+                XCTAssertEqual(requests.count, expectedMode == .light ? 1 : 2, mode.name)
                 for request in requests {
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any])
                     XCTAssertEqual(payload["mode"] as? String, expectedMode.rawValue)
@@ -159,8 +162,10 @@ private actor VoiceInputModeProbeLLM: LLMClient {
         requests.append(request)
         let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
         return LLMResponse(
-            text: request.options.responseFormat == .jsonObject
-                ? #"{"edits":[]}"# : (payload?["canonical_text"] as? String ?? ""),
+            text: request.task == .voicePolishAnalyze
+                ? #"{"source_roles":[],"edits":[]}"#
+                : (request.options.responseFormat == .jsonObject
+                    ? #"{"edits":[]}"# : (payload?["canonical_text"] as? String ?? "")),
             model: config.model
         )
     }

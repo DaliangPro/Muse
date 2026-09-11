@@ -308,6 +308,7 @@ enum VoicePolishQualityRunner {
         var preResolutionCanonicalInput: String? = nil
         var canonicalSegments: [RecognitionSegment]? = nil
         var resolvedEntities: [QualityResolvedEntityEvidence]? = nil
+        var repairAttemptCount: Int? = nil
     }
 
     private struct QualityRunReport: Codable {
@@ -705,7 +706,8 @@ enum VoicePolishQualityRunner {
                     finishedAt: Date(),
                     preResolutionCanonicalInput: envelope.fallbackText,
                     canonicalSegments: envelope.segments,
-                    resolvedEntities: resolvedEntitiesForReport(resolvedEntities)
+                    resolvedEntities: resolvedEntitiesForReport(resolvedEntities),
+                    repairAttemptCount: result.repairAttemptCount
                 ))
                 report = replacing(
                     report,
@@ -854,7 +856,8 @@ enum VoicePolishQualityRunner {
             finishedAt: Date(),
             preResolutionCanonicalInput: canonical,
             canonicalSegments: [],
-            resolvedEntities: []
+            resolvedEntities: [],
+            repairAttemptCount: 0
         )
     }
 

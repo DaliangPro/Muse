@@ -105,6 +105,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         XCTAssertEqual(report["executed_route"] as? String, "direct")
         XCTAssertEqual(report["llm_call_count"] as? Int, 0)
         XCTAssertEqual(report["llm_attempt_count"] as? Int, 0)
+        XCTAssertEqual(report["repair_attempt_count"] as? Int, 0)
         XCTAssertEqual(report["internal_chunk_count"] as? Int, 0)
         XCTAssertEqual((report["stage_responses"] as? [Any])?.count, 0)
         XCTAssertEqual(report["fallback_used"] as? Bool, false)

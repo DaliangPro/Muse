@@ -2,6 +2,122 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishTextEditRegressionTests: XCTestCase {
+    func test第三轮真实误标类型的机械组合可以完整落稿() throws {
+        let cases = [
+            ("嗯我今天大概七点半到你们不用等我吃饭先吃就行", "我今天大概七点半到，你们不用等我吃饭，先吃就行。"),
+            ("部署要做三步第一跑swift test第二跑swift build短横线c release第三执行scripts斜杠package短横线app点sh等一下还有一步要检查codesign所以一共四步最后再启动应用", "部署要做三步：第一，跑 swift test；第二，跑 swift build -c release；第三，执行 scripts/package-app.sh。等一下，还有一步要检查 codesign，所以一共四步，最后再启动应用。")
+        ]
+        for (before, after) in cases {
+            for kind in [VoicePolishTextEdit.Kind.punctuation, .filler, .symbol, .word, .correction] {
+                let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: kind)]
+                XCTAssertFalse(VoicePolishTextEditor.requiresSemanticReview(edits), "\(kind)")
+                XCTAssertEqual(try apply(edits, to: before), after)
+            }
+        }
+    }
+
+    func test填充声口吃符号和标点组合仍由同一实际变化证明() throws {
+        let before = "嗯我我今天跑swift build短横线c release然后看结果"
+        let after = "我今天跑 swift build -c release，然后看结果。"
+        let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .punctuation)]
+        XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits))
+        XCTAssertEqual(try apply(edits, to: before), after)
+        let unicode = "👨‍👩‍👧‍👦，嗯今天用e\u{301}看结果👍🏽\r\n再运行scripts斜杠app点sh"
+        let output = "👨‍👩‍👧‍👦，今天用 e\u{301}，看结果👍🏽。\r\n再运行 scripts/app.sh。"
+        XCTAssertEqual(try apply([.init(before: unicode, after: output, kind: .punctuation)], to: unicode), output)
+    }
+
+    func test机械组合不能合并技术词删除事实或重排原段落() {
+        for (before, after) in [
+            ("嗯a点b c", "a.bc"), ("v点2 api", "v.2api"),
+            ("swift test", "swifttest"), ("swift build短横线c release", "swift build -crelease"),
+            ("嗯明天小李负责发送", "明天发送。"), ("金额1212", "金额12"),
+            ("嗯甲乙\n丙", "甲\n乙丙"), ("甲\r\n乙丙", "甲乙\r\n丙")
+        ] {
+            let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .punctuation)]
+            XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits), before)
+            XCTAssertThrowsError(try apply(edits, to: before), before)
+        }
+        let long = String(repeating: "甲乙丙丁", count: 80)
+        XCTAssertThrowsError(try apply([.init(before: long, after: String(long.reversed()), kind: .punctuation)], to: long))
+    }
+
+    func test口吃免审不包括数字技术词或标点隔开的重复() {
+        for (before, after) in [("1212", "12"), ("api api", "api"), ("很好，很好", "很好")] {
+            XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview([
+                .init(before: before, after: after, kind: .stutter)
+            ]), before)
+        }
+        XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview([
+            .init(before: "按装软件", after: "安装软件", kind: .word)
+        ]))
+    }
+
+    func test无标点编辑要求需显式核对且未变后缀只负责定位() throws {
+        let prefix = "帮我整理一下"
+        let suffix = "明天小李负责发材料。"
+        let source = prefix + suffix
+        let edits: [VoicePolishTextEdit] = [.init(before: source, after: suffix, kind: .directive)]
+        XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits))
+        XCTAssertThrowsError(try apply(edits, to: source))
+        XCTAssertEqual(try VoicePolishTextEditor.apply(
+            edits, to: source, source: source, mode: .light, allowsReviewedInlineDirectives: true
+        ), suffix)
+        let longSuffix = String(repeating: "原文正文和事实保持原位。", count: 12)
+        XCTAssertEqual(try VoicePolishTextEditor.apply(
+            [.init(before: prefix + longSuffix, after: longSuffix, kind: .directive)],
+            to: prefix + longSuffix, source: prefix + longSuffix, mode: .light,
+            allowsReviewedInlineDirectives: true
+        ), longSuffix)
+    }
+
+    func test经核对编辑要求也不能超界多处删除插入移字或清空正文() {
+        let longPrefix = String(repeating: "整理", count: 17)
+        for (source, before, after) in [
+            (longPrefix + "正文", longPrefix + "正文", "正文"),
+            ("请整理甲并润色乙", "请整理甲并润色乙", "甲乙"),
+            ("帮我整理甲乙", "帮我整理甲乙", "乙甲"),
+            ("帮我整理正文", "帮我整理正文", "新正文"),
+            ("帮我整理。", "帮我整理", ""),
+            ("甲\n帮我整理乙", "甲\n帮我整理乙", "甲乙")
+        ] {
+            XCTAssertThrowsError(try VoicePolishTextEditor.apply(
+                [.init(before: before, after: after, kind: .directive)], to: source, source: source,
+                mode: .light, allowsReviewedInlineDirectives: true
+            ), source)
+        }
+    }
+
+    func test机械证明失败不能只交付同批正确补丁() {
+        let source = "嗯今天运行swift test"
+        XCTAssertThrowsError(try apply([
+            .init(before: "嗯今天", after: "今天，", kind: .punctuation),
+            .init(before: "swift test", after: "swifttest", kind: .punctuation)
+        ], to: source))
+    }
+
+    func test复核可在已补标点的实际稿定位原文支持的远处改口() throws {
+        let source = "阿文负责复查重复报名\n重复报名的复查改由阿宁来做"
+        let draft = "阿文负责复查重复报名。\n重复报名的复查改由阿宁来做。"
+        let edit = VoicePolishTextEdit(before: "阿文负责复查重复报名。", after: "阿宁负责复查重复报名。",
+                                       kind: .correction, evidence: "重复报名的复查改由阿宁来做")
+        XCTAssertEqual(try VoicePolishTextEditor.apply(
+            [edit], to: draft, source: source, mode: .light, allowsReviewedSourceCorrections: true
+        ), "阿宁负责复查重复报名。\n重复报名的复查改由阿宁来做。")
+        XCTAssertThrowsError(try VoicePolishTextEditor.apply([edit], to: draft, source: source, mode: .light))
+        for (original, actual) in [("阿文负责 api test", "阿文负责 apitest。"),
+                                   ("阿文负责 a.b c", "阿文负责 a.bc。"),
+                                   ("阿文负责\n复查", "阿文负责复查。"),
+                                   ("阿文负责其他任务", "阿文负责复查。") ] {
+            let evidence = "复查改由阿宁来做"
+            XCTAssertThrowsError(try VoicePolishTextEditor.apply(
+                [.init(before: actual, after: actual.replacingOccurrences(of: "阿文", with: "阿宁"),
+                       kind: .correction, evidence: evidence)], to: actual, source: original + "\n" + evidence,
+                mode: .light, allowsReviewedSourceCorrections: true
+            ), original)
+        }
+    }
+
     func test符号恢复可同时补标点但不能改变正文或技术含义() throws {
         let source = "swift build短横线c release第三执行"
         XCTAssertEqual(try apply([
@@ -125,7 +241,7 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
     }
 
     func test填充声补丁不能混删实词或技术符号() throws {
-        for source in ["嗯今天要发送", "嗯+参数", "嗯_参数", "嗯/参数", "嗯`参数", "嗯.参数", "嗯:参数"] {
+        for source in ["嗯今天要发送", "嗯+参数", "嗯_参数", "嗯/参数", "嗯`参数"] {
             let output = source == "嗯今天要发送" ? "发送" : "参数"
             XCTAssertThrowsError(try apply([
                 .init(before: source, after: output, kind: .filler)
@@ -140,6 +256,91 @@ final class VoicePolishTextEditRegressionTests: XCTestCase {
         XCTAssertEqual(try apply([
             .init(before: "嗯今天呃发送", after: "今天发送", kind: .filler)
         ], to: "嗯今天呃发送"), "今天发送")
+    }
+
+    func test填充声可组合普通标点但不得删除点文件或词内技术点() throws {
+        for source in ["嗯.参数", "嗯:参数"] {
+            XCTAssertEqual(try apply([.init(before: source, after: "参数", kind: .filler)], to: source), "参数")
+        }
+        for (before, after) in [("嗯 .env", "env"), ("嗯 .gitignore", "gitignore"), ("嗯 a.b", "ab")] {
+            let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .punctuation)]
+            XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits))
+            XCTAssertThrowsError(try apply(edits, to: before), before)
+        }
+        XCTAssertEqual(try apply([.init(before: "嗯 .env然后检查", after: ".env，然后检查。", kind: .punctuation)],
+                                 to: "嗯 .env然后检查"), ".env，然后检查。")
+    }
+
+    func test填充声免审必须绑定真实边界并保留额字实词() throws {
+        for (source, before, after) in [("嗯我今天发。", "嗯我今天发。", "我今天发。"),
+                                        ("先说，呃今天发。", "呃今天发。", "今天发。"),
+                                        ("嗯呃我今天发。", "嗯呃我今天发。", "我今天发。"),
+                                        ("额，今天发。", "额，今天发。", "今天发。") ] {
+            let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .punctuation)]
+            XCTAssertEqual(VoicePolishTextEditor.requiresSemanticReview(edits, in: source), before.contains("呃"), source)
+            XCTAssertEqual(try apply(edits, to: source), source.replacingOccurrences(of: before, with: after))
+        }
+        for source in ["额外安排复查。", "额度要保留。", "本周额外安排复查。", "金额待定。", "声音嗯要保留。"] {
+            let removed = source.contains("额") ? "额" : "嗯"
+            let after = source.replacingOccurrences(of: removed, with: "")
+            for kind in [VoicePolishTextEdit.Kind.filler, .punctuation] {
+                let edits: [VoicePolishTextEdit] = [.init(before: removed, after: "", kind: kind)]
+                XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits, in: source), source)
+                if kind == .punctuation { XCTAssertThrowsError(try apply(edits, to: source), source) }
+                else { XCTAssertEqual(try apply(edits, to: source), after) }
+            }
+        }
+    }
+
+    func test窄锚点不能拆分合并或删除周围真实技术词() {
+        for (source, before, after) in [("运行swift test", " ", ""), ("调用api", "ap", "ap "),
+                                        ("运行swift test", "t ", "t"), ("使用.env", ".", ""),
+                                        ("使用a.b", ".", "") ] {
+            let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .punctuation)]
+            XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits, in: source), source)
+            XCTAssertThrowsError(try apply(edits, to: source), source)
+        }
+    }
+
+    func test相邻重复形状可预览但包括人名在内都必须语义核对() throws {
+        for (before, after) in [("莉莉负责审核。", "莉负责审核。"), ("宝宝今天到了。", "宝今天到了。"),
+                               ("我我今天发。", "我今天发。") ] {
+            let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: .punctuation)]
+            XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits, in: before), before)
+            XCTAssertEqual(try apply(edits, to: before), after)
+        }
+    }
+
+    func test唔呃删除可形成待核对稿但不得作为停顿声免审() throws {
+        for (before, after) in [("唔可以退款", "可以退款"), ("唔可以取消订单", "可以取消订单"),
+                               ("呃钱", "钱"), ("先说，呃今天发。", "先说，今天发。") ] {
+            for kind in [VoicePolishTextEdit.Kind.filler, .punctuation] {
+                let edits: [VoicePolishTextEdit] = [.init(before: before, after: after, kind: kind)]
+                XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(edits, in: before), "\(before) / \(kind)")
+                XCTAssertEqual(try apply(edits, to: before), after)
+            }
+        }
+        let source = "嗯唔可以退款"
+        let preservesNegation: [VoicePolishTextEdit] = [.init(before: source, after: "唔可以退款", kind: .punctuation)]
+        XCTAssertFalse(VoicePolishTextEditor.requiresSemanticReview(preservesNegation, in: source))
+        XCTAssertEqual(try apply(preservesNegation, to: source), "唔可以退款")
+    }
+
+    func test各自安全的空格删除合批后仍不能并词且不能夹字词补丁绕过() throws {
+        let spaces: [VoicePolishTextEdit] = [
+            .init(before: "swift ", after: "swift", kind: .punctuation),
+            .init(before: " test", after: "test", kind: .punctuation)
+        ]
+        let source = "运行swift  test"
+        XCTAssertTrue(VoicePolishTextEditor.requiresSemanticReview(spaces, in: source))
+        XCTAssertThrowsError(try apply(spaces, to: source))
+        XCTAssertThrowsError(try apply([
+            .init(before: "按装", after: "安装", kind: .word)
+        ] + spaces, to: "按装后运行swift  test"))
+        XCTAssertEqual(try apply([
+            .init(before: "按装", after: "安装", kind: .word),
+            .init(before: "运行swift test", after: "运行 swift test。", kind: .punctuation)
+        ], to: "按装后运行swift test"), "安装后运行 swift test。")
     }
 
     func test重叠出现的原文锚点也不唯一() {

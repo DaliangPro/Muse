@@ -947,7 +947,7 @@ final class RecognitionSessionTests: XCTestCase {
             with: "邮件里说明周五一定不会对外发布"
         )
         // 复核给出无法定位的补丁，程序必须拒绝，不能把未经确认的初稿交付。
-        let invalidReview = #"{"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
+        let invalidReview = #"{"source_roles":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [wrong, invalidReview])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -979,7 +979,6 @@ final class RecognitionSessionTests: XCTestCase {
         }
         let reachedReview = await AsyncTimeout.asyncValue(.seconds(10)) {
             await client.waitForRequestCount(2)
-            return true
         }
         let unavailable = await AsyncTimeout.asyncValue(.seconds(10)) {
             while !recorder.values.contains("voicePolishUnavailable:validationFailed"),
@@ -990,6 +989,11 @@ final class RecognitionSessionTests: XCTestCase {
         }
 
         let requestCount = await client.requestCount()
+        guard reachedReview.value == true, unavailable.value == true else {
+            await session.abortCurrentSession()
+            pendingTask.cancel()
+            return XCTFail("未进入预期失败状态，events=\(recorder.values) requests=\(requestCount)")
+        }
         XCTAssertFalse(reachedReview.timedOut, "requests=\(requestCount)")
         XCTAssertEqual(requestCount, 2)
         XCTAssertFalse(unavailable.timedOut, "events=\(recorder.values)")
@@ -1000,7 +1004,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
         let accepted = await session.useCanonicalVoicePolishResult()
         XCTAssertTrue(accepted)
-        let result = await pendingTask.value
+        let result = await boundedCompletion(pendingTask, session: session) ?? nil
 
         XCTAssertEqual(result?.finalText, source)
         XCTAssertNil(result?.processedText)
@@ -1023,9 +1027,9 @@ final class RecognitionSessionTests: XCTestCase {
             with: "邮件里说明周五一定不会对外发布"
         )
         let polished = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。\n\n邮件里不要承诺周五对外发布。"
-        let invalidReview = #"{"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
+        let invalidReview = #"{"source_roles":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"content","evidence":"周五上午先发内部试看"}]}"#
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            wrong, invalidReview, polished, #"{"edits":[]}"#,
+            wrong, invalidReview, polished, #"{"source_roles":[],"edits":[]}"#,
         ])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1059,7 +1063,11 @@ final class RecognitionSessionTests: XCTestCase {
             return recorder.values.contains("voicePolishUnavailable:validationFailed")
         }
 
-        XCTAssertFalse(firstRun.timedOut)
+        guard firstRun.value == true else {
+            await session.abortCurrentSession()
+            pendingTask.cancel()
+            return XCTFail("首轮没有进入用户选择状态，events=\(recorder.values)")
+        }
         let firstRequestCount = await client.requestCount()
         XCTAssertEqual(firstRequestCount, 2)
         // 复核失败后已经冻结标准档位，迟到的轻度快捷键不能改写本次重试。
@@ -1069,9 +1077,13 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertTrue(retryAccepted)
         let secondRun = await AsyncTimeout.asyncValue(.seconds(10)) {
             await client.waitForRequestCount(4)
-            return true
         }
-        let result = await pendingTask.value
+        guard secondRun.value == true else {
+            await session.abortCurrentSession()
+            pendingTask.cancel()
+            return XCTFail("重试未完成预期调用，events=\(recorder.values)")
+        }
+        let result = await boundedCompletion(pendingTask, session: session) ?? nil
         let requestCount = await client.requestCount()
 
         XCTAssertFalse(secondRun.timedOut)
@@ -1119,13 +1131,17 @@ final class RecognitionSessionTests: XCTestCase {
                 }
                 return true
             }
-            XCTAssertFalse(waiting.timedOut)
+            guard waiting.value == true else {
+                await session.abortCurrentSession()
+                pending.cancel()
+                return XCTFail("没有进入用户选择状态，events=\(recorder.values)")
+            }
             // 留出真实选择等待，核对 Session 确实记录并剔除这段时间。
             try await Task.sleep(for: .milliseconds(50))
             if shouldRetry {
                 let accepted = await session.retryVoicePolishResult()
                 XCTAssertTrue(accepted)
-                let result = await pending.value
+                let result = await boundedCompletion(pending, session: session) ?? nil
                 let measurement = try XCTUnwrap(result?.performance)
                 XCTAssertEqual(result?.processedText, source)
                 XCTAssertEqual(measurement.firstAutomaticOutcome, .fallback)
@@ -1137,7 +1153,7 @@ final class RecognitionSessionTests: XCTestCase {
                 XCTAssertNotNil(measurement.asrReadyLatencyMilliseconds)
             } else {
                 await session.abortCurrentSession()
-                let result = await pending.value
+                let result = await boundedCompletion(pending, session: session) ?? nil
                 XCTAssertNil(result)
                 let sample = try XCTUnwrap(VoicePolishPerformanceStore.samples(defaults: vocabulary.userDefaults).last)
                 XCTAssertEqual(sample.qualityMode, .light)
@@ -1150,6 +1166,21 @@ final class RecognitionSessionTests: XCTestCase {
                 XCTAssertFalse(recorder.values.contains("processing:\(source)"))
             }
         }
+    }
+
+    /// 请求数到达不等于已交付；终态等待必须有界，失败时释放用户选择 continuation。
+    private func boundedCompletion<Value: Sendable>(
+        _ pending: Task<Value, Never>, session: RecognitionSession,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async -> Value? {
+        let completion = await AsyncTimeout.asyncValue(.seconds(10)) { await pending.value }
+        guard !completion.timedOut else {
+            await session.abortCurrentSession()
+            pending.cancel()
+            XCTFail("会话未在10秒内结束，已取消本次测试会话", file: file, line: line)
+            return nil
+        }
+        return completion.value
     }
 
     private static func voicePolishPayload(from request: LLMRequest) throws -> [String: Any] {
@@ -1394,8 +1425,9 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
         models.append(config.model)
         if request.options.responseFormat == .jsonObject,
            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
-            if payload["mode"] as? String == "standard" {
-                return LLMResponse(text: #"{"edits":[]}"#, model: config.model)
+            if request.task == .voicePolishAnalyze,
+               ["light", "standard"].contains(payload["mode"] as? String ?? "") {
+                return LLMResponse(text: #"{"source_roles":[],"edits":[]}"#, model: config.model)
             }
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -1531,7 +1563,6 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
 private actor RecognitionSessionScriptedVoicePolishLLM: LLMClient {
     private var responses: [String]
     private var requests: [LLMRequest] = []
-    private var requestWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     init(responses: [String]) {
         self.responses = responses
@@ -1539,9 +1570,6 @@ private actor RecognitionSessionScriptedVoicePolishLLM: LLMClient {
 
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
         requests.append(request)
-        let ready = requestWaiters.filter { requests.count >= $0.0 }
-        requestWaiters.removeAll { requests.count >= $0.0 }
-        ready.forEach { $0.1.resume() }
         guard !responses.isEmpty else { throw URLError(.badServerResponse) }
         return LLMResponse(text: responses.removeFirst(), model: config.model)
     }
@@ -1561,11 +1589,12 @@ private actor RecognitionSessionScriptedVoicePolishLLM: LLMClient {
     func requestCount() -> Int { requests.count }
     func recordedRequests() -> [LLMRequest] { requests }
 
-    func waitForRequestCount(_ count: Int) async {
-        guard requests.count < count else { return }
-        await withCheckedContinuation { continuation in
-            requestWaiters.append((count, continuation))
+    func waitForRequestCount(_ count: Int) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while requests.count < count, !Task.isCancelled, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
         }
+        return requests.count >= count
     }
 }
 

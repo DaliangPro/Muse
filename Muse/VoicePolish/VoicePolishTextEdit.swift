@@ -73,6 +73,18 @@ enum VoicePolishTextEditor {
     }
     private static let technicalMarks = Set("-_/\\`@#%")
 
+    /// 是否免于语义核对取决于完整实际变化，模型自报 kind 不授予免审权限。
+    static func requiresSemanticReview(_ edits: [VoicePolishTextEdit], in draft: String? = nil) -> Bool {
+        guard !edits.contains(where: { $0.kind == .content || !isMechanicalEdit($0, in: draft) }) else { return true }
+        guard let draft else { return false }
+        let projected = edits.map { edit in
+            VoicePolishTextEdit(before: edit.before, after: mechanicalProjection(edit, in: draft) ?? edit.after, kind: edit.kind)
+        }
+        guard let expected = applyingProjections(projected, to: draft),
+              let actual = applyingProjections(edits, to: draft) else { return true }
+        return !punctuationPreservesTechnicalTokens(expected, actual)
+    }
+
     static func decode(_ raw: String) throws -> [VoicePolishTextEdit] {
         guard raw.utf8.count <= VoicePolishOutputNormalizer.maximumResponseBytes,
               let data = raw.data(using: .utf8),
@@ -95,6 +107,7 @@ enum VoicePolishTextEditor {
         allowsReviewedSourceCorrections: Bool = false
     ) throws -> String {
         var located: [Modification] = []
+        var projectedEdits: [VoicePolishTextEdit] = []
         for edit in edits {
             guard !edit.before.isEmpty,
                   let range = draft.range(of: edit.before, options: .literal),
@@ -109,10 +122,12 @@ enum VoicePolishTextEditor {
             }
             if mode == .light {
                 try validateLight(edit, modifications: modifications, source: source,
+                                  draft: draft,
+                                  allowsReviewedDirectives: allowsReviewedInlineDirectives,
                                   allowsReviewedSourceCorrections: allowsReviewedSourceCorrections)
-                if edit.kind == .directive,
+                if edit.kind == .directive, !isMechanicalEdit(edit, in: draft, allowsReviewedChanges: true),
                    ((!allowsReviewedInlineDirectives && nsRange.location != 0)
-                        || nsRange.length == (draft as NSString).length) {
+                        || (!allowsReviewedInlineDirectives && nsRange.length == (draft as NSString).length)) {
                     throw VoicePolishTextEditError.editOutsideMode
                 }
             } else {
@@ -121,6 +136,10 @@ enum VoicePolishTextEditor {
                       source.range(of: evidence, options: .literal) != nil else {
                     throw VoicePolishTextEditError.missingEvidence
                 }
+            }
+            if mode == .light {
+                projectedEdits.append(.init(before: edit.before,
+                    after: mechanicalProjection(edit, in: draft, allowsReviewedChanges: true) ?? edit.after, kind: edit.kind))
             }
             for modification in modifications {
                 // 相同位置的同一插入可由相邻锚点重复描述，只提交一次。
@@ -141,6 +160,16 @@ enum VoicePolishTextEditor {
             return $0.range.length > $1.range.length
         }) {
             result.replaceCharacters(in: item.range, with: item.inserted)
+        }
+        if mode == .light {
+            guard let expected = applyingProjections(projectedEdits, to: draft),
+                  punctuationPreservesTechnicalTokens(expected, result as String) else {
+                throw VoicePolishTextEditError.editOutsideMode
+            }
+        }
+        if mode == .light, edits.contains(where: { $0.kind == .directive }),
+           lexicalCharacters(result as String).isEmpty {
+            throw VoicePolishTextEditError.editOutsideMode
         }
         return result as String
     }
@@ -240,10 +269,32 @@ enum VoicePolishTextEditor {
         return NSIntersectionRange(first, second).length > 0
     }
 
+    /// 整批投影也使用同一原稿和冲突规则，防止两个各自保留空格的补丁合并后拆坏技术词。
+    private static func applyingProjections(_ edits: [VoicePolishTextEdit], to draft: String) -> String? {
+        var located: [Modification] = []
+        for edit in edits {
+            guard !edit.before.isEmpty, let range = draft.range(of: edit.before, options: .literal),
+                  draft.range(of: edit.before, options: .literal,
+                              range: draft.unicodeScalars.index(after: range.lowerBound)..<draft.endIndex) == nil else { return nil }
+            for change in modifications(for: edit, anchorLocation: NSRange(range, in: draft).location) {
+                if change.range.length == 0, located.contains(where: { $0.range == change.range && $0.inserted == change.inserted }) { continue }
+                guard !located.contains(where: { conflicts($0.range, change.range) }) else { return nil }
+                located.append(change)
+            }
+        }
+        let output = NSMutableString(string: draft)
+        for change in located.sorted(by: {
+            $0.range.location == $1.range.location ? $0.range.length > $1.range.length : $0.range.location > $1.range.location
+        }) { output.replaceCharacters(in: change.range, with: change.inserted) }
+        return output as String
+    }
+
     private static func validateLight(
         _ edit: VoicePolishTextEdit,
         modifications: [Modification],
         source: String = "",
+        draft: String? = nil,
+        allowsReviewedDirectives: Bool = false,
         allowsReviewedSourceCorrections: Bool = false
     ) throws {
         let before = lexicalCharacters(edit.before)
@@ -254,7 +305,6 @@ enum VoicePolishTextEditor {
             .map { lexicalCharacters(String($0)) }
         let paragraphPairs = Array(zip(beforeParagraphs, afterParagraphs))
         guard edit.kind != .content,
-              edit.kind == .punctuation || edit.before.count <= 96,
               edit.before.filter(\.isNewline) == edit.after.filter(\.isNewline),
               beforeParagraphs.count == afterParagraphs.count,
               modifications.allSatisfy({
@@ -263,21 +313,13 @@ enum VoicePolishTextEditor {
               edit.after.filter({ $0 == "\n" }).count <= edit.before.filter({ $0 == "\n" }).count else {
             throw VoicePolishTextEditError.editOutsideMode
         }
+        if isMechanicalEdit(edit, in: draft, allowsReviewedChanges: true) { return }
+        guard edit.kind == .punctuation || edit.kind == .directive || edit.before.count <= 96 else {
+            throw VoicePolishTextEditError.editOutsideMode
+        }
         switch edit.kind {
         case .punctuation:
-            let embeddedToken = #"[A-Za-z0-9]+(?:[.:][A-Za-z0-9]+)+"#
-            let expression = try NSRegularExpression(pattern: embeddedToken)
-            func tokens(_ text: String) -> [String] {
-                let source = text as NSString
-                return expression.matches(in: text, range: NSRange(location: 0, length: source.length))
-                    .map { source.substring(with: $0.range) }
-            }
-            guard before == after,
-                  beforeParagraphs == afterParagraphs,
-                  edit.before.filter({ technicalMarks.contains($0) }) == edit.after.filter({ technicalMarks.contains($0) }),
-                  tokens(edit.before) == tokens(edit.after) else {
-                throw VoicePolishTextEditError.editOutsideMode
-            }
+            throw VoicePolishTextEditError.editOutsideMode
         case .stutter:
             guard isAdjacentRepetitionRemoval(before: before, after: after),
                   paragraphPairs.allSatisfy({ $0.0 == $0.1 || isAdjacentRepetitionRemoval(before: $0.0, after: $0.1) }) else {
@@ -293,23 +335,7 @@ enum VoicePolishTextEditor {
                 throw VoicePolishTextEditError.editOutsideMode
             }
         case .symbol:
-            // 只恢复明确口述的技术符号；不把自然语言的“点”全局改成小数点。
-            var projected = edit.before
-            for (spoken, symbol) in [("双横线", "--"), ("短横线", "-"),
-                                     ("反斜杠", "\\"), ("斜杠", "/"), ("下划线", "_")] {
-                projected = projected.replacingOccurrences(of: spoken, with: symbol)
-            }
-            projected = projected.replacingOccurrences(
-                of: #"(?<=[A-Za-z0-9_])点(?=[A-Za-z0-9_])"#,
-                with: ".", options: .regularExpression
-            )
-            guard projected != edit.before else {
-                throw VoicePolishTextEditError.editOutsideMode
-            }
-            // 模型可以在一次局部编辑中恢复口述符号并补标点；投影后的剩余
-            // 修改仍须通过同一标点权限，不能借此改命令、数字或正文。
-            try validateLight(.init(before: projected, after: edit.after, kind: .punctuation),
-                              modifications: [])
+            throw VoicePolishTextEditError.editOutsideMode
         case .correction:
             let cues = ["不对", "说错", "改成", "改为", "改由", "应该是", "我改一下", "不用写", "不要写", "actually", "i mean", "scratch that"]
             if cues.contains(where: edit.before.lowercased().contains), isSubsequence(after, of: before),
@@ -319,7 +345,7 @@ enum VoicePolishTextEditor {
             guard allowsReviewedSourceCorrections,
                   let evidence = edit.evidence, !evidence.isEmpty, evidence.unicodeScalars.count <= 192,
                   source.range(of: evidence, options: .literal) != nil,
-                  source.range(of: edit.before, options: .literal) != nil,
+                  sourceContainsPunctuationEquivalentAnchor(edit.before, in: source),
                   cues.contains(where: evidence.lowercased().contains),
                   edit.before.unicodeScalars.count <= 96,
                   paragraphPairs.filter({ $0.0 != $0.1 }).count == 1,
@@ -344,14 +370,190 @@ enum VoicePolishTextEditor {
                 throw VoicePolishTextEditError.editOutsideMode
             }
         case .directive:
-            // 仅允许移除很短的当前编辑前缀；内嵌任务与正文没有该删除权限。
-            guard edit.before.count <= 32, edit.after.isEmpty,
-                  edit.before.last.map({ "：:，,。.".contains($0) }) == true else {
-                throw VoicePolishTextEditError.editOutsideMode
+            if allowsReviewedDirectives {
+                // 未变后缀仅帮助定位；删除权限只覆盖实际连续短片段，必须另经语义核对。
+                guard modifications.count == 1, let change = modifications.first,
+                      change.inserted.isEmpty, !change.removed.isEmpty, change.removed.count <= 32 else {
+                    throw VoicePolishTextEditError.editOutsideMode
+                }
+            } else {
+                guard edit.before.count <= 32, edit.after.isEmpty,
+                      edit.before.last.map({ "：:，,。.".contains($0) }) == true else {
+                    throw VoicePolishTextEditError.editOutsideMode
+                }
             }
         case .content:
             throw VoicePolishTextEditError.editOutsideMode
         }
+    }
+
+    private static func sourceContainsPunctuationEquivalentAnchor(_ anchor: String, in source: String) -> Bool {
+        if source.range(of: anchor, options: .literal) != nil { return true }
+        let characters = Array(source)
+        let indices = lexicalIndices(characters)
+        let words = indices.map { characters[$0] }
+        let wanted = lexicalCharacters(anchor)
+        guard !wanted.isEmpty, wanted.count <= words.count else { return false }
+        for start in 0...(words.count - wanted.count) {
+            guard Array(words[start..<(start + wanted.count)]) == wanted else { continue }
+            let candidate = String(characters[indices[start]...indices[start + wanted.count - 1]])
+            if candidate.filter(\.isNewline) == anchor.filter(\.isNewline),
+               punctuationPreservesTechnicalTokens(candidate, anchor) { return true }
+        }
+        return false
+    }
+
+    private static func isMechanicalEdit(_ edit: VoicePolishTextEdit, in draft: String? = nil,
+                                         allowsReviewedChanges: Bool = false) -> Bool {
+        mechanicalProjection(edit, in: draft, allowsReviewedChanges: allowsReviewedChanges) != nil
+    }
+
+    private static func mechanicalProjection(_ edit: VoicePolishTextEdit, in draft: String? = nil,
+                                         allowsReviewedChanges: Bool = false) -> String? {
+        let context = draft ?? edit.before
+        guard !edit.before.isEmpty, let anchor = context.range(of: edit.before, options: .literal),
+              context.range(of: edit.before, options: .literal,
+                            range: context.unicodeScalars.index(after: anchor.lowerBound)..<context.endIndex) == nil,
+              edit.before.filter(\.isNewline) == edit.after.filter(\.isNewline),
+              !VoicePolishCharacterSafety.containsUnsafeCharacters(edit.after),
+              modifications(for: edit, anchorLocation: 0).allSatisfy({
+                  !$0.removed.contains(where: \.isNewline) && !$0.inserted.contains(where: \.isNewline)
+              }) else { return nil }
+        var symbolProjection = edit.before
+        for (spoken, symbol) in [("双横线", "--"), ("短横线", "-"), ("反斜杠", "\\"),
+                                 ("斜杠", "/"), ("下划线", "_")] {
+            symbolProjection = symbolProjection.replacingOccurrences(of: spoken, with: symbol)
+        }
+        symbolProjection = symbolProjection.replacingOccurrences(
+            of: #"(?<=[A-Za-z0-9_])点(?=[A-Za-z0-9_])"#, with: ".", options: .regularExpression
+        )
+        let permissions = fillerPermissions(in: context, anchor: NSRange(anchor, in: context))
+        let rawParagraphs = edit.before.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        let newParagraphs = edit.after.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        for candidate in [edit.before, symbolProjection] {
+            let oldParagraphs = candidate.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            guard oldParagraphs.count == newParagraphs.count else { continue }
+            var fillers = 0
+            var valid = true
+            var permissionOffset = 0
+            var projections: [String] = []
+            for (index, pair) in zip(oldParagraphs, newParagraphs).enumerated() {
+                let (old, new) = pair
+                let count = rawParagraphs[index].filter { "嗯呃额啊唔".contains($0) }.count
+                guard permissionOffset + count <= permissions.count else { valid = false; break }
+                guard let projection = mechanicalParagraph(String(old), matching: String(new),
+                                                           fillers: &fillers,
+                                                           permissions: Array(permissions[permissionOffset..<(permissionOffset + count)]),
+                                                           allowsReviewedChanges: allowsReviewedChanges),
+                      punctuationPreservesTechnicalTokens(projection, String(new)) else {
+                    valid = false
+                    break
+                }
+                projections.append(projection)
+                permissionOffset += count
+            }
+            if valid {
+                let separators = candidate.filter(\.isNewline).map(String.init)
+                let projection = projections.enumerated().map { index, part in
+                    part + (index < separators.count ? separators[index] : "")
+                }.joined()
+                // 局部证明放回真实稿再核对技术 token，覆盖锚点边缘的拆词与并词。
+                let expected = context.replacingCharacters(in: anchor, with: projection)
+                let actual = context.replacingCharacters(in: anchor, with: edit.after)
+                if punctuationPreservesTechnicalTokens(expected, actual) { return projection }
+            }
+        }
+        return nil
+    }
+
+    /// 返回原段落中被证明保留的字符，既不生成词语，也不跨原段落寻找删除证据。
+    private static func mechanicalParagraph(_ before: String, matching after: String,
+                                            fillers: inout Int, permissions: [Bool], allowsReviewedChanges: Bool) -> String? {
+        let characters = Array(before)
+        let indices = lexicalIndices(characters)
+        let old = indices.map { characters[$0] }
+        let new = lexicalCharacters(after)
+        let fillerCharacters = Set("嗯呃额啊唔")
+        var allowedFillers: Set<Int> = []
+        var ordinal = 0
+        for (index, character) in characters.enumerated() where fillerCharacters.contains(character) {
+            if ordinal < permissions.count, permissions[ordinal] { allowedFillers.insert(index) }
+            ordinal += 1
+        }
+        let numberCharacters = Set("零〇一二三四五六七八九十百千万亿两")
+        var failed: Set<String> = []
+        func match(_ i: Int, _ j: Int, _ used: Int) -> (kept: [Int], fillers: Int)? {
+            if i == old.count && j == new.count { return ([], used) }
+            let key = "\(i):\(j):\(used)"
+            guard !failed.contains(key) else { return nil }
+            if i < old.count, j < new.count, old[i] == new[j],
+               let rest = match(i + 1, j + 1, used) {
+                return ([i] + rest.kept, rest.fillers)
+            }
+            // 唔、呃也能承载否定或实词义；只允许形成待核对稿，不能据停顿声形状免审。
+            if i < old.count, used < 6, fillerCharacters.contains(old[i]), allowedFillers.contains(indices[i]),
+               (allowsReviewedChanges || !Set("唔呃").contains(old[i])),
+               let rest = match(i + 1, j, used + 1) { return rest }
+            // 数字、英文技术词及标点隔开的有意重复不自动解释为口吃。
+            let maximumWidth = min((old.count - i) / 2, new.count - j)
+            if allowsReviewedChanges, before.count <= 96, maximumWidth > 0 {
+                for width in 1...maximumWidth {
+                    let unit = Array(old[i..<(i + width)])
+                    guard unit == Array(new[j..<(j + width)]),
+                          unit.allSatisfy({ $0.isLetter && !$0.isASCII && !numberCharacters.contains($0) }) else { continue }
+                    var end = i + width
+                    while end + width <= old.count, Array(old[end..<(end + width)]) == unit {
+                        end += width
+                        let raw = characters[indices[i]...indices[end - 1]]
+                        guard raw.allSatisfy({ !$0.isPunctuation }) else { break }
+                        if let rest = match(end, j + width, used) {
+                            return (Array(i..<(i + width)) + rest.kept, rest.fillers)
+                        }
+                    }
+                }
+            }
+            failed.insert(key)
+            return nil
+        }
+        guard let result = match(0, 0, fillers) else { return nil }
+        fillers = result.fillers
+        let kept = Set(result.kept.map { indices[$0] })
+        let lexical = Set(indices)
+        return String(characters.enumerated().compactMap { lexical.contains($0.offset) && !kept.contains($0.offset) ? nil : $0.element })
+    }
+
+    private static func fillerPermissions(in text: String, anchor: NSRange) -> [Bool] {
+        let characters = Array(text)
+        let fillers = Set("嗯呃额啊唔")
+        var location = 0
+        var result: [Bool] = []
+        for (index, character) in characters.enumerated() {
+            defer { location += String(character).utf16.count }
+            guard fillers.contains(character), NSLocationInRange(location, anchor) else { continue }
+            var start = index
+            var end = index + 1
+            while start > 0, fillers.contains(characters[start - 1]) { start -= 1 }
+            while end < characters.count, fillers.contains(characters[end]) { end += 1 }
+            let leftBoundary = start == 0 || characters[start - 1].isWhitespace || characters[start - 1].isPunctuation
+            let rightBoundary = end == characters.count || characters[end].isWhitespace || characters[end].isPunctuation
+            result.append(leftBoundary && (!characters[start..<end].contains("额") || rightBoundary))
+        }
+        return result
+    }
+
+    private static func punctuationPreservesTechnicalTokens(_ before: String, _ after: String) -> Bool {
+        func tokens(_ text: String, _ pattern: String) -> [String] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+            let source = text as NSString
+            return regex.matches(in: text, range: NSRange(location: 0, length: source.length))
+                .map { source.substring(with: $0.range) }
+        }
+        return lexicalCharacters(before) == lexicalCharacters(after)
+            && before.filter({ technicalMarks.contains($0) }) == after.filter({ technicalMarks.contains($0) })
+            && tokens(before, #"[A-Za-z0-9]+(?:[.:][A-Za-z0-9]+)+"#) == tokens(after, #"[A-Za-z0-9]+(?:[.:][A-Za-z0-9]+)+"#)
+            && tokens(before, #"[A-Za-z0-9_]+"#) == tokens(after, #"[A-Za-z0-9_]+"#)
+            && tokens(before, #"(?<![A-Za-z0-9_])\.[A-Za-z0-9_][A-Za-z0-9_.-]*"#)
+                == tokens(after, #"(?<![A-Za-z0-9_])\.[A-Za-z0-9_][A-Za-z0-9_.-]*"#)
     }
 
     private static func technicalContent(in lexical: [Character]) -> String {
@@ -368,16 +570,20 @@ enum VoicePolishTextEditor {
 
     private static func lexicalCharacters(_ text: String) -> [Character] {
         let characters = Array(text)
+        return lexicalIndices(characters).map { characters[$0] }
+    }
+
+    private static func lexicalIndices(_ characters: [Character]) -> [Int] {
         func asciiWord(_ character: Character) -> Bool {
             character.isASCII && (character.isLetter || character.isNumber)
         }
         return characters.enumerated().compactMap { index, character in
-            if technicalMarks.contains(character) { return character }
+            if technicalMarks.contains(character) { return index }
             if (character == "." || character == ":"), index > 0, index + 1 < characters.count,
                asciiWord(characters[index - 1]), asciiWord(characters[index + 1]) {
-                return character
+                return index
             }
-            return character.isWhitespace || character.isPunctuation ? nil : character
+            return character.isWhitespace || character.isPunctuation ? nil : index
         }
     }
 
