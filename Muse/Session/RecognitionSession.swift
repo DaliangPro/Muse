@@ -1264,13 +1264,16 @@ actor RecognitionSession {
         allowsVoicePolishUserChoice: Bool = false
     ) async -> LLMPostProcessingResult? {
         let asrReadyAt = ContinuousClock.now
-        // rawText 必须原样留给历史审计。所有模式共用统一术语仓库生成 canonical；
-        // 固定/整句 Snippet 仍由运行时先执行，应用级规则只读取录音开始时冻结的目标应用。
-        var finalText = canonicalText(
-            for: rawText,
-            sessionID: sessionID,
-            vocabularyContext: vocabularyContext
-        )
+        // rawText 必须原样留给历史审计。语音润色分支会在构造 envelope 时
+        // 一次性完成术语规范化；其他模式仍在这里生成 canonical。
+        var finalText = rawText
+        if currentMode.kind != .voicePolish {
+            finalText = canonicalText(
+                for: rawText,
+                sessionID: sessionID,
+                vocabularyContext: vocabularyContext
+            )
+        }
         var processedText: String?
         var llmFailed = false
         var voicePolishHistoryStatus: String?
@@ -1457,7 +1460,11 @@ actor RecognitionSession {
                     context: writingContext
                 )
                 let styleProfile: StyleProfile?
-                if VoicePolishSettings.personalizationEnabled(
+                // 轻度润色的管线只做一次快速编辑，当前不消费 StyleProfile。
+                // 跳过历史纠正读取可避免停止录音后的一次无效数据库查询；标准润色
+                // 仍保留原有准备路径，便于后续继续使用个性化信息。
+                if mode.voicePolishQualityMode != .light,
+                   VoicePolishSettings.personalizationEnabled(
                     defaults: vocabularyContext.userDefaults
                 ) {
                     let corrections = (try? await historyStore.fetchVoicePolishCorrections(
