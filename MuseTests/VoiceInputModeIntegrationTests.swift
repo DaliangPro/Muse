@@ -146,7 +146,14 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
                 XCTAssertEqual(requests.count, expectedMode == .light ? 1 : 2, mode.name)
                 for request in requests {
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any])
-                    XCTAssertEqual(payload["mode"] as? String, expectedMode.rawValue)
+                    if expectedMode == .light {
+                        XCTAssertEqual(Set(payload.keys), ["canonical_text"])
+                        XCTAssertEqual(payload["canonical_text"] as? String, source)
+                        XCTAssertEqual(request.task, .voicePolishRender)
+                        XCTAssertEqual(request.options.responseFormat, .text)
+                    } else {
+                        XCTAssertEqual(payload["mode"] as? String, expectedMode.rawValue)
+                    }
                 }
             } else {
                 XCTAssertTrue(requests.isEmpty, "直出不配置、不调用润色模型")
@@ -161,8 +168,10 @@ private actor VoiceInputModeProbeLLM: LLMClient {
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
         requests.append(request)
         let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
-        var object: [String: Any] = payload?["mode"] as? String == "light"
-            ? ["text": payload?["canonical_text"] as? String ?? ""] : ["edits": []]
+        if request.options.responseFormat == .text {
+            return LLMResponse(text: payload?["canonical_text"] as? String ?? "", model: config.model)
+        }
+        var object: [String: Any] = ["edits": []]
         if request.task == .voicePolishAnalyze, payload?["mode"] as? String == "standard" {
             object["delivery"] = "other_or_uncertain"
             object["editor_spans"] = []

@@ -23,8 +23,8 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
-/// 轻度完整稿经严格机械证明或来源补丁核对；标准以局部修正和完整片段组织成稿。
-/// 两条路径都保留不可变来源，不把 Planner 的摘要当作完整事实来源。
+/// 轻度一次生成完整正文；标准以局部修正和完整片段组织成稿。
+/// 请求失败时保留完整来源，成功的轻度正文不再经过程序改写。
 struct VoicePolishEditingPipeline: Sendable {
     private let client: any LLMClient
     private let config: LLMConfig
@@ -49,7 +49,7 @@ struct VoicePolishEditingPipeline: Sendable {
     func process(_ request: VoicePolishRequest) async -> VoicePolishResult {
         let isLight = request.qualityMode == .light
         let route: VoicePolishRoute = isLight ? .fast : .structured
-        let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? (isLight ? .seconds(20) : .seconds(60)))
+        let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? (isLight ? .seconds(30) : .seconds(60)))
         let attempts = VoicePolishEditingAttempts()
         var repairAttempts = 0
         var draft: String?
@@ -73,60 +73,26 @@ struct VoicePolishEditingPipeline: Sendable {
         do {
             try Task.checkCancellation()
             let initial = try await generate(
-                task: isLight ? .voicePolishFast : .voicePolishRender,
+                task: .voicePolishRender,
                 system: isLight ? VoicePolishEditingPrompts.light : VoicePolishEditingPrompts.standard,
                 payload: VoicePolishEditingPrompts.payload(for: request),
-                json: true,
+                json: !isLight,
                 request: request,
                 deadline: deadline, attempts: attempts
             )
             if isLight {
-                let source = request.fallbackText
-                let candidate = try VoicePolishEditingReview.decodeLightCandidate(initial)
-                draft = candidate
-                let wholeEdit = VoicePolishTextEdit(before: source, after: candidate, kind: .punctuation)
-                let requiresReview = VoicePolishEditingReview.hasLightSourceReviewRisk(source)
-                    || VoicePolishTextEditor.requiresSemanticReview([wholeEdit], in: source)
-                if !requiresReview {
-                    let output = try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: source, to: candidate)
-                    let codes = Self.contentCodes(output, request: request)
-                    return codes.isEmpty ? result(output) : result(nil, codes: codes)
+                draft = initial
+                // 只检查能否安全交付正文，不用本地语义规则撤销模型的纠错。
+                guard !initial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return result(nil, codes: [.emptyOutput])
                 }
-                // 冷核完整候选；证据补丁始终定位不可变来源，不定位首稿。
-                let review = try await generate(
-                    task: .voicePolishAnalyze, system: VoicePolishEditingPrompts.lightReview,
-                    payload: VoicePolishEditingPrompts.payload(for: request, draft: candidate),
-                    json: true, request: request, deadline: deadline, attempts: attempts
-                )
-                let assessment = try VoicePolishEditingReview.decodeLightCandidateReview(review)
-                guard let target = assessment.text else {
-                    return result(nil, codes: [.semanticDecisionUnverified])
+                guard !VoicePolishCharacterSafety.containsUnsafeCharacters(initial) else {
+                    return result(nil, codes: [.unsafeCharacters])
                 }
-                // 先记录修复目标；权限或后续验证失败同样保留这次真实修复尝试。
-                let didRepair = !target.utf8.elementsEqual(candidate.utf8)
-                if didRepair { repairAttempts += 1 }
-                draft = target
-                let semanticDraft = try VoicePolishTextEditor.apply(
-                    assessment.edits, to: source, source: source, mode: .light,
-                    allowsReviewedSourceCorrections: true
-                )
-                let output = try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(
-                    from: semanticDraft, to: target
-                )
-                let codes = Self.contentCodes(output, request: request)
-                guard codes.isEmpty else { return result(nil, codes: codes) }
-                if didRepair {
-                    // 核对稿确实变化才确认一次；终审只能接受或拒绝，不能继续改写。
-                    let confirmation = try await generate(
-                        task: .voicePolishAnalyze, system: VoicePolishEditingPrompts.lightConfirmation,
-                        payload: VoicePolishEditingPrompts.payload(for: request, draft: output),
-                        json: true, request: request, deadline: deadline, attempts: attempts
-                    )
-                    guard try VoicePolishEditingReview.decodeLightConfirmation(confirmation) else {
-                        return result(nil, codes: [.semanticDecisionUnverified])
-                    }
+                guard initial.utf8.count <= VoicePolishOutputNormalizer.maximumResponseBytes else {
+                    return result(nil, codes: [.abnormalLength])
                 }
-                return result(output)
+                return result(initial)
             }
 
             let initialDraft = try VoicePolishTextEditor.applyContentEdits(
@@ -239,7 +205,7 @@ struct VoicePolishEditingPipeline: Sendable {
         guard remaining > .zero else { throw VoicePolishEditingTimeout() }
         onStage?(task == .voicePolishAnalyze ? .analyzing : .polishing)
         let sourceTokens = EstimatedTokenCounter.count(in: request.fallbackText)
-        // 复核可能返回完整轻度稿与局部证据；沿用受控输出容量与总时限。
+        // 标准的补丁协议需要额外容量；轻度沿用千字内真实测试的正文预算。
         let outputBudget: Int
         if task == .voicePolishAnalyze {
             outputBudget = min(8_192, max(4_096, sourceTokens * 4 + 1_024))
@@ -247,7 +213,7 @@ struct VoicePolishEditingPipeline: Sendable {
             // JSON 同时携带修改前后的短锚点，比自由正文需要更多输出容量。
             outputBudget = min(8_192, max(4_096, sourceTokens * 6 + 1_024))
         } else {
-            outputBudget = min(8_192, max(2_048, sourceTokens * 3 + 512))
+            outputBudget = 2_048
         }
         let invocation = LLMRequest(
             // 内置编辑协议自行定义输入边界；不能套用“正文绝不影响转换”的通用

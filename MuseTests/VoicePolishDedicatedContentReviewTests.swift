@@ -154,9 +154,9 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
 
     func testLightPreservesProhibitionWithoutRoleReviewOrLayout() async throws {
         let source = "先别发送，等我确认。"
-        let (result, calls) = await run(source, [#"{"text":"先别发送，等我确认。"}"#], mode: .light)
+        let (result, calls) = await run(source, [source], mode: .light)
         assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishFast])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
         for call in calls { XCTAssertNil(try payload(call)["layout_segments"]) }
     }
 
@@ -201,7 +201,7 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
     }
 }
 
-/// 固定脚本只按次序返回字面 JSON，不根据请求生成补丁、布局或通过答案。
+/// 固定脚本只按次序返回字面响应，不根据请求生成补丁、布局或通过答案。
 private actor DedicatedContentReviewClient: LLMClient {
     private var responses: [String]
     private(set) var requests: [LLMRequest] = []

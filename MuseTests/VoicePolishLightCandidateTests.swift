@@ -1,8 +1,120 @@
 import XCTest
 @testable import Muse
 
-/// 固定候选及原文证据验证 v10 控制流，不代替真实模型的保真判读。
+/// 固定响应验证单次轻度调用和原样交付，不替代真实模型的语义质量验收。
+/// 仍保留独立 TextEditor 与历史响应 decoder 的边界回归，轻度管线不再调用这些协议。
 final class VoicePolishLightCandidateTests: XCTestCase {
+    func testThousandCharacterBoundedUnchangedAndPunctuationOutputsStayOneCall() async {
+        let source = String(repeating: "先核对原始资料再记录原因和限制", count: 50)
+        let punctuated = String(repeating: "先核对原始资料，再记录原因和限制。", count: 50)
+        XCTAssertLessThanOrEqual(max(source.count, punctuated.count), 1_000)
+        for target in [source, punctuated] {
+            let (result, calls) = await run(source, [target])
+            XCTAssertFalse(result.usedFallback)
+            XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
+            XCTAssertEqual(result.llmAttemptCount, 1)
+            XCTAssertEqual(result.repairAttemptCount, 0)
+            XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+            XCTAssertEqual(calls.first?.options.maxOutputTokens, 2048)
+        }
+    }
+
+    func testBoundedLongWordCorrectionAndFillerDeletionDoNotRequireReview() async {
+        let prefix = String(repeating: "先核对原始资料，再记录原因和限制。", count: 45)
+        let source = prefix + "嗯，请按装软件。"
+        let target = prefix + "请安装软件。"
+        XCTAssertLessThanOrEqual(source.count, 1_000)
+        let (result, calls) = await run(source, [target])
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(result.repairAttemptCount, 0)
+        XCTAssertEqual(calls.count, 1)
+    }
+
+    func testStutterWordAndSelfCorrectionOutputsAreNotLocallyRejected() async {
+        for (source, target) in [
+            ("我我明天到", "我明天到。"),
+            ("请先核对发票的抬投和税号。", "请先核对发票的抬头和税号。"),
+            ("这份方案的优缺点需要再权横一下。", "这份方案的优缺点需要再权衡一下。"),
+            ("人数三十，不对，二十四。预算八百，不对，六百。", "人数二十四，预算六百。"),
+            ("很重要，很重要，先别承诺日期。", "很重要，先别承诺日期。")
+        ] {
+            let (result, calls) = await run(source, [target])
+            XCTAssertFalse(result.usedFallback, source)
+            XCTAssertEqual(result.text, target)
+            XCTAssertTrue(result.validationCodes.isEmpty)
+            XCTAssertEqual(result.llmAttemptCount, 1)
+            XCTAssertEqual(result.repairAttemptCount, 0)
+            XCTAssertEqual(calls.count, 1)
+        }
+    }
+
+    func testExistingRiskPhrasesDoNotTriggerAnotherCallForUnchangedText() async {
+        for source in ["不对，日期还待确认。", "请同事不要改由阿宁。", "我补一句，先保留原因。"] {
+            let (result, calls) = await run(source, [source, "不应读取第二条响应"])
+            XCTAssertFalse(result.usedFallback, source)
+            XCTAssertEqual(result.text, source)
+            XCTAssertEqual(result.llmAttemptCount, 1)
+            XCTAssertEqual(result.repairAttemptCount, 0)
+            XCTAssertEqual(calls.count, 1)
+        }
+    }
+
+    func testOutputPreservesLeadingTrailingSpacesLineEndingsAndUnicodeBytes() async {
+        let source = "👍🏽先看资料。가再确认。"
+        let target = "  👍🏽先看资料。\r\n\r\n\t\u{1100}\u{1161}再确认。  \n"
+        let (result, calls) = await run(source, [target])
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(calls.count, 1)
+    }
+
+    func testCanonicalEquivalentUnicodeIsDeliveredWithoutNormalization() async {
+        let source = "가先保留。"
+        let target = "\u{1100}\u{1161}先保留。"
+        XCTAssertEqual(source, target)
+        XCTAssertFalse(source.utf8.elementsEqual(target.utf8))
+        let (result, calls) = await run(source, [target])
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
+        XCTAssertEqual(result.repairAttemptCount, 0)
+        XCTAssertEqual(calls.count, 1)
+    }
+
+    func testLiteralPrefixMarkupAndRepeatedParagraphsAreNotCleanedAfterGeneration() async {
+        let paragraph = "这一段是需要保留的完整正文，说明先核对资料，再确认时间，同时保留具体原因和相关限制，不要提前发布。"
+        for target in ["润色后：这是用户实际需要的标题。", "```text\n请保留这段示例。\n```",
+                       paragraph + "\n\n" + paragraph] {
+            let (result, calls) = await run("请保留正文格式。", [target])
+            XCTAssertFalse(result.usedFallback)
+            XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
+            XCTAssertEqual(calls.count, 1)
+        }
+    }
+
+    func testEmptyOrWhitespaceResponseFallsBackWithoutRetry() async {
+        let source = "完整原文必须保留。还有第二项任务。"
+        for target in ["", " ", "\r\n\t  ", "\u{0085}", "\u{200B}"] {
+            let (result, calls) = await run(source, [target, "不应读取第二条响应"])
+            assertFailure(result, source: source, calls: calls, count: 1, repairs: 0, code: .emptyOutput)
+            XCTAssertEqual(result.validationCodes, [.emptyOutput])
+            XCTAssertEqual(result.failureReason, .validationFailed)
+            XCTAssertEqual(result.rejectedDraft, target)
+        }
+    }
+
+    func testUnsafeResponseFallsBackWithoutDeliveringPartialText() async {
+        let source = "完整原文必须保留。还有第二项任务。"
+        for target in ["第一项。\u{0000}第二项。", "第一项。\u{001B}[31m第二项。", "正文\u{FFFF}", "\u{001C}"] {
+            let (result, calls) = await run(source, [target, "不应重试"])
+            assertFailure(result, source: source, calls: calls, count: 1, repairs: 0, code: .unsafeCharacters)
+            XCTAssertEqual(result.validationCodes, [.unsafeCharacters])
+            XCTAssertEqual(result.rejectedDraft, target)
+        }
+    }
+
     func testStrictWholeSourceMechanicalProofPreservesUnicodeParagraphsAndTechnicalTokens() throws {
         for (source, target) in [
             ("今天先核对明天发送", "今天先核对，明天发送。"),
@@ -22,39 +134,6 @@ final class VoicePolishLightCandidateTests: XCTestCase {
         }
     }
 
-    func testThousandCharacterBoundedUnchangedAndPunctuationCandidatesStayOneCall() async {
-        let unit = "先核对原始资料再记录原因和限制"
-        let source = String(repeating: unit, count: 50)
-        let punctuated = String(repeating: "先核对原始资料，再记录原因和限制。", count: 50)
-        XCTAssertLessThanOrEqual(max(source.count, punctuated.count), 1_000)
-        for target in [source, punctuated] {
-            let (result, calls) = await run(source, [candidate(target)])
-            XCTAssertFalse(result.usedFallback)
-            XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
-            XCTAssertEqual(calls.count, 1)
-        }
-    }
-
-    func testLongMechanicalFillerDeletionDoesNotUseRecursiveCallStack() async {
-        let prefix = String(repeating: "先核对原始资料，再记录原因和限制。", count: 45)
-        let source = prefix + "嗯，请继续核对。"
-        let target = prefix + "请继续核对。"
-        XCTAssertLessThanOrEqual(source.count, 1_000)
-        let (result, calls) = await run(source, [candidate(target)])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
-        XCTAssertEqual(calls.count, 1)
-    }
-
-    func testLongSemanticResidualStillRejectsTheWholeCandidate() async {
-        let prefix = String(repeating: "先核对原始资料，再记录原因和限制。", count: 45)
-        let source = prefix + "请按装软件。"
-        let target = prefix + "请安装软件。"
-        XCTAssertLessThanOrEqual(source.count, 1_000)
-        let (result, calls) = await run(source, [candidate(target), review(target)])
-        assertFailure(result, source: source, calls: calls, count: 2, repairs: 0, code: .planIntegrityFailure)
-    }
-
     func testIterativeLongMatchingPreservesFillerBudgetAndReviewPermission() throws {
         let prefix = String(repeating: "先核对原始资料，再记录原因和限制。", count: 45)
         let target = prefix + "请继续核对。"
@@ -68,200 +147,6 @@ final class VoicePolishLightCandidateTests: XCTestCase {
         XCTAssertEqual(try VoicePolishTextEditor.apply([
             .init(before: needsReview, after: target, kind: .punctuation)
         ], to: needsReview, source: needsReview, mode: .light), target)
-    }
-
-    func testStutterAndAmbiguousFillersCannotSilentlyUseOneCall() async {
-        for (source, target) in [("我我明天到", "我明天到。"), ("唔，我去。", "我去。"), ("呃，我去。", "我去。")] {
-            let (result, calls) = await run(source, [candidate(target), review(nil)])
-            assertFailure(result, source: source, calls: calls, count: 2, repairs: 0, code: .semanticDecisionUnverified)
-        }
-    }
-
-    func testImmutableSourceRiskForcesReviewEvenWhenCandidateIsIdentical() async {
-        for source in ["不对，日期还待确认。", "请同事不要改由阿宁。", "我补一句，先保留原因。"] {
-            let (result, calls) = await run(source, [candidate(source), review(source)])
-            XCTAssertFalse(result.usedFallback)
-            XCTAssertEqual(result.text, source)
-            XCTAssertEqual(calls.count, 2)
-            XCTAssertEqual(result.repairAttemptCount, 0)
-        }
-    }
-
-    func testReviewEditsAnchorOriginalSourceInsteadOfCandidate() async {
-        let source = "请按装软件马上检查"
-        let target = "请安装软件，马上检查。"
-        let edit = VoicePolishTextEdit(before: "按装", after: "安装", kind: .word)
-        let (good, calls) = await run(source, [candidate(target), review(target, [edit])])
-        XCTAssertFalse(good.usedFallback)
-        XCTAssertTrue(good.text.utf8.elementsEqual(target.utf8))
-        XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(good.repairAttemptCount, 0, "首稿已包含修改，复核给出证据不等于修复首稿")
-        let wrongAnchor = VoicePolishTextEdit(before: "安装", after: "安装", kind: .word)
-        let (bad, failedCalls) = await run(source, [candidate(target), review(target, [wrongAnchor])])
-        assertFailure(bad, source: source, calls: failedCalls, count: 2, repairs: 0, code: .planIntegrityFailure)
-    }
-
-    func testResidualUnstatedWordCorrectionFailsWholeCandidate() async {
-        let source = "请按装软件并从新检查。"
-        let target = "请安装软件并重新检查。"
-        let (result, calls) = await run(source, [candidate(target), review(target, [
-            .init(before: "按装", after: "安装", kind: .word)
-        ])])
-        assertFailure(result, source: source, calls: calls, count: 2, repairs: 0, code: .planIntegrityFailure)
-        XCTAssertNotEqual(result.text, "请安装软件并从新检查。", "不得交付部分通过的修改")
-    }
-
-    func testResidualStutterCannotHideBehindReviewedMechanicalPermission() async {
-        let source = "我我去按装软件。"
-        let target = "我去安装软件。"
-        let (result, calls) = await run(source, [candidate(target), review(target, [
-            .init(before: "按装", after: "安装", kind: .word)
-        ])])
-        assertFailure(result, source: source, calls: calls, count: 2, repairs: 0, code: .planIntegrityFailure)
-    }
-
-    func testOriginalSourceStutterEvidenceAllowsSameCandidateAfterReview() async {
-        let source = "我我去按装软件。"
-        let target = "我去安装软件。"
-        let (result, calls) = await run(source, [candidate(target), review(target, [
-            .init(before: "我我去", after: "我去", kind: .stutter),
-            .init(before: "按装", after: "安装", kind: .word)
-        ])])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, target)
-        XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(result.repairAttemptCount, 0)
-    }
-
-    func testRepairHasOneFinalConfirmationWithActualSourceDraftAndChanges() async throws {
-        let source = "我补一句，请按装软件。"
-        let target = "我补一句，请安装软件。"
-        let (result, calls) = await run(source, [candidate(source), review(target, [
-            .init(before: "按装", after: "安装", kind: .word)
-        ]), #"{"approved":true}"#])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
-        XCTAssertEqual(result.llmAttemptCount, 3)
-        XCTAssertEqual(result.repairAttemptCount, 1)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishFast, .voicePolishAnalyze, .voicePolishAnalyze])
-        guard calls.count == 3 else { return }
-        let second = try payload(calls[1]); let third = try payload(calls[2])
-        XCTAssertEqual(second["draft_text"] as? String, source)
-        XCTAssertEqual(third["canonical_text"] as? String, source)
-        XCTAssertEqual(third["draft_text"] as? String, target)
-        XCTAssertTrue((second["changes"] as? [[String: Any]])?.isEmpty == true)
-        let changes = try XCTUnwrap(third["changes"] as? [[String: String]])
-        XCTAssertTrue(changes.contains { $0["removed"] == "按" && $0["inserted"] == "安" })
-        XCTAssertTrue(calls[2].system?.contains("approved") == true)
-        XCTAssertTrue(calls.allSatisfy { !$0.user.contains("layout_segments") })
-    }
-
-    func testExplicitNullRefusalNeverCountsRepairOrDeliversInitialCandidate() async {
-        let source = "请按装软件。"
-        let (result, calls) = await run(source, [candidate("请安装软件。"), review(nil, [
-            .init(before: "按装", after: "安装", kind: .word)
-        ]), #"{"approved":true}"#])
-        assertFailure(result, source: source, calls: calls, count: 2, repairs: 0, code: .semanticDecisionUnverified)
-    }
-
-    func testChangedInvalidRepairRecordsAttemptBeforePermissionsRejectIt() async {
-        let source = "我补一句，给同事的任务是先核对。"
-        for kind in [VoicePolishTextEdit.Kind.directive, .content] {
-            let (result, calls) = await run(source, [candidate(source), review("先核对。", [
-                .init(before: "我补一句，给同事的任务是", after: "", kind: kind)
-            ])])
-            assertFailure(result, source: source, calls: calls, count: 2, repairs: 1, code: .planIntegrityFailure)
-        }
-    }
-
-    func testChangedTargetWithMissingSemanticEvidenceRecordsFailedRepair() async {
-        let source = "我补一句，请按装软件。"
-        let (result, calls) = await run(source, [candidate(source), review("我补一句，请安装软件。")])
-        assertFailure(result, source: source, calls: calls, count: 2, repairs: 1, code: .planIntegrityFailure)
-    }
-
-    func testFalseOrInvalidThirdResponseCannotStartFourthCall() async {
-        let source = "我补一句，请按装软件。"
-        let target = "我补一句，请安装软件。"
-        for (last, code) in [(#"{"approved":false}"#, VoicePolishValidationCode.semanticDecisionUnverified),
-                             (#"{"approved":true,"text":"另稿"}"#, .invalidStructuredResponse),
-                             (#"{"edits":[]}"#, .invalidStructuredResponse)] {
-            let (result, calls) = await run(source, [candidate(source), review(target, [
-                .init(before: "按装", after: "安装", kind: .word)
-            ]), last, #"{"approved":true}"#])
-            assertFailure(result, source: source, calls: calls, count: 3, repairs: 1, code: code)
-        }
-    }
-
-    func testReviewMayRejectBadCandidateAndReturnCorrectedOriginalWithConfirmation() async {
-        let source = "请检查软件。"
-        let (result, calls) = await run(source, [candidate("请卸载软件。"), review(source), #"{"approved":true}"#])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, source)
-        XCTAssertEqual(calls.count, 3)
-        XCTAssertEqual(result.repairAttemptCount, 1)
-    }
-
-    func testChangedPunctuationTargetIsConfirmedAndNeverOverwrittenByFirstCandidate() async {
-        let source = "不对先别执行等确认"
-        let initial = "不对，先别执行，等确认。"
-        let target = "不对。先别执行，等确认。"
-        let (result, calls) = await run(source, [candidate(initial), review(target), #"{"approved":true}"#])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
-        XCTAssertEqual(calls.count, 3)
-        XCTAssertEqual(result.repairAttemptCount, 1)
-    }
-
-    func testRepeatedAnchorsFailAndExplicitUnchangedContextDisambiguates() async {
-        let source = "先按装甲，再按装乙。"
-        let target = "先安装甲，再按装乙。"
-        let (bad, badCalls) = await run(source, [candidate(target), review(target, [
-            .init(before: "按装", after: "安装", kind: .word)
-        ])])
-        assertFailure(bad, source: source, calls: badCalls, count: 2, repairs: 0, code: .planIntegrityFailure)
-        let (good, goodCalls) = await run(source, [candidate(target), review(target, [
-            .init(before: "先按装甲", after: "先安装甲", kind: .word)
-        ])])
-        XCTAssertFalse(good.usedFallback)
-        XCTAssertEqual(good.text, target)
-        XCTAssertEqual(goodCalls.count, 2)
-    }
-
-    func testEmojiSourceAnchorPreservesExactFinalUTF8() async {
-        let source = "👨‍👩‍👧‍👦请按装👍🏽"
-        let target = "👨‍👩‍👧‍👦请安装👍🏽。"
-        let (result, calls) = await run(source, [candidate(target), review(target, [
-            .init(before: "按装", after: "安装", kind: .word)
-        ])])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
-        XCTAssertEqual(calls.count, 2)
-    }
-
-    func testLateCorrectionRequiresOriginalEvidenceAndRetainsReason() async {
-        let source = "阿文负责复查。其他内容先保留。复查改由阿宁，阿文要出差。"
-        let target = "阿宁负责复查。其他内容先保留。阿文要出差。"
-        let edits: [VoicePolishTextEdit] = [
-            .init(before: "阿文负责复查。", after: "阿宁负责复查。", kind: .correction, evidence: "复查改由阿宁，阿文要出差。"),
-            .init(before: "复查改由阿宁，", after: "", kind: .correction)
-        ]
-        let (result, calls) = await run(source, [candidate(target), review(target, edits)])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, target)
-        XCTAssertEqual(calls.count, 2)
-        let missing = [VoicePolishTextEdit(before: "阿文负责复查。", after: "阿宁负责复查。", kind: .correction), edits[1]]
-        let (bad, badCalls) = await run(source, [candidate(target), review(target, missing)])
-        assertFailure(bad, source: source, calls: badCalls, count: 2, repairs: 0, code: .planIntegrityFailure)
-    }
-
-    func testCorrectionBudgetCannotBeBypassedByFullCandidate() async {
-        let retained = "最终保留。"
-        let source = String(repeating: "原先事项必须记录", count: 5) + "不对，" + retained
-        let (result, calls) = await run(source, [candidate(retained), review(retained, [
-            .init(before: source, after: retained, kind: .correction)
-        ])])
-        assertFailure(result, source: source, calls: calls, count: 2, repairs: 0, code: .planIntegrityFailure)
     }
 
     func testAllThreeResponseSchemasRejectWrongKeysTypesAndEmptyText() {
@@ -279,32 +164,6 @@ final class VoicePolishLightCandidateTests: XCTestCase {
                     #"{"approved":true,"edits":[]}"#, "{}"] {
             assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightConfirmation(raw) }
         }
-    }
-
-    func testOldFirstProtocolAndMalformedReviewHaveNoRepairAttempts() async {
-        let source = "不对，先核对。"
-        let (first, firstCalls) = await run(source, [#"{"edits":[]}"#])
-        assertFailure(first, source: source, calls: firstCalls, count: 1, repairs: 0, code: .invalidStructuredResponse)
-        let (second, secondCalls) = await run(source, [candidate(source), #"{"text":"已改","edits":null}"#])
-        assertFailure(second, source: source, calls: secondCalls, count: 2, repairs: 0, code: .invalidStructuredResponse)
-    }
-
-    func testUTF8DifferenceCannotUseSwiftCanonicalEqualityToSkipConfirmation() async {
-        let source = "不对，가先保留。"
-        let target = "不对，\u{1100}\u{1161}先保留。"
-        XCTAssertEqual(source, target)
-        XCTAssertFalse(source.utf8.elementsEqual(target.utf8))
-        let (result, calls) = await run(source, [candidate(source), review(target), #"{"approved":true}"#])
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.repairAttemptCount, 1)
-        XCTAssertEqual(calls.count, 3)
-        XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
-    }
-
-    func testWhitespaceOnlyMechanicalCandidateStillFailsFinalContentGuard() async {
-        let source = "。"
-        let (result, calls) = await run(source, [candidate(" ")])
-        assertFailure(result, source: source, calls: calls, count: 1, repairs: 0, code: .emptyOutput)
     }
 
     func testDuplicateRootNestedAndEscapedEquivalentKeysAreRejected() throws {
@@ -383,9 +242,6 @@ final class VoicePolishLightCandidateTests: XCTestCase {
     }
     private func json(_ value: [String: Any]) -> String {
         String(decoding: try! JSONSerialization.data(withJSONObject: value), as: UTF8.self)
-    }
-    private func payload(_ request: LLMRequest) throws -> [String: Any] {
-        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any])
     }
     private func run(_ source: String, _ responses: [String]) async -> (VoicePolishResult, [LLMRequest]) {
         let client = LightCandidateClient(responses)

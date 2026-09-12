@@ -666,10 +666,19 @@ enum VoicePolishQualityRunner {
                     receiptPath: providerAuditURL.path,
                     successCounter: successCounter
                 )
-                let result = await VoicePolishPipeline(
-                    client: auditedClient,
-                    config: configured.config
-                ).process(request)
+                let pipeline = VoicePolishPipeline(client: auditedClient, config: configured.config)
+                let result: VoicePolishResult
+                if invocation.mode == .light,
+                   ProcessInfo.processInfo.environment["MUSE_QUALITY_CAPTURE_LIGHT_REQUEST_BODY"] == "1" {
+                    // 仅显式后台验收保存实际请求体；普通会话和其他质量模式不增加文件写入。
+                    let bodyURL = URL(fileURLWithPath: invocation.reportPath).deletingLastPathComponent()
+                        .appendingPathComponent("light-request-\(index + 1).json")
+                    result = await VoicePolishProviderAudit.withRequestProbe(bodyPath: bodyURL.path) {
+                        await pipeline.process(request)
+                    }
+                } else {
+                    result = await pipeline.process(request)
+                }
                 let elapsed = ContinuousClock.now - startedAt
                 let successfulProviderCallCount = await successCounter.currentCount()
                 expectedProviderReceiptCount += successfulProviderCallCount

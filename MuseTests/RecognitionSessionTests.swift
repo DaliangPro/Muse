@@ -1098,6 +1098,40 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.repairAttemptCount, 1)
     }
 
+    func testLightSingleCallKeepsCompleteCanonicalInputAndVerbatimOutput() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        try SnippetStorage.save([(trigger: "Code X", value: "Codex")], context: fixture.context)
+        let raw = "我在用 Code X。预算八百，不对，六百。\n第二段保持原位。"
+        let canonical = "我在用 Codex。预算八百，不对，六百。\n第二段保持原位。"
+        let response = "  我在用 Codex。预算六百。\r\n第二段保持原位。 e\u{301} 👩🏽‍💻\r\n"
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [response])
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
+            llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") }
+        )
+        let transcript = RecognitionTranscript(confirmedSegments: [raw], partialText: "",
+                                              authoritativeText: raw, isFinal: true)
+        let result = await session.postProcessForTesting(
+            rawText: raw, transcript: transcript, mode: .lightPolish,
+            vocabularyContext: fixture.context
+        )
+        let calls = await client.recordedRequests()
+        XCTAssertEqual(calls.count, 1)
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.task, .voicePolishRender)
+        let payload = try Self.voicePolishPayload(from: call)
+        XCTAssertEqual(Set(payload.keys), ["canonical_text"])
+        XCTAssertEqual(payload["canonical_text"] as? String, canonical)
+        let output = try XCTUnwrap(result)
+        XCTAssertEqual(Array(output.finalText.utf8), Array(response.utf8))
+        XCTAssertEqual(Array(try XCTUnwrap(output.processedText).utf8), Array(response.utf8))
+        XCTAssertFalse(output.llmFailed)
+        XCTAssertEqual(output.historyStatus, "voice_polish_success")
+        XCTAssertEqual(output.performance?.llmAttemptCount, 1)
+        XCTAssertEqual(output.performance?.repairAttemptCount, 0)
+    }
+
     func testLightRetryAndCancelKeepFirstFailureMetricsWithoutCountingRetryAsRepair() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
@@ -1105,7 +1139,7 @@ final class RecognitionSessionTests: XCTestCase {
         let transcript = RecognitionTranscript(confirmedSegments: [source], partialText: "",
                                               authoritativeText: source, isFinal: true)
         for shouldRetry in [true, false] {
-            let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["invalid-json", #"{"text":"请先核对链接。"}"#])
+            let client = RecognitionSessionScriptedVoicePolishLLM(responses: [" \n", "请先核对链接。"])
             let recorder = RecognitionEventRecorder()
             let session = RecognitionSession(
                 historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },

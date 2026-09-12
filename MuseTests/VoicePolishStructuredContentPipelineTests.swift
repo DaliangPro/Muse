@@ -98,13 +98,15 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
     }
 
-    func testLightCannotAcceptStandardLayoutField() async throws {
+    func testLightDoesNotRequestOrRenderStandardLayout() async throws {
         let source = "等一下，先别发送，等我确认。"
-        let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, calls) = await run(source, [#"{"text":"等一下，先别发送，等我确认。"}"#, review], mode: .light)
-        XCTAssertTrue(result.usedFallback)
-        XCTAssertEqual(result.llmAttemptCount, 2)
-        for call in calls { XCTAssertNil(try payload(call)["layout_segments"]) }
+        let (result, calls) = await run(source, [source], mode: .light)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, source)
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.options.responseFormat, .text)
+        XCTAssertEqual(Set(try payload(call).keys), ["canonical_text"])
     }
 
     func testStandardContentStillProtectsDeliberateEmphasis() async {
@@ -120,16 +122,14 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
     func testClockCorrectionKeepsFinalWholeASCIIClockInBothModes() async throws {
         let source = "会议10:30，不对，10:45开始。"
         let patch = #"{"edits":[{"before":"会议10:30，不对，10:45开始。","after":"会议10:45开始。","kind":"correction"}]}"#
-        var lightReview = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(patch.utf8)) as? [String: Any])
-        lightReview["text"] = "会议10:45开始。"
-        let lightResponses = [try json(["text": "会议10:45开始。"]), try json(lightReview)]
+        let lightResponses = ["会议10:45开始。"]
         for mode in [VoicePolishQualityMode.light, .standard] {
             let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
             let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
             let (result, _) = await run(source, mode == .light ? lightResponses : [patch, review, layout], mode: mode)
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, "会议10:45开始。")
-            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 2 : 3)
+            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 3)
         }
     }
 
