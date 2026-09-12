@@ -50,6 +50,93 @@ final class InteractiveTestRuntimeTests: XCTestCase {
         XCTAssertTrue((defaults.persistentDomain(forName: suite) ?? [:]).isEmpty)
     }
 
+    func testBundledVocabularyInitializationUsesOnlyExistingDefaultsWithoutMigration() throws {
+        let context = try makeVocabularyContext()
+        context.userDefaults.set("不得导入的旧热词", forKey: "tf_hotwords")
+        context.userDefaults.set(
+            try JSONEncoder().encode([["不得导入的旧错词", "不得导入的旧正词"]]),
+            forKey: "tf_snippets"
+        )
+        let preferencesBefore = NSDictionary(dictionary: context.userDefaults.dictionaryRepresentation())
+
+        try initializeVocabulary(in: context)
+
+        XCTAssertEqual(HotwordStorage.loadBuiltin(context: context), HotwordStorage.defaultHotwords)
+        XCTAssertEqual(
+            SnippetStorage.loadBuiltin(context: context).map { [$0.trigger, $0.value] },
+            SnippetStorage.defaultSnippets.map { [$0.trigger, $0.value] }
+        )
+        XCTAssertEqual(
+            Set(try context.fileManager.contentsOfDirectory(atPath: context.supportDirectory.path)),
+            Set(["builtin-hotwords.json", "builtin-snippets.json"])
+        )
+        XCTAssertEqual(NSDictionary(dictionary: context.userDefaults.dictionaryRepresentation()), preferencesBefore)
+    }
+
+    func testBundledVocabularyPreparesLiveTranscriptWithoutGuessingOtherWords() throws {
+        let context = try makeVocabularyContext()
+        try initializeVocabulary(in: context)
+        let raw = "你觉得是 Cloud Code 比较好用，还是 CodeX 比较好用呢？或者说 有很多的，主要是他们的文件吧。到底是 agents 点 MD 更好，还是 cloud 点 MD 更好？"
+        let expected = "你觉得是 Claude Code 比较好用，还是 Codex 比较好用呢？或者说 有很多的，主要是他们的文件吧。到底是 agents 点 MD 更好，还是 cloud 点 MD 更好？"
+        let prepared = VoicePolishTerminologyRuntime.prepare(
+            rawText: raw, applicationBundleIdentifier: nil, context: context
+        )
+        XCTAssertEqual(prepared.canonicalText, expected)
+
+        let reason = "我觉得这个事还是交给小李去处理吧，小李比较心细。哦，不对，小李请假了，还是交给小王去处理吧。"
+        XCTAssertEqual(VoicePolishTerminologyRuntime.prepare(
+            rawText: reason, applicationBundleIdentifier: nil, context: context
+        ).canonicalText, reason)
+    }
+
+    func testRepeatedBundledVocabularyInitializationPreservesCustomizedFiles() throws {
+        let context = try makeVocabularyContext()
+        try initializeVocabulary(in: context)
+        try HotwordStorage.saveBuiltin(["测试自定义内置热词"], context: context)
+        try SnippetStorage.saveBuiltin(
+            [(trigger: "测试自定义内置错词", value: "测试自定义内置正词")], context: context
+        )
+        try HotwordStorage.save(["测试用户热词"], context: context)
+        try SnippetStorage.save(
+            [(trigger: "测试用户错词", value: "测试用户正词")], context: context
+        )
+        let files = [
+            HotwordStorage.builtinFileURL(in: context), SnippetStorage.builtinFileURL(in: context),
+            HotwordStorage.userFileURL(in: context), SnippetStorage.userFileURL(in: context),
+        ]
+        let contentsBefore = try files.map { try Data(contentsOf: $0) }
+
+        try initializeVocabulary(in: context)
+        try initializeVocabulary(in: context)
+
+        XCTAssertEqual(try files.map { try Data(contentsOf: $0) }, contentsBefore)
+    }
+
+    private func initializeVocabulary(in context: VocabularyStorageContext) throws {
+        try InteractiveTestRuntime.initializeBundledVocabulary(
+            supportDirectory: context.supportDirectory, defaults: context.userDefaults
+        )
+    }
+
+    private func makeVocabularyContext() throws -> VocabularyStorageContext {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseInteractiveVocabularyTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let suite = "MuseTests.InteractiveVocabulary.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+        }
+        return VocabularyStorageContext(
+            supportDirectory: directory,
+            userDefaults: defaults,
+            fileManager: .default,
+            hotwordsDidChange: {},
+            revealFile: { _ in }
+        )
+    }
+
     private func resolve(_ path: String?) throws -> URL? {
         try InteractiveTestRuntime.validatedSupportDirectory(
             bundleID: InteractiveTestRuntime.bundleIdentifier,

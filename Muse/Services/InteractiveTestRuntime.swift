@@ -16,6 +16,35 @@ enum InteractiveTestRuntime {
         ) else { return }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         UserDefaults.standard.setVolatileDomain(preferences, forName: UserDefaults.argumentDomain)
+        try initializeBundledVocabulary(supportDirectory: root, defaults: .standard)
+    }
+
+    /// 仅补齐正常产品自带的两份内置词库，不执行历史迁移或触发词表同步。
+    /// 统一术语运行时会从这些文件读取默认纠正，无需另建测试专用规则。
+    static func initializeBundledVocabulary(supportDirectory: URL, defaults: UserDefaults) throws {
+        let context = VocabularyStorageContext(
+            supportDirectory: supportDirectory,
+            userDefaults: defaults,
+            fileManager: .default,
+            hotwordsDidChange: {},
+            revealFile: { _ in }
+        )
+        switch HotwordStorage.loadBuiltinResult(context: context) {
+        case .missing:
+            try HotwordStorage.saveBuiltin(HotwordStorage.defaultHotwords, context: context)
+        case .value:
+            break
+        case .corrupt(let backupURL, _):
+            throw TerminologyRepositoryError.recoveryRequired(backupURL)
+        }
+        switch SnippetStorage.loadBuiltinResult(context: context) {
+        case .missing:
+            try SnippetStorage.saveBuiltin(SnippetStorage.defaultSnippets, context: context)
+        case .value:
+            break
+        case .corrupt(let backupURL, _):
+            throw TerminologyRepositoryError.recoveryRequired(backupURL)
+        }
     }
 
     static var supportDirectory: URL {
