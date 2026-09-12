@@ -112,6 +112,11 @@ private struct InteractiveTestApp: App {
     }
 }
 
+private final class InteractiveTestControlPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
 private struct VoicePolishQualityRunnerApp: App {
     @NSApplicationDelegateAdaptor(VoicePolishQualityRunnerAppDelegate.self) var appDelegate
 
@@ -147,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settingsWindowPresenter = SettingsWindowPresenter()
     private let menuBarVisibilityMonitor = MenuBarVisibilityMonitor()
     private var statusItem: NSStatusItem?
+    private var interactiveTestControlPanel: NSPanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if !InteractiveTestRuntime.isEnabled, VoicePolishQualityRunner.startIfRequested() {
@@ -269,6 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if InteractiveTestRuntime.isEnabled {
             installInteractiveTestMenuBarItem()
+            showInteractiveTestControlPanel()
             DebugFileLogger.log("interactive test ready; microphone idle; global hotkeys disabled")
             return
         }
@@ -395,6 +402,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
+    private func showInteractiveTestControlPanel() {
+        let panel = interactiveTestControlPanel ?? Self.makeInteractiveTestControlPanel(target: self)
+        interactiveTestControlPanel = panel
+        let mouseLocation = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) ?? NSScreen.main {
+            let visibleFrame = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(
+                x: visibleFrame.midX - panel.frame.width / 2,
+                y: visibleFrame.maxY - panel.frame.height - 90
+            ))
+        }
+        // 测试入口不依赖系统是否展示菜单栏图标，也不夺取目标应用的输入焦点。
+        panel.orderFrontRegardless()
+    }
+
+    static func makeInteractiveTestControlPanel(target: AnyObject?) -> NSPanel {
+        let panel = InteractiveTestControlPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 284),
+            styleMask: [.nonactivatingPanel, .titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Muse 交互测试"
+        panel.level = .floating
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.isMovableByWindowBackground = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 284))
+        let instruction = NSTextField(labelWithString: "先点选空白输入框，再开始录音")
+        instruction.frame = NSRect(x: 20, y: 244, width: 340, height: 22)
+        instruction.font = .systemFont(ofSize: 14)
+        content.addSubview(instruction)
+        for (index, item) in makeInteractiveTestStatusMenu(target: target).items.enumerated() {
+            let button = NSButton(title: item.title, target: item.target, action: item.action)
+            button.frame = NSRect(x: 20, y: 194 - CGFloat(index) * 42, width: 340, height: 32)
+            button.bezelStyle = .rounded
+            button.font = .systemFont(ofSize: 14)
+            content.addSubview(button)
+        }
+        panel.contentView = content
+        return panel
+    }
+
     /// 单独构造菜单，测试不需要实例化会打开历史库的 AppDelegate。
     static func makeInteractiveTestStatusMenu(target: AnyObject?) -> NSMenu {
         let menu = NSMenu()
@@ -416,8 +469,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func prepareInteractiveTestPermissions() {
         guard InteractiveTestRuntime.isEnabled else { return }
         statusItem?.button?.title = "Mu测·准备"
+        interactiveTestControlPanel?.title = "Muse 交互测试 · 正在准备权限"
         Task { @MainActor in
-            defer { self.statusItem?.button?.title = "Mu测" }
+            defer {
+                self.statusItem?.button?.title = "Mu测"
+                self.interactiveTestControlPanel?.title = "Muse 交互测试"
+            }
             // 仅用户点选时请求原生只读授权，钥匙串中的凭据不复制到测试目录。
             let asrStatus = KeychainService.authorizeASRCredentialAccess(for: .volcano)
             let asrReadable = KeychainService.loadASRConfig(for: .volcano) != nil
@@ -438,7 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "润色凭据：\(llmReadable ? "普通读取成功" : "尚不可读取（授权状态 \(llmStatus)）")",
                 "麦克风：\(microphoneAllowed ? "已允许" : "未允许")",
                 "辅助功能上屏：\(accessibilityAllowed ? "已允许" : "待系统允许")",
-                "全部允许后，请关闭此提示，点选空白输入框，再从 Mu测 菜单开始录音。",
+                "全部允许后，请关闭此提示，点选空白输入框，再从测试面板开始录音。",
             ].joined(separator: "\n")
             alert.addButton(withTitle: "知道了")
             alert.runModal()
@@ -463,10 +520,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard PermissionManager.hasMicrophonePermission,
               PermissionManager.hasAccessibilityPermission else {
-            appState.showError("请先从 Mu测 菜单准备录音与上屏权限，再点选目标输入框开始录音。")
+            appState.showError("请先从测试面板准备录音与上屏权限，再点选目标输入框开始录音。")
             return
         }
-        // 状态菜单不激活 Muse；沿用用户当前输入框与正常会话的焦点捕获、注入流程。
+        // 测试面板和状态菜单不激活 Muse；沿用正常会话的焦点捕获、注入流程。
         appState.currentMode = mode
         appState.startRecording()
         Task { await session.startRecording(mode: mode) }

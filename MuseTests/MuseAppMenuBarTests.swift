@@ -1,7 +1,29 @@
+import AppKit
 import XCTest
 @testable import Muse
 
 final class MuseAppMenuBarTests: XCTestCase {
+    @MainActor
+    func test交互测试面板保持目标焦点并复用菜单动作() throws {
+        let panel = AppDelegate.makeInteractiveTestControlPanel(target: nil)
+        defer { panel.close() }
+        let content = try XCTUnwrap(panel.contentView)
+        let buttons = content.subviews.compactMap { $0 as? NSButton }
+        let menu = AppDelegate.makeInteractiveTestStatusMenu(target: nil)
+
+        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertFalse(panel.canBecomeKey)
+        XCTAssertFalse(panel.canBecomeMain)
+        XCTAssertFalse(panel.hidesOnDeactivate)
+        XCTAssertEqual(panel.level, .floating)
+        XCTAssertEqual(buttons.map(\.title), menu.items.map(\.title))
+        XCTAssertEqual(buttons.map(\.action), menu.items.map(\.action))
+        XCTAssertTrue(buttons.allSatisfy { $0.keyEquivalent.isEmpty })
+        XCTAssertTrue(content.subviews.compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue == "先点选空白输入框，再开始录音"
+        })
+    }
+
     @MainActor
     func test交互测试菜单只暴露手动测试动作并且没有快捷键() {
         let menu = AppDelegate.makeInteractiveTestStatusMenu(target: nil)
