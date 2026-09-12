@@ -34,6 +34,39 @@ final class InteractiveTestRuntimeTests: XCTestCase {
         ))
     }
 
+    func testFirstLaunchCreatesDirectoryAndReopeningPreservesExistingData() throws {
+        let context = try makeVocabularyContext()
+        let root = context.supportDirectory.appendingPathComponent("test-data", isDirectory: true)
+        XCTAssertFalse(context.fileManager.fileExists(atPath: root.path))
+
+        try InteractiveTestRuntime.ensureSupportDirectoryExists(at: root)
+        var isDirectory = ObjCBool(false)
+        XCTAssertTrue(context.fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        let existingFile = root.appendingPathComponent("existing-record.txt")
+        let existingData = Data("复开前已存在的测试记录".utf8)
+        try existingData.write(to: existingFile)
+
+        try InteractiveTestRuntime.ensureSupportDirectoryExists(at: root)
+
+        XCTAssertEqual(try Data(contentsOf: existingFile), existingData)
+        XCTAssertEqual(try context.fileManager.contentsOfDirectory(atPath: root.path), ["existing-record.txt"])
+    }
+
+    func testExistingRegularFileCannotBecomeSupportDirectory() throws {
+        let context = try makeVocabularyContext()
+        let root = context.supportDirectory.appendingPathComponent("test-data", isDirectory: false)
+        let existingData = Data("同名普通文件必须保留".utf8)
+        try existingData.write(to: root)
+
+        XCTAssertThrowsError(try InteractiveTestRuntime.ensureSupportDirectoryExists(at: root))
+
+        XCTAssertEqual(try Data(contentsOf: root), existingData)
+        var isDirectory = ObjCBool(true)
+        XCTAssertTrue(context.fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory))
+        XCTAssertFalse(isDirectory.boolValue)
+    }
+
     func testTestPreferencesStayVolatileAndDisableLearning() throws {
         let suite = "MuseTests.InteractiveRuntime.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

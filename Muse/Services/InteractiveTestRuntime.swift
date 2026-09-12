@@ -14,9 +14,19 @@ enum InteractiveTestRuntime {
             bundleURL: Bundle.main.bundleURL,
             environment: ProcessInfo.processInfo.environment
         ) else { return }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        try ensureSupportDirectoryExists(at: root)
         UserDefaults.standard.setVolatileDomain(preferences, forName: UserDefaults.argumentDomain)
         try initializeBundledVocabulary(supportDirectory: root, defaults: .standard)
+    }
+
+    /// 路径校验通过后，首次启动创建目录；复开只复用目录，不改动其中的数据。
+    static func ensureSupportDirectoryExists(at root: URL) throws {
+        var isDirectory = ObjCBool(false)
+        if FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else { throw ConfigurationError.invalidRoot }
+            return
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     }
 
     /// 仅补齐正常产品自带的两份内置词库，不执行历史迁移或触发词表同步。
