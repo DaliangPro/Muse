@@ -2,6 +2,20 @@ import XCTest
 @testable import Muse
 
 final class MuseAppMenuBarTests: XCTestCase {
+    @MainActor
+    func test交互测试菜单只暴露手动测试动作并且没有快捷键() {
+        let menu = AppDelegate.makeInteractiveTestStatusMenu(target: nil)
+
+        XCTAssertEqual(menu.items.map(\.title), [
+            "准备录音与上屏权限", "开始轻度录音", "开始直出录音", "停止并上屏", "退出测试",
+        ])
+        XCTAssertEqual(menu.items.compactMap { $0.action.map(NSStringFromSelector) }, [
+            "prepareInteractiveTestPermissions", "startInteractiveLightRecording",
+            "startInteractiveDirectRecording", "stopInteractiveRecording", "quitFromStatusMenu",
+        ])
+        XCTAssertTrue(menu.items.allSatisfy { $0.keyEquivalent.isEmpty })
+    }
+
     func test菜单栏图标保持原尺寸不被AppKit向上放大() {
         XCTAssertEqual(MuseApp.menuBarImageScaling, .scaleProportionallyDown)
     }

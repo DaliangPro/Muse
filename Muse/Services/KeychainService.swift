@@ -27,6 +27,25 @@ enum KeychainService {
 
     static var isUsingIsolatedTestStorage: Bool { isRunningTests }
 
+    @TaskLocal private static var interactiveReadOnlyTestScope = false
+
+    /// 交互测试只复用指定服务的现有凭据，不允许改动共享钥匙串或历史凭据文件。
+    private static var isCredentialReadOnly: Bool {
+        InteractiveTestRuntime.isEnabled || (isRunningTests && interactiveReadOnlyTestScope)
+    }
+
+    /// 只在 XCTest 的内存后端模拟交互测试限制，不打开真实系统存储。
+    static func withInteractiveCredentialReadOnlyForTesting<T>(
+        _ body: () throws -> T
+    ) rethrows -> T {
+        precondition(isRunningTests)
+        return try $interactiveReadOnlyTestScope.withValue(true, operation: body)
+    }
+
+    private static func mayReadCredential(key: String) -> Bool {
+        !isCredentialReadOnly || key == "tf_asr_volcano" || key == "tf_llm_deepseek"
+    }
+
     private static func withIsolatedTestStorage<T>(
         _ body: (inout IsolatedTestStorage) throws -> T
     ) rethrows -> T {
@@ -42,6 +61,7 @@ enum KeychainService {
     // MARK: - Core read/write (now supports nested objects)
 
     private static func loadAll() -> [String: Any] {
+        guard !isCredentialReadOnly else { return [:] }
         if isRunningTests {
             return withIsolatedTestStorage { $0.legacyValues }
         }
@@ -52,6 +72,7 @@ enum KeychainService {
     }
 
     private static func saveAll(_ dict: [String: Any]) throws {
+        guard !isCredentialReadOnly else { throw KeychainError.saveFailed(errSecReadOnly) }
         if isRunningTests {
             withIsolatedTestStorage { $0.legacyValues = dict }
             return
@@ -82,6 +103,7 @@ enum KeychainService {
     }
 
     private static func saveSecureData(_ data: Data, key: String) throws {
+        guard !isCredentialReadOnly else { throw KeychainError.saveFailed(errSecReadOnly) }
         if isRunningTests {
             withIsolatedTestStorage { $0.secureData[key] = data }
             return
@@ -107,6 +129,7 @@ enum KeychainService {
     }
 
     private static func loadSecureData(key: String) -> Data? {
+        guard mayReadCredential(key: key) else { return nil }
         if isRunningTests {
             return withIsolatedTestStorage { $0.secureData[key] }
         }
@@ -130,6 +153,7 @@ enum KeychainService {
 
     @discardableResult
     private static func deleteSecureData(key: String) -> Bool {
+        guard !isCredentialReadOnly else { return false }
         if isRunningTests {
             return withIsolatedTestStorage {
                 $0.secureData.removeValue(forKey: key) != nil
@@ -332,16 +356,27 @@ enum KeychainService {
     /// ACL、不回退到文件、不返回凭据。常规录音及质量跑测不调用此方法。
     static func authorizeLLMCredentialAccess(for provider: LLMProvider) -> OSStatus {
         guard provider != .localQwen else { return errSecParam }
+        return authorizeCredentialAccess(key: llmStorageKey(for: provider))
+    }
+
+    /// 交互测试菜单的显式授权入口；只返回状态，不向调用方暴露凭据。
+    static func authorizeASRCredentialAccess(for provider: ASRProvider) -> OSStatus {
+        guard provider == .volcano || provider == .aliyun else { return errSecParam }
+        return authorizeCredentialAccess(key: asrStorageKey(for: provider))
+    }
+
+    private static func authorizeCredentialAccess(key: String) -> OSStatus {
+        guard mayReadCredential(key: key) else { return errSecAuthFailed }
         if isRunningTests {
             return withIsolatedTestStorage {
-                $0.secureData[llmStorageKey(for: provider)] == nil ? errSecItemNotFound : errSecSuccess
+                $0.secureData[key] == nil ? errSecItemNotFound : errSecSuccess
             }
         }
         let interactionStatus = SecKeychainSetUserInteractionAllowed(true)
         guard interactionStatus == errSecSuccess else { return interactionStatus }
         defer { SecKeychainSetUserInteractionAllowed(false) }
 
-        var query = keychainQuery(for: llmStorageKey(for: provider))
+        var query = keychainQuery(for: key)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var data: CFTypeRef?
@@ -572,7 +607,7 @@ enum KeychainService {
     /// Migrate legacy flat keys to provider-grouped format,
     /// move Application Support directory, and migrate UserDefaults from old bundle ID.
     static func migrateIfNeeded() {
-        guard !isRunningTests else { return }
+        guard !isCredentialReadOnly, !isRunningTests else { return }
         migrateAppSupportDirectory()
         migrateKeychainService()
         migrateUserDefaults()

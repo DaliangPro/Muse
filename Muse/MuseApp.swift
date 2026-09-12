@@ -4,7 +4,17 @@ import SwiftUI
 @main
 enum MuseMain {
     static func main() {
-        if VoicePolishQualityRunner.isRequested() {
+        do {
+            // 必须先于 AppDelegate 的历史库、模式与设置初始化，隔离失败时不能回退日常目录。
+            try InteractiveTestRuntime.bootstrap()
+        } catch {
+            let message = "Muse 交互测试启动失败：\(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            exit(EXIT_FAILURE)
+        }
+        if InteractiveTestRuntime.isEnabled {
+            InteractiveTestApp.main()
+        } else if VoicePolishQualityRunner.isRequested() {
             VoicePolishQualityRunnerApp.main()
         } else {
             MuseApp.main()
@@ -93,6 +103,15 @@ struct MuseApp: App {
     }
 }
 
+private struct InteractiveTestApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    var body: some Scene {
+        // 完整设置页会同步开机启动与模型设置；交互测试只提供菜单入口。
+        Settings { EmptyView() }
+    }
+}
+
 private struct VoicePolishQualityRunnerApp: App {
     @NSApplicationDelegateAdaptor(VoicePolishQualityRunnerAppDelegate.self) var appDelegate
 
@@ -116,7 +135,9 @@ private final class VoicePolishQualityRunnerAppDelegate: NSObject, NSApplication
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    let appState = AppState()
+    let appState = AppState(
+        initialModes: InteractiveTestRuntime.isEnabled ? [.direct, .lightPolish] : nil
+    )
     let appUpdater = AppUpdater()
     private let holdHotkeyStopFallbackDelay: Duration = .milliseconds(120)
     private var floatingBarController: FloatingBarController?
@@ -128,14 +149,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if VoicePolishQualityRunner.startIfRequested() {
+        if !InteractiveTestRuntime.isEnabled, VoicePolishQualityRunner.startIfRequested() {
             return
         }
         AppLogger.log("[Muse] applicationDidFinishLaunching")
-        AppStartupCoordinator.configureActivationPolicy()
+        if InteractiveTestRuntime.isEnabled {
+            NSApp.setActivationPolicy(.accessory)
+        } else {
+            AppStartupCoordinator.configureActivationPolicy()
+        }
         AppearanceController.start()  // 启动即设 app 级外观，让窗口创建前就定好，避免设置窗口首帧深色
-        AppStartupCoordinator.runMigrations()
-        AppStartupCoordinator.reconcileSelectedASRProviderIfNeeded()
+        if !InteractiveTestRuntime.isEnabled {
+            AppStartupCoordinator.runMigrations()
+            AppStartupCoordinator.reconcileSelectedASRProviderIfNeeded()
+        }
 
         DebugFileLogger.startSession()
         DebugFileLogger.log("applicationDidFinishLaunching")
@@ -153,25 +180,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return false }
             return await self.session.retryVoicePolishResult()
         }
-        AppStartupCoordinator.scheduleDebugWindowsIfNeeded(
-            hudDebugPresenter: hudDebugPresenter,
-            appState: appState,
-            openSettingsWindow: { [weak self] in
-                self?.openSettingsWindow(preferManualWindow: true)
-            }
-        )
+        if !InteractiveTestRuntime.isEnabled {
+            AppStartupCoordinator.scheduleDebugWindowsIfNeeded(
+                hudDebugPresenter: hudDebugPresenter,
+                appState: appState,
+                openSettingsWindow: { [weak self] in
+                    self?.openSettingsWindow(preferManualWindow: true)
+                }
+            )
+        }
 
         // Bridge ASR events → AppState for floating bar display
         let session = self.session
 
         // 历史记录文本指标迁移（用 session 自带的 historyStore，迁移后 UI 能刷新）
-        Task { await session.historyStore.migrateTextMetrics() }
+        if !InteractiveTestRuntime.isEnabled {
+            Task { await session.historyStore.migrateTextMetrics() }
+        }
         let appState = self.appState
 
-        SoundFeedback.warmUp()
-
-        // Pre-warm audio subsystem so the first recording starts instantly
-        Task { await session.warmUp() }
+        if !InteractiveTestRuntime.isEnabled {
+            SoundFeedback.warmUp()
+            // Pre-warm audio subsystem so the first recording starts instantly
+            Task { await session.warmUp() }
+        }
 
         // Bridge audio level → isolated meter (no SwiftUI observation overhead)
         Task {
@@ -233,6 +265,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
+        }
+
+        if InteractiveTestRuntime.isEnabled {
+            installInteractiveTestMenuBarItem()
+            DebugFileLogger.log("interactive test ready; microphone idle; global hotkeys disabled")
+            return
         }
 
         // Start periodic update checking
@@ -348,6 +386,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private func installInteractiveTestMenuBarItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "Mu测"
+        item.button?.toolTip = "Muse 交互测试"
+        item.menu = Self.makeInteractiveTestStatusMenu(target: self)
+        item.isVisible = true
+        statusItem = item
+    }
+
+    /// 单独构造菜单，测试不需要实例化会打开历史库的 AppDelegate。
+    static func makeInteractiveTestStatusMenu(target: AnyObject?) -> NSMenu {
+        let menu = NSMenu()
+        let actions: [(String, Selector)] = [
+            ("准备录音与上屏权限", #selector(AppDelegate.prepareInteractiveTestPermissions)),
+            ("开始轻度录音", #selector(AppDelegate.startInteractiveLightRecording)),
+            ("开始直出录音", #selector(AppDelegate.startInteractiveDirectRecording)),
+            ("停止并上屏", #selector(AppDelegate.stopInteractiveRecording)),
+            ("退出测试", #selector(AppDelegate.quitFromStatusMenu)),
+        ]
+        for (title, action) in actions {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = target
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func prepareInteractiveTestPermissions() {
+        guard InteractiveTestRuntime.isEnabled else { return }
+        statusItem?.button?.title = "Mu测·准备"
+        Task { @MainActor in
+            defer { self.statusItem?.button?.title = "Mu测" }
+            // 仅用户点选时请求原生只读授权，钥匙串中的凭据不复制到测试目录。
+            let asrStatus = KeychainService.authorizeASRCredentialAccess(for: .volcano)
+            let asrReadable = KeychainService.loadASRConfig(for: .volcano) != nil
+            let llmStatus = KeychainService.authorizeLLMCredentialAccess(for: .deepseek)
+            let llmReadable = KeychainService.loadLLMProviderConfig(for: .deepseek) != nil
+            let microphoneAllowed = await PermissionManager.requestMicrophonePermission()
+            if !PermissionManager.hasAccessibilityPermission {
+                PermissionManager.promptAccessibilityPermission()
+            }
+            let accessibilityAllowed = PermissionManager.hasAccessibilityPermission
+            DebugFileLogger.log(
+                "interactive permissions asrStatus=\(asrStatus) asrReadable=\(asrReadable) llmStatus=\(llmStatus) llmReadable=\(llmReadable) microphone=\(microphoneAllowed) accessibility=\(accessibilityAllowed)"
+            )
+            let alert = NSAlert()
+            alert.messageText = "Muse 交互测试权限"
+            alert.informativeText = [
+                "识别凭据：\(asrReadable ? "普通读取成功" : "尚不可读取（授权状态 \(asrStatus)）")",
+                "润色凭据：\(llmReadable ? "普通读取成功" : "尚不可读取（授权状态 \(llmStatus)）")",
+                "麦克风：\(microphoneAllowed ? "已允许" : "未允许")",
+                "辅助功能上屏：\(accessibilityAllowed ? "已允许" : "待系统允许")",
+                "全部允许后，请关闭此提示，点选空白输入框，再从 Mu测 菜单开始录音。",
+            ].joined(separator: "\n")
+            alert.addButton(withTitle: "知道了")
+            alert.runModal()
+        }
+    }
+
+    @objc private func startInteractiveLightRecording() {
+        startInteractiveRecording(mode: .lightPolish)
+    }
+
+    @objc private func startInteractiveDirectRecording() {
+        startInteractiveRecording(mode: .direct)
+    }
+
+    private func startInteractiveRecording(mode: ProcessingMode) {
+        guard InteractiveTestRuntime.isEnabled else { return }
+        switch appState.barPhase {
+        case .hidden, .done, .error:
+            break
+        default:
+            return
+        }
+        guard PermissionManager.hasMicrophonePermission,
+              PermissionManager.hasAccessibilityPermission else {
+            appState.showError("请先从 Mu测 菜单准备录音与上屏权限，再点选目标输入框开始录音。")
+            return
+        }
+        // 状态菜单不激活 Muse；沿用用户当前输入框与正常会话的焦点捕获、注入流程。
+        appState.currentMode = mode
+        appState.startRecording()
+        Task { await session.startRecording(mode: mode) }
+    }
+
+    @objc private func stopInteractiveRecording() {
+        guard InteractiveTestRuntime.isEnabled,
+              appState.barPhase == .recording || appState.barPhase == .preparing else { return }
+        requestHotkeyStop()
+    }
+
     private func makeStatusMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(statusMenuItem(L("设置", "Settings"), action: #selector(openSettingsFromStatusMenu)))
@@ -401,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func registerHotkeys(for provider: ASRProvider) {
+        guard !InteractiveTestRuntime.isEnabled else { return }
         let availableModes = appState.availableModes
         let modes = ASRProviderRegistry.supportedModes(from: availableModes, for: provider)
         let bindings: [ModeBinding] = modes.compactMap { mode in
@@ -515,6 +646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyRetryCount = 0
 
     private func startHotkeyWithRetry() {
+        guard !InteractiveTestRuntime.isEnabled else { return }
         let success = hotkeyManager.start()
         AppLogger.log("[Muse] Hotkey setup: \(success ? "OK" : "FAILED (need Accessibility permission)")")
         DebugFileLogger.log("hotkey setup \(success ? "OK" : "FAILED need accessibility")")
@@ -592,6 +724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static var openSetupAction: (() -> Void)?
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard !InteractiveTestRuntime.isEnabled else { return }
         // Synchronous kill: don't rely on async Task, app exits immediately after this returns
         SenseVoiceServerManager.killAllServerProcesses()
     }
@@ -599,10 +732,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - URL Scheme Handling
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard !InteractiveTestRuntime.isEnabled else { return }
         AppURLCommandHandler.handle(urls)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !InteractiveTestRuntime.isEnabled else { return false }
         if !flag {
             openSettingsWindow()
         }
@@ -611,6 +746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openSettingsWindow(preferManualWindow: Bool = false) {
+        guard !InteractiveTestRuntime.isEnabled else { return }
         settingsWindowPresenter.open(
             preferManualWindow: preferManualWindow,
             appState: appState,

@@ -6,9 +6,12 @@ import Foundation
 /// 早期版本曾用旧项目名目录，已由 `KeychainService.migrateAppSupportDirectory()` 一次性并入本目录。
 enum AppPaths {
 
-    /// 应用支持目录（仅计算路径，不保证目录已创建）。
+    /// 应用支持目录（仅计算路径，不保证目录已创建）。独立交互测试包使用显式隔离目录。
     static var supportDir: URL {
-        FileManager.default
+        if InteractiveTestRuntime.isEnabled {
+            return InteractiveTestRuntime.supportDirectory
+        }
+        return FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Muse", isDirectory: true)
     }

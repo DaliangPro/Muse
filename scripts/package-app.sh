@@ -116,6 +116,10 @@ APP_NAME="${APP_NAME:-Muse}"
 APP_EXECUTABLE="Muse"
 APP_ICON_NAME="AppIcon"
 APP_BUNDLE_ID="${APP_BUNDLE_ID:-pro.daliang.muse}"
+APP_URL_SCHEME="muse"
+if [ "$APP_BUNDLE_ID" = "pro.daliang.muse.interactive-test" ]; then
+    APP_URL_SCHEME="muse-interactive-test"
+fi
 APP_VERSION="${APP_VERSION:-2.0.0}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
@@ -359,7 +363,7 @@ cat >"$INFO_PLIST" <<EOF
             <string>${APP_BUNDLE_ID}</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>muse</string>
+                <string>${APP_URL_SCHEME}</string>
             </array>
         </dict>
     </array>
