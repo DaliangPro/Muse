@@ -413,7 +413,10 @@ actor RecognitionSession {
         DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
 
         if effectiveMode.kind == .voicePolish {
-            let level = VoicePolishSettings.contextLevel()
+            // 轻度管线只接收规范化正文，不读取附近文字；标准模式保留完整上下文。
+            let level: WritingContextLevel = effectiveMode.voicePolishQualityMode == .light
+                ? .metadataOnly
+                : VoicePolishSettings.contextLevel()
             let capture = writingContextCapture
             writingContextTask = Task { await capture(level) }
             writingContextTaskSessionID = sessionID
@@ -1321,16 +1324,18 @@ actor RecognitionSession {
                 writingContextTaskSessionID = nil
             } else {
                 writingContext = WritingContext(
-                    level: VoicePolishSettings.contextLevel(
-                        defaults: vocabularyContext.userDefaults
-                    ),
+                    level: mode.voicePolishQualityMode == .light
+                        ? .metadataOnly
+                        : VoicePolishSettings.contextLevel(defaults: vocabularyContext.userDefaults),
                     safety: .unknown
                 )
             }
             let recentInputContextEnabled = VoicePolishSettings.recentInputContextEnabled(
                 defaults: vocabularyContext.userDefaults
             )
-            if recentInputContextEnabled {
+            let usesRecentInputContext = recentInputContextEnabled
+                && mode.voicePolishQualityMode != .light
+            if usesRecentInputContext {
                 let recentInputs = await voicePolishRecentInputStore.recentInputs(
                     applicationBundleID: writingContext.applicationBundleID
                 )
