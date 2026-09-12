@@ -2,154 +2,104 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishDedicatedContentReviewTests: XCTestCase {
-    func testRiskySourceReceivesContentOnlyReviewBeforeLayoutEvenWithoutRepair() async throws {
+    func testRiskySourceStillUsesOnlyTwoFullTextStages() async throws {
         let source = "先别发送，等我确认。材料已经备齐。"
-        let contentReview = #"{"delivery":"direct_reply","editor_spans":[],"edits":[]}"#
-        let layout = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]},{"style":"paragraph","segment_ids":["c2"]}]}"#
-        XCTAssertTrue(VoicePolishEditingReview.hasSourceReviewRisk(source))
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, contentReview, layout])
-        assertSuccess(result, calls: calls, text: "先别发送，等我确认。\n\n材料已经备齐。", attempts: 3, repairs: 0)
-        guard calls.count == 3 else { return }
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishAnalyze, .voicePolishAnalyze])
-        let second = try payload(calls[1]), third = try payload(calls[2])
-        XCTAssertNil(second["layout_segments"])
-        XCTAssertEqual(second["canonical_text"] as? String, source)
-        XCTAssertEqual(second["draft_text"] as? String, source)
-        XCTAssertEqual(calls[1].system, VoicePolishEditingPrompts.standardContentReview)
-        XCTAssertEqual(calls[2].system, VoicePolishEditingPrompts.review)
-        XCTAssertEqual(third["layout_segments"] as? [[String: String]], [
-            ["id": "c1", "text": "先别发送，等我确认。"], ["id": "c2", "text": "材料已经备齐。"]
-        ])
+        let structured = "先别发送，等我确认。\n\n材料已经备齐。"
+        let (result, calls) = await run(source, [source, structured])
+        assertSuccess(result, calls: calls, text: structured, attempts: 2, repairs: 0)
+        guard calls.count == 2 else { return }
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(calls[0].system, VoicePolishEditingPrompts.light)
+        XCTAssertEqual(calls[1].system, VoicePolishEditingPrompts.standard)
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": source])
     }
 
-    func testDistantOwnerCorrectionKeepsValidReasonAndBindsRepairedDraft() async throws {
+    func testDistantOwnerCorrectionAndReasonArePassedToStructureTogether() async throws {
         let source = "阿文负责复查。共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。阿文要出差，复查改由阿宁。"
-        let repaired = "阿宁负责复查。共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。阿文要出差。"
-        let contentReview = #"{"delivery":"delegated_task","editor_spans":[],"edits":[{"before":"阿文负责复查。","after":"阿宁负责复查。","kind":"correction","evidence":"复查改由阿宁。"},{"before":"阿文要出差，复查改由阿宁。","after":"阿文要出差。","kind":"correction"}]}"#
-        let layout = #"{"delivery":"delegated_task","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1","c6"]},{"style":"paragraph","segment_ids":["c2","c3","c4","c5"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, contentReview, layout])
-        assertSuccess(result, calls: calls, text: "阿宁负责复查。阿文要出差。\n\n共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。", attempts: 3, repairs: 1)
-        guard calls.count == 3 else { return }
-        let second = try payload(calls[1]), third = try payload(calls[2])
-        XCTAssertNil(second["layout_segments"])
-        XCTAssertEqual(second["draft_text"] as? String, source)
-        XCTAssertEqual(third["canonical_text"] as? String, source)
-        XCTAssertEqual(third["draft_text"] as? String, repaired)
-        XCTAssertEqual(third["layout_segments"] as? [[String: String]], [
-            ["id": "c1", "text": "阿宁负责复查。"],
-            ["id": "c2", "text": "共享材料使用带日期的文件。"],
-            ["id": "c3", "text": "访问范围保持为项目成员，外部链接暂时不开放。"],
-            ["id": "c4", "text": "设备报错先记录原话，尚未确认的原因不要自行补充。"],
-            ["id": "c5", "text": "检查名单时先标记重复记录，再等我确认。"],
-            ["id": "c6", "text": "阿文要出差。"]
-        ])
+        let prepared = "阿宁负责复查。共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。阿文要出差。"
+        let structured = "阿宁负责复查。阿文要出差。\n\n共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。"
+        let (result, calls) = await run(source, [prepared, structured])
+        assertSuccess(result, calls: calls, text: structured, attempts: 2, repairs: 0)
+        guard calls.count == 2 else { return }
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
     }
 
-    func testClearingRiskCueInFirstDraftCannotSkipDedicatedReview() async throws {
+    func testFirstStageCleanupDoesNotSkipStructure() async throws {
         let source = "帮我整理一下：资料已备齐。"
-        let initial = #"{"edits":[{"before":"帮我整理一下：","after":"","kind":"directive"}]}"#
-        let contentReview = #"{"delivery":"direct_reply","editor_spans":["帮我整理一下："],"edits":[]}"#
-        let layout = #"{"delivery":"direct_reply","editor_spans":["帮我整理一下："],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertTrue(VoicePolishEditingReview.hasSourceReviewRisk(source))
-        XCTAssertFalse(VoicePolishEditingReview.hasSourceReviewRisk("资料已备齐。"))
-        let (result, calls) = await run(source, [initial, contentReview, layout])
-        assertSuccess(result, calls: calls, text: "资料已备齐。", attempts: 3, repairs: 0)
-        guard calls.count == 3 else { return }
-        let second = try payload(calls[1])
-        XCTAssertNil(second["layout_segments"])
-        XCTAssertEqual(second["canonical_text"] as? String, source)
-        XCTAssertEqual(second["draft_text"] as? String, "资料已备齐。")
+        let prepared = "资料已备齐。"
+        let (result, calls) = await run(source, [prepared, prepared])
+        assertSuccess(result, calls: calls, text: prepared, attempts: 2, repairs: 0)
+        guard calls.count == 2 else { return }
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
     }
 
-    func testContentReviewCannotSmuggleLayoutField() async {
+    // 旧协议解析器单独保留反例，实际标准链不再调用它。
+    func testLegacyContentReviewCannotSmuggleLayoutField() {
         let source = "先别发送，等我确认。"
         let wrongReview = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, wrongReview, wrongReview])
-        assertFallback(result, calls: calls, source: source, attempts: 2, repairs: 0, code: .invalidStructuredResponse)
+        XCTAssertThrowsError(try VoicePolishEditingReview.decode(wrongReview, source: source))
     }
 
-    func testLayoutUsesActualRepairedSentenceBoundaries() async throws {
+    func testStructureReceivesActualCorrectedSentenceBoundaries() async throws {
         let source = "帮我整理一下：先检查，再发送。"
-        let initial = #"{"edits":[{"before":"帮我整理一下：","after":"","kind":"directive"}]}"#
-        let contentReview = #"{"delivery":"other_or_uncertain","editor_spans":["帮我整理一下："],"edits":[{"before":"先检查，再发送。","after":"先检查。再发送。","kind":"punctuation"}]}"#
-        let layout = #"{"delivery":"other_or_uncertain","editor_spans":["帮我整理一下："],"edits":[],"layout":[{"style":"numbered","segment_ids":["c1"]},{"style":"numbered","segment_ids":["c2"]}]}"#
-        let (result, calls) = await run(source, [initial, contentReview, layout])
-        assertSuccess(result, calls: calls, text: "1. 先检查。\n\n2. 再发送。", attempts: 3, repairs: 1)
-        guard calls.count == 3 else { return }
-        let second = try payload(calls[1]), third = try payload(calls[2])
-        XCTAssertNil(second["layout_segments"])
-        XCTAssertEqual(second["draft_text"] as? String, "先检查，再发送。")
-        XCTAssertEqual(third["draft_text"] as? String, "先检查。再发送。")
-        XCTAssertEqual(third["canonical_text"] as? String, source)
-        XCTAssertEqual(third["layout_segments"] as? [[String: String]], [
-            ["id": "c1", "text": "先检查。"], ["id": "c2", "text": "再发送。"]
-        ])
+        let prepared = "先检查。再发送。"
+        let structured = "1. 先检查。\n\n2. 再发送。"
+        let (result, calls) = await run(source, [prepared, structured])
+        assertSuccess(result, calls: calls, text: structured, attempts: 2, repairs: 0)
+        guard calls.count == 2 else { return }
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
     }
 
-    func testThirdCallCannotRequestAnotherRepairOrStartFourthCall() async {
+    func testSecondStageNeverConsumesAdditionalReviewOrRepairResponses() async {
         let source = "先别发送，等我确认。"
-        let contentReview = #"{"delivery":"direct_reply","editor_spans":[],"edits":[]}"#
-        let furtherRepair = #"{"delivery":"direct_reply","editor_spans":[],"edits":[{"before":"确认","after":"回复","kind":"word"}],"layout":[]}"#
-        let unusedFourth = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, contentReview, furtherRepair, unusedFourth])
-        assertFallback(result, calls: calls, source: source, attempts: 3, repairs: 0, code: .planIntegrityFailure)
+        let (result, calls) = await run(source, [source, source, "不应读取的复核", "不应读取的修复"])
+        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
     }
 
-    func testPublicCorrectionIsReviewedWithoutDeletingRecipientExplanation() async {
+    func testPublicCorrectionExplanationIsPassedThroughBothStages() async {
         let source = "公开更正：原通知时间说错了，请以本通知为准。"
-        let contentReview = #"{"delivery":"direct_reply","editor_spans":[],"edits":[]}"#
-        let layout = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertTrue(VoicePolishEditingReview.hasSourceReviewRisk(source))
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, contentReview, layout])
-        assertSuccess(result, calls: calls, text: source, attempts: 3, repairs: 0)
+        let (result, calls) = await run(source, [source, source])
+        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
     }
 
-    func testDownstreamProhibitionIsReviewedWithoutBecomingEditorDeletion() async {
+    func testDownstreamProhibitionIsPassedThroughWithoutEditorDeletionProtocol() async {
         let source = "请转告同事：先别按旧安排发送，等我确认后再发。"
-        let contentReview = #"{"delivery":"delegated_task","editor_spans":[],"edits":[]}"#
-        let layout = #"{"delivery":"delegated_task","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertTrue(VoicePolishEditingReview.hasSourceReviewRisk(source))
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, contentReview, layout])
-        assertSuccess(result, calls: calls, text: source, attempts: 3, repairs: 0)
+        let (result, calls) = await run(source, [source, source])
+        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
     }
 
     func testOrdinaryShortSentenceKeepsTwoCallStandardRoute() async throws {
         let source = "材料已经备齐。"
-        let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertFalse(VoicePolishEditingReview.hasSourceReviewRisk(source))
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, layout])
+        let (result, calls) = await run(source, [source, source])
         assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
         guard calls.count == 2 else { return }
-        XCTAssertNotNil(try payload(calls[1])["layout_segments"])
-        XCTAssertEqual(calls[1].system, VoicePolishEditingPrompts.review)
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": source])
+        XCTAssertEqual(calls[1].system, VoicePolishEditingPrompts.standard)
     }
 
     func testOrdinaryWordCorrectionDoesNotAddDedicatedCall() async throws {
         let source = "请按装软件。"
-        let initial = #"{"edits":[{"before":"按装","after":"安装","kind":"word"}]}"#
-        let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertFalse(VoicePolishEditingReview.hasSourceReviewRisk(source))
-        let (result, calls) = await run(source, [initial, layout])
-        assertSuccess(result, calls: calls, text: "请安装软件。", attempts: 2, repairs: 0)
+        let prepared = "请安装软件。"
+        let (result, calls) = await run(source, [prepared, prepared])
+        assertSuccess(result, calls: calls, text: prepared, attempts: 2, repairs: 0)
         guard calls.count == 2 else { return }
-        XCTAssertEqual(try payload(calls[1])["draft_text"] as? String, "请安装软件。")
-        XCTAssertNotNil(try payload(calls[1])["layout_segments"])
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
     }
 
-    func testInvalidContentRepairStopsBeforeLayoutAndRecordsAttempt() async {
+    func testUnsafeFirstStageStopsBeforeStructureAndKeepsOriginalSource() async {
         let source = "帮我整理一下：资料还没核对。"
-        let invalidRepair = #"{"delivery":"direct_reply","editor_spans":[],"edits":[{"before":"资料还没核对。","after":"资料已经核对。","kind":"content","evidence":"资料还没核对。"}]}"#
-        let unusedLayout = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, invalidRepair, unusedLayout])
-        assertFallback(result, calls: calls, source: source, attempts: 2, repairs: 1, code: .planIntegrityFailure)
+        let (result, calls) = await run(source, ["资料\u{0000}还没核对。", "不应调用结构整理"])
+        assertFallback(result, calls: calls, source: source, attempts: 1, repairs: 0, code: .unsafeCharacters)
     }
 
-    func testUnappliedEditorSpanStopsContentReviewBeforeLayout() async {
+    func testLegacyReviewReportsUnappliedEditorSpanWithoutDeletingIt() throws {
         let source = "帮我整理一下：资料已备齐。"
         let contentReview = #"{"delivery":"direct_reply","editor_spans":["帮我整理一下："],"edits":[]}"#
-        let unusedLayout = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, contentReview, unusedLayout])
-        assertFallback(result, calls: calls, source: source, attempts: 2, repairs: 0, code: .planIntegrityFailure)
+        let review = try VoicePolishEditingReview.decode(contentReview, source: source)
+        XCTAssertTrue(review.containsUnappliedEditorInstruction(in: source))
+        XCTAssertFalse(review.containsUnappliedEditorInstruction(in: "资料已备齐。"))
     }
 
     func testLightPreservesProhibitionWithoutRoleReviewOrLayout() async throws {

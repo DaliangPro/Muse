@@ -18,6 +18,7 @@ final class MuseAppMenuBarTests: XCTestCase {
         XCTAssertEqual(panel.level, .floating)
         XCTAssertEqual(buttons.map(\.title), menu.items.map(\.title))
         XCTAssertEqual(buttons.map(\.action), menu.items.map(\.action))
+        XCTAssertTrue(buttons.allSatisfy { content.bounds.contains($0.frame) })
         XCTAssertTrue(buttons.allSatisfy { $0.keyEquivalent.isEmpty })
         XCTAssertTrue(content.subviews.compactMap { $0 as? NSTextField }.contains {
             $0.stringValue == "先点选空白输入框，再开始录音"
@@ -29,11 +30,11 @@ final class MuseAppMenuBarTests: XCTestCase {
         let menu = AppDelegate.makeInteractiveTestStatusMenu(target: nil)
 
         XCTAssertEqual(menu.items.map(\.title), [
-            "准备录音与上屏权限", "开始轻度录音", "开始直出录音", "停止并上屏", "退出测试",
+            "准备录音与上屏权限", "开始轻度录音", "开始标准录音", "开始直出录音", "停止并上屏", "退出测试",
         ])
         XCTAssertEqual(menu.items.compactMap { $0.action.map(NSStringFromSelector) }, [
             "prepareInteractiveTestPermissions", "startInteractiveLightRecording",
-            "startInteractiveDirectRecording", "stopInteractiveRecording", "quitFromStatusMenu",
+            "startInteractiveStandardRecording", "startInteractiveDirectRecording", "stopInteractiveRecording", "quitFromStatusMenu",
         ])
         XCTAssertTrue(menu.items.allSatisfy { $0.keyEquivalent.isEmpty })
     }

@@ -1683,6 +1683,103 @@ def v11_light_stage_contract(row: dict, payloads: list) -> tuple[list[str], list
     return ["voicePolishRender"], failures
 
 
+def decode_v12_standard_payload(raw: str, source: str, expected_requirements: str = "") -> dict:
+    """结构请求的可选偏好必须来自独立预期，不能由请求自己声明授权来源。"""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("v12 结构请求不允许重复字段")
+            result[key] = value
+        return result
+
+    if not isinstance(expected_requirements, str):
+        raise ValueError("v12 显式偏好来源必须是字符串")
+    expected = {"canonical_text": source}
+    if not v11_foundation_whitespace_only(expected_requirements):
+        expected["additional_requirements"] = expected_requirements
+    payload = json.loads(raw, object_pairs_hook=unique_object)
+    if (not isinstance(payload, dict) or set(payload) != set(expected)
+            or any(not isinstance(payload[key], str)
+                   or payload[key].encode("utf-8") != value.encode("utf-8") for key, value in expected.items())):
+        raise ValueError("v12 结构请求必须逐字绑定首稿及独立提供的显式偏好")
+    return payload
+
+
+def v12_standard_stage_contract(row: dict, payloads: list) -> tuple[list[str], list[str]]:
+    """两次串行完整正文的证据契约；不恢复旧补丁、布局或语义门禁。"""
+    source, stages, fallback = row["canonical_input"], row["stage_responses"], row.get("fallback_used")
+    allowed, failures = ["voicePolishRender", "voicePolishStructured"], []
+    if not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0:
+        failures.append("v12 标准必须明确记录零次修复")
+    if any(payload is None for payload in payloads):
+        failures.append("v12 标准请求正文不可审计")
+    if any(not valid_integer(stage.get("attempt_ordinal")) for stage in stages):
+        failures.append("v12 标准阶段序号必须是真正的整数")
+    if row.get("diagnostic_codes") != []:
+        failures.append("v12 标准没有额外语义诊断阶段")
+
+    reason, codes = row.get("failure_reason"), row.get("hard_validation_codes")
+    if fallback:
+        if row.get("model_output") != source:
+            failures.append("v12 标准失败必须交付最初完整 canonical 原文，不能交付首稿")
+        expected_codes = {"validationFailed": {"emptyOutput", "unsafeCharacters", "abnormalLength"},
+                          "timeout": {"emptyOutput"}, "requestFailed": {"emptyOutput"}}
+        if (not isinstance(reason, str) or reason not in expected_codes or not isinstance(codes, list)
+                or len(codes) != 1 or not isinstance(codes[0], str) or codes[0] not in expected_codes[reason]):
+            failures.append("v12 标准回退原因与传输安全错误码不匹配")
+    elif reason is not None or codes != []:
+        failures.append("v12 标准成功输出同时声称请求或传输安全失败")
+
+    draft, stopped, returned_failure_code = None, False, None
+    for index, stage in enumerate(stages):
+        if stopped:
+            failures.append("v12 标准在前一阶段失败后仍发起了下一请求")
+        if index and stages[index - 1].get("status") != "succeeded":
+            failures.append("v12 结构整理未等待校对正文成功返回")
+        if index:
+            try:
+                previous_end = datetime.fromisoformat(stages[index - 1]["finished_at"].replace("Z", "+00:00"))
+                current_start = datetime.fromisoformat(stage["started_at"].replace("Z", "+00:00"))
+                if current_start < previous_end:
+                    failures.append("v12 两阶段请求的时间记录发生重叠")
+            except (KeyError, AttributeError, TypeError, ValueError):
+                failures.append("v12 缺少可证明串行执行的阶段时间")
+        if stage.get("status") != "succeeded":
+            stopped = True
+            continue
+        raw = stage.get("response_text")
+        try:
+            raw_bytes = raw.encode("utf-8")
+        except (AttributeError, UnicodeError):
+            failures.append("v12 实际响应不是有效 UTF-8 正文")
+            stopped = True
+            continue
+        draft = raw
+        code = ("emptyOutput" if v11_foundation_whitespace_only(raw) else "unsafeCharacters" if v7_unsafe_characters(raw)
+                else "abnormalLength" if len(raw_bytes) > 1_048_576 else None)
+        if code:
+            stopped = True
+            returned_failure_code = code
+            if not fallback or reason != "validationFailed" or codes != [code]:
+                failures.append(f"v12 标准实际响应未按 {code} 整篇回退")
+
+    if fallback:
+        if reason == "validationFailed" and returned_failure_code is None:
+            # 没有完整正文时，仅客户端的截断/超限异常会映射为 abnormalLength。
+            if not stages or stages[-1].get("status") == "succeeded" or codes != ["abnormalLength"]:
+                failures.append("v12 标准没有对应的不安全正文或截断请求，不能冒充校验回退")
+        # 请求失败不产生新正文；第二请求失败时，Swift 保留第一实际稿供显式诊断。
+        if row.get("rejected_model_output") != draft:
+            failures.append("v12 标准被拒绝稿未绑定最近实际返回的完整正文")
+    else:
+        if row.get("rejected_model_output") is not None:
+            failures.append("v12 标准成功结果伪造了被拒绝稿")
+        if len(stages) != 2 or stopped or row.get("model_output") != draft:
+            failures.append("v12 标准成功必须逐字交付第二次实际返回的完整正文")
+    return allowed, failures
+
+
 def v7_payload_field_failures(payload: dict, mode: str, stage_index: int, *,
                               separates_content_review: bool = False) -> list[str]:
     """按当前 Payload 构造闭合字段；本 Runner 的 nil 可选值必须省略。"""
@@ -1879,6 +1976,8 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                     started: datetime, finished: datetime) -> tuple[list[str], list[str]]:
     """证据失败与质量失败分开；这里不自动授予 direct_send 或发布通过。"""
     failures, quality = [], []
+    is_v12 = expected["editing_prompt_version"] == 12
+    plain_text_protocol = is_v12 or (expected["editing_prompt_version"] == 11 and mode == "light")
     pairs = {
         "schema_version": 5, "status": "complete", "mode": mode, "quality_mode": mode,
         "run_nonce": nonce, "process_id": process_id, "run_input_sha256": expected["run_input_sha256"],
@@ -1941,7 +2040,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
-            if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11) and (
+            if (is_v12 or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11)) and (
                 not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
             ):
                 failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
@@ -1956,7 +2055,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if is_v12 or expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -1968,7 +2067,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if is_v12 or expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -1998,8 +2097,16 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             elif stage.get("response_text") != "" or (stage.get("status") == "failed" and not stage.get("failure_reason")):
                 failures.append(f"{tid}: 失败阶段伪造正文或缺少失败原因")
             try:
-                if expected["editing_prompt_version"] == 11 and mode == "light":
-                    payloads.append(decode_v11_light_payload(stage["request_payload"], row["canonical_input"]))
+                if plain_text_protocol:
+                    # v12 标准第二请求只绑定第一实际正文；不能再次绑定原稿或塞入旧复核字段。
+                    body_source = (stages[ordinal - 2].get("response_text")
+                                   if is_v12 and mode == "standard" and ordinal > 1 else row["canonical_input"])
+                    if is_v12 and mode == "standard" and ordinal > 1:
+                        # 当前冻结 Runner 明确构造空偏好；不能从 payload 反推 expected_requirements。
+                        payloads.append(decode_v12_standard_payload(stage["request_payload"], body_source,
+                                                                   expected_requirements=""))
+                    else:
+                        payloads.append(decode_v11_light_payload(stage["request_payload"], body_source))
                     continue
                 payload = json.loads(stage["request_payload"])
                 if payload.get("mode") != mode or payload.get("canonical_text") != row.get("canonical_input"):
@@ -2053,7 +2160,13 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11):
+        if is_v12:
+            allowed, stage_failures = (v11_light_stage_contract(row, payloads) if mode == "light"
+                                       else v12_standard_stage_contract(row, payloads))
+            failures.extend(f"{tid}: {failure}" for failure in stage_failures)
+            if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > len(allowed):
+                failures.append(f"{tid}: v12 尝试数超出模式的固定调用预算")
+        elif expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11):
             allowed, stage_failures = (v7_stage_contract(row, payloads, mode, expected["editing_prompt_version"]) if expected["editing_prompt_version"] in (7, 8, 9, 10, 11)
                                        else v4_stage_contract(row, payloads, mode, expected["editing_prompt_version"]))
             failures.extend(f"{tid}: {failure}" for failure in stage_failures)
@@ -2069,7 +2182,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11) else 2
+        minimum_stages = len(allowed) if is_v12 or mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11) else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -2078,16 +2191,16 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
         if len(case_receipts) != len(successful):
             failures.append(f"{tid}: 成功阶段缺少一一对应 Provider 回执")
         for stage, receipt in zip(successful, case_receipts):
-            if expected["editing_prompt_version"] == 11 and mode == "light":
+            if plain_text_protocol:
                 try:
                     legacy.sha256_text(stage.get("response_text", ""))
                 except (AttributeError, UnicodeError):
-                    failures.append(f"{tid}: v11 响应不能绑定有效 UTF-8 哈希")
+                    failures.append(f"{tid}: 正文响应不能绑定有效 UTF-8 哈希")
                     continue
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9, 10, 11):
+        if not is_v12 and not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9, 10, 11):
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],

@@ -2641,6 +2641,222 @@ class ThreeModeEvidenceTests(unittest.TestCase):
         report["cases"][0]["repair_attempt_count"] = 0
         self.assertEqual(self.check(report, receipts, "direct"), ([], []))
 
+    def v12_standard_report(self, source="我我先核对。报价等财务回复。", first="我先核对。报价等财务回复。",
+                            final="我先核对。\n\n报价等财务回复。"):
+        self.text = source
+        self.inputs[0].update(spoken_input=source, segment_texts=[source])
+        report, receipts = self.report("standard")
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 12
+        row = report["cases"][0]
+        row.update(repair_attempt_count=0, model_output=final,
+                   canonical_segments=e.frozen_input_envelope(self.inputs[0])[1])
+        for i, (task, body, raw) in enumerate([
+            ("voicePolishRender", source, first), ("voicePolishStructured", first, final)
+        ]):
+            row["stage_responses"][i].update(task=task, response_text=raw,
+                request_payload=json.dumps({"canonical_text": body}, ensure_ascii=False))
+            receipts[i].update(llm_task=task, response_text_sha256=e.legacy.sha256_text(raw))
+        return report, receipts
+
+    def test_v12_light_keeps_v11_single_render_contract(self):
+        for raw in ["周三。", "  首尾\r\n\r空白 e\u0301 👩🏽‍💻\n", '{"edits":[]}', "与来源语义不同也只做证据审计"]:
+            report, receipts = self.v11_report(response=raw)
+            self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 12
+            self.assertEqual(self.check(report, receipts, "light"), ([], []))
+            for field, value in [("llm_attempt_count", 2), ("repair_attempt_count", 1),
+                                 ("model_output", "偷偷清洗正文")]:
+                changed = copy.deepcopy(report)
+                changed["cases"][0][field] = value
+                self.assertTrue(self.check(changed, receipts, "light")[0], field)
+        report, receipts = self.v11_report("甲", "\x00甲")
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 12
+        report["cases"][0].update(fallback_used=True, model_output="甲", failure_reason="validationFailed",
+            hard_validation_codes=["unsafeCharacters"], rejected_model_output="\x00甲")
+        failures, quality = self.check(report, receipts, "light")
+        self.assertEqual(failures, []); self.assertTrue(quality)
+
+    def test_v12_standard_binds_two_complete_plain_text_stages(self):
+        for first, final in [("校对稿。", "结构稿。"),
+                             ("  甲\r\n乙 e\u0301 👩🏽‍💻\t ", "  乙\r\n\r甲 é 👩🏽‍💻\t "),
+                             ('{"edits":[]}', '<think>正文标签</think>\n润色后：{"text":"甲"}')]:
+            report, receipts = self.v12_standard_report(first=first, final=final)
+            self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+        # 本检查只保证实际正文与请求/交付一致，不用语义、扩写比例或行文样式拒绝响应。
+        report, receipts = self.v12_standard_report(first="乙" * 300, final="丙" * 600)
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+
+    def test_v12_standard_rejects_source_task_or_output_tampering(self):
+        for index in (0, 1):
+            for payload in ["{}", "[]", '"正文"', "null", '{"canonical_text":null}',
+                            '{"canonical_text":"错误来源"}',
+                            '{"canonical_text":"甲","canonical_text":"甲"}',
+                            r'{"canonical_text":"甲","\u0063anonical_text":"甲"}',
+                            r'{"canonical_text":"\ud800"}']:
+                report, receipts = self.v12_standard_report()
+                report["cases"][0]["stage_responses"][index]["request_payload"] = payload
+                self.assertTrue(self.check(report, receipts, "standard")[0], (index, payload))
+            for field, value in [("schema_version", 12), ("mode", "standard"), ("source_segments", []),
+                                 ("authorized_context", []), ("draft_text", "首稿"), ("layout_segments", [])]:
+                report, receipts = self.v12_standard_report()
+                self.v7_payload(report, index, **{field: value})
+                self.assertTrue(self.check(report, receipts, "standard")[0], (index, field))
+            report, receipts = self.v12_standard_report()
+            report["cases"][0]["stage_responses"][index]["task"] = receipts[index]["llm_task"] = "voicePolishAnalyze"
+            self.assertTrue(self.check(report, receipts, "standard")[0])
+        report, receipts = self.v12_standard_report()
+        self.v7_payload(report, 1, canonical_text=self.text)
+        self.assertTrue(self.check(report, receipts, "standard")[0], "第二请求不能重新读原稿")
+        for field, value in [("canonical_segments", []), ("resolved_entities", [{"surface_text": "伪造"}]),
+                             ("pre_resolution_canonical_input", "伪造来源"), ("context_fixture", {})]:
+            report, receipts = self.v12_standard_report()
+            report["cases"][0][field] = value
+            self.assertTrue(self.check(report, receipts, "standard")[0], field)
+        for raw, changed in [(" 甲 ", "甲"), ("甲\r\n乙", "甲\n乙"), ("e\u0301", "é"),
+                             ("甲\n\n甲", "甲"), ("甲乙", "甲")]:
+            report, receipts = self.v12_standard_report(final=raw)
+            report["cases"][0]["model_output"] = changed
+            self.assertTrue(self.check(report, receipts, "standard")[0], repr(raw))
+            report, receipts = self.v12_standard_report(first=raw)
+            self.v7_payload(report, 1, canonical_text=changed)
+            self.assertTrue(self.check(report, receipts, "standard")[0], "第二请求不能清洗首稿")
+        for raw in (None, 1, "\ud800"):
+            report, receipts = self.v12_standard_report()
+            report["cases"][0]["stage_responses"][1]["response_text"] = raw
+            self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v12_standard_failure_preserves_original_and_stops(self):
+        for failing_index in (0, 1):
+            for reason, code in [("timeout", "emptyOutput"), ("requestFailed", "emptyOutput"),
+                                 ("validationFailed", "abnormalLength")]:
+                report, receipts = self.v12_standard_report()
+                row = report["cases"][0]
+                first = row["stage_responses"][0]["response_text"]
+                row["stage_responses"] = row["stage_responses"][:failing_index + 1]
+                row["stage_responses"][-1].update(status="failed", response_text="", failure_reason="单元测试客户端异常")
+                row.update(fallback_used=True, model_output=self.text, failure_reason=reason,
+                    hard_validation_codes=[code], llm_call_count=failing_index, llm_attempt_count=failing_index + 1,
+                    rejected_model_output=first if failing_index else None)
+                failures, quality = self.check(report, receipts[:failing_index], "standard")
+                self.assertEqual(failures, [], (failing_index, reason)); self.assertTrue(quality)
+                for field, value in [("model_output", first), ("rejected_model_output", "不存在的模型稿"),
+                                     ("hard_validation_codes", []), ("hard_validation_codes", [[]]),
+                                     ("failure_reason", None), ("failure_reason", [])]:
+                    changed = copy.deepcopy(report); changed["cases"][0][field] = value
+                    self.assertTrue(self.check(changed, receipts[:failing_index], "standard")[0], field)
+                if failing_index:
+                    row.update(hard_validation_codes=["unsafeCharacters"], failure_reason="validationFailed")
+                    self.assertTrue(self.check(report, receipts[:1], "standard")[0], "无正文的请求失败不能伪造字符门禁")
+        for started_count in (0, 1):
+            for reason in ("timeout", "requestFailed"):
+                report, receipts = self.v12_standard_report()
+                row = report["cases"][0]
+                draft = row["stage_responses"][0]["response_text"] if started_count else None
+                row.update(stage_responses=row["stage_responses"][:started_count], llm_call_count=started_count,
+                    llm_attempt_count=started_count, fallback_used=True, model_output=self.text,
+                    failure_reason=reason, hard_validation_codes=["emptyOutput"], rejected_model_output=draft)
+                failures, quality = self.check(report, receipts[:started_count], "standard")
+                self.assertEqual(failures, []); self.assertTrue(quality)
+        report, receipts = self.v12_standard_report()
+        row = report["cases"][0]
+        row["stage_responses"][0].update(status="failed", response_text="", failure_reason="首阶段失败")
+        row.update(fallback_used=True, model_output=self.text, failure_reason="requestFailed",
+                   hard_validation_codes=["emptyOutput"], llm_call_count=1)
+        self.v7_payload(report, 1, canonical_text="")
+        self.assertTrue(self.check(report, receipts[1:], "standard")[0], "首阶段失败后不得继续结构请求")
+
+    def test_v12_standard_rejects_third_attempt_or_repair(self):
+        for field, value in [("llm_call_count", 1), ("llm_call_count", True), ("llm_attempt_count", 1),
+                             ("llm_attempt_count", 3), ("repair_attempt_count", 1),
+                             ("repair_attempt_count", False), ("internal_chunk_count", 2),
+                             ("rejected_model_output", "伪造拒绝稿")]:
+            report, receipts = self.v12_standard_report()
+            report["cases"][0][field] = value
+            self.assertTrue(self.check(report, receipts, "standard")[0], field)
+        report, receipts = self.v12_standard_report()
+        row = report["cases"][0]
+        row["stage_responses"][0]["attempt_ordinal"] = True
+        self.assertTrue(self.check(report, receipts, "standard")[0])
+        report, receipts = self.v12_standard_report()
+        row = report["cases"][0]
+        row["stage_responses"].append(copy.deepcopy(row["stage_responses"][-1]))
+        row["stage_responses"][-1].update(attempt_ordinal=3)
+        row.update(llm_call_count=3, llm_attempt_count=3)
+        receipts.append(copy.deepcopy(receipts[-1]))
+        receipts[-1].update(request_ordinal=3, provider_response_id="unit-test-only-v12-third",
+            request_binding_sha256=e.legacy.provider_request_binding_sha256(self.nonce, "fixture-01", 3, "e" * 64))
+        self.assertTrue(self.check(report, receipts, "standard")[0])
+        report, receipts = self.v12_standard_report()
+        row = report["cases"][0]
+        row.update(stage_responses=row["stage_responses"][:1], llm_call_count=1, llm_attempt_count=1,
+                   model_output=row["stage_responses"][0]["response_text"])
+        self.assertTrue(self.check(report, receipts[:1], "standard")[0], "首稿不能冒充标准成功")
+        report, receipts = self.v12_standard_report()
+        report["cases"][0]["stage_responses"][1]["started_at"] = (self.now - timedelta(milliseconds=1)).isoformat()
+        self.assertTrue(self.check(report, receipts, "standard")[0], "两个请求不能并行")
+
+    def test_v12_standard_transport_guards_apply_to_both_bodies(self):
+        for index in (0, 1):
+            for raw, code in [("", "emptyOutput"), (" \r\n\u0085\u200b", "emptyOutput"),
+                              ("甲\x00", "unsafeCharacters"), ("甲\ufdd0", "unsafeCharacters"),
+                              ("😀" * 262_144 + "甲", "abnormalLength")]:
+                report, receipts = self.v12_standard_report()
+                row = report["cases"][0]
+                self.v7_response(report, receipts, index, raw)
+                row.update(stage_responses=row["stage_responses"][:index + 1], llm_call_count=index + 1,
+                    llm_attempt_count=index + 1, fallback_used=True, model_output=self.text,
+                    failure_reason="validationFailed", hard_validation_codes=[code], rejected_model_output=raw)
+                failures, quality = self.check(report, receipts[:index + 1], "standard")
+                self.assertEqual(failures, [], (index, repr(raw[:20]))); self.assertTrue(quality)
+                row.update(fallback_used=False, failure_reason=None, hard_validation_codes=[],
+                           rejected_model_output=None, model_output=raw)
+                self.assertTrue(self.check(report, receipts[:index + 1], "standard")[0])
+        report, receipts = self.v12_standard_report(first="😀" * 262_144, final="😀" * 262_144)
+        self.assertEqual(self.check(report, receipts, "standard"), ([], []))
+
+    def test_v12_standard_requires_both_provider_receipts(self):
+        for mutation in ("missing", "http", "response", "nonce", "task", "running"):
+            report, receipts = self.v12_standard_report()
+            if mutation == "missing": receipts = receipts[:1]
+            elif mutation == "http": receipts[1]["http_status"] = 500
+            elif mutation == "response": receipts[1]["response_text_sha256"] = "0" * 64
+            elif mutation == "nonce": receipts[1]["run_nonce"] = "0" * 64
+            elif mutation == "task": receipts[1]["llm_task"] = "voicePolishAnalyze"
+            else: report["cases"][0]["stage_responses"][1]["status"] = "running"
+            self.assertTrue(self.check(report, receipts, "standard")[0], mutation)
+
+    def test_v12_standard_optional_requirements_need_an_independent_source(self):
+        source, requirements = "  校对正文\r\n", "  按事项分点，保留我的语气。\n"
+        payload = {"canonical_text": source, "additional_requirements": requirements}
+        raw = json.dumps(payload, ensure_ascii=False)
+        self.assertEqual(e.decode_v12_standard_payload(raw, source, requirements), payload)
+        with self.assertRaises(ValueError):
+            e.decode_v12_standard_payload(raw, source)
+        for changed in [requirements.strip(), "别的要求", None, 1]:
+            value = dict(payload, additional_requirements=changed)
+            with self.assertRaises(ValueError):
+                e.decode_v12_standard_payload(json.dumps(value, ensure_ascii=False), source, requirements)
+        with self.assertRaises(ValueError):
+            e.decode_v12_standard_payload(json.dumps({"canonical_text": source}), source, requirements)
+        for whitespace in ("", " \t\r\n", "\u0085\u200b"):
+            single = {"canonical_text": source}
+            self.assertEqual(e.decode_v12_standard_payload(json.dumps(single), source, whitespace), single)
+            with self.assertRaises(ValueError):
+                e.decode_v12_standard_payload(json.dumps(dict(single, additional_requirements=whitespace)),
+                                             source, whitespace)
+        # 当前 Runner 的偏好恒为空；不能拿实际请求中的字段作为它自己的来源证据。
+        for index in (0, 1):
+            report, receipts = self.v12_standard_report()
+            self.v7_payload(report, index, additional_requirements="请分点")
+            self.assertTrue(self.check(report, receipts, "standard")[0])
+
+    def test_v12_direct_still_has_zero_requests_and_repairs(self):
+        self.expected["editing_prompt_version"] = 12
+        report, receipts = self.report("direct")
+        report["cases"][0]["repair_attempt_count"] = 0
+        self.assertEqual(self.check(report, receipts, "direct"), ([], []))
+        report["cases"][0]["repair_attempt_count"] = False
+        self.assertTrue(self.check(report, receipts, "direct")[0])
+
     def test_input_limit_checks_both_sources_and_rejects_answers(self):
         for source_length, segment_length, valid in [(1000, 1000, True), (1001, 1, False), (1, 1001, False)]:
             inputs = copy.deepcopy(self.inputs)

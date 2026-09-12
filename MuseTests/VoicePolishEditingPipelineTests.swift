@@ -138,26 +138,24 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         ).isEmpty)
     }
 
-    func testStandardPartialTimeRequiresSemanticReviewAndCannotInventDate() async {
+    func testStandardPassesCorrectedPartialTimeToStructureWithoutSemanticReview() async throws {
         let source = "会议原定周三上午十点，培训安排周四上午十点。会议时间改成十点半，日期不变。培训安排也不变。"
-        let patch = #"{"edits":[{"before":"会议原定周三上午十点","after":"会议原定周三上午十点半","kind":"correction","evidence":"会议时间改成十点半，日期不变。"}]}"#
-        let good = source.replacingOccurrences(of: "会议原定周三上午十点", with: "会议原定周三上午十点半")
-        let client = EditingTestClient([.text(patch), .review(#"{"edits":[]}"#), .review(#"{"edits":[]}"#)])
+        let prepared = "会议改为周三上午十点半，培训安排周四上午十点。培训安排不变。"
+        let client = EditingTestClient([.text(prepared), .text(prepared)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, good)
-        XCTAssertEqual(result.llmAttemptCount, 3)
+        XCTAssertEqual(result.text, prepared)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.repairAttemptCount, 0)
+        let calls = await client.requests
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+                       ["canonical_text": prepared])
+        // 离线事实校验器仍保留跨日期反例，但标准运行链不调用它。
         XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
             sourceText: source, outputText: "会议改为周五上午十点半。", scene: .workChat,
             allowsPartialTimeReview: true
         ).isEmpty)
-        let wrong = #"{"edits":[{"before":"会议原定周三上午十点","after":"会议原定周四上午十点半","kind":"correction","evidence":"会议时间改成十点半，日期不变。"}]}"#
-        let repair = #"{"edits":[{"before":"会议原定周四上午十点半","after":"会议原定周三上午十点半","kind":"word"}]}"#
-        let correctionClient = EditingTestClient([.text(wrong), .review(repair), .review(#"{"edits":[]}"#)])
-        let corrected = await pipeline(correctionClient).process(request(source, .standard))
-        // 跨日期补丁缺少支持最终值的连续来源，必须在首稿阶段拒绝。
-        XCTAssertTrue(corrected.usedFallback)
-        XCTAssertEqual(corrected.llmAttemptCount, 1)
     }
 
     func testLightAcceptsMeaningPreservingEmphasisConsolidation() async {
@@ -190,22 +188,19 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
     }
 
-    func testStandardInlineEditingInstructionMustPassReviewOfActualDraft() async throws {
+    func testStandardPassesCompleteFirstDraftWithoutDirectiveReviewPayload() async throws {
         let source = "给客户回一下，我们会尽快核实。别先答应赔偿，费用还没确认。"
-        let patch = #"{"edits":[{"before":"给客户回一下，","after":"","kind":"directive"},{"before":"别先答应赔偿，","after":"","kind":"directive"}]}"#
-        let client = EditingTestClient([.text(patch), .review(#"{"edits":[]}"#), .review(#"{"edits":[]}"#)])
+        let structured = "给客户回一下，我们会尽快核实。\n\n别先答应赔偿，费用还没确认。"
+        let client = EditingTestClient([.text(source), .text(structured)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, "我们会尽快核实。费用还没确认。")
-        XCTAssertEqual(result.llmAttemptCount, 3)
+        XCTAssertEqual(result.text, structured)
+        XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishAnalyze, .voicePolishAnalyze])
-        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: Any])
-        XCTAssertEqual(payload["canonical_text"] as? String, source)
-        XCTAssertEqual(payload["draft_text"] as? String, result.text)
-        XCTAssertNotNil(payload["changes"] as? [[String: String]])
-        XCTAssertEqual(payload["mode"] as? String, "standard")
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+                       ["canonical_text": source])
     }
 
     func testLightNeverConsumesAnAvailableReviewOrRepairResponse() async {
@@ -269,17 +264,14 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     func testClockCorrectionCanInheritPeriodWithoutCalendarDate() async {
         let source = "会议下午三点，不对，三点半。"
         let output = "会议下午三点半。"
-        let patch = #"{"edits":[{"before":"下午三点，不对，三点半","after":"下午三点半","kind":"correction"}]}"#
         for mode in [VoicePolishQualityMode.light, .standard] {
-            var replies: [EditingTestClient.Step] = mode == .light
-                ? [.text(output)]
-                : [.text(patch), .review(#"{"edits":[]}"#)]
-            if mode == .standard { replies.append(.review(#"{"edits":[]}"#)) }
+            let replies: [EditingTestClient.Step] = mode == .light
+                ? [.text(output)] : [.text(output), .text(output)]
             let client = EditingTestClient(replies)
             let result = await pipeline(client).process(request(source, mode))
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, output)
-            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 3)
+            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 2)
         }
         XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(in: source), ["15:30"])
         XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
@@ -355,57 +347,44 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(output, "👨‍👩‍👧‍👦我安装软件，然后看看效果👍🏽。")
     }
 
-    func testStandardReviewsActualDraftWithFullSourceAndComputedDeletions() async throws {
+    func testStandardStructureReceivesOnlyActualDraftWithoutLegacyDiffFields() async throws {
         let source = "小李下午有别的事，所以请小周接手。"
-        let client = EditingTestClient([.text(#"{"edits":[]}"#), .review(#"{"edits":[]}"#)])
+        let client = EditingTestClient([.text(source), .text(source)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 2)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishAnalyze])
-        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: Any])
-        XCTAssertEqual(payload["canonical_text"] as? String, source)
-        XCTAssertEqual(payload["draft_text"] as? String, source)
-        XCTAssertEqual(payload["mode"] as? String, "standard")
-        XCTAssertNotNil(payload["changes"])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+                       ["canonical_text": source])
     }
 
-    func testStandardCanRepairMissingReasonAndMustConfirmActualRepairedDraft() async throws {
+    func testStandardKeepsReasonAcrossTwoStagesWithoutConsumingRepairResponse() async throws {
         let source = "小李有事，请小周接手。"
-        let client = EditingTestClient([
-            .text(#"{"edits":[{"before":"小李有事，","after":"","kind":"directive"}]}"#),
-            .review(#"{"edits":[{"before":"请小周","after":"小李有事，请小周","kind":"word"}]}"#),
-            .review(#"{"edits":[]}"#)
-        ])
+        let client = EditingTestClient([.text(source), .text(source), .text("不应读取的修复")])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, source)
-        XCTAssertEqual(result.llmAttemptCount, 3)
-        let calls = await client.requests
-        let firstReview = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: Any])
-        let changes = try XCTUnwrap(firstReview["changes"] as? [[String: String]])
-        XCTAssertTrue(changes.compactMap { $0["removed"] }.joined().contains("小李有事"))
-        let confirmation = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[2].user.utf8)) as? [String: Any])
-        XCTAssertEqual(confirmation["draft_text"] as? String, source)
-        XCTAssertEqual(confirmation["layout_segments"] as? [[String: String]], [["id": "c1", "text": source]])
-    }
-
-    func testStandardRejectsUnbackedReviewerPatch() async {
-        let source = "请小周接手。"
-        let client = EditingTestClient([
-            .text(#"{"edits":[]}"#),
-            .review(#"{"edits":[{"before":"请小周接手。","after":"小李请假了，请小周接手。","kind":"content","evidence":"小李请假了"}]}"#)
-        ])
-        let result = await pipeline(client).process(request(source, .standard))
-        XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.repairAttemptCount, 0)
+        let calls = await client.requests
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+                       ["canonical_text": source])
     }
 
-    func testStandardCannotAcceptUnbackedCurrencyEvenWhenReviewerPasses() async {
-        let client = EditingTestClient([.text(#"{"edits":[{"before":"一万六","after":"16000元","kind":"word"}]}"#), .review(#"{"edits":[]}"#)])
-        let result = await pipeline(client).process(request("预算是一万六。", .standard))
-        XCTAssertTrue(result.usedFallback)
-        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+    func testLegacyContentEditorRejectsUnbackedReviewerPatch() throws {
+        let source = "请小周接手。"
+        let edit = VoicePolishTextEdit(before: source, after: "小李请假了，请小周接手。",
+                                       kind: .content, evidence: "小李请假了")
+        XCTAssertThrowsError(try VoicePolishTextEditor.applyContentEdits([edit], to: source, source: source))
+    }
+
+    func testLegacyFactGuardRejectsUnbackedCurrency() {
+        let codes = VoicePolishEditingPipeline.outputCodes(
+            "预算是16000元。", request: request("预算是一万六。", .standard)
+        )
+        XCTAssertFalse(codes.isEmpty)
     }
 
     func testFactGuardAcceptsEquivalentBareNumbersAndUnitsButRejectsInventedOnes() {
@@ -424,14 +403,15 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         }
     }
 
-    func testStandardRejectsConfirmationThatStillWantsToRepair() async {
-        let patch = #"{"edits":[{"before":"请检查。","after":"请核对。","kind":"word"}]}"#
-        let more = #"{"edits":[{"before":"请核对。","after":"请检查。","kind":"word"}]}"#
-        let client = EditingTestClient([.text(#"{"edits":[]}"#), .review(patch), .review(more)])
-        let result = await pipeline(client).process(request("请检查。", .standard))
-        XCTAssertTrue(result.usedFallback)
-        XCTAssertEqual(result.llmAttemptCount, 3)
-        XCTAssertEqual(result.repairAttemptCount, 1)
+    func testStandardPreservesLiteralJSONInsteadOfTreatingItAsRepairRequest() async throws {
+        let source = #"请保留示例：{"edits":[]}"#
+        let structured = #"示例：{"edits":[]}"#
+        let client = EditingTestClient([.text(source), .text(structured), .text("不应读取")])
+        let result = await pipeline(client).process(request(source, .standard))
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, structured)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
     func testContextPayloadDoesNotExposeRawNearbyOrRecentInputFacts() throws {
@@ -443,7 +423,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertFalse(payload.contains("已授权的同应用近期输入"))
     }
 
-    func testEveryEditingStageKeepsSourceBoundariesAndCanonicalEntityMapping() async throws {
+    func testStandardStartsFromCanonicalEntityMappingThenUsesActualFirstDraft() async throws {
         let first = "请核对灵建的资料，这部分单独交代"
         let second = "文件权限，由运营组负责。"
         let source = first + second
@@ -460,43 +440,19 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
             resolvedEntities: [.init(surfaceText: "灵建", canonical: "灵简", sourceSegmentIDs: ["s1"],
                                      candidateSource: .authorizedContext, confidence: 1)]
         )
-        let initial = "请核对灵简的资料，这部分交代。文件权限，由运营组负责。"
-        let repaired = "请核对灵简的资料，这部分单独交代。文件权限，由运营组负责。"
-        let edit = VoicePolishTextEdit(before: "这部分交代", after: "这部分单独交代", kind: .word)
-        let repairJSON = String(decoding: try JSONEncoder().encode(["edits": [edit]]), as: UTF8.self)
-        let initialJSON = #"{"edits":[{"before":"这部分单独交代","after":"这部分交代","kind":"directive"},{"before":"交代文件权限","after":"交代。文件权限","kind":"punctuation"}]}"#
-        let client = EditingTestClient([.text(initialJSON), .review(repairJSON), .review(#"{"edits":[]}"#)])
+        let prepared = "请核对灵简的资料。这部分单独交代文件权限，由运营组负责。"
+        let structured = "请核对灵简的资料。\n\n这部分单独交代文件权限，由运营组负责。"
+        let client = EditingTestClient([.text(prepared), .text(structured)])
         let result = await VoicePolishEditingPipeline(client: client, config: config).process(originalRequest)
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.text, structured)
         let calls = await client.requests
-        XCTAssertEqual(calls.count, 3)
+        XCTAssertEqual(calls.count, 2)
         for (index, call) in calls.enumerated() {
-            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: Any])
-            XCTAssertEqual(payload["schema_version"] as? Int, VoicePolishEditingPrompts.version)
-            XCTAssertEqual(payload["canonical_text"] as? String, canonical)
-            XCTAssertEqual(payload["source_segments"] as? [[String: String]],
-                           [["id": "s1", "text": first], ["id": "s2", "text": second]])
-            XCTAssertEqual(payload["authorized_context"] as? [String], ["灵建 → 灵简"])
-            XCTAssertEqual(payload["draft_text"] as? String, index == 0 ? nil : (index == 1 ? initial : repaired))
-            if index == 0 {
-                XCTAssertNil(payload["review_focus"])
-                XCTAssertNil(payload["review_focus_total"])
-            } else {
-                let focus = try XCTUnwrap(payload["review_focus"] as? [[String: Any]])
-                XCTAssertNotNil(payload["changes"])
-                if index == 1 {
-                    XCTAssertEqual(focus.count, 1)
-                    XCTAssertEqual(payload["review_focus_total"] as? Int, 1)
-                    XCTAssertTrue(try XCTUnwrap(focus.first?["source_context"] as? String)
-                        .contains("这部分单独交代"))
-                } else {
-                    // 修后只多一个句号，终审不能沿用首稿的内容删除焦点。
-                    XCTAssertTrue(focus.isEmpty)
-                    XCTAssertEqual(payload["review_focus_total"] as? Int, 0)
-                }
-            }
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: String],
+                           ["canonical_text": index == 0 ? canonical : prepared])
         }
+        XCTAssertEqual(originalRequest.input.segments.map(\.text), [first, second])
     }
 
     func testLightDelayedCorrectionUsesCompleteSourceWithoutReview() async throws {
@@ -603,35 +559,27 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(VoicePolishTextChange.between("原文", ""), [.init(removed: "原文", inserted: "")])
     }
 
-    func testStandardEmptyPlanStillReviewsSourceAndCanRepairUnpunctuatedPrefix() async throws {
+    func testStandardPassesFirstStagePrefixCleanupToStructureWithoutConfirmation() async throws {
         let source = "帮我回他一下我晚点到，你们先吃。"
-        let spans = #"["帮我回他一下"]"#
-        let repair = #"{"delivery":"direct_reply","editor_spans":\#(spans),"edits":[{"before":"帮我回他一下我晚点到","after":"我晚点到","kind":"directive"}]}"#
-        let confirmation = #"{"delivery":"direct_reply","editor_spans":\#(spans),"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(repair), .text(confirmation)])
+        let prepared = "我晚点到，你们先吃。"
+        let client = EditingTestClient([.text(prepared), .text(prepared)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, "我晚点到，你们先吃。")
-        XCTAssertEqual(result.llmAttemptCount, 3)
-        XCTAssertEqual(result.repairAttemptCount, 1)
+        XCTAssertEqual(result.text, prepared)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishAnalyze, .voicePolishAnalyze])
-        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(calls[2].user.utf8)) as? [String: Any])
-        XCTAssertEqual(payload["canonical_text"] as? String, source)
-        XCTAssertEqual(payload["draft_text"] as? String, result.text)
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+                       ["canonical_text": prepared])
     }
 
-    func testEmptyEditsCannotApproveDeclaredButUnappliedEditorInstruction() async {
+    func testLegacyReviewDetectsDeclaredButUnappliedEditorInstruction() throws {
         let source = "替我回他一句：时间还没确定。"
         let assessment = #"{"delivery":"direct_reply","editor_spans":["替我回他一句："],"edits":[]}"#
-        for mode in [VoicePolishQualityMode.standard] {
-            let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(assessment)])
-            let result = await pipeline(client).process(request(source, mode))
-            XCTAssertTrue(result.usedFallback)
-            XCTAssertEqual(result.llmAttemptCount, 2)
-            XCTAssertEqual(result.repairAttemptCount, 0)
-            XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
-        }
+        let review = try VoicePolishEditingReview.decode(assessment, source: source)
+        XCTAssertTrue(review.containsUnappliedEditorInstruction(in: source))
+        XCTAssertFalse(review.containsUnappliedEditorInstruction(in: "时间还没确定。"))
     }
 
     func testLightKeepsInstructionsThatBelongToDownstreamColleague() async {
@@ -643,34 +591,22 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
     }
 
-    func testMalformedReviewIsReportedBeforeAnyRepairAttempt() async {
+    func testLegacyReviewDecoderRejectsMalformedAssessment() {
         let source = "帮我回他：不对，日期还没有确定。"
         for assessment in [
             #"{"source_roles":[{"quote":"帮我回他：","role":"current_editor","target_evidence":"用户要求输入法代写"}],"edits":[]}"#,
             #"{"delivery":"direct_reply","editor_spans":["用户要求输入法代写"],"edits":[]}"#,
             #"{"delivery":"direct_reply","editor_spans":[],"edits":[{"after":"正文","kind":"content"}]}"#
         ] {
-            for mode in [VoicePolishQualityMode.standard] {
-                let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(assessment)])
-                let result = await pipeline(client).process(request(source, mode))
-                XCTAssertTrue(result.usedFallback)
-                XCTAssertEqual(result.text, source)
-                XCTAssertEqual(result.llmAttemptCount, 2)
-                XCTAssertEqual(result.repairAttemptCount, 0)
-                XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
-                XCTAssertFalse(result.validationCodes.contains(.planIntegrityFailure))
-            }
+            XCTAssertThrowsError(try VoicePolishEditingReview.decode(assessment, source: source))
         }
     }
 
-    func testDeliveryLabelCannotOverrideUnappliedEditorInstruction() async {
+    func testLegacyDeliveryLabelCannotOverrideUnappliedEditorInstruction() throws {
         let source = "替我回他一句：时间还没确定。"
         let assessment = #"{"delivery":"delegated_task","editor_spans":["替我回他一句："],"edits":[]}"#
-        let client = EditingTestClient([.text(#"{"edits":[]}"#), .text(assessment)])
-        let result = await pipeline(client).process(request(source, .standard))
-        XCTAssertTrue(result.usedFallback)
-        XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertTrue(result.validationCodes.contains(.planIntegrityFailure))
+        let review = try VoicePolishEditingReview.decode(assessment, source: source)
+        XCTAssertTrue(review.containsUnappliedEditorInstruction(in: source))
     }
 
     func testLightDoesNotRunStandardContentOrDirectiveReview() async {
@@ -712,7 +648,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
 }
 
 private actor EditingTestClient: LLMClient {
-    enum Step: Sendable { case text(String), review(String), delay(Duration, String), truncated, failure(LLMError) }
+    enum Step: Sendable { case text(String), delay(Duration, String), truncated, failure(LLMError) }
     private var steps: [Step]
     private(set) var requests: [LLMRequest] = []
     private var startWaiter: CheckedContinuation<Void, Never>?
@@ -728,20 +664,6 @@ private actor EditingTestClient: LLMClient {
         guard !steps.isEmpty else { throw LLMError.emptyResponse(nil) }
         switch steps.removeFirst() {
         case .text(let text): return LLMResponse(text: text, model: config.model)
-        case .review(let edits):
-            // 这些回归考察补丁与调用流程；默认布局逐项引用请求中的实际片段，专门的布局反例用原始 text 响应。
-            var object = try JSONSerialization.jsonObject(with: Data(edits.utf8)) as! [String: Any]
-            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
-            if payload?["mode"] as? String == "standard" {
-                object["delivery"] = "other_or_uncertain"
-                object["editor_spans"] = []
-            }
-            if let segments = payload?["layout_segments"] as? [[String: String]], object["layout"] == nil {
-                let ids = segments.compactMap { $0["id"] }
-                object["layout"] = (object["edits"] as? [Any])?.isEmpty == true
-                    ? [["style": "paragraph", "segment_ids": ids]] : []
-            }
-            return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self), model: config.model)
         case .delay(let duration, let text):
             try await Task.sleep(for: duration)
             return LLMResponse(text: text, model: config.model)

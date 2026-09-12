@@ -2,100 +2,88 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishStructuredContentPipelineTests: XCTestCase {
-    func testStructureMovesReasonWithoutDeletingAnyContent() async throws {
+    func testStructureMovesReasonWithoutRewritingReturnedContent() async throws {
         let source = "小赵负责核对名单。报价等财务回复。小李下午有别的事。"
-        let review = #"{"delivery":"delegated_task","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1","c3"]},{"style":"paragraph","segment_ids":["c2"]}]}"#
-        let (result, calls) = await run(source, [#"{"edits":[]}"#, review])
+        let structured = "小赵负责核对名单。小李下午有别的事。\n\n报价等财务回复。"
+        let (result, calls) = await run(source, [source, structured])
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, "小赵负责核对名单。小李下午有别的事。\n\n报价等财务回复。")
+        XCTAssertEqual(result.text, structured)
         XCTAssertEqual(result.llmAttemptCount, 2)
         XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishAnalyze])
-        XCTAssertEqual(calls.first?.options.responseFormat, .jsonObject)
-        let initial = try payload(calls[0])
-        XCTAssertNil(initial["layout_segments"])
-        let reviewed = try payload(calls[1])
-        let segments = try XCTUnwrap(reviewed["layout_segments"] as? [[String: String]])
-        XCTAssertEqual(segments.compactMap { $0["text"] }.joined(), source)
-        XCTAssertEqual(segments.compactMap { $0["id"] }, ["c1", "c2", "c3"])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        for call in calls {
+            XCTAssertEqual(call.options.responseFormat, .text)
+            XCTAssertEqual(try payload(call) as? [String: String], ["canonical_text": source])
+        }
     }
 
-    func testMissingReasonSegmentCannotBecomeSuccessfulOutput() async {
+    // 旧布局工具仍保留独立反例；标准运行链不再解码或执行这些布局协议。
+    func testLegacyLayoutDecoderRejectsMissingDuplicatedAndInventedReasonSegments() throws {
         let source = "小赵负责名单。小李下午有别的事。"
+        let segments = try VoicePolishStructurePlan.segments(in: source)
         for layout in [
             #"[{"style":"paragraph","segment_ids":["c1"]}]"#,
             #"[{"style":"paragraph","segment_ids":["c1","c1"]}]"#,
             #"[{"style":"paragraph","segment_ids":["c1","made-up"]}]"#,
             #"[{"style":"paragraph","segment_ids":["c1","c2"],"text":"小赵负责名单。"}]"#
         ] {
-            let review = #"{"delivery":"delegated_task","editor_spans":[],"edits":[],"layout":\#(layout)}"#
-            let (result, _) = await run(source, [#"{"edits":[]}"#, review])
-            XCTAssertTrue(result.usedFallback)
-            XCTAssertEqual(result.text, source)
-            XCTAssertEqual(result.llmAttemptCount, 2)
-            XCTAssertEqual(result.repairAttemptCount, 0)
-            XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
+            let object = try JSONSerialization.jsonObject(with: Data(layout.utf8))
+            XCTAssertThrowsError(try VoicePolishStructurePlan.decodeLayout(from: object, segments: segments))
         }
     }
 
-    func testStandardNoLongerAcceptsFreeTextOrUnboundedContentRewrite() async {
+    func testStandardPassesCompleteFirstDraftToStructureInsteadOfApplyingPatches() async throws {
         let source = "名单交给小赵。小李下午有别的事，所以调整分工。"
-        for initial in ["名单交给小赵。", #"{"edits":[{"before":"名单交给小赵。小李下午有别的事，所以调整分工。","after":"名单交给小赵。","kind":"content","evidence":"名单交给小赵。"}]}"#] {
-            let (result, _) = await run(source, [initial])
-            XCTAssertTrue(result.usedFallback)
-            XCTAssertEqual(result.text, source)
-            XCTAssertEqual(result.llmAttemptCount, 1)
-        }
+        let prepared = "名单交给小赵，小李下午有别的事，所以调整分工。"
+        let (result, calls) = await run(source, [prepared, prepared])
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, prepared)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
     }
 
-    func testProgramNumberingDoesNotGrantNewNumbersToModelContent() async {
+    func testReturnedNumberingIsPreservedWithoutProgramRenumbering() async {
         let source = "请执行 `swift test`。等审核完成。请执行 `swift build`。"
-        let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"numbered","segment_ids":["c1"]},{"style":"paragraph","segment_ids":["c2"]},{"style":"numbered","segment_ids":["c3"]}]}"#
-        let (result, _) = await run(source, [#"{"edits":[]}"#, review], scene: .code)
+        let structured = "1. 请执行 `swift test`。\n\n等审核完成。\n\n2. 请执行 `swift build`。"
+        let (result, _) = await run(source, [source, structured], scene: .code)
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, "1. 请执行 `swift test`。\n\n等审核完成。\n\n1. 请执行 `swift build`。")
-        let insertion = #"{"edits":[{"before":"等审核完成","after":"等审核3天完成","kind":"word"}]}"#
-        let (invented, _) = await run(source, [insertion, review], scene: .code)
-        XCTAssertTrue(invented.usedFallback)
-        XCTAssertEqual(invented.text, source)
+        XCTAssertEqual(result.text, structured)
+        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
+            sourceText: source, outputText: "等审核3天完成。", scene: .code
+        ).isEmpty)
     }
 
-    func testManyTrustedBulletMarkersAreNotMistakenForContentExpansion() async throws {
+    func testManyReturnedBulletMarkersAreNotMistakenForContentExpansion() async {
         let source = String(repeating: "甲。", count: 20)
-        let layout = (1...20).map { ["style": "bullet", "segment_ids": ["c\($0)"]] as [String: Any] }
-        let review = try json(["delivery": "other_or_uncertain", "editor_spans": [], "edits": [], "layout": layout])
-        let (result, _) = await run(source, [#"{"edits":[]}"#, review])
+        let structured = Array(repeating: "- 甲。", count: 20).joined(separator: "\n\n")
+        let (result, _) = await run(source, [source, structured])
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, Array(repeating: "- 甲。", count: 20).joined(separator: "\n\n"))
+        XCTAssertEqual(result.text, structured)
         XCTAssertGreaterThan(result.text.count, source.count * 2)
     }
 
-    func testRepairRebuildsSegmentsAndRejectsPreviousLayout() async throws {
-        let source = "先检查，再发送。"
-        let repair = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"先检查，再发送。","after":"先检查。再发送。","kind":"punctuation"}],"layout":[]}"#
+    func testLegacyLayoutRejectsSegmentsFromBeforeSentenceBoundaryChange() throws {
+        let original = try VoicePolishStructurePlan.segments(in: "先检查，再发送。")
+        let corrected = try VoicePolishStructurePlan.segments(in: "先检查。再发送。")
+        XCTAssertEqual(original.count, 1)
+        XCTAssertEqual(corrected.count, 2)
         for ids in [["c1"], ["c1", "c2"]] {
-            let confirmation = try json(["delivery": "other_or_uncertain", "editor_spans": [], "edits": [],
-                                         "layout": [["style": "paragraph", "segment_ids": ids]]])
-            let (result, calls) = await run(source, [#"{"edits":[]}"#, repair, confirmation])
-            XCTAssertEqual(result.usedFallback, ids.count == 1)
-            XCTAssertEqual(result.llmAttemptCount, 3)
-            XCTAssertEqual(result.repairAttemptCount, 1)
-            XCTAssertEqual(result.text, ids.count == 1 ? source : "先检查。再发送。")
-            let second = try payload(calls[1]), third = try payload(calls[2])
-            XCTAssertEqual((second["layout_segments"] as? [Any])?.count, 1)
-            XCTAssertEqual((third["layout_segments"] as? [Any])?.count, 2)
-            XCTAssertEqual(third["draft_text"] as? String, "先检查。再发送。")
+            let blocks: [[String: Any]] = [["style": "paragraph", "segment_ids": ids]]
+            if ids.count == 1 {
+                XCTAssertThrowsError(try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: corrected))
+            } else {
+                let layout = try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: corrected)
+                XCTAssertEqual(try VoicePolishStructurePlan.render(layout, segments: corrected), "先检查。再发送。")
+            }
         }
     }
 
-    func testPendingContentRepairCannotAlsoApproveOldLayout() async {
+    func testLegacyReviewCannotApplyPendingContentRepairAndOldLayoutTogether() throws {
         let source = "请按装软件。"
         let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"按装","after":"安装","kind":"word"}],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, _) = await run(source, [#"{"edits":[]}"#, review])
-        XCTAssertTrue(result.usedFallback)
-        XCTAssertEqual(result.llmAttemptCount, 2)
-        XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
+        XCTAssertThrowsError(try VoicePolishEditingReview.decode(
+            review, source: source, structureSegments: VoicePolishStructurePlan.segments(in: source)
+        ))
     }
 
     func testLightDoesNotRequestOrRenderStandardLayout() async throws {
@@ -109,47 +97,46 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         XCTAssertEqual(Set(try payload(call).keys), ["canonical_text"])
     }
 
-    func testStandardContentStillProtectsDeliberateEmphasis() async {
+    func testStandardKeepsMeaningPreservingEmphasisConsolidationFromFirstStage() async {
         let source = "确实确实有帮助。"
-        let patch = #"{"edits":[{"before":"确实确实","after":"确实","kind":"stutter"}]}"#
-        let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        let (result, _) = await run(source, [patch, review])
-        XCTAssertTrue(result.usedFallback)
-        XCTAssertEqual(result.text, source)
-        XCTAssertTrue(result.validationCodes.contains(.missingProtectedFact))
+        let prepared = "确实有帮助。"
+        let (result, _) = await run(source, [prepared, prepared])
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, prepared)
+        XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
     func testClockCorrectionKeepsFinalWholeASCIIClockInBothModes() async throws {
         let source = "会议10:30，不对，10:45开始。"
-        let patch = #"{"edits":[{"before":"会议10:30，不对，10:45开始。","after":"会议10:45开始。","kind":"correction"}]}"#
-        let lightResponses = ["会议10:45开始。"]
+        let output = "会议10:45开始。"
         for mode in [VoicePolishQualityMode.light, .standard] {
-            let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[]}"#
-            let layout = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-            let (result, _) = await run(source, mode == .light ? lightResponses : [patch, review, layout], mode: mode)
+            let (result, _) = await run(source, mode == .light ? [output] : [output, output], mode: mode)
             XCTAssertFalse(result.usedFallback, "\(mode)")
-            XCTAssertEqual(result.text, "会议10:45开始。")
-            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 3)
+            XCTAssertEqual(result.text, output)
+            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 2)
         }
     }
 
-    func testIndentedCodeCannotAcquireProgramListMarkers() async {
+    func testLegacyLayoutCannotAddProgramListMarkersInsideIndentedCode() throws {
         let source = "代码如下：\n    if ready:\n        send()"
+        let segments = try VoicePolishStructurePlan.segments(in: source)
         for style in ["numbered", "bullet", "paragraph"] {
-            let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"\#(style)","segment_ids":["c1"]}]}"#
-            let (result, _) = await run(source, [#"{"edits":[]}"#, review], scene: .code)
-            XCTAssertEqual(result.usedFallback, style != "paragraph")
-            XCTAssertEqual(result.text, source)
-            XCTAssertEqual(result.llmAttemptCount, 2)
+            let blocks: [[String: Any]] = [["style": style, "segment_ids": ["c1"]]]
+            if style == "paragraph" {
+                let layout = try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: segments)
+                XCTAssertEqual(try VoicePolishStructurePlan.render(layout, segments: segments), source)
+            } else {
+                XCTAssertThrowsError(try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: segments))
+            }
         }
     }
 
     func testExistingBlankLinesDoNotCreateEmptyNumberedItem() async {
         let source = "先检查。\n\n再发布。"
-        let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"numbered","segment_ids":["c1"]},{"style":"numbered","segment_ids":["c2"]}]}"#
-        let (result, _) = await run(source, [#"{"edits":[]}"#, review])
+        let structured = "1. 先检查。\n\n2. 再发布。"
+        let (result, _) = await run(source, [source, structured])
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, "1. 先检查。\n\n2. 再发布。")
+        XCTAssertEqual(result.text, structured)
         XCTAssertEqual(RecognitionSession.finalizeInsertionText(result.text, mode: .formalWriting, isLLMOutput: true), result.text)
     }
 

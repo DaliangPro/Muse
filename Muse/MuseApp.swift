@@ -418,8 +418,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     static func makeInteractiveTestControlPanel(target: AnyObject?) -> NSPanel {
+        let menu = makeInteractiveTestStatusMenu(target: target)
+        let panelHeight = CGFloat(menu.items.count) * 42 + 74
         let panel = InteractiveTestControlPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 284),
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: panelHeight),
             styleMask: [.nonactivatingPanel, .titled],
             backing: .buffered,
             defer: false
@@ -432,14 +434,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 284))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: panelHeight))
         let instruction = NSTextField(labelWithString: "先点选空白输入框，再开始录音")
-        instruction.frame = NSRect(x: 20, y: 244, width: 340, height: 22)
+        instruction.frame = NSRect(x: 20, y: panelHeight - 40, width: 340, height: 22)
         instruction.font = .systemFont(ofSize: 14)
         content.addSubview(instruction)
-        for (index, item) in makeInteractiveTestStatusMenu(target: target).items.enumerated() {
+        for (index, item) in menu.items.enumerated() {
             let button = NSButton(title: item.title, target: item.target, action: item.action)
-            button.frame = NSRect(x: 20, y: 194 - CGFloat(index) * 42, width: 340, height: 32)
+            button.frame = NSRect(x: 20, y: panelHeight - 90 - CGFloat(index) * 42, width: 340, height: 32)
             button.bezelStyle = .rounded
             button.font = .systemFont(ofSize: 14)
             content.addSubview(button)
@@ -454,6 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let actions: [(String, Selector)] = [
             ("准备录音与上屏权限", #selector(AppDelegate.prepareInteractiveTestPermissions)),
             ("开始轻度录音", #selector(AppDelegate.startInteractiveLightRecording)),
+            ("开始标准录音", #selector(AppDelegate.startInteractiveStandardRecording)),
             ("开始直出录音", #selector(AppDelegate.startInteractiveDirectRecording)),
             ("停止并上屏", #selector(AppDelegate.stopInteractiveRecording)),
             ("退出测试", #selector(AppDelegate.quitFromStatusMenu)),
@@ -504,6 +507,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func startInteractiveLightRecording() {
         startInteractiveRecording(mode: .lightPolish)
+    }
+
+    @objc private func startInteractiveStandardRecording() {
+        startInteractiveRecording(mode: .formalWriting)
     }
 
     @objc private func startInteractiveDirectRecording() {

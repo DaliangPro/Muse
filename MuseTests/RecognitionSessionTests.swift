@@ -271,9 +271,11 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.historyStatus, "voice_polish_success")
         let requests = await client.recordedRequests()
         XCTAssertEqual(requests.count, 2)
-        XCTAssertEqual(try Self.voicePolishPayload(from: requests[0])["mode"] as? String, "standard")
-        XCTAssertTrue(requests[0].user.contains(#""user_preferences":"""#))
-        XCTAssertTrue(requests[0].user.contains(source))
+        XCTAssertEqual(requests.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        for request in requests {
+            XCTAssertEqual(try Self.voicePolishPayload(from: request) as? [String: String],
+                           ["canonical_text": source])
+        }
     }
 
     func testVoicePolishUsesCanonicalTextAndCompleteEffectiveSnippetRules() async throws {
@@ -788,14 +790,13 @@ final class RecognitionSessionTests: XCTestCase {
             XCTAssertEqual(diagnostic.applicationBundleID, applicationID)
             XCTAssertEqual(diagnostic.recentMuseInputCount, enabled ? 1 : 0)
             let requests = await client.recordedRequests()
-            XCTAssertEqual(requests.count, 2, "标准模式须完成生成和复核")
+            XCTAssertEqual(requests.count, 2, "标准模式须完成轻度校对和结构整理")
             for request in requests {
                 let payload = try Self.voicePolishPayload(from: request)
                 // canonical 已由本地 Resolver 纠正，不能靠模型自行猜对来通过测试。
                 XCTAssertEqual(payload["canonical_text"] as? String, expected)
-                XCTAssertEqual(payload["mode"] as? String, "standard")
-                let context = try XCTUnwrap(payload["authorized_context"] as? [String])
-                XCTAssertEqual(context, enabled ? ["缪斯 → Muse"] : [])
+                XCTAssertEqual(Set(payload.keys), ["canonical_text"])
+                XCTAssertNil(payload["authorized_context"], "已应用的本地映射不另传为模型上下文")
                 XCTAssertFalse(request.user.contains(previousInput))
                 XCTAssertFalse(request.user.contains("长语音测试刚刚结束"))
                 XCTAssertFalse(request.user.contains("客户预算"))
@@ -942,9 +943,8 @@ final class RecognitionSessionTests: XCTestCase {
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
         let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
-        // 复核给出无法定位的局部补丁，必须等待用户选择，不能静默交付原稿。
-        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"word"}],"layout":[]}"#
-        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [#"{"edits":[]}"#, invalidReview])
+        // 结构阶段返回空白正文，必须等待用户选择，不能静默交付原稿。
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [source, " \n"])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
             historyStore: HistoryStore(path: ":memory:"),
@@ -1010,20 +1010,18 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
         XCTAssertEqual(result?.performance?.outcome, .canonicalExit)
         XCTAssertEqual(result?.performance?.llmAttemptCount, 2)
-        XCTAssertEqual(result?.performance?.repairAttemptCount, 1)
+        XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
     }
 
-    func testVoicePolishExplicitRetryStartsFreshPipelineAndReturnsReviewedDraft() async throws {
+    func testVoicePolishExplicitRetryStartsFreshTwoStepPipelineAndReturnsStructuredDraft() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
         let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
         let polished = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。\n\n邮件里不要承诺周五对外发布。"
-        let invalidReview = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"不在候选稿中的片段","after":"修正","kind":"word"}],"layout":[]}"#
-        let punctuation = #"{"edits":[{"before":"内部试看，先让","after":"内部试看。先让","kind":"punctuation"},{"before":"再发邮件，邮件里","after":"再发邮件。邮件里","kind":"punctuation"}]}"#
-        let approved = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1","c2"]},{"style":"paragraph","segment_ids":["c3"]}]}"#
+        let prepared = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。邮件里不要承诺周五对外发布。"
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            #"{"edits":[]}"#, invalidReview, punctuation, approved,
+            source, " \n", prepared, polished,
         ])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1064,7 +1062,7 @@ final class RecognitionSessionTests: XCTestCase {
         }
         let firstRequestCount = await client.requestCount()
         XCTAssertEqual(firstRequestCount, 2)
-        // 复核失败后已经冻结标准档位，迟到的轻度快捷键不能改写本次重试。
+        // 结构阶段失败后已经冻结标准档位，迟到的轻度快捷键不能改写本次重试。
         await session.switchMode(to: .lightPolish)
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
         let retryAccepted = await session.retryVoicePolishResult()
@@ -1082,8 +1080,12 @@ final class RecognitionSessionTests: XCTestCase {
 
         XCTAssertFalse(secondRun.timedOut)
         XCTAssertEqual(requestCount, 4)
-        for request in await client.recordedRequests() {
-            XCTAssertEqual(try Self.voicePolishPayload(from: request)["mode"] as? String, "standard")
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.task), [.voicePolishRender, .voicePolishStructured,
+                                              .voicePolishRender, .voicePolishStructured])
+        for (index, request) in requests.enumerated() {
+            XCTAssertEqual(try Self.voicePolishPayload(from: request) as? [String: String],
+                           ["canonical_text": index == 3 ? prepared : source])
         }
         XCTAssertEqual(result?.finalText, polished)
         XCTAssertEqual(result?.processedText, polished)
@@ -1095,7 +1097,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.outcome, .success)
         XCTAssertEqual(result?.performance?.userRetryCount, 1)
         XCTAssertEqual(result?.performance?.llmAttemptCount, 4)
-        XCTAssertEqual(result?.performance?.repairAttemptCount, 1)
+        XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
     }
 
     func testLightSingleCallKeepsCompleteCanonicalInputAndVerbatimOutput() async throws {
@@ -1453,23 +1455,6 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
         models.append(config.model)
         if request.options.responseFormat == .jsonObject,
            let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
-            if request.task == .voicePolishAnalyze,
-               ["light", "standard"].contains(payload["mode"] as? String ?? "") {
-                var review: [String: Any] = ["edits": []]
-                if payload["mode"] as? String == "standard" {
-                    review["delivery"] = "other_or_uncertain"
-                    review["editor_spans"] = []
-                }
-                if let segments = payload["layout_segments"] as? [[String: String]] {
-                    review["layout"] = [["style": "paragraph", "segment_ids": segments.compactMap { $0["id"] }]]
-                }
-                return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: review), as: UTF8.self), model: config.model)
-            }
-            if payload["mode"] as? String == "standard", request.task == .voicePolishRender,
-               let source = payload["canonical_text"] as? String {
-                let edits: [[String: String]] = source == response ? [] : [["before": source, "after": response, "kind": "word"]]
-                return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: ["edits": edits]), as: UTF8.self), model: config.model)
-            }
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase
             if payload["draft_document"] != nil {

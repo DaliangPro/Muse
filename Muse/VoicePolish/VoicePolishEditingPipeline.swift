@@ -23,8 +23,8 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
-/// 轻度一次生成完整正文；标准以局部修正和完整片段组织成稿。
-/// 请求失败时保留完整来源，成功的轻度正文不再经过程序改写。
+/// 轻度一次生成完整正文；标准先执行同一校对，再整理实际校对稿的结构。
+/// 任一步失败都保留完整来源，成功正文不再经过程序改写。
 struct VoicePolishEditingPipeline: Sendable {
     private let client: any LLMClient
     private let config: LLMConfig
@@ -51,7 +51,6 @@ struct VoicePolishEditingPipeline: Sendable {
         let route: VoicePolishRoute = isLight ? .fast : .structured
         let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? (isLight ? .seconds(30) : .seconds(60)))
         let attempts = VoicePolishEditingAttempts()
-        var repairAttempts = 0
         var draft: String?
         func result(_ text: String?, codes: [VoicePolishValidationCode] = [],
                     reason: VoicePolishFailureReason? = nil) -> VoicePolishResult {
@@ -64,7 +63,7 @@ struct VoicePolishEditingPipeline: Sendable {
                 usedFallback: text == nil,
                 failureReason: text == nil ? (reason ?? .validationFailed) : nil,
                 rejectedDraft: text == nil ? draft : nil,
-                repairAttemptCount: repairAttempts
+                repairAttemptCount: 0
             )
         }
         guard request.qualityMode == .light || request.qualityMode == .standard else {
@@ -74,99 +73,26 @@ struct VoicePolishEditingPipeline: Sendable {
             try Task.checkCancellation()
             let initial = try await generate(
                 task: .voicePolishRender,
-                system: isLight ? VoicePolishEditingPrompts.light : VoicePolishEditingPrompts.standard,
-                payload: VoicePolishEditingPrompts.payload(for: request),
-                json: !isLight,
-                request: request,
+                system: VoicePolishEditingPrompts.light,
+                payload: VoicePolishEditingPrompts.fullTextPayload(request.fallbackText),
                 deadline: deadline, attempts: attempts
             )
-            if isLight {
-                draft = initial
-                // 只检查能否安全交付正文，不用本地语义规则撤销模型的纠错。
-                guard !initial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    return result(nil, codes: [.emptyOutput])
-                }
-                guard !VoicePolishCharacterSafety.containsUnsafeCharacters(initial) else {
-                    return result(nil, codes: [.unsafeCharacters])
-                }
-                guard initial.utf8.count <= VoicePolishOutputNormalizer.maximumResponseBytes else {
-                    return result(nil, codes: [.abnormalLength])
-                }
-                return result(initial)
-            }
+            draft = initial
+            if let code = Self.deliveryFailureCode(initial) { return result(nil, codes: [code]) }
+            if isLight { return result(initial) }
 
-            let initialDraft = try VoicePolishTextEditor.applyContentEdits(
-                VoicePolishTextEditor.decode(initial), to: request.fallbackText, source: request.fallbackText,
-                allowsReviewedInlineDirectives: true, allowsReviewedSourceCorrections: true
-            )
-            draft = initialDraft
-            let initialCodes = Self.contentCodes(initialDraft, request: request)
-            let initialSegments = try VoicePolishStructurePlan.segments(in: initialDraft)
-            let separatesContentReview = VoicePolishEditingReview.hasSourceReviewRisk(request.fallbackText)
-            let review = try await generate(
-                task: .voicePolishAnalyze,
-                system: separatesContentReview ? VoicePolishEditingPrompts.standardContentReview : VoicePolishEditingPrompts.review,
-                payload: VoicePolishEditingPrompts.payload(
-                    for: request, draft: initialDraft, codes: initialCodes,
-                    includesLayoutSegments: !separatesContentReview
+            // 第二步只接收第一步实际返回的完整正文，不重用原稿，也不增加语义复核。
+            let structured = try await generate(
+                task: .voicePolishStructured,
+                system: VoicePolishEditingPrompts.standard,
+                payload: VoicePolishEditingPrompts.fullTextPayload(
+                    initial, additionalRequirements: request.preferences.additionalRequirements
                 ),
-                json: true,
-                request: request,
                 deadline: deadline, attempts: attempts
             )
-            let assessment = try VoicePolishEditingReview.decode(
-                review, source: request.fallbackText, structureSegments: separatesContentReview ? nil : initialSegments
-            )
-            let edits = assessment.edits
-            if edits.isEmpty && !separatesContentReview {
-                guard !assessment.containsUnappliedEditorInstruction(in: initialDraft) else {
-                    return result(nil, codes: [.planIntegrityFailure])
-                }
-                guard initialCodes.isEmpty, let layout = assessment.layout else {
-                    return result(nil, codes: initialCodes.isEmpty ? [.planIntegrityFailure] : initialCodes)
-                }
-                let output = try VoicePolishStructurePlan.render(layout, segments: initialSegments)
-                draft = output
-                let content = try VoicePolishStructurePlan.render(layout, segments: initialSegments, includesMarkers: false)
-                let codes = Self.outputCodes(output, request: request, contentForValidation: content)
-                return codes.isEmpty ? result(output) : result(nil, codes: codes)
-            }
-            if !edits.isEmpty { repairAttempts += 1 }
-            let repaired = edits.isEmpty ? initialDraft : try VoicePolishTextEditor.applyContentEdits(
-                edits, to: initialDraft, source: request.fallbackText,
-                allowsReviewedInlineDirectives: true, allowsReviewedSourceCorrections: true
-            )
-            draft = repaired
-            var repairedCodes = Self.contentCodes(repaired, request: request)
-            if assessment.containsUnappliedEditorInstruction(in: repaired) {
-                repairedCodes.append(.planIntegrityFailure)
-            }
-            guard repairedCodes.isEmpty else { return result(nil, codes: repairedCodes) }
-            let repairedSegments = try VoicePolishStructurePlan.segments(in: repaired)
-
-            // 风险输入先完成专职内容复核，再用完整实际稿排版；即使复核无修改也不能跳过此步。
-            // 修复最多一次，最终确认没有继续改写的权限。
-            let confirmation = try await generate(
-                task: .voicePolishAnalyze,
-                system: VoicePolishEditingPrompts.review,
-                payload: VoicePolishEditingPrompts.payload(for: request, draft: repaired),
-                json: true,
-                request: request,
-                deadline: deadline, attempts: attempts
-            )
-            let finalAssessment = try VoicePolishEditingReview.decode(
-                confirmation, source: request.fallbackText, structureSegments: repairedSegments
-            )
-            guard finalAssessment.edits.isEmpty,
-                  !finalAssessment.containsUnappliedEditorInstruction(in: repaired),
-                  let layout = finalAssessment.layout else {
-                return result(nil, codes: [.planIntegrityFailure])
-            }
-            let output = try VoicePolishStructurePlan.render(layout, segments: repairedSegments)
-            draft = output
-            let content = try VoicePolishStructurePlan.render(layout, segments: repairedSegments, includesMarkers: false)
-            let codes = Self.outputCodes(output, request: request, contentForValidation: content)
-            return codes.isEmpty ? result(output) : result(nil, codes: codes)
+            draft = structured
+            if let code = Self.deliveryFailureCode(structured) { return result(nil, codes: [code]) }
+            return result(structured)
         } catch is VoicePolishEditingTimeout {
             return result(nil, codes: [.emptyOutput], reason: .timeout)
         } catch let error as LLMError {
@@ -178,14 +104,6 @@ struct VoicePolishEditingPipeline: Sendable {
             default:
                 return result(nil, codes: [.emptyOutput], reason: .requestFailed)
             }
-        } catch is VoicePolishEditingReviewError {
-            return result(nil, codes: [.invalidStructuredResponse])
-        } catch is VoicePolishTextEditError {
-            return result(nil, codes: [.planIntegrityFailure])
-        } catch is VoicePolishStructurePlanError {
-            return result(nil, codes: [.planIntegrityFailure])
-        } catch is DecodingError {
-            return result(nil, codes: [.invalidStructuredResponse])
         } catch {
             return result(nil, codes: [.emptyOutput], reason: .requestFailed)
         }
@@ -195,26 +113,13 @@ struct VoicePolishEditingPipeline: Sendable {
         task: LLMTask,
         system: String,
         payload: String,
-        json: Bool,
-        request: VoicePolishRequest,
         deadline: ContinuousClock.Instant,
         attempts: VoicePolishEditingAttempts
     ) async throws -> String {
         try Task.checkCancellation()
         let remaining = deadline - ContinuousClock.now
         guard remaining > .zero else { throw VoicePolishEditingTimeout() }
-        onStage?(task == .voicePolishAnalyze ? .analyzing : .polishing)
-        let sourceTokens = EstimatedTokenCounter.count(in: request.fallbackText)
-        // 标准的补丁协议需要额外容量；轻度沿用千字内真实测试的正文预算。
-        let outputBudget: Int
-        if task == .voicePolishAnalyze {
-            outputBudget = min(8_192, max(4_096, sourceTokens * 4 + 1_024))
-        } else if request.qualityMode == .standard {
-            // JSON 同时携带修改前后的短锚点，比自由正文需要更多输出容量。
-            outputBudget = min(8_192, max(4_096, sourceTokens * 6 + 1_024))
-        } else {
-            outputBudget = 2_048
-        }
+        onStage?(task == .voicePolishStructured ? .rendering : .polishing)
         let invocation = LLMRequest(
             // 内置编辑协议自行定义输入边界；不能套用“正文绝不影响转换”的通用
             // 自定义模式封装，否则口述中的合法改口与当前编辑要求也可能被忽略。
@@ -224,9 +129,9 @@ struct VoicePolishEditingPipeline: Sendable {
             user: payload,
             options: LLMGenerationOptions(
                 temperature: 0,
-                maxOutputTokens: outputBudget,
+                maxOutputTokens: 2_048,
                 reasoningPolicy: .disabled,
-                responseFormat: json ? .jsonObject : .text
+                responseFormat: .text
             )
         )
         let response = try await AsyncTimeout.throwingValue(
@@ -241,15 +146,15 @@ struct VoicePolishEditingPipeline: Sendable {
         return response.text
     }
 
-    private static func contentCodes(_ output: String, request: VoicePolishRequest) -> [VoicePolishValidationCode] {
-        var codes = outputCodes(output, request: request)
-        if VoicePolishValidator.deliberateRepetitionPhrases(in: request.fallbackText)
-            .contains(where: { !output.contains($0) }) {
-            codes.append(.missingProtectedFact)
-        }
-        return codes
+    /// 两步均沿用轻度已验收的交付边界，不用本地语义规则撤销模型纠错。
+    private static func deliveryFailureCode(_ output: String) -> VoicePolishValidationCode? {
+        if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .emptyOutput }
+        if VoicePolishCharacterSafety.containsUnsafeCharacters(output) { return .unsafeCharacters }
+        if output.utf8.count > VoicePolishOutputNormalizer.maximumResponseBytes { return .abnormalLength }
+        return nil
     }
 
+    /// 旧规则的离线回归入口；轻度和标准的实际执行均不调用它。
     static func outputCodes(
         _ output: String, request: VoicePolishRequest, contentForValidation: String? = nil
     ) -> [VoicePolishValidationCode] {

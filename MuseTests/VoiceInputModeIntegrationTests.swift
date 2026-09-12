@@ -144,16 +144,15 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
                 XCTAssertFalse(result?.llmFailed ?? true, mode.name)
                 XCTAssertEqual(result?.historyStatus, "voice_polish_success", mode.name)
                 XCTAssertEqual(requests.count, expectedMode == .light ? 1 : 2, mode.name)
+                XCTAssertEqual(requests.map(\.task), expectedMode == .light
+                    ? [.voicePolishRender] : [.voicePolishRender, .voicePolishStructured], mode.name)
+                XCTAssertEqual(requests.map(\.system), expectedMode == .light
+                    ? [VoicePolishEditingPrompts.light]
+                    : [VoicePolishEditingPrompts.light, VoicePolishEditingPrompts.standard], mode.name)
                 for request in requests {
-                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any])
-                    if expectedMode == .light {
-                        XCTAssertEqual(Set(payload.keys), ["canonical_text"])
-                        XCTAssertEqual(payload["canonical_text"] as? String, source)
-                        XCTAssertEqual(request.task, .voicePolishRender)
-                        XCTAssertEqual(request.options.responseFormat, .text)
-                    } else {
-                        XCTAssertEqual(payload["mode"] as? String, expectedMode.rawValue)
-                    }
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: String])
+                    XCTAssertEqual(payload, ["canonical_text": source], mode.name)
+                    XCTAssertEqual(request.options.responseFormat, .text, mode.name)
                 }
             } else {
                 XCTAssertTrue(requests.isEmpty, "直出不配置、不调用润色模型")
@@ -168,19 +167,8 @@ private actor VoiceInputModeProbeLLM: LLMClient {
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
         requests.append(request)
         let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any]
-        if request.options.responseFormat == .text {
-            return LLMResponse(text: payload?["canonical_text"] as? String ?? "", model: config.model)
-        }
-        var object: [String: Any] = ["edits": []]
-        if request.task == .voicePolishAnalyze, payload?["mode"] as? String == "standard" {
-            object["delivery"] = "other_or_uncertain"
-            object["editor_spans"] = []
-            if let segments = payload?["layout_segments"] as? [[String: String]] {
-                object["layout"] = [["style": "paragraph", "segment_ids": segments.compactMap { $0["id"] }]]
-            }
-        }
-        return LLMResponse(text: String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self),
-                           model: config.model)
+        XCTAssertEqual(request.options.responseFormat, .text)
+        return LLMResponse(text: payload?["canonical_text"] as? String ?? "", model: config.model)
     }
 
     func process(text: String, prompt: String, context: LLMRequestContext, config: LLMConfig) async throws -> String {
