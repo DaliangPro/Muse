@@ -1958,7 +1958,7 @@ actor RecognitionSession {
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: rawText,
-            processingMode: currentMode.name,
+            processingMode: historyProcessingModeName,
             processedText: llmResult.processedText,
             finalText: finalText,
             status: status,
@@ -1990,7 +1990,7 @@ actor RecognitionSession {
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: "",
-            processingMode: currentMode.name,
+            processingMode: historyProcessingModeName,
             processedText: nil,
             finalText: "",
             status: status,
@@ -1999,6 +1999,18 @@ actor RecognitionSession {
         ))
         guard isCurrent(sessionID) else { return }
         DebugFileLogger.log("stop: no text recognized, saved to history as \(status)")
+    }
+
+    /// 正常输出页把直出和轻度润色合并为一个入口，但识别记录仍需保留实际档位。
+    private var historyProcessingModeName: String {
+        switch currentMode.id {
+        case ProcessingMode.directId:
+            return L("直出模式", "Direct Output")
+        case ProcessingMode.lightPolishId:
+            return L("轻度润色", "Light Polish")
+        default:
+            return currentMode.name
+        }
     }
 
     private func teardownASRClient(

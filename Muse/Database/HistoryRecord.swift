@@ -22,6 +22,9 @@ struct HistoryRecord: Identifiable, Hashable, Sendable {
             "正常输出", "Normal Output", "直出", "Direct", "Direct Output", "直出模式"
         ])
         if directAliases.contains(processingMode) {
+            if status.hasPrefix("voice_polish_") {
+                return L("轻度润色", "Light Polish")
+            }
             return L("直出模式", "Direct Output")
         }
         return processingMode

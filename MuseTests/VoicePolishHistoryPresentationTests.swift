@@ -7,6 +7,10 @@ final class VoicePolishHistoryPresentationTests: XCTestCase {
             historyRecord(mode: ProcessingMode.direct.name).processingModeDisplayName,
             L("直出模式", "Direct Output")
         )
+        XCTAssertEqual(
+            historyRecord(mode: ProcessingMode.direct.name, status: "voice_polish_success").processingModeDisplayName,
+            L("轻度润色", "Light Polish")
+        )
         for name in [ProcessingMode.lightPolish.name, ProcessingMode.formalWriting.name,
                      "语音润色", "我的自定义工作表达"] {
             let record = historyRecord(mode: name)
@@ -16,11 +20,11 @@ final class VoicePolishHistoryPresentationTests: XCTestCase {
         XCTAssertNil(historyRecord(mode: " ").processingModeDisplayName)
     }
 
-    private func historyRecord(mode: String?) -> HistoryRecord {
+    private func historyRecord(mode: String?, status: String = "completed") -> HistoryRecord {
         HistoryRecord(
             id: "mode-label", createdAt: Date(), durationSeconds: 1,
             rawText: "原文", processingMode: mode, processedText: nil,
-            finalText: "原文", status: "completed", characterCount: 2
+            finalText: "原文", status: status, characterCount: 2
         )
     }
 
