@@ -17,7 +17,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
         let call = try XCTUnwrap(calls.first)
         XCTAssertEqual(call.context, .structuredTask)
-        XCTAssertEqual(call.system, "你是语音输入法的轻度校对器。修正明确错词、口误、口吃和标点；遇到明确口误，删除说错的旧内容和改口过程，只保留最终说法。保持原有表达和顺序，保留有效信息，不扩写。只返回润色后的完整正文。")
+        XCTAssertEqual(call.system, "你是语音输入法的轻度校对器。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。保持原有表达和顺序，不扩写。只返回润色后的完整正文。")
         XCTAssertEqual(call.options, LLMGenerationOptions(temperature: 0, maxOutputTokens: 2048,
             reasoningPolicy: .disabled, responseFormat: .text))
         let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: String])
