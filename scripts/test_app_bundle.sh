@@ -4,6 +4,7 @@ set -euo pipefail
 APP_PATH="${1:-${APP_PATH:-/Applications/Muse.app}}"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
 EXPECTED_BUNDLE_ID="${APP_BUNDLE_ID:-pro.daliang.muse}"
+EXPECTED_APP_NAME="${APP_NAME:-Muse}"
 EXPECTED_VERSION="${APP_VERSION:-2.0.0}"
 EXPECTED_BUILD="${APP_BUILD:-1}"
 EXPECTED_MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
@@ -31,8 +32,8 @@ esac
 
 [ "$(read_plist CFBundleExecutable)" = "Muse" ] || fail "CFBundleExecutable should be Muse"
 [ "$(read_plist CFBundleIdentifier)" = "$EXPECTED_BUNDLE_ID" ] || fail "CFBundleIdentifier should be $EXPECTED_BUNDLE_ID"
-[ "$(read_plist CFBundleName)" = "Muse" ] || fail "CFBundleName should be Muse"
-[ "$(read_plist CFBundleDisplayName)" = "Muse" ] || fail "CFBundleDisplayName should be Muse"
+[ "$(read_plist CFBundleName)" = "$EXPECTED_APP_NAME" ] || fail "CFBundleName should be $EXPECTED_APP_NAME"
+[ "$(read_plist CFBundleDisplayName)" = "$EXPECTED_APP_NAME" ] || fail "CFBundleDisplayName should be $EXPECTED_APP_NAME"
 [ "$(read_plist CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType should be APPL"
 [ "$(read_plist CFBundleShortVersionString)" = "$EXPECTED_VERSION" ] || fail "CFBundleShortVersionString should be $EXPECTED_VERSION"
 [ "$(read_plist CFBundleVersion)" = "$EXPECTED_BUILD" ] || fail "CFBundleVersion should be $EXPECTED_BUILD"

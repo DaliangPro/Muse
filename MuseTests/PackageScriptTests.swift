@@ -157,6 +157,21 @@ final class PackageScriptTests: XCTestCase {
         XCTAssertFalse(result.output.contains("Signing outer app bundle last"), result.output)
     }
 
+    func testInteractiveBundleKeepsItsOwnNameAndURLScheme() throws {
+        let fixture = try makePackagingFixture()
+        defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
+        let packaging = try runPackage(fixture, includesLocalServices: false, extraEnvironment: [
+            "APP_NAME": "Muse 交互测试",
+            "APP_BUNDLE_ID": "pro.daliang.muse.interactive-test",
+        ])
+        XCTAssertEqual(packaging.status, 0, packaging.output)
+        let data = try Data(contentsOf: fixture.app.appendingPathComponent("Contents/Info.plist"))
+        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        XCTAssertEqual(plist["CFBundleName"] as? String, "Muse 交互测试")
+        let urlTypes = try XCTUnwrap(plist["CFBundleURLTypes"] as? [[String: Any]])
+        XCTAssertEqual(urlTypes.first?["CFBundleURLSchemes"] as? [String], ["muse-interactive-test"])
+    }
+
     func testCloudBundlePassesStrictVerification() throws {
         let fixture = try makePackagingFixture()
         defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
