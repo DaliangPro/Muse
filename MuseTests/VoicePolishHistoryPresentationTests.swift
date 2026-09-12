@@ -3,8 +3,12 @@ import XCTest
 
 final class VoicePolishHistoryPresentationTests: XCTestCase {
     func testHistoryShowsRecordedModeNamesWithoutGuessingLegacyModes() {
-        for name in [ProcessingMode.direct.name, ProcessingMode.lightPolish.name,
-                     ProcessingMode.formalWriting.name, "语音润色", "我的自定义工作表达"] {
+        XCTAssertEqual(
+            historyRecord(mode: ProcessingMode.direct.name).processingModeDisplayName,
+            L("直出模式", "Direct Output")
+        )
+        for name in [ProcessingMode.lightPolish.name, ProcessingMode.formalWriting.name,
+                     "语音润色", "我的自定义工作表达"] {
             let record = historyRecord(mode: name)
             XCTAssertEqual(record.processingModeDisplayName, name)
         }

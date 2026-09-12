@@ -136,18 +136,6 @@ struct RecentHistoryRowView: View {
                         .accessibilityValue(modeName)
                 }
 
-                if let voicePolishPresentation {
-                    Text(L(voicePolishPresentation.labelZH, voicePolishPresentation.labelEN))
-                        .font(TF.settingsFontMetadata)
-                        .foregroundStyle(voicePolishStatusColor(voicePolishPresentation.tone))
-                        .lineLimit(1)
-                        .help(L(voicePolishPresentation.detailZH, voicePolishPresentation.detailEN))
-                        .accessibilityLabel(L("语音润色状态", "Voice Polish status"))
-                        .accessibilityValue(L(
-                            voicePolishPresentation.detailZH,
-                            voicePolishPresentation.detailEN
-                        ))
-                }
             }
             .frame(width: GeneralSettingsStyle.recordInfoColumnWidth, alignment: .leading)
 
@@ -212,22 +200,6 @@ struct RecentHistoryRowView: View {
         }
     }
 
-    private var voicePolishPresentation: VoicePolishHistoryPresentation? {
-        VoicePolishHistoryPresentation(status: record.status)
-    }
-
-    private func voicePolishStatusColor(
-        _ tone: VoicePolishHistoryPresentation.Tone
-    ) -> Color {
-        switch tone {
-        case .success:
-            return TF.settingsAccentGreen
-        case .caution:
-            return TF.settingsAccentAmber
-        case .failure:
-            return TF.settingsAccentRed
-        }
-    }
 }
 
 // 供其他行式列表复用（提炼页最近提炼行的删除键与本页同款,2026-07）

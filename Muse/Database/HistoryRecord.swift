@@ -12,10 +12,18 @@ struct HistoryRecord: Identifiable, Hashable, Sendable {
     let characterCount: Int?
     let tokenCount: Int?
 
-    /// 只展示写入时的模式名；旧记录没有模式时不推断轻度、标准或直出。
+    /// 识别记录只展示一个模式标签。直出模式兼容历史上曾写入的“正常输出”名称；
+    /// 其他模式沿用写入时的名称，旧记录没有模式时不猜测。
     var processingModeDisplayName: String? {
         guard let processingMode,
               !processingMode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let directAliases = Set([
+            ProcessingMode.direct.name,
+            "正常输出", "Normal Output", "直出", "Direct", "Direct Output", "直出模式"
+        ])
+        if directAliases.contains(processingMode) {
+            return L("直出模式", "Direct Output")
+        }
         return processingMode
     }
 
