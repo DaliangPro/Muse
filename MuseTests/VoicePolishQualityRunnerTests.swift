@@ -15,6 +15,60 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         XCTAssertTrue(VoicePolishQualityRunner.isRequested(arguments: arguments))
     }
 
+    func test轻度管线跨超时任务后保留显式请求体捕获路径且默认不捕获() async throws {
+        let source = "请先核对完整资料，再发送。"
+        let input = VoicePolishRequest(
+            input: VoiceInputEnvelope(providerFinalText: source,
+                segments: [.init(id: "s1", text: source, startTimeMs: nil, endTimeMs: nil,
+                                 confidence: nil, isFinal: true)], durationMs: 1_000, provider: .volcano),
+            context: WritingContext(scene: .workChat),
+            preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: .light
+        )
+        let config = LLMConfig(apiKey: "test-only", model: "test-model", baseURL: "https://example.invalid")
+        let capturePaths: [String?] = [nil, "/tmp/quality-probe-context-test/light-request-1.json"]
+        for bodyPath in capturePaths {
+            let base = QualityRequestProbeContextClient(response: source)
+            let client = VoicePolishProviderAuditedLLMClient(
+                base: base, runNonce: runNonce, testInputID: "probe-context-1",
+                receiptPath: "/tmp/quality-probe-context-test/provider-audit.jsonl",
+                requestProbeBodyPath: bodyPath
+            )
+            let result = await VoicePolishPipeline(client: client, config: config).process(input)
+            XCTAssertFalse(result.usedFallback)
+            XCTAssertEqual(result.text, source)
+            XCTAssertEqual(result.llmAttemptCount, 1)
+            let observations = await base.observations
+            XCTAssertEqual(observations.count, 1)
+            let observation = try XCTUnwrap(observations.first)
+            XCTAssertEqual(observation.requestProbeBodyPath, bodyPath)
+            XCTAssertEqual(observation.auditContext, client.context)
+            XCTAssertEqual(observation.request.task, .voicePolishRender)
+            XCTAssertNil(VoicePolishProviderAudit.requestProbeBodyPath)
+        }
+    }
+
+    func test审计客户端默认路径不覆盖当前任务已有实验上下文() async throws {
+        let base = QualityRequestProbeContextClient(response: "完整正文。")
+        let client = VoicePolishProviderAuditedLLMClient(
+            base: base, runNonce: runNonce, testInputID: "existing-probe-context",
+            receiptPath: "/tmp/quality-probe-context-test/provider-audit.jsonl"
+        )
+        let request = LLMRequest(context: .structuredTask, task: .voicePolishRender,
+            system: "测试提示词", user: "测试原文", options: .init(responseFormat: .text))
+        let config = LLMConfig(apiKey: "test-only", model: "test-model", baseURL: "https://example.invalid")
+        let existingPath = "/tmp/quality-probe-context-test/request-body.json"
+        let response = try await VoicePolishProviderAudit.withRequestProbe(bodyPath: existingPath) {
+            try await client.generate(request, config: config)
+        }
+        XCTAssertEqual(response.text, "完整正文。")
+        let observations = await base.observations
+        XCTAssertEqual(observations.count, 1)
+        let observation = try XCTUnwrap(observations.first)
+        XCTAssertEqual(observation.requestProbeBodyPath, existingPath)
+        XCTAssertEqual(observation.auditContext, client.context)
+        XCTAssertNil(VoicePolishProviderAudit.requestProbeBodyPath)
+    }
+
     func test显式参数可解析且不需要凭据参数() throws {
         let invocation = try XCTUnwrap(VoicePolishQualityRunner.parseInvocation(arguments: [
             "Muse",
@@ -923,4 +977,33 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         }
         return String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
+}
+
+/// 只读取真正进入 base.generate 时的 TaskLocal，不访问文件或网络。
+private actor QualityRequestProbeContextClient: LLMClient {
+    struct Observation: Sendable {
+        let request: LLMRequest
+        let requestProbeBodyPath: String?
+        let auditContext: VoicePolishProviderAudit.Context?
+    }
+
+    private let response: String
+    private(set) var observations: [Observation] = []
+
+    init(response: String) { self.response = response }
+
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        observations.append(Observation(
+            request: request,
+            requestProbeBodyPath: VoicePolishProviderAudit.requestProbeBodyPath,
+            auditContext: VoicePolishProviderAudit.currentContext
+        ))
+        return LLMResponse(text: response, model: config.model)
+    }
+
+    func process(text: String, prompt: String, context: LLMRequestContext, config: LLMConfig) async throws -> String {
+        throw LLMError.emptyResponse(nil)
+    }
+
+    func warmUp(baseURL: String) async {}
 }

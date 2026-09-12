@@ -86,16 +86,19 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
     let base: any LLMClient
     let context: VoicePolishProviderAudit.Context
     let successCounter: VoicePolishProviderAuditSuccessCounter
+    let requestProbeBodyPath: String?
 
     init(
         base: any LLMClient,
         runNonce: String,
         testInputID: String,
         receiptPath: String,
-        successCounter: VoicePolishProviderAuditSuccessCounter = .init()
+        successCounter: VoicePolishProviderAuditSuccessCounter = .init(),
+        requestProbeBodyPath: String? = nil
     ) {
         self.base = base
         self.successCounter = successCounter
+        self.requestProbeBodyPath = requestProbeBodyPath
         context = VoicePolishProviderAudit.Context(
             runNonce: runNonce,
             testInputID: testInputID,
@@ -112,7 +115,13 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
                 testInputID: context.testInputID,
                 receiptPath: context.receiptPath
             ) {
-                try await base.generate(request, config: config)
+                if let requestProbeBodyPath {
+                    return try await VoicePolishProviderAudit.withRequestProbe(bodyPath: requestProbeBodyPath) {
+                        try await base.generate(request, config: config)
+                    }
+                }
+                // 未指定路径时保留调用方已在当前任务设置的实验上下文。
+                return try await base.generate(request, config: config)
             }
             // 网络层只有在 HTTP 200 响应解析成功且回执已经 fsync 后才返回。
             await successCounter.recordFinished(
@@ -659,26 +668,25 @@ enum VoicePolishQualityRunner {
                 )
                 let canonicalInput = request.fallbackText
                 let successCounter = VoicePolishProviderAuditSuccessCounter()
+                let requestProbeBodyPath: String?
+                if invocation.mode == .light,
+                   ProcessInfo.processInfo.environment["MUSE_QUALITY_CAPTURE_LIGHT_REQUEST_BODY"] == "1" {
+                    // 路径随客户端进入真正的 generate，跨越管线内部的 detached 超时任务。
+                    requestProbeBodyPath = URL(fileURLWithPath: invocation.reportPath).deletingLastPathComponent()
+                        .appendingPathComponent("light-request-\(index + 1).json").path
+                } else {
+                    requestProbeBodyPath = nil
+                }
                 let auditedClient = VoicePolishProviderAuditedLLMClient(
                     base: providerClient,
                     runNonce: invocation.runNonce,
                     testInputID: input.testInputId,
                     receiptPath: providerAuditURL.path,
-                    successCounter: successCounter
+                    successCounter: successCounter,
+                    requestProbeBodyPath: requestProbeBodyPath
                 )
                 let pipeline = VoicePolishPipeline(client: auditedClient, config: configured.config)
-                let result: VoicePolishResult
-                if invocation.mode == .light,
-                   ProcessInfo.processInfo.environment["MUSE_QUALITY_CAPTURE_LIGHT_REQUEST_BODY"] == "1" {
-                    // 仅显式后台验收保存实际请求体；普通会话和其他质量模式不增加文件写入。
-                    let bodyURL = URL(fileURLWithPath: invocation.reportPath).deletingLastPathComponent()
-                        .appendingPathComponent("light-request-\(index + 1).json")
-                    result = await VoicePolishProviderAudit.withRequestProbe(bodyPath: bodyURL.path) {
-                        await pipeline.process(request)
-                    }
-                } else {
-                    result = await pipeline.process(request)
-                }
+                let result = await pipeline.process(request)
                 let elapsed = ContinuousClock.now - startedAt
                 let successfulProviderCallCount = await successCounter.currentCount()
                 expectedProviderReceiptCount += successfulProviderCallCount
