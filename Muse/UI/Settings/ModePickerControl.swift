@@ -28,7 +28,7 @@ struct ModePickerControl: View {
                     .frame(width: 8, height: 8)
             }
         }
-        .accessibilityLabel(L("选择输入模式", "Select input mode"))
+        .accessibilityLabel(L("选择输出模式", "Select output mode"))
         .settingsScreenFrame($triggerFrame)
         .frame(
             width: ModeSettingsLayout.modePickerWidth,

@@ -19,6 +19,8 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
     @State private var captureTap = ModeHotkeyCaptureTap()
     @State private var pendingModifierCode: Int?
     @State private var pendingModifierModifiers: UInt64 = 0
+    @State private var contextRaw = VoicePolishSettings.contextLevel().rawValue
+    @State private var recentInput = VoicePolishSettings.recentInputContextEnabled()
 
     init(
         mode: ProcessingMode,
@@ -41,19 +43,22 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if mode.kind == .voicePolish {
-                Text(L(
-                    "此处只设置语音润色的快捷键和按键方式；润色要求请到一级“语音润色”页面编辑。",
-                    "Set only the Voice Polish shortcut and key behavior here. Edit polishing requirements on the top-level Voice Polish page."
-                ))
-                .font(TF.settingsFontCaption)
-                .foregroundStyle(TF.settingsTextTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            } else {
+            if mode.isUserDeletable {
                 fieldsSection
+            } else {
+                Text(NormalOutputSettings.isNormal(mode) ? L("正常输出", "Normal Output") : mode.name)
+                    .font(TF.settingsFontBodyStrong)
+                    .foregroundStyle(TF.settingsText)
             }
             shortcutSection
             triggerSection
+            if NormalOutputSettings.isNormal(mode) || mode.kind == .voicePolish {
+                DisclosureGroup(L("上下文与隐私", "Context & privacy")) {
+                    OutputContextSettings(context: $contextRaw, recentInput: $recentInput)
+                        .padding(.top, 8)
+                }
+                .font(TF.settingsFontCaption)
+            }
 
             if let conflict {
                 conflictWarning(conflict)
@@ -178,13 +183,17 @@ private extension ModeSettingsSheet {
             SettingsTextButton(L("保存", "Save"), variant: .primary, width: 64) {
                 stopListening()
                 var updated = mode
-                if mode.kind != .voicePolish {
+                if mode.isUserDeletable {
                     updated.name = sanitizedModeName
                     updated.processingLabel = sanitizedProcessingLabel
                 }
                 updated.hotkeyCode = hotkeyCode
                 updated.hotkeyModifiers = hotkeyModifiers
                 updated.hotkeyStyle = hotkeyStyle
+                if NormalOutputSettings.isNormal(mode) || mode.kind == .voicePolish {
+                    VoicePolishSettings.setContextLevel(WritingContextLevel(rawValue: contextRaw) ?? .nearbyText)
+                    VoicePolishSettings.setRecentInputContextEnabled(recentInput)
+                }
                 onSave(updated)
             }
         }

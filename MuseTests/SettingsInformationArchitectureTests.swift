@@ -2,22 +2,10 @@ import XCTest
 @testable import Muse
 
 final class SettingsInformationArchitectureTests: XCTestCase {
-    func testTerminologyAndVoicePolishAreStableTopLevelDestinations() {
-        let tabs = SettingsTab.allCases
-        XCTAssertEqual(
-            tabs,
-            [.general, .assetLibrary, .vocabulary, .voicePolish, .modes, .models, .about]
-        )
-        guard let terminologyIndex = tabs.firstIndex(of: .vocabulary),
-              let voicePolishIndex = tabs.firstIndex(of: .voicePolish),
-              let modesIndex = tabs.firstIndex(of: .modes) else {
-            return XCTFail("缺少术语、语音润色或输入模式一级入口")
-        }
-
-        XCTAssertLessThan(terminologyIndex, voicePolishIndex)
-        XCTAssertLessThan(voicePolishIndex, modesIndex)
-        XCTAssertEqual(SettingsTab.vocabulary.displayName, L("术语与纠错", "Terminology"))
-        XCTAssertEqual(SettingsTab.voicePolish.displayName, L("语音润色", "Voice Polish"))
+    func testLightweightSettingsKeepFiveDestinations() {
+        XCTAssertEqual(SettingsTab.allCases, [.general, .modes, .vocabulary, .models, .about])
+        XCTAssertEqual(SettingsTab.modes.displayName, L("输出模式", "Output Modes"))
+        XCTAssertEqual(SettingsTab.vocabulary.displayName, L("我的词库", "My Vocabulary"))
     }
 
     func testVoicePolishAndDirectModesCannotBeDeleted() {

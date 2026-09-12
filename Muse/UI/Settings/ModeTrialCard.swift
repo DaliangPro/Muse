@@ -35,8 +35,8 @@ struct ModeTrialCard: View {
 
     /// 翻译模式：一段书面中文，译文质量一目了然
     static var translateSampleText: String { L(
-        "这款产品的核心价值在于，把你每天的语音输入自动沉淀为可复用的创作素材，让灵感不再流失。",
-        "把你每天的语音输入自动沉淀为可复用的创作素材，让灵感不再流失——这就是这款产品的核心价值。"
+        "这款输入法可以把口述内容变成文字，日常输入更快，需要时还能整理内容结构。",
+        "这款输入法可以把口述内容变成文字，日常输入更快，需要时还能整理内容结构。"
     ) }
 
     /// 分模式默认样例（2026-06-12 用户拍板）
@@ -326,6 +326,11 @@ private extension ModeTrialCard {
         draftMode.processingLabel = processingLabel
         draftMode.prompt = prompt
         draftMode.hotkeyStyle = hotkeyStyle
+
+        if draftMode.kind == .direct {
+            trialOutput = VoicePolishTerminologyRuntime.prepare(rawText: input, applicationBundleIdentifier: nil).canonicalText
+            return
+        }
 
         guard let llmConfig = KeychainService.loadLLMConfig() else {
             trialError = L("当前 LLM 没有可用配置", "Current LLM is not configured")

@@ -112,9 +112,12 @@ final class AppState {
         // 测试必须注入内存模式，避免读取或隔离真实用户的 modes.json。
         let modes = initialModes ?? ModeStorage().load()
         availableModes = modes
-        currentMode = modes.first(where: { $0.id == ProcessingMode.smartDirectId })
+        let initialMode = modes.first(where: { $0.id == ProcessingMode.smartDirectId })
             ?? modes.first
             ?? .direct
+        currentMode = initialModes == nil
+            ? NormalOutputSettings.resolve(initialMode, in: modes, light: NormalOutputSettings.usesLightPolish())
+            : initialMode
         self.voicePolishCanonicalExitDelay = voicePolishCanonicalExitDelay
     }
 

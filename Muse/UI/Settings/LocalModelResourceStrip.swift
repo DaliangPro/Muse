@@ -37,7 +37,7 @@ struct LocalModelResourceStrip: View, SettingsCardHelpers {
             InventoryItem(
                 id: "qwen3.5-9b",
                 name: "Qwen3.5-9B",
-                role: L("文本处理 / 语料沉淀", "Text processing / extraction"),
+                role: L("文本处理", "Text processing"),
                 size: "5.3GB",
                 installed: LocalQwenLLMConfig.isModelAvailable,
                 downloadable: true
@@ -181,7 +181,6 @@ struct LocalModelResourceStrip: View, SettingsCardHelpers {
                 && (UserDefaults.standard.object(forKey: DefaultsKeys.qwen3FinalEnabled) as? Bool ?? true)
         case "qwen3.5-9b":
             return KeychainService.selectedLLMProvider == .localQwen
-                || KeychainService.selectedAssetExtractionLLMProvider == .localQwen
         case "punctuation":
             return asr == .sherpa
         default:

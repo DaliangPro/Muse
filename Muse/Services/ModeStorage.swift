@@ -149,18 +149,18 @@ struct ModeStorage {
     /// 重置为当前语言默认名；用户改过的名称（不在集合内）一律保留。
     /// 「Promp优化」是历史 typo 世代的默认名，必须入册否则存量数据不迁移。
     private static let knownDefaultNames: [UUID: Set<String>] = [
-        ProcessingMode.direct.id: ["直出模式", "Direct Output"],
+        ProcessingMode.direct.id: ["直出模式", "Direct Output", "正常输出", "Normal Output"],
         ProcessingMode.smartDirect.id: ["智能模式", "Smart Mode"],
-        ProcessingMode.formalWriting.id: ["语音润色", "Voice Polish", "标准润色", "Standard Polish"],
+        ProcessingMode.formalWriting.id: ["语音润色", "Voice Polish", "标准润色", "Standard Polish", "结构化输出", "Structured Output"],
         ProcessingMode.lightPolishId: ["轻度润色", "Light Polish"],
-        ProcessingMode.promptOptimize.id: ["Prompt优化", "Promp优化", "Prompt Optimizer"],
+        ProcessingMode.promptOptimize.id: ["Prompt优化", "Promp优化", "提示词优化", "Prompt Optimizer"],
         ProcessingMode.translate.id: ["英文翻译", "Translation"],
         ProcessingMode.commandMode.id: ["命令模式", "Command Mode"],
     ]
 
     /// 各默认模式的「已知默认处理标签」集合：同名称逻辑，自定义标签保留
     private static let knownDefaultLabels: [UUID: Set<String>] = [
-        ProcessingMode.formalWriting.id: ["润色中", "Polishing", "标准润色中", "Standard polishing"],
+        ProcessingMode.formalWriting.id: ["润色中", "Polishing", "标准润色中", "Standard polishing", "整理中", "Structuring"],
         ProcessingMode.lightPolishId: ["轻度润色中", "Light polishing"],
         ProcessingMode.promptOptimize.id: ["优化中", "Optimizing"],
         ProcessingMode.translate.id: ["翻译中", "Translating"],

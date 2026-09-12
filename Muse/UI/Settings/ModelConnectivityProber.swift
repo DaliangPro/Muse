@@ -4,7 +4,7 @@ extension Notification.Name {
     static let modelConnectivityProbed = Notification.Name("Muse.modelConnectivityProbed")
 }
 
-/// 启动时静默探测三个模型角色的连通性（2026-06-12 用户拍板）：
+/// 启动时静默探测语音识别与文本处理的连通性（2026-06-12 用户拍板）：
 /// 结果写入 ModelConnectivityCache，打开模型设置页即见灯，无需逐个手动测试。
 /// 每次应用生命周期只探一次；页面内手动测试仍可随时刷新。
 @MainActor
@@ -23,7 +23,7 @@ enum ModelConnectivityProber {
 
     static func probeAll() async {
         async let asr: Void = probeASR()
-        async let llm: Void = probeLLMAndAsset()
+        async let llm: Void = probeTextProcessing()
         _ = await (asr, llm)
         AppLogger.log("[ConnectivityProber] 启动连通性探测完成")
         // 通知模型设置页刷新色点（页面可能在探测完成前就已打开）
@@ -52,7 +52,7 @@ enum ModelConnectivityProber {
         }
     }
 
-    private static func probeLLMAndAsset() async {
+    private static func probeTextProcessing() async {
         let llmProvider = KeychainService.selectedLLMProvider
         let llmConfig = KeychainService.loadLLMConfig()
         let llmStatus = await probeLLM(provider: llmProvider, config: llmConfig)
@@ -65,28 +65,7 @@ enum ModelConnectivityProber {
             ModelConnectivityCache.llm = nil
         }
 
-        let assetProvider = KeychainService.selectedAssetExtractionLLMProvider
-        let assetConfig = KeychainService.loadAssetExtractionLLMConfig()
-        if let assetConfig,
-           let llmConfig,
-           LLMConnectivitySignature(provider: assetProvider, config: assetConfig)
-            == LLMConnectivitySignature(provider: llmProvider, config: llmConfig) {
-            // 完整执行配置一致时才复用，不能只按服务商复用。
-            ModelConnectivityCache.asset = LLMConnectivityCacheEntry(
-                signature: LLMConnectivitySignature(provider: assetProvider, config: assetConfig),
-                status: llmStatus
-            )
-        } else {
-            let status = await probeLLM(provider: assetProvider, config: assetConfig)
-            if let assetConfig {
-                ModelConnectivityCache.asset = LLMConnectivityCacheEntry(
-                    signature: LLMConnectivitySignature(provider: assetProvider, config: assetConfig),
-                    status: status
-                )
-            } else {
-                ModelConnectivityCache.asset = nil
-            }
-        }
+
     }
 
     private static func probeLLM(provider: LLMProvider, config: LLMConfig?) async -> SettingsTestStatus {

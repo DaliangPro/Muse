@@ -26,6 +26,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     @State private var testTask: Task<Void, Never>?
     @State private var serverStarting = false
     @State private var serverRunning = false
+    @State private var polishModelOverride = VoicePolishSettings.modelOverride() ?? ""
     @State private var thinkingMode: LLMThinkingMode = .disabled
     @State private var lockedThinkingMode: LLMThinkingMode?
     @State private var thinkingFeedback: String?
@@ -119,6 +120,19 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
                     localStatusColor: localStatusColor,
                     controlWidth: inspectorControlWidth
                 )
+
+                settingsInspectorRow(
+                    L("润色模型", "Polish model"),
+                    labelWidth: ModelSettingsStyle.inspectorLabelWidth,
+                    rowHeight: ModelSettingsStyle.inspectorRowHeight,
+                    horizontalPadding: 0
+                ) {
+                    TextField(L("留空跟随文本处理模型", "Use text model if blank"), text: $polishModelOverride)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: inspectorControlWidth)
+                        .disabled(!isEditingLLM)
+                        .help(L("可选，同一服务商下的润色专用模型名。", "Optional polishing model from the same provider."))
+                }
 
                 thinkingModeRows
 
@@ -490,6 +504,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             try KeychainService.saveLLMCredentials(for: selectedLLMProvider, values: values)
             KeychainService.selectedLLMProvider = selectedLLMProvider
             persistThinkingMode(thinkingMode)
+            VoicePolishSettings.setModelOverride(polishModelOverride)
             // REPAIR_PLAN H1 改进①：改选本地模型立即预热引擎
             AppStartupCoordinator.startLocalServerIfNeeded()
             llmCredentialValues = Self.displayValues(from: values, fields: currentLLMFields)

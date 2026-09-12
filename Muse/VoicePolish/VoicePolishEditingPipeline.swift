@@ -74,7 +74,10 @@ struct VoicePolishEditingPipeline: Sendable {
             let initial = try await generate(
                 task: .voicePolishRender,
                 system: VoicePolishEditingPrompts.light,
-                payload: VoicePolishEditingPrompts.fullTextPayload(request.fallbackText),
+                payload: VoicePolishEditingPrompts.fullTextPayload(
+                    request.fallbackText,
+                    additionalRequirements: isLight ? request.preferences.additionalRequirements : ""
+                ),
                 deadline: deadline, attempts: attempts
             )
             draft = initial

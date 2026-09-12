@@ -34,18 +34,7 @@ enum ModelSettingsSummary {
         )
     }
 
-    static func asset() -> ModelSettingsSummaryData {
-        let provider = KeychainService.selectedAssetExtractionLLMProvider
-        let override = KeychainService.loadAssetExtractionModelOverride(for: provider)
-        let config = KeychainService.loadAssetExtractionLLMConfig()
-        let configured = provider == .localQwen ? LocalQwenLLMConfig.isModelAvailable : config != nil
-        return ModelSettingsSummaryData(
-            provider: provider.displayName,
-            model: llmModelName(provider: provider, config: config, override: override),
-            statusTitle: configured ? L("已保存", "Saved") : L("待配置", "Needs setup"),
-            statusTone: configured ? .success : .warning
-        )
-    }
+
 
     private static func asrModelName(provider: ASRProvider, credentials: [String: String]) -> String {
         switch provider {

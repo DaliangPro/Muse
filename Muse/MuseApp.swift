@@ -597,7 +597,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func registerHotkeys(for provider: ASRProvider) {
         guard !InteractiveTestRuntime.isEnabled else { return }
         let availableModes = appState.availableModes
-        let modes = ASRProviderRegistry.supportedModes(from: availableModes, for: provider)
+        let visibleModes = NormalOutputSettings.visibleModes(
+            in: availableModes, light: NormalOutputSettings.usesLightPolish()
+        )
+        let modes = ASRProviderRegistry.supportedModes(from: visibleModes, for: provider)
         let bindings: [ModeBinding] = modes.compactMap { mode in
             guard let code = mode.hotkeyCode else { return nil }
             let modifiers = CGEventFlags(rawValue: mode.hotkeyModifiers ?? 0)
@@ -626,7 +629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                     let selectedProvider = KeychainService.selectedASRProvider
                     let resolvedMode = ASRProviderRegistry.resolvedMode(for: capturedMode, provider: selectedProvider)
-                    let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+                    let storedMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+                    let effectiveMode = NormalOutputSettings.resolve(storedMode, in: availableModes, light: NormalOutputSettings.usesLightPolish())
                     MainActor.assumeIsolated { self.hotkeyManager.isSessionActive = true }
                     AppLogger.log("[Muse] >>> HOTKEY: Record START (mode: \(effectiveMode.name))")
                     DebugFileLogger.log("hotkey record start mode=\(effectiveMode.name)")
@@ -655,7 +659,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let newMode = availableModes.first(where: { $0.id == newModeId }) else { return }
             let selectedProvider = KeychainService.selectedASRProvider
             let resolvedMode = ASRProviderRegistry.resolvedMode(for: newMode, provider: selectedProvider)
-            let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+            let storedMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+            let effectiveMode = NormalOutputSettings.resolve(storedMode, in: availableModes, light: NormalOutputSettings.usesLightPolish())
             AppLogger.log("[Muse] >>> HOTKEY: Cross-mode stop → \(effectiveMode.name)")
             DebugFileLogger.log("hotkey cross-mode stop → \(effectiveMode.name)")
             Task { @MainActor in

@@ -8,7 +8,6 @@ private enum SettingsTabPageStyle {
 struct SettingsContentArea: View {
     let selectedTab: SettingsTab
     let pageInsets: EdgeInsets
-    var voicePolishModeID = ProcessingMode.formalWriting.id
 
     var body: some View {
         currentTabPage
@@ -48,14 +47,10 @@ private extension SettingsContentArea {
         switch selectedTab {
         case .general:
             GeneralSettingsTab()
-        case .assetLibrary:
-            AssetLibraryTab()
         case .models:
             ModelSettingsTab()
         case .vocabulary:
             TerminologySettingsTab()
-        case .voicePolish:
-            VoicePolishSettingsTab(initialModeID: voicePolishModeID)
         case .modes:
             ModesSettingsTab()
         case .about:
@@ -67,9 +62,9 @@ private extension SettingsContentArea {
 private extension SettingsTab {
     var pageStyle: SettingsTabPageStyle {
         switch self {
-        case .general, .assetLibrary:
+        case .general, .modes, .vocabulary:
             .fixed
-        case .models, .vocabulary, .voicePolish, .modes, .about:
+        case .models, .about:
             .scroll(showsIndicators: false)
         }
     }

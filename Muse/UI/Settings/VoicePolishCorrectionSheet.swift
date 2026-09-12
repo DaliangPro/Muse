@@ -131,8 +131,8 @@ private extension VoicePolishCorrectionSheet {
                         .foregroundStyle(TF.settingsText)
                     }
                     Text(L(
-                        "从下次开始，它会用于支持的识别增强、识别后纠错、语音润色保护，并显示在“术语与纠错”中。",
-                        "From next time, it is used for supported ASR boosting, post-ASR correction, Voice Polish protection, and appears in Terminology."
+                        "从下次开始，它会用于支持的识别增强和识别后纠错，可在“我的词库”中管理。",
+                        "It will be used for supported ASR boosting and post-ASR correction. Manage it in My Vocabulary."
                     ))
                     .font(TF.settingsFontCaption)
                     .foregroundStyle(TF.settingsTextTertiary)
@@ -343,7 +343,7 @@ private extension VoicePolishCorrectionSheet {
         if terminologyCandidates.isEmpty {
             return L("编辑后若检测到明确的错词 → 正确术语，这里会显示并允许记住。", "After editing, a clear misheard term → correct term will appear here and can be remembered.")
         }
-        return L("只保存下方明确检测到的对应关系，可随时到“术语与纠错”管理。", "Saves only the explicit mappings shown below; manage them anytime in Terminology.")
+        return L("只保存下方明确检测到的对应关系，可随时到“我的词库”管理。", "Saves only the explicit mappings shown below; manage them anytime in Terminology.")
     }
 
     var canConfirm: Bool {

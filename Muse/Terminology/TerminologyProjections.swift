@@ -50,6 +50,16 @@ struct TerminologyProjectionBundle: Sendable, Equatable {
 }
 
 enum TerminologyProjections {
+    /// 词库允许整句替换，但识别提示只下发短词，避免把模板、网址或长句发给 ASR。
+    private static func isRecognitionTerm(_ text: String) -> Bool {
+        let marks = CharacterSet(charactersIn: "。！？；!?;，,：:\n\r")
+        let lower = text.lowercased()
+        return (1...64).contains(text.count)
+            && text.rangeOfCharacter(from: marks) == nil
+            && text.split(whereSeparator: \.isWhitespace).count <= 6
+            && !["http://", "https://", "www.", "@"].contains(where: lower.contains)
+    }
+
     static func make(
         from document: TerminologyDocument,
         applicationBundleIdentifier: String? = nil
@@ -82,6 +92,7 @@ enum TerminologyProjections {
         var seenHotwords = Set<String>()
         var hotwords: [String] = []
         for entry in ordered {
+            guard isRecognitionTerm(entry.canonicalText) else { continue }
             let key = TerminologyText.normalizedKey(entry.canonicalText)
             guard seenHotwords.insert(key).inserted else { continue }
             hotwords.append(entry.canonicalText)

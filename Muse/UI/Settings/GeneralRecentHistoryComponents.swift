@@ -132,7 +132,7 @@ struct RecentHistoryRowView: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .help(modeName)
-                        .accessibilityLabel(L("输入模式", "Input mode"))
+                        .accessibilityLabel(L("输出模式", "Output mode"))
                         .accessibilityValue(modeName)
                 }
 

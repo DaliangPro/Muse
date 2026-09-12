@@ -24,6 +24,18 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(payload, ["canonical_text": source])
     }
 
+    func testLightTrialRequirementsReachTheSingleRequest() async throws {
+        let client = EditingTestClient([.text("明天见。")])
+        let input = request("明天见", .light, requirements: "使用中文标点")
+        _ = await pipeline(client).process(input)
+        let calls = await client.requests
+        XCTAssertEqual(calls.count, 1)
+        let call = try XCTUnwrap(calls.first)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: String])
+        XCTAssertEqual(payload["additional_requirements"], "使用中文标点")
+        XCTAssertEqual(payload["canonical_text"], "明天见")
+    }
+
     func testLightCanLeaveNaturalSentenceUnchanged() async {
         let source = "对对对，我明白了。"
         let client = EditingTestClient([.text(source)])
@@ -636,13 +648,14 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     }
 
     private func request(_ source: String, _ mode: VoicePolishQualityMode,
-                         context: WritingContext = WritingContext(scene: .workChat)) -> VoicePolishRequest {
+                         context: WritingContext = WritingContext(scene: .workChat),
+                         requirements: String = "") -> VoicePolishRequest {
         VoicePolishRequest(
             input: VoiceInputEnvelope(providerFinalText: source,
                                       segments: [RecognitionSegment(id: "s1", text: source, startTimeMs: nil,
                                                                      endTimeMs: nil, confidence: nil, isFinal: true)],
                                       durationMs: 1_000, provider: .volcano),
-            context: context, preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: mode
+            context: context, preferences: UserPolishPreferences(additionalRequirements: requirements), qualityMode: mode
         )
     }
 }
