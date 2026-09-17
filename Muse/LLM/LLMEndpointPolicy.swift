@@ -350,6 +350,7 @@ struct LLMStreamingParser: Sendable {
     private var events: SSEEventAccumulator
     private var result = ""
     private var resultBytes = 0
+    var hasContent: Bool { !result.isEmpty }
     private let maxResponseBytes: Int
     private(set) var isComplete = false
     private(set) var reasoningObserved = false

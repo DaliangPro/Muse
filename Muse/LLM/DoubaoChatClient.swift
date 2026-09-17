@@ -588,7 +588,10 @@ actor DoubaoChatClient: LLMClient {
         model: String,
         requestStartedAt: ContinuousClock.Instant
     ) async throws -> LLMExecutionResult {
-        let (bytes, response) = try await session.bytes(for: request)
+        let timing = LLMNetworkTiming.current()
+        timing?.record("request_start")
+        let (bytes, response) = try await session.bytes(for: request, delegate: timing)
+        timing?.record("response_headers")
         guard let http = response as? HTTPURLResponse else {
             throw LLMError.requestFailed(0)
         }
@@ -604,6 +607,7 @@ actor DoubaoChatClient: LLMClient {
 
         var lineCount = 0
         var didRecordFirstByte = false
+        var didRecordFirstContent = false
         var parser = LLMStreamingParser()
         var decoder = SSEByteStreamDecoder()
         var responseID: String?
@@ -612,6 +616,7 @@ actor DoubaoChatClient: LLMClient {
             for try await byte in bytes {
                 if !didRecordFirstByte {
                     didRecordFirstByte = true
+                    timing?.record("first_body_byte")
                     DebugFileLogger.log(
                         "LLM[\(model)]: ttft_ms=\(Self.milliseconds(ContinuousClock.now - requestStartedAt)) transport=stream"
                     )
@@ -623,6 +628,10 @@ actor DoubaoChatClient: LLMClient {
                         responseModel = responseModel ?? identity.model
                     }
                     try parser.consume(line: line)
+                    if !didRecordFirstContent, parser.hasContent {
+                        didRecordFirstContent = true
+                        timing?.record("first_content")
+                    }
                     if parser.isComplete { break }
                 }
             }
@@ -633,6 +642,10 @@ actor DoubaoChatClient: LLMClient {
                     responseModel = responseModel ?? identity.model
                 }
                 try parser.consume(line: line)
+                if !didRecordFirstContent, parser.hasContent {
+                    didRecordFirstContent = true
+                    timing?.record("first_content")
+                }
             }
         } catch {
             if Self.shouldFlushPendingLine(after: error) {
@@ -653,6 +666,8 @@ actor DoubaoChatClient: LLMClient {
 
         do {
             let text = try parser.finish()
+            if !didRecordFirstContent { timing?.record("first_content") }
+            timing?.record("stream_finished")
             return LLMExecutionResult(
                 text: text,
                 evidence: LLMThinkingProbeEvidence(
