@@ -4,34 +4,19 @@ import XCTest
 
 final class SettingsWindowPresenterTests: XCTestCase {
     @MainActor
-    func testReusesSwiftUISettingsWindowBeforeCreatingManualWindow() async {
+    func testOpenBeforeSceneActionIsReadyQueuesOnlyOneOpen() async {
         _ = NSApplication.shared
-        let window = makeWindow(identifier: "settings")
-        XCTAssertTrue(SettingsWindowPresenter.existingSettingsWindow(in: [window], retained: nil) === window)
+        let presenter = SettingsWindowPresenter()
+        var calls = 0
+        presenter.open()
+        presenter.open()
+        XCTAssertEqual(calls, 0)
+        presenter.register { calls += 1 }
+        XCTAssertEqual(calls, 1)
+        presenter.register { calls += 1 }
+        XCTAssertEqual(calls, 1)
+        presenter.open()
+        XCTAssertEqual(calls, 2)
     }
 
-    @MainActor
-    func testClosedRetainedWindowCanBeReopenedWithoutCreatingAnother() async {
-        _ = NSApplication.shared
-        let window = makeWindow(identifier: "settings")
-        XCTAssertTrue(SettingsWindowPresenter.existingSettingsWindow(in: [], retained: window) === window)
-    }
-
-    @MainActor
-    func testIgnoresSetupAndOtherWindowsWithTheSameTitle() async {
-        _ = NSApplication.shared
-        let setup = makeWindow(identifier: "setup")
-        setup.title = "Muse 设置"
-        XCTAssertNil(SettingsWindowPresenter.existingSettingsWindow(in: [setup], retained: nil))
-        let settings = makeWindow(identifier: "settings")
-        XCTAssertTrue(SettingsWindowPresenter.existingSettingsWindow(in: [setup, settings], retained: nil) === settings)
-    }
-
-    @MainActor
-    private func makeWindow(identifier: String) -> NSWindow {
-        let window = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier(identifier)
-        return window
-    }
 }

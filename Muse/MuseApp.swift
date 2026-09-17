@@ -91,6 +91,14 @@ struct MuseApp: App {
         )
         .defaultPosition(.center)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                SettingsMenuCommand(
+                    register: appDelegate.registerSettingsWindowAction,
+                    open: appDelegate.openSettingsWindow
+                )
+            }
+        }
 
         Window(L("Muse 设置向导", "Muse Setup"), id: "setup") {
             SetupWizardView()
@@ -191,7 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 hudDebugPresenter: hudDebugPresenter,
                 appState: appState,
                 openSettingsWindow: { [weak self] in
-                    self?.openSettingsWindow(preferManualWindow: true)
+                    self?.openSettingsWindow()
                 }
             )
         }
@@ -560,7 +568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSettingsFromStatusMenu() {
-        openSettingsWindow(preferManualWindow: true)
+        openSettingsWindow()
     }
 
     @objc private func openSetupFromStatusMenu() {
@@ -573,7 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openAboutFromStatusMenu() {
-        openSettingsWindow(preferManualWindow: true)
+        openSettingsWindow()
         NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.about)
     }
 
@@ -815,14 +823,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    private func openSettingsWindow(preferManualWindow: Bool = false) {
+    func registerSettingsWindowAction(_ action: @escaping () -> Void) {
+        settingsWindowPresenter.register(openAction: action)
+    }
+
+    func openSettingsWindow() {
         guard !InteractiveTestRuntime.isEnabled else { return }
-        settingsWindowPresenter.open(
-            preferManualWindow: preferManualWindow,
-            appState: appState,
-            appUpdater: appUpdater,
-            swiftUIOpenAction: Self.openSettingsAction
-        )
+        settingsWindowPresenter.open()
     }
 
     /// Only reset hotkey state when no new recording is in progress.
