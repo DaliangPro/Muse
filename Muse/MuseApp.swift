@@ -90,7 +90,8 @@ struct MuseApp: App {
             height: SettingsLayout.windowContentHeight
         )
         .defaultPosition(.center)
-        .windowStyle(.hiddenTitleBar)
+        // 保留原生标题栏的按钮容器；标题文字和背景由设置窗口配置器隐藏。
+        .windowStyle(.titleBar)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 SettingsMenuCommand(
