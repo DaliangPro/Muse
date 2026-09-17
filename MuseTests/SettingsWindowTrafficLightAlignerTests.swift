@@ -28,6 +28,9 @@ final class SettingsWindowTrafficLightAlignerTests: XCTestCase {
         let aligner = SettingsWindowTrafficLightAligner(leadingInset: 16, topInset: 16)
         for _ in 0..<3 {
             aligner.align(in: window)
+            let screenRect = window.convertToScreen(close.convert(close.bounds, to: nil))
+            XCTAssertEqual(window.frame.maxY - screenRect.maxY, 16, accuracy: 0.5)
+            XCTAssertEqual(screenRect.minX - window.frame.minX, 16, accuracy: 0.5)
             XCTAssertTrue(frameView.subviews.last === titlebarContainer, "全尺寸内容不得遮住标题栏")
             for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
                 let button = try XCTUnwrap(window.standardWindowButton(kind))
