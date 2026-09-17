@@ -541,7 +541,15 @@ private extension TerminologySettingsTab {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return entries.filter { query.isEmpty || $0.canonical.localizedCaseInsensitiveContains(query)
             || $0.aliases.contains { $0.localizedCaseInsensitiveContains(query) } }
-            .sorted { $0.canonical.localizedStandardCompare($1.canonical) == .orderedAscending }
+            .sorted { lhs, rhs in
+                // 旧短语没有创建时间，排在有时间的词条之后。
+                let lhsDate = lhs.term?.createdAt ?? .distantPast
+                let rhsDate = rhs.term?.createdAt ?? .distantPast
+                if lhsDate != rhsDate { return lhsDate > rhsDate }
+                let nameOrder = lhs.canonical.localizedStandardCompare(rhs.canonical)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                return lhs.id < rhs.id
+            }
     }
 
     func saveLegacyReplacement(_ group: VocabularySnippetGroup, updated: TerminologyEntry?) {
