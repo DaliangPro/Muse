@@ -2658,6 +2658,47 @@ class ThreeModeEvidenceTests(unittest.TestCase):
             receipts[i].update(llm_task=task, response_text_sha256=e.legacy.sha256_text(raw))
         return report, receipts
 
+    def v13_report(self, mode="standard", source="原定周二，改为周三。", response="周三。"):
+        report, receipts = self.v11_report(source, response)
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 13
+        report["mode"] = report["quality_mode"] = mode
+        row = report["cases"][0]
+        row["mode"] = mode
+        row["detected_route"] = row["executed_route"] = "structured" if mode == "standard" else "fast"
+        task = "voicePolishStructured" if mode == "standard" else "voicePolishRender"
+        row["stage_responses"][0]["task"] = task
+        receipts[0].update(mode=mode, llm_task=task)
+        return report, receipts
+
+    def test_v13_both_modes_read_original_once_and_preserve_response(self):
+        for mode in ("light", "standard"):
+            report, receipts = self.v13_report(mode, response="  周三。\r\nCafe\u0301 👩🏽‍💻\t ")
+            self.assertEqual(self.check(report, receipts, mode), ([], []))
+
+    def test_v13_rejects_extra_request_wrong_task_source_and_output(self):
+        for field, value in [("llm_attempt_count", 2), ("repair_attempt_count", 1),
+                             ("model_output", "清洗后的正文"), ("diagnostic_codes", ["额外诊断"])]:
+            report, receipts = self.v13_report()
+            report["cases"][0][field] = value
+            self.assertTrue(self.check(report, receipts, "standard")[0], field)
+        report, receipts = self.v12_standard_report()
+        self.expected["editing_prompt_version"] = report["editing_prompt_version"] = 13
+        self.assertTrue(self.check(report, receipts, "standard")[0], "两次请求不可冒充新标准")
+        for changes in [{"task": "voicePolishRender"},
+                        {"request_payload": '{"canonical_text":"轻度生成稿"}'}]:
+            report, receipts = self.v13_report()
+            report["cases"][0]["stage_responses"][0].update(changes)
+            self.assertTrue(self.check(report, receipts, "standard")[0], changes)
+
+    def test_v13_invalid_response_falls_back_to_complete_original(self):
+        report, receipts = self.v13_report(source="完整原文。", response=" \n")
+        report["cases"][0].update(fallback_used=True, model_output="完整原文。",
+            failure_reason="validationFailed", hard_validation_codes=["emptyOutput"],
+            rejected_model_output=" \n")
+        failures, quality = self.check(report, receipts, "standard")
+        self.assertEqual(failures, [])
+        self.assertTrue(quality)
+
     def test_v12_light_keeps_v11_single_render_contract(self):
         for raw in ["周三。", "  首尾\r\n\r空白 e\u0301 👩🏽‍💻\n", '{"edits":[]}', "与来源语义不同也只做证据审计"]:
             report, receipts = self.v11_report(response=raw)

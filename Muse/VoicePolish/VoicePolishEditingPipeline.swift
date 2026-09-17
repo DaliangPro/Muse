@@ -23,8 +23,8 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
-/// 轻度一次生成完整正文；标准先执行同一校对，再整理实际校对稿的结构。
-/// 任一步失败都保留完整来源，成功正文不再经过程序改写。
+/// 两档分别使用各自提示词，直接从完整来源一次生成正文。
+/// 请求失败保留完整来源，成功正文不再经过程序改写。
 struct VoicePolishEditingPipeline: Sendable {
     private let client: any LLMClient
     private let config: LLMConfig
@@ -49,7 +49,7 @@ struct VoicePolishEditingPipeline: Sendable {
     func process(_ request: VoicePolishRequest) async -> VoicePolishResult {
         let isLight = request.qualityMode == .light
         let route: VoicePolishRoute = isLight ? .fast : .structured
-        let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? (isLight ? .seconds(30) : .seconds(60)))
+        let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? .seconds(30))
         let attempts = VoicePolishEditingAttempts()
         var draft: String?
         func result(_ text: String?, codes: [VoicePolishValidationCode] = [],
@@ -71,31 +71,18 @@ struct VoicePolishEditingPipeline: Sendable {
         }
         do {
             try Task.checkCancellation()
-            let initial = try await generate(
-                task: .voicePolishRender,
-                system: VoicePolishEditingPrompts.light,
+            let output = try await generate(
+                task: isLight ? .voicePolishRender : .voicePolishStructured,
+                system: isLight ? VoicePolishEditingPrompts.light : VoicePolishEditingPrompts.standard,
                 payload: VoicePolishEditingPrompts.fullTextPayload(
                     request.fallbackText,
-                    additionalRequirements: isLight ? request.preferences.additionalRequirements : ""
+                    additionalRequirements: request.preferences.additionalRequirements
                 ),
                 deadline: deadline, attempts: attempts
             )
-            draft = initial
-            if let code = Self.deliveryFailureCode(initial) { return result(nil, codes: [code]) }
-            if isLight { return result(initial) }
-
-            // 第二步只接收第一步实际返回的完整正文，不重用原稿，也不增加语义复核。
-            let structured = try await generate(
-                task: .voicePolishStructured,
-                system: VoicePolishEditingPrompts.standard,
-                payload: VoicePolishEditingPrompts.fullTextPayload(
-                    initial, additionalRequirements: request.preferences.additionalRequirements
-                ),
-                deadline: deadline, attempts: attempts
-            )
-            draft = structured
-            if let code = Self.deliveryFailureCode(structured) { return result(nil, codes: [code]) }
-            return result(structured)
+            draft = output
+            if let code = Self.deliveryFailureCode(output) { return result(nil, codes: [code]) }
+            return result(output)
         } catch is VoicePolishEditingTimeout {
             return result(nil, codes: [.emptyOutput], reason: .timeout)
         } catch let error as LLMError {
@@ -149,7 +136,7 @@ struct VoicePolishEditingPipeline: Sendable {
         return response.text
     }
 
-    /// 两步均沿用轻度已验收的交付边界，不用本地语义规则撤销模型纠错。
+    /// 两档均沿用轻度已验收的交付边界，不用本地语义规则撤销模型纠错。
     private static func deliveryFailureCode(_ output: String) -> VoicePolishValidationCode? {
         if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .emptyOutput }
         if VoicePolishCharacterSafety.containsUnsafeCharacters(output) { return .unsafeCharacters }

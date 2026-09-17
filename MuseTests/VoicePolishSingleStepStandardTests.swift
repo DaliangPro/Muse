@@ -3,89 +3,74 @@ import XCTest
 import os
 @testable import Muse
 
-final class VoicePolishTwoStepStandardTests: XCTestCase {
+final class VoicePolishSingleStepStandardTests: XCTestCase {
     private let config = LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1")
 
-    func testStandardReusesLightRequestThenConsumesItsExactActualResponse() async throws {
+    func testStandardReadsCanonicalSourceOnceAndPreservesExactOutput() async throws {
         let source = "请用 Cloud Code 复查，小李负责。小李请假了，改成小王负责。"
-        let initial = " \r\n请用 Claude Code 复查，小王负责。小李请假了。Cafe\u{301} 👩🏽‍💻\t "
-        let final = "\n请用 Claude Code 复查。\r\n小王负责，小李请假了。Cafe\u{301} 👩🏽‍💻\n "
-        let lightClient = TwoStepStandardClient([.text(initial), .text("不应调用")])
-        let lightInput = request(source, mode: .light, correctsCloudCode: true)
-        let lightResult = await pipeline(lightClient).process(lightInput)
-        let lightCalls = await lightClient.requests
+        let output = " \r\n请用 Claude Code 复查。\n小王负责，小李请假了。Cafe\u{301} 👩🏽‍💻\t "
+        let input = request(source, correctsCloudCode: true)
+        let client = SingleStepStandardClient([.text(output), .text("不应复核")])
         let stages = OSAllocatedUnfairLock(initialState: [VoicePolishStage]())
-        let standardClient = TwoStepStandardClient([.text(initial), .text(final), .text("不应复核")])
-        let standardPipeline = VoicePolishEditingPipeline(client: standardClient, config: config) { stage in
+        let subject = VoicePolishEditingPipeline(client: client, config: config) { stage in
             stages.withLock { $0.append(stage) }
         }
-
-        let result = await standardPipeline.process(request(source, correctsCloudCode: true))
-        let calls = await standardClient.requests
-
-        XCTAssertEqual(lightCalls.count, 1)
-        XCTAssertEqual(calls.count, 2)
-        let first = try XCTUnwrap(calls.first)
-        XCTAssertEqual(first, lightCalls.first)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(try payload(first), ["canonical_text": lightInput.fallbackText])
-        let second = try XCTUnwrap(calls.last)
-        let actualSecondSource = try XCTUnwrap(payload(second)["canonical_text"])
-        XCTAssertTrue(actualSecondSource.utf8.elementsEqual(initial.utf8))
-        XCTAssertEqual(Set(try payload(second).keys), Set(["canonical_text"]))
-        XCTAssertEqual(first.system, VoicePolishEditingPrompts.light)
-        XCTAssertEqual(second.system, VoicePolishEditingPrompts.standard)
-        XCTAssertEqual(stages.withLock { $0 }, [.polishing, .rendering])
-        for call in calls {
-            XCTAssertEqual(call.context, .structuredTask)
-            XCTAssertEqual(call.options, LLMGenerationOptions(
-                temperature: 0, maxOutputTokens: 2_048, reasoningPolicy: .disabled, responseFormat: .text
-            ))
-        }
-        XCTAssertTrue(lightResult.text.utf8.elementsEqual(initial.utf8))
-        XCTAssertTrue(result.text.utf8.elementsEqual(final.utf8))
+        let result = await subject.process(input)
+        let calls = await client.requests
+        XCTAssertEqual(calls.count, 1)
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.task, .voicePolishStructured)
+        XCTAssertEqual(try payload(call), ["canonical_text": input.fallbackText])
+        XCTAssertEqual(call.system, VoicePolishEditingPrompts.standard)
+        XCTAssertEqual(call.context, .structuredTask)
+        XCTAssertEqual(call.options, LLMGenerationOptions(
+            temperature: 0, maxOutputTokens: 2_048, reasoningPolicy: .disabled, responseFormat: .text
+        ))
+        XCTAssertEqual(stages.withLock { $0 }, [.rendering])
+        XCTAssertTrue(result.text.utf8.elementsEqual(output.utf8))
         XCTAssertFalse(result.usedFallback)
         XCTAssertNil(result.failureReason)
         XCTAssertNil(result.rejectedDraft)
         XCTAssertTrue(result.validationCodes.isEmpty)
         XCTAssertEqual(result.detectedRoute, .structured)
         XCTAssertEqual(result.executedRoute, .structured)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
     func testPromptsKeepAcceptedLightAndApprovedStructureWording() {
-        XCTAssertEqual(VoicePolishEditingPrompts.version, 12)
+        XCTAssertEqual(VoicePolishEditingPrompts.version, 13)
         XCTAssertEqual(VoicePolishEditingPrompts.light,
             "你是语音输入法的轻度校对器。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。保持原有表达和顺序，不扩写。只返回润色后的完整正文。")
         XCTAssertEqual(VoicePolishEditingPrompts.standard,
             "你是语音输入法的文字编辑。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。把同一事项及其补充合在一起，再按事项分段或列点，保持原有口吻，不扩写。只返回润色后的完整正文。")
     }
 
-    func testExplicitRequirementsOnlyEnterStructureStageWithoutChangingLightRequest() async throws {
+    func testExplicitRequirementsReachEachModeWithoutAnIntermediateDraft() async throws {
         let source = "本周先整理客户反馈，再发测试报告。"
-        let intermediate = "本周先整理客户反馈，再发测试报告。"
         let requirements = "请用简短段落。\n  保留英文术语 Cafe\u{301}。"
         let input = request(source, additionalRequirements: requirements)
-        let client = TwoStepStandardClient([.text(intermediate), .text("本周先整理客户反馈。\n再发测试报告。")])
-        let lightClient = TwoStepStandardClient([.text(intermediate)])
+        let client = SingleStepStandardClient([.text(source)])
+        let lightClient = SingleStepStandardClient([.text(source)])
         _ = await pipeline(lightClient).process(request(source, mode: .light, additionalRequirements: requirements))
-
         let result = await pipeline(client).process(input)
         let calls = await client.requests
         let lightCalls = await lightClient.requests
-
-        XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(calls.first, lightCalls.first)
-        XCTAssertEqual(try payload(XCTUnwrap(calls.first)), ["canonical_text": source])
-        let second = try payload(XCTUnwrap(calls.last))
-        XCTAssertEqual(Set(second.keys), Set(["canonical_text", "additional_requirements"]))
-        XCTAssertEqual(second["canonical_text"], intermediate)
-        let actualRequirements = try XCTUnwrap(second["additional_requirements"])
-        XCTAssertTrue(actualRequirements.utf8.elementsEqual(input.preferences.additionalRequirements.utf8))
-        XCTAssertEqual(calls.last?.system, VoicePolishEditingPrompts.standard)
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(lightCalls.count, 1)
+        XCTAssertEqual(lightCalls.first?.task, .voicePolishRender)
+        XCTAssertEqual(lightCalls.first?.system, VoicePolishEditingPrompts.light)
+        XCTAssertEqual(try payload(XCTUnwrap(lightCalls.first)), [
+            "canonical_text": source, "additional_requirements": input.preferences.additionalRequirements
+        ])
+        let body = try payload(XCTUnwrap(calls.first))
+        XCTAssertEqual(Set(body.keys), Set(["canonical_text", "additional_requirements"]))
+        XCTAssertEqual(body["canonical_text"], source)
+        let actual = try XCTUnwrap(body["additional_requirements"])
+        XCTAssertTrue(actual.utf8.elementsEqual(input.preferences.additionalRequirements.utf8))
+        XCTAssertEqual(calls.first?.system, VoicePolishEditingPrompts.standard)
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
@@ -102,37 +87,23 @@ final class VoicePolishTwoStepStandardTests: XCTestCase {
         XCTAssertTrue(actual.utf8.elementsEqual(original.utf8))
     }
 
-    func testInvalidFirstResponseStopsBeforeStructureAndPreservesCanonical() async {
+    func testInvalidResponsePreservesCanonicalWithoutRetry() async {
         let input = request("请用 Cloud Code 复查。", correctsCloudCode: true)
         for (response, code) in invalidResponses {
-            let client = TwoStepStandardClient([.text(response), .text("不应进入第二步")])
+            let client = SingleStepStandardClient([.text(response), .text("不应进入第二步")])
             let result = await pipeline(client).process(input)
             assertFallback(result, source: input.fallbackText, attempts: 1, reason: .validationFailed)
             XCTAssertEqual(result.validationCodes, [code])
             XCTAssertEqual(result.rejectedDraft, response)
             let calls = await client.requests
-            XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+            XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         }
     }
 
-    func testInvalidSecondResponseNeverDeliversIntermediateDraft() async {
-        let input = request("小李负责。小李请假了，改成小王负责。")
-        let intermediate = "小王负责，小李请假了。"
-        for (response, code) in invalidResponses {
-            let client = TwoStepStandardClient([.text(intermediate), .text(response), .text("不应重试")])
-            let result = await pipeline(client).process(input)
-            assertFallback(result, source: input.fallbackText, attempts: 2, reason: .validationFailed)
-            XCTAssertEqual(result.validationCodes, [code])
-            XCTAssertEqual(result.rejectedDraft, response)
-            let calls = await client.requests
-            XCTAssertEqual(calls.count, 2)
-        }
-    }
-
-    func testFirstClientFailureNeverStartsAnotherStage() async {
+    func testClientFailureNeverStartsAnotherRequest() async {
         let input = request("请用 Cloud Code 复查，先别发送。", correctsCloudCode: true)
         for error in clientFailures {
-            let client = TwoStepStandardClient([.failure(error), .text("不应重试")])
+            let client = SingleStepStandardClient([.failure(error), .text("不应重试")])
             let result = await pipeline(client).process(input)
             assertFallback(result, source: input.fallbackText, attempts: 1, reason: expectedReason(error))
             XCTAssertNil(result.rejectedDraft)
@@ -141,46 +112,33 @@ final class VoicePolishTwoStepStandardTests: XCTestCase {
         }
     }
 
-    func testSecondClientFailureRetainsOriginalSourceInsteadOfFirstDraft() async {
-        let input = request("小李负责。小李请假了，改成小王负责。")
-        let intermediate = "小王负责，小李请假了。"
-        for error in clientFailures {
-            let client = TwoStepStandardClient([.text(intermediate), .failure(error), .text("不应重试")])
-            let result = await pipeline(client).process(input)
-            assertFallback(result, source: input.fallbackText, attempts: 2, reason: expectedReason(error))
-            XCTAssertEqual(result.rejectedDraft, intermediate)
-            let calls = await client.requests
-            XCTAssertEqual(calls.count, 2)
-        }
-    }
-
-    func testSecondStageHonorsStageTimeoutWithoutDeliveringFirstDraft() async {
+    func testRequestHonorsStageTimeout() async {
         let source = "有两件事。先校对，再整理。"
-        let client = TwoStepStandardClient([.text("先校对，再整理。"), .delay(.seconds(1), "迟到的稿")])
+        let client = SingleStepStandardClient([.delay(.seconds(1), "迟到的稿")])
         let subject = VoicePolishEditingPipeline(
             client: client, config: config, totalTimeout: .seconds(2), stageTimeout: .milliseconds(30)
         )
         let result = await subject.process(request(source))
-        assertFallback(result, source: source, attempts: 2, reason: .timeout)
+        assertFallback(result, source: source, attempts: 1, reason: .timeout)
         let calls = await client.requests
-        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls.count, 1)
     }
 
-    func testSecondStageSharesTheOriginalTotalDeadline() async {
+    func testRequestHonorsTotalDeadline() async {
         let source = "先校对，再整理。"
-        let client = TwoStepStandardClient([.text("校对后的正文。"), .delay(.seconds(1), "迟到的稿")])
+        let client = SingleStepStandardClient([.delay(.seconds(1), "迟到的稿")])
         let subject = VoicePolishEditingPipeline(
             client: client, config: config, totalTimeout: .milliseconds(80), stageTimeout: .seconds(2)
         )
         let result = await subject.process(request(source))
-        assertFallback(result, source: source, attempts: 2, reason: .timeout)
+        assertFallback(result, source: source, attempts: 1, reason: .timeout)
         let calls = await client.requests
-        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls.count, 1)
     }
 
     func testExpiredBudgetDoesNotCountAnUnstartedClientCall() async {
         let source = "保留原文。"
-        let client = TwoStepStandardClient([.text("不应请求")])
+        let client = SingleStepStandardClient([.text("不应请求")])
         let subject = VoicePolishEditingPipeline(client: client, config: config, totalTimeout: .zero)
         let result = await subject.process(request(source))
         assertFallback(result, source: source, attempts: 0, reason: .timeout)
@@ -188,9 +146,9 @@ final class VoicePolishTwoStepStandardTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
-    func testCancellationDuringFirstStageDoesNotStartStructure() async {
+    func testCancellationDoesNotStartAnotherRequest() async {
         let source = "先确认，再发送。"
-        let client = TwoStepStandardClient([.delay(.seconds(5), "迟到的稿"), .text("不应整理")])
+        let client = SingleStepStandardClient([.delay(.seconds(5), "迟到的稿"), .text("不应整理")])
         let subject = pipeline(client)
         let input = request(source)
         let task = Task { await subject.process(input) }
@@ -200,22 +158,6 @@ final class VoicePolishTwoStepStandardTests: XCTestCase {
         assertFallback(result, source: source, attempts: 1, reason: .requestFailed)
         let calls = await client.requests
         XCTAssertEqual(calls.count, 1)
-    }
-
-    func testCancellationDuringSecondStageNeverDeliversFirstDraft() async {
-        let source = "小李负责。小李请假了，改成小王负责。"
-        let intermediate = "小王负责，小李请假了。"
-        let client = TwoStepStandardClient([.text(intermediate), .delay(.seconds(5), "迟到的稿")])
-        let subject = pipeline(client)
-        let input = request(source)
-        let task = Task { await subject.process(input) }
-        await client.waitUntilRequestCount(2)
-        task.cancel()
-        let result = await task.value
-        assertFallback(result, source: source, attempts: 2, reason: .requestFailed)
-        XCTAssertEqual(result.rejectedDraft, intermediate)
-        let calls = await client.requests
-        XCTAssertEqual(calls.count, 2)
     }
 
     private var invalidResponses: [(String, VoicePolishValidationCode)] {
@@ -251,7 +193,7 @@ final class VoicePolishTwoStepStandardTests: XCTestCase {
         try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: String])
     }
 
-    private func pipeline(_ client: TwoStepStandardClient) -> VoicePolishEditingPipeline {
+    private func pipeline(_ client: SingleStepStandardClient) -> VoicePolishEditingPipeline {
         VoicePolishEditingPipeline(client: client, config: config)
     }
 
@@ -275,7 +217,7 @@ final class VoicePolishTwoStepStandardTests: XCTestCase {
     }
 }
 
-private actor TwoStepStandardClient: LLMClient {
+private actor SingleStepStandardClient: LLMClient {
     enum Step: Sendable { case text(String), failure(LLMError), delay(Duration, String) }
     private var steps: [Step]
     private(set) var requests: [LLMRequest] = []

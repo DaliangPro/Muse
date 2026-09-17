@@ -2,36 +2,33 @@ import XCTest
 @testable import Muse
 
 final class VoicePolishDedicatedContentReviewTests: XCTestCase {
-    func testRiskySourceStillUsesOnlyTwoFullTextStages() async throws {
+    func testRiskySourceStillUsesOnlyOneFullTextRequest() async throws {
         let source = "先别发送，等我确认。材料已经备齐。"
         let structured = "先别发送，等我确认。\n\n材料已经备齐。"
-        let (result, calls) = await run(source, [source, structured])
-        assertSuccess(result, calls: calls, text: structured, attempts: 2, repairs: 0)
-        guard calls.count == 2 else { return }
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(calls[0].system, VoicePolishEditingPrompts.light)
-        XCTAssertEqual(calls[1].system, VoicePolishEditingPrompts.standard)
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": source])
+        let (result, calls) = await run(source, [structured])
+        assertSuccess(result, calls: calls, text: structured, attempts: 1, repairs: 0)
+        guard calls.count == 1 else { return }
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
+        XCTAssertEqual(calls[0].system, VoicePolishEditingPrompts.standard)
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
     func testDistantOwnerCorrectionAndReasonArePassedToStructureTogether() async throws {
         let source = "阿文负责复查。共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。阿文要出差，复查改由阿宁。"
-        let prepared = "阿宁负责复查。共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。阿文要出差。"
         let structured = "阿宁负责复查。阿文要出差。\n\n共享材料使用带日期的文件。访问范围保持为项目成员，外部链接暂时不开放。设备报错先记录原话，尚未确认的原因不要自行补充。检查名单时先标记重复记录，再等我确认。"
-        let (result, calls) = await run(source, [prepared, structured])
-        assertSuccess(result, calls: calls, text: structured, attempts: 2, repairs: 0)
-        guard calls.count == 2 else { return }
+        let (result, calls) = await run(source, [structured])
+        assertSuccess(result, calls: calls, text: structured, attempts: 1, repairs: 0)
+        guard calls.count == 1 else { return }
         XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
     }
 
-    func testFirstStageCleanupDoesNotSkipStructure() async throws {
+    func testSourcePrefixUsesStandardPrompt() async throws {
         let source = "帮我整理一下：资料已备齐。"
         let prepared = "资料已备齐。"
-        let (result, calls) = await run(source, [prepared, prepared])
-        assertSuccess(result, calls: calls, text: prepared, attempts: 2, repairs: 0)
-        guard calls.count == 2 else { return }
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
+        let (result, calls) = await run(source, [prepared])
+        assertSuccess(result, calls: calls, text: prepared, attempts: 1, repairs: 0)
+        guard calls.count == 1 else { return }
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
     // 旧协议解析器单独保留反例，实际标准链不再调用它。
@@ -41,54 +38,53 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
         XCTAssertThrowsError(try VoicePolishEditingReview.decode(wrongReview, source: source))
     }
 
-    func testStructureReceivesActualCorrectedSentenceBoundaries() async throws {
+    func testStructureReceivesOriginalSentenceBoundaries() async throws {
         let source = "帮我整理一下：先检查，再发送。"
-        let prepared = "先检查。再发送。"
         let structured = "1. 先检查。\n\n2. 再发送。"
-        let (result, calls) = await run(source, [prepared, structured])
-        assertSuccess(result, calls: calls, text: structured, attempts: 2, repairs: 0)
-        guard calls.count == 2 else { return }
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
+        let (result, calls) = await run(source, [structured])
+        assertSuccess(result, calls: calls, text: structured, attempts: 1, repairs: 0)
+        guard calls.count == 1 else { return }
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
-    func testSecondStageNeverConsumesAdditionalReviewOrRepairResponses() async {
+    func testSingleRequestNeverConsumesAdditionalReviewOrRepairResponses() async {
         let source = "先别发送，等我确认。"
         let (result, calls) = await run(source, [source, source, "不应读取的复核", "不应读取的修复"])
-        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
     }
 
-    func testPublicCorrectionExplanationIsPassedThroughBothStages() async {
+    func testPublicCorrectionExplanationIsPassedThroughSingleRequest() async {
         let source = "公开更正：原通知时间说错了，请以本通知为准。"
-        let (result, calls) = await run(source, [source, source])
-        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
+        let (result, calls) = await run(source, [source])
+        assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
     }
 
     func testDownstreamProhibitionIsPassedThroughWithoutEditorDeletionProtocol() async {
         let source = "请转告同事：先别按旧安排发送，等我确认后再发。"
-        let (result, calls) = await run(source, [source, source])
-        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
+        let (result, calls) = await run(source, [source])
+        assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
     }
 
-    func testOrdinaryShortSentenceKeepsTwoCallStandardRoute() async throws {
+    func testOrdinaryShortSentenceKeepsSingleCallStandardRoute() async throws {
         let source = "材料已经备齐。"
-        let (result, calls) = await run(source, [source, source])
-        assertSuccess(result, calls: calls, text: source, attempts: 2, repairs: 0)
-        guard calls.count == 2 else { return }
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": source])
-        XCTAssertEqual(calls[1].system, VoicePolishEditingPrompts.standard)
+        let (result, calls) = await run(source, [source])
+        assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
+        guard calls.count == 1 else { return }
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
+        XCTAssertEqual(calls[0].system, VoicePolishEditingPrompts.standard)
     }
 
     func testOrdinaryWordCorrectionDoesNotAddDedicatedCall() async throws {
         let source = "请按装软件。"
         let prepared = "请安装软件。"
-        let (result, calls) = await run(source, [prepared, prepared])
-        assertSuccess(result, calls: calls, text: prepared, attempts: 2, repairs: 0)
-        guard calls.count == 2 else { return }
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
+        let (result, calls) = await run(source, [prepared])
+        assertSuccess(result, calls: calls, text: prepared, attempts: 1, repairs: 0)
+        guard calls.count == 1 else { return }
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
-    func testUnsafeFirstStageStopsBeforeStructureAndKeepsOriginalSource() async {
+    func testUnsafeResponseStopsWithoutRetryAndKeepsOriginalSource() async {
         let source = "帮我整理一下：资料还没核对。"
         let (result, calls) = await run(source, ["资料\u{0000}还没核对。", "不应调用结构整理"])
         assertFallback(result, calls: calls, source: source, attempts: 1, repairs: 0, code: .unsafeCharacters)

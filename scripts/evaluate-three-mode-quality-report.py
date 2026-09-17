@@ -1977,7 +1977,9 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
     """证据失败与质量失败分开；这里不自动授予 direct_send 或发布通过。"""
     failures, quality = [], []
     is_v12 = expected["editing_prompt_version"] == 12
-    plain_text_protocol = is_v12 or (expected["editing_prompt_version"] == 11 and mode == "light")
+    is_v13 = expected["editing_prompt_version"] == 13
+    full_text_protocol = is_v12 or is_v13
+    plain_text_protocol = full_text_protocol or (expected["editing_prompt_version"] == 11 and mode == "light")
     pairs = {
         "schema_version": 5, "status": "complete", "mode": mode, "quality_mode": mode,
         "run_nonce": nonce, "process_id": process_id, "run_input_sha256": expected["run_input_sha256"],
@@ -2040,7 +2042,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             failures.append(f"{tid}: 缺少阶段审计数组")
             continue
         if mode == "direct":
-            if (is_v12 or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11)) and (
+            if (full_text_protocol or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11)) and (
                 not valid_integer(row.get("repair_attempt_count")) or row["repair_attempt_count"] != 0
             ):
                 failures.append(f"{tid}: v4 直出必须明确记录整数零次修复尝试")
@@ -2055,7 +2057,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                 failures.append(f"{tid}: 直出canonical来源证据不完整")
             continue
         prepared_source, frozen_segments = None, None
-        if is_v12 or expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if full_text_protocol or expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
             try:
                 prepared_source, frozen_segments = frozen_input_envelope(item)
             except (ValueError, KeyError, TypeError) as error:
@@ -2067,7 +2069,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                               for segment in canonical_segments]
                              if isinstance(canonical_segments, list)
                              and all(isinstance(segment, dict) for segment in canonical_segments) else None)
-        if is_v12 or expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if full_text_protocol or expected["editing_prompt_version"] in (3, 4, 5, 6, 7, 8, 9, 10, 11):
             if frozen_segments is None or reported_segments != frozen_segments:
                 failures.append(f"{tid}: canonical 分段的 ID、边界或正文不符合冻结输入的确定性构造")
             expected_segments = frozen_segments
@@ -2160,7 +2162,15 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
                         failures.append(f"{tid}: 轻度核对未空编辑确认却交付，或擅自执行核对修复")
                 except (KeyError, TypeError, ValueError, AttributeError):
                     failures.append(f"{tid}: 轻度核对无法绑定原文、局部稿、差异和实际响应")
-        if is_v12:
+        if is_v13:
+            allowed, stage_failures = v11_light_stage_contract(row, payloads)
+            allowed = ["voicePolishRender" if mode == "light" else "voicePolishStructured"]
+            failures.extend(f"{tid}: {failure.replace('v11', 'v13')}" for failure in stage_failures)
+            if row.get("diagnostic_codes") != []:
+                failures.append(f"{tid}: v13 没有额外语义诊断阶段")
+            if valid_integer(row.get("llm_attempt_count")) and row["llm_attempt_count"] > 1:
+                failures.append(f"{tid}: v13 自动润色最多调用一次")
+        elif is_v12:
             allowed, stage_failures = (v11_light_stage_contract(row, payloads) if mode == "light"
                                        else v12_standard_stage_contract(row, payloads))
             failures.extend(f"{tid}: {failure}" for failure in stage_failures)
@@ -2182,7 +2192,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             allowed = ["voicePolishRender", "voicePolishAnalyze", "voicePolishAnalyze"]
         if tasks != allowed[:len(tasks)] or len(tasks) > len(allowed):
             failures.append(f"{tid}: 阶段任务顺序与模式不对应")
-        minimum_stages = len(allowed) if is_v12 or mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11) else 2
+        minimum_stages = len(allowed) if full_text_protocol or mode == "light" or expected["editing_prompt_version"] in (4, 5, 6, 7, 8, 9, 10, 11) else 2
         if not row.get("fallback_used") and (len(tasks) < minimum_stages or any(s.get("status") != "succeeded" for s in stages)):
             failures.append(f"{tid}: 成功输出缺少完整模式链路")
         if row.get("llm_call_count") != len(successful):
@@ -2200,7 +2210,7 @@ def validate_report(report: dict, receipts: list[dict], inputs: list[dict], *, m
             if (receipt.get("llm_task") != stage.get("task")
                     or receipt.get("response_text_sha256") != legacy.sha256_text(stage.get("response_text", ""))):
                 failures.append(f"{tid}: Provider 回执任务或响应哈希与阶段不匹配")
-        if not is_v12 and not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9, 10, 11):
+        if not full_text_protocol and not row.get("fallback_used") and successful and expected["editing_prompt_version"] not in (4, 5, 6, 7, 8, 9, 10, 11):
             try:
                 if mode == "light":
                     if apply_recorded_edits(row["canonical_input"], successful[0]["response_text"],

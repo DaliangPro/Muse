@@ -143,12 +143,12 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
                 XCTAssertEqual(result?.processedText, source, mode.name)
                 XCTAssertFalse(result?.llmFailed ?? true, mode.name)
                 XCTAssertEqual(result?.historyStatus, "voice_polish_success", mode.name)
-                XCTAssertEqual(requests.count, expectedMode == .light ? 1 : 2, mode.name)
+                XCTAssertEqual(requests.count, 1, mode.name)
                 XCTAssertEqual(requests.map(\.task), expectedMode == .light
-                    ? [.voicePolishRender] : [.voicePolishRender, .voicePolishStructured], mode.name)
+                    ? [.voicePolishRender] : [.voicePolishStructured], mode.name)
                 XCTAssertEqual(requests.map(\.system), expectedMode == .light
                     ? [VoicePolishEditingPrompts.light]
-                    : [VoicePolishEditingPrompts.light, VoicePolishEditingPrompts.standard], mode.name)
+                    : [VoicePolishEditingPrompts.standard], mode.name)
                 for request in requests {
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: String])
                     XCTAssertEqual(payload, ["canonical_text": source], mode.name)

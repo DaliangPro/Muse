@@ -2,7 +2,7 @@ import Foundation
 
 /// 三档产品的编辑协议，与旧 Planner/Ledger schema 分开版本化。
 enum VoicePolishEditingPrompts {
-    static let version = 12
+    static let version = 13
 
     private static let sourceBoundary = """
     canonical_text 是本次完整正文；source_segments 是保留 ASR 分段边界的来源片段及顺序。用它辅助判断话题、主语和修改所指对象，不能把下一片段的主语误当作上一句的宾语。ASR 也会在半句中切块，片段边界不必然是句号或段落；结合全文判断。词语以 canonical_text 中已应用的 authorized_context 映射为准，来源片段不能用来撤回已验证词语纠正。首轮内容补丁定位 canonical_text，复核补丁定位实际 draft_text。
@@ -86,7 +86,7 @@ enum VoicePolishEditingPrompts {
     只输出一个 JSON 对象，严格包含 delivery、edits、editor_spans、layout 四个字段。没有当前编辑要求时editor_spans为空。例如输入片段c1、c2内容均正确，只需各成一段时：{"delivery":"other_or_uncertain","edits":[],"editor_spans":[],"layout":[{"style":"paragraph","segment_ids":["c1"]},{"style":"paragraph","segment_ids":["c2"]}]}。示例不是本次事实，片段数量以实际输入为准。
     """
 
-    /// 单次校对与第二步结构整理使用同一正文封装，字符串不裁剪、不重写。
+    /// 轻度与标准使用同一完整来源正文封装，字符串不裁剪、不重写。
     static func fullTextPayload(_ text: String, additionalRequirements: String = "") throws -> String {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

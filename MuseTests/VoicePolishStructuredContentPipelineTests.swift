@@ -5,12 +5,12 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
     func testStructureMovesReasonWithoutRewritingReturnedContent() async throws {
         let source = "小赵负责核对名单。报价等财务回复。小李下午有别的事。"
         let structured = "小赵负责核对名单。小李下午有别的事。\n\n报价等财务回复。"
-        let (result, calls) = await run(source, [source, structured])
+        let (result, calls) = await run(source, [structured])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         for call in calls {
             XCTAssertEqual(call.options.responseFormat, .text)
             XCTAssertEqual(try payload(call) as? [String: String], ["canonical_text": source])
@@ -32,20 +32,20 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         }
     }
 
-    func testStandardPassesCompleteFirstDraftToStructureInsteadOfApplyingPatches() async throws {
+    func testStandardPassesCompleteSourceToStructureInsteadOfApplyingPatches() async throws {
         let source = "名单交给小赵。小李下午有别的事，所以调整分工。"
         let prepared = "名单交给小赵，小李下午有别的事，所以调整分工。"
-        let (result, calls) = await run(source, [prepared, prepared])
+        let (result, calls) = await run(source, [prepared])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, prepared)
-        XCTAssertEqual(result.llmAttemptCount, 2)
-        XCTAssertEqual(try payload(calls[1]) as? [String: String], ["canonical_text": prepared])
+        XCTAssertEqual(result.llmAttemptCount, 1)
+        XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
     func testReturnedNumberingIsPreservedWithoutProgramRenumbering() async {
         let source = "请执行 `swift test`。等审核完成。请执行 `swift build`。"
         let structured = "1. 请执行 `swift test`。\n\n等审核完成。\n\n2. 请执行 `swift build`。"
-        let (result, _) = await run(source, [source, structured], scene: .code)
+        let (result, _) = await run(source, [structured], scene: .code)
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
         XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
@@ -56,7 +56,7 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
     func testManyReturnedBulletMarkersAreNotMistakenForContentExpansion() async {
         let source = String(repeating: "甲。", count: 20)
         let structured = Array(repeating: "- 甲。", count: 20).joined(separator: "\n\n")
-        let (result, _) = await run(source, [source, structured])
+        let (result, _) = await run(source, [structured])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
         XCTAssertGreaterThan(result.text.count, source.count * 2)
@@ -97,10 +97,10 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         XCTAssertEqual(Set(try payload(call).keys), ["canonical_text"])
     }
 
-    func testStandardKeepsMeaningPreservingEmphasisConsolidationFromFirstStage() async {
+    func testStandardKeepsMeaningPreservingEmphasisConsolidationFromResponse() async {
         let source = "确实确实有帮助。"
         let prepared = "确实有帮助。"
-        let (result, _) = await run(source, [prepared, prepared])
+        let (result, _) = await run(source, [prepared])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, prepared)
         XCTAssertEqual(result.repairAttemptCount, 0)
@@ -110,10 +110,10 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         let source = "会议10:30，不对，10:45开始。"
         let output = "会议10:45开始。"
         for mode in [VoicePolishQualityMode.light, .standard] {
-            let (result, _) = await run(source, mode == .light ? [output] : [output, output], mode: mode)
+            let (result, _) = await run(source, [output], mode: mode)
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, output)
-            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 2)
+            XCTAssertEqual(result.llmAttemptCount, 1)
         }
     }
 
@@ -134,7 +134,7 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
     func testExistingBlankLinesDoNotCreateEmptyNumberedItem() async {
         let source = "先检查。\n\n再发布。"
         let structured = "1. 先检查。\n\n2. 再发布。"
-        let (result, _) = await run(source, [source, structured])
+        let (result, _) = await run(source, [structured])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
         XCTAssertEqual(RecognitionSession.finalizeInsertionText(result.text, mode: .formalWriting, isLLMOutput: true), result.text)

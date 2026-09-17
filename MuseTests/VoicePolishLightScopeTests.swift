@@ -76,7 +76,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
         }
     }
 
-    func testLightPayloadContainsOnlyCompleteCanonicalTextDespiteAdditionalContext() async throws {
+    func testLightPayloadKeepsExplicitRequirementsButExcludesUnrelatedContext() async throws {
         let source = "请核对灵建的资料。\n权限保持不变，先别发布。"
         let canonical = "请核对灵简的资料。\n权限保持不变，先别发布。"
         let input = VoiceInputEnvelope(providerFinalText: source,
@@ -96,10 +96,10 @@ final class VoicePolishLightScopeTests: XCTestCase {
         let calls = await client.requests
         let first = try XCTUnwrap(calls.first)
         let object = try payload(first)
-        XCTAssertEqual(Set(object.keys), Set(["canonical_text"]))
+        XCTAssertEqual(Set(object.keys), Set(["canonical_text", "additional_requirements"]))
         XCTAssertEqual(object["canonical_text"] as? String, canonical)
         XCTAssertFalse(first.user.contains("无关"))
-        XCTAssertFalse(first.user.contains("正式公文"))
+        XCTAssertEqual(object["additional_requirements"] as? String, request.preferences.additionalRequirements)
         XCTAssertEqual(calls.count, 1)
     }
 

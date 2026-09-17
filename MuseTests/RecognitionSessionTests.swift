@@ -270,8 +270,8 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.llmFailed, false)
         XCTAssertEqual(result?.historyStatus, "voice_polish_success")
         let requests = await client.recordedRequests()
-        XCTAssertEqual(requests.count, 2)
-        XCTAssertEqual(requests.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.map(\.task), [.voicePolishStructured])
         for request in requests {
             XCTAssertEqual(try Self.voicePolishPayload(from: request) as? [String: String],
                            ["canonical_text": source])
@@ -330,7 +330,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(payload["canonical_text"] as? String, canonical)
         XCTAssertFalse(request.user.contains("内置整句"))
         let models = await client.recordedModels()
-        XCTAssertEqual(models, ["voice-polish-fast-model", "voice-polish-fast-model"])
+        XCTAssertEqual(models, ["voice-polish-fast-model"])
     }
 
     func testDirectAndVoicePolishShareGlobalCanonicalAndFixedSnippetBehavior() async throws {
@@ -790,7 +790,7 @@ final class RecognitionSessionTests: XCTestCase {
             XCTAssertEqual(diagnostic.applicationBundleID, applicationID)
             XCTAssertEqual(diagnostic.recentMuseInputCount, enabled ? 1 : 0)
             let requests = await client.recordedRequests()
-            XCTAssertEqual(requests.count, 2, "标准模式须完成轻度校对和结构整理")
+            XCTAssertEqual(requests.count, 1, "标准模式须直接从原文一次整理")
             for request in requests {
                 let payload = try Self.voicePolishPayload(from: request)
                 // canonical 已由本地 Resolver 纠正，不能靠模型自行猜对来通过测试。
@@ -865,7 +865,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertNil(result?.processedText)
         XCTAssertFalse(result?.llmFailed ?? true)
         XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
-        XCTAssertTrue(recorder.values.contains("voicePolishStage:polishing"))
+        XCTAssertTrue(recorder.values.contains("voicePolishStage:rendering"))
         XCTAssertTrue(recorder.values.contains("processing:\(canonical)"))
     }
 
@@ -944,7 +944,7 @@ final class RecognitionSessionTests: XCTestCase {
         let vocabularyContext = fixture.context
         let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
         // 结构阶段返回空白正文，必须等待用户选择，不能静默交付原稿。
-        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [source, " \n"])
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: [" \n"])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
             historyStore: HistoryStore(path: ":memory:"),
@@ -974,7 +974,7 @@ final class RecognitionSessionTests: XCTestCase {
             )
         }
         let reachedReview = await AsyncTimeout.asyncValue(.seconds(10)) {
-            await client.waitForRequestCount(2)
+            await client.waitForRequestCount(1)
         }
         let unavailable = await AsyncTimeout.asyncValue(.seconds(10)) {
             while !recorder.values.contains("voicePolishUnavailable:validationFailed"),
@@ -991,7 +991,7 @@ final class RecognitionSessionTests: XCTestCase {
             return XCTFail("未进入预期失败状态，events=\(recorder.values) requests=\(requestCount)")
         }
         XCTAssertFalse(reachedReview.timedOut, "requests=\(requestCount)")
-        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(requestCount, 1)
         XCTAssertFalse(unavailable.timedOut, "events=\(recorder.values)")
         XCTAssertTrue(
             recorder.values.contains("voicePolishUnavailable:validationFailed"),
@@ -1009,19 +1009,18 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertTrue(recorder.values.contains("processing:\(source)"))
         XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
         XCTAssertEqual(result?.performance?.outcome, .canonicalExit)
-        XCTAssertEqual(result?.performance?.llmAttemptCount, 2)
+        XCTAssertEqual(result?.performance?.llmAttemptCount, 1)
         XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
     }
 
-    func testVoicePolishExplicitRetryStartsFreshTwoStepPipelineAndReturnsStructuredDraft() async throws {
+    func testVoicePolishExplicitRetryStartsFreshSingleRequestAndReturnsStructuredDraft() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
         let source = "周五上午先发内部试看，先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件，邮件里不要承诺周五对外发布。"
         let polished = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。\n\n邮件里不要承诺周五对外发布。"
-        let prepared = "周五上午先发内部试看。先让课程助教、讲师和运营同事一起核对页面、链接、字幕、下载资料与回放入口，确认所有内容都能正常打开以后再发邮件。邮件里不要承诺周五对外发布。"
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [
-            source, " \n", prepared, polished,
+            " \n", polished,
         ])
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -1061,14 +1060,14 @@ final class RecognitionSessionTests: XCTestCase {
             return XCTFail("首轮没有进入用户选择状态，events=\(recorder.values)")
         }
         let firstRequestCount = await client.requestCount()
-        XCTAssertEqual(firstRequestCount, 2)
+        XCTAssertEqual(firstRequestCount, 1)
         // 结构阶段失败后已经冻结标准档位，迟到的轻度快捷键不能改写本次重试。
         await session.switchMode(to: .lightPolish)
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
         let retryAccepted = await session.retryVoicePolishResult()
         XCTAssertTrue(retryAccepted)
         let secondRun = await AsyncTimeout.asyncValue(.seconds(10)) {
-            await client.waitForRequestCount(4)
+            await client.waitForRequestCount(2)
         }
         guard secondRun.value == true else {
             await session.abortCurrentSession()
@@ -1079,13 +1078,12 @@ final class RecognitionSessionTests: XCTestCase {
         let requestCount = await client.requestCount()
 
         XCTAssertFalse(secondRun.timedOut)
-        XCTAssertEqual(requestCount, 4)
+        XCTAssertEqual(requestCount, 2)
         let requests = await client.recordedRequests()
-        XCTAssertEqual(requests.map(\.task), [.voicePolishRender, .voicePolishStructured,
-                                              .voicePolishRender, .voicePolishStructured])
-        for (index, request) in requests.enumerated() {
+        XCTAssertEqual(requests.map(\.task), [.voicePolishStructured, .voicePolishStructured])
+        for request in requests {
             XCTAssertEqual(try Self.voicePolishPayload(from: request) as? [String: String],
-                           ["canonical_text": index == 3 ? prepared : source])
+                           ["canonical_text": source])
         }
         XCTAssertEqual(result?.finalText, polished)
         XCTAssertEqual(result?.processedText, polished)
@@ -1096,7 +1094,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
         XCTAssertEqual(result?.performance?.outcome, .success)
         XCTAssertEqual(result?.performance?.userRetryCount, 1)
-        XCTAssertEqual(result?.performance?.llmAttemptCount, 4)
+        XCTAssertEqual(result?.performance?.llmAttemptCount, 2)
         XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
     }
 

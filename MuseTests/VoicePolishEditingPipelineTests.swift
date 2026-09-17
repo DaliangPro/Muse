@@ -153,16 +153,16 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     func testStandardPassesCorrectedPartialTimeToStructureWithoutSemanticReview() async throws {
         let source = "会议原定周三上午十点，培训安排周四上午十点。会议时间改成十点半，日期不变。培训安排也不变。"
         let prepared = "会议改为周三上午十点半，培训安排周四上午十点。培训安排不变。"
-        let client = EditingTestClient([.text(prepared), .text(prepared)])
+        let client = EditingTestClient([.text(prepared)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, prepared)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
-                       ["canonical_text": prepared])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[0].user.utf8)) as? [String: String],
+                       ["canonical_text": source])
         // 离线事实校验器仍保留跨日期反例，但标准运行链不调用它。
         XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
             sourceText: source, outputText: "会议改为周五上午十点半。", scene: .workChat,
@@ -200,18 +200,18 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
     }
 
-    func testStandardPassesCompleteFirstDraftWithoutDirectiveReviewPayload() async throws {
+    func testStandardPassesCompleteSourceWithoutDirectiveReviewPayload() async throws {
         let source = "给客户回一下，我们会尽快核实。别先答应赔偿，费用还没确认。"
         let structured = "给客户回一下，我们会尽快核实。\n\n别先答应赔偿，费用还没确认。"
-        let client = EditingTestClient([.text(source), .text(structured)])
+        let client = EditingTestClient([.text(structured)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[0].user.utf8)) as? [String: String],
                        ["canonical_text": source])
     }
 
@@ -283,7 +283,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
             let result = await pipeline(client).process(request(source, mode))
             XCTAssertFalse(result.usedFallback, "\(mode)")
             XCTAssertEqual(result.text, output)
-            XCTAssertEqual(result.llmAttemptCount, mode == .light ? 1 : 2)
+            XCTAssertEqual(result.llmAttemptCount, 1)
         }
         XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(in: source), ["15:30"])
         XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
@@ -359,29 +359,29 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(output, "👨‍👩‍👧‍👦我安装软件，然后看看效果👍🏽。")
     }
 
-    func testStandardStructureReceivesOnlyActualDraftWithoutLegacyDiffFields() async throws {
+    func testStandardStructureReceivesOnlyOriginalSourceWithoutLegacyDiffFields() async throws {
         let source = "小李下午有别的事，所以请小周接手。"
-        let client = EditingTestClient([.text(source), .text(source)])
+        let client = EditingTestClient([.text(source)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[0].user.utf8)) as? [String: String],
                        ["canonical_text": source])
     }
 
-    func testStandardKeepsReasonAcrossTwoStagesWithoutConsumingRepairResponse() async throws {
+    func testStandardKeepsReasonInSingleRequestWithoutConsumingRepairResponse() async throws {
         let source = "小李有事，请小周接手。"
         let client = EditingTestClient([.text(source), .text(source), .text("不应读取的修复")])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, source)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[0].user.utf8)) as? [String: String],
                        ["canonical_text": source])
     }
 
@@ -418,11 +418,11 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     func testStandardPreservesLiteralJSONInsteadOfTreatingItAsRepairRequest() async throws {
         let source = #"请保留示例：{"edits":[]}"#
         let structured = #"示例：{"edits":[]}"#
-        let client = EditingTestClient([.text(source), .text(structured), .text("不应读取")])
+        let client = EditingTestClient([.text(structured), .text("不应读取")])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
@@ -435,7 +435,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertFalse(payload.contains("已授权的同应用近期输入"))
     }
 
-    func testStandardStartsFromCanonicalEntityMappingThenUsesActualFirstDraft() async throws {
+    func testStandardStartsFromCanonicalEntityMappingThenUsesCompleteSource() async throws {
         let first = "请核对灵建的资料，这部分单独交代"
         let second = "文件权限，由运营组负责。"
         let source = first + second
@@ -452,17 +452,16 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
             resolvedEntities: [.init(surfaceText: "灵建", canonical: "灵简", sourceSegmentIDs: ["s1"],
                                      candidateSource: .authorizedContext, confidence: 1)]
         )
-        let prepared = "请核对灵简的资料。这部分单独交代文件权限，由运营组负责。"
         let structured = "请核对灵简的资料。\n\n这部分单独交代文件权限，由运营组负责。"
-        let client = EditingTestClient([.text(prepared), .text(structured)])
+        let client = EditingTestClient([.text(structured)])
         let result = await VoicePolishEditingPipeline(client: client, config: config).process(originalRequest)
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
         let calls = await client.requests
-        XCTAssertEqual(calls.count, 2)
-        for (index, call) in calls.enumerated() {
+        XCTAssertEqual(calls.count, 1)
+        for call in calls {
             XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: String],
-                           ["canonical_text": index == 0 ? canonical : prepared])
+                           ["canonical_text": canonical])
         }
         XCTAssertEqual(originalRequest.input.segments.map(\.text), [first, second])
     }
@@ -571,19 +570,19 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(VoicePolishTextChange.between("原文", ""), [.init(removed: "原文", inserted: "")])
     }
 
-    func testStandardPassesFirstStagePrefixCleanupToStructureWithoutConfirmation() async throws {
+    func testStandardPassesOriginalPrefixToStructureWithoutConfirmation() async throws {
         let source = "帮我回他一下我晚点到，你们先吃。"
         let prepared = "我晚点到，你们先吃。"
-        let client = EditingTestClient([.text(prepared), .text(prepared)])
+        let client = EditingTestClient([.text(prepared)])
         let result = await pipeline(client).process(request(source, .standard))
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, prepared)
-        XCTAssertEqual(result.llmAttemptCount, 2)
+        XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender, .voicePolishStructured])
-        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[1].user.utf8)) as? [String: String],
-                       ["canonical_text": prepared])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[0].user.utf8)) as? [String: String],
+                       ["canonical_text": source])
     }
 
     func testLegacyReviewDetectsDeclaredButUnappliedEditorInstruction() throws {
