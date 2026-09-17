@@ -11,27 +11,31 @@ struct SettingsWindowTrafficLightAligner {
             let zoomButton = window.standardWindowButton(.zoomButton)
         else { return }
 
-        let closeFrame = closeButton.frame
-        let minimizeFrame = minimizeButton.frame
-        let zoomFrame = zoomButton.frame
-        let minimizeOffset = minimizeFrame.minX - closeFrame.minX
-        let zoomOffset = zoomFrame.minX - closeFrame.minX
-        let targetY: CGFloat
-        if let buttonContainer = closeButton.superview {
-            targetY = buttonContainer.bounds.height - topInset - closeFrame.height
-        } else {
-            targetY = closeFrame.minY
+        let closeScreenRect = window.convertToScreen(closeButton.convert(closeButton.bounds, to: nil))
+        let xDelta = window.frame.minX + leadingInset - closeScreenRect.minX
+        let yDelta = window.frame.maxY - topInset - closeScreenRect.maxY
+
+        // 全尺寸内容视图可能被 SwiftUI 排在标题栏之上，保持原生按钮所在容器位于内容上方。
+        if let frameView = window.contentView?.superview {
+            var titlebar: NSView = closeButton
+            while let parent = titlebar.superview, parent !== frameView { titlebar = parent }
+            if titlebar.superview === frameView, frameView.subviews.last !== titlebar {
+                frameView.addSubview(titlebar, positioned: .above, relativeTo: nil)
+            }
         }
 
-        closeButton.setFrameOrigin(NSPoint(x: leadingInset, y: targetY))
-        minimizeButton.setFrameOrigin(NSPoint(x: leadingInset + minimizeOffset, y: targetY))
-        zoomButton.setFrameOrigin(NSPoint(x: leadingInset + zoomOffset, y: targetY))
-        alignToWindowEdges(
-            in: window,
-            closeButton: closeButton,
-            minimizeButton: minimizeButton,
-            zoomButton: zoomButton
-        )
+        for button in [closeButton, minimizeButton, zoomButton] {
+            guard let container = button.superview else { continue }
+            let desiredY = button.frame.minY + yDelta
+            let minimumY = container.bounds.minY
+            let maximumY = container.bounds.maxY - button.frame.height
+            // SwiftUI 的标题栏可能只有 28pt；16pt 顶距会把按钮移到容器外。
+            // 空间不足时使用原生容器的垂直中心，不能以窗口边缘对齐覆盖此约束。
+            let targetY = (minimumY...max(minimumY, maximumY)).contains(desiredY)
+                ? desiredY
+                : max(minimumY, container.bounds.midY - button.frame.height / 2)
+            button.setFrameOrigin(NSPoint(x: button.frame.minX + xDelta, y: targetY))
+        }
     }
 
     func alignAfterSystemLayout(in window: NSWindow) {
@@ -53,23 +57,7 @@ struct SettingsWindowTrafficLightAligner {
         }
     }
 
-    private func alignToWindowEdges(
-        in window: NSWindow,
-        closeButton: NSButton,
-        minimizeButton: NSButton,
-        zoomButton: NSButton
-    ) {
-        let closeScreenRect = window.convertToScreen(closeButton.convert(closeButton.bounds, to: nil))
-        let desiredButtonLeft = window.frame.minX + leadingInset
-        let desiredButtonTop = window.frame.maxY - topInset
-        let xDelta = desiredButtonLeft - closeScreenRect.minX
-        let yDelta = desiredButtonTop - closeScreenRect.maxY
-        guard abs(xDelta) >= 0.5 || abs(yDelta) >= 0.5 else { return }
 
-        [closeButton, minimizeButton, zoomButton].forEach { button in
-            button.setFrameOrigin(NSPoint(x: button.frame.minX + xDelta, y: button.frame.minY + yDelta))
-        }
-    }
 }
 
 final class SettingsWindowTrafficLightAlignmentObserver {
