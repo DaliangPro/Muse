@@ -9,7 +9,7 @@ final class LLMStreamingParserTests: XCTestCase {
             let data = try JSONSerialization.data(withJSONObject: chunk)
             try parser.consume(line: "data: " + String(decoding: data, as: UTF8.self))
             try parser.consume(line: "")
-            XCTAssertEqual(try parser.finish(allowReasoningOnlyProbe: true), content)
+            XCTAssertEqual(try parser.finish(allowIncompleteProbeAnswer: true), content)
             XCTAssertTrue(parser.reasoningObserved)
             XCTAssertTrue(parser.isComplete)
             XCTAssertTrue(parser.hitOutputTokenLimit)
@@ -23,21 +23,30 @@ final class LLMStreamingParserTests: XCTestCase {
         try parser.consume(line: #"data: {"choices":[{"delta":{"reasoning_content":"推理测试"},"finish_reason":null}]}"#)
         try parser.consume(line: "")
         XCTAssertTrue(parser.reasoningObserved)
-        XCTAssertThrowsError(try parser.finish(allowReasoningOnlyProbe: true))
+        XCTAssertThrowsError(try parser.finish(allowIncompleteProbeAnswer: true))
     }
 
-    func testThinkingProbeRejectsTokenLimitWithoutReasoningEvidence() throws {
+    func testThinkingProbeAcceptsLimitedAnswerWithoutInventingReasoningEvidence() throws {
         var parser = LLMStreamingParser()
         try parser.consume(line: #"data: {"choices":[{"delta":{"content":"不完整正文"},"finish_reason":"length"}]}"#)
         try parser.consume(line: "")
-        XCTAssertThrowsError(try parser.finish(allowReasoningOnlyProbe: true))
+        XCTAssertEqual(try parser.finish(allowIncompleteProbeAnswer: true), "不完整正文")
+        XCTAssertFalse(parser.reasoningObserved)
+        XCTAssertThrowsError(try parser.finish())
+    }
+
+    func testThinkingProbeRejectsEmptyTokenLimitResponse() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+        try parser.consume(line: "")
+        XCTAssertThrowsError(try parser.finish(allowIncompleteProbeAnswer: true))
     }
 
     func testThinkingProbeAllowsCompleteReasoningWithoutFinalAnswer() throws {
         var parser = LLMStreamingParser()
         try parser.consume(line: #"data: {"choices":[{"delta":{"reasoning_content":"推理测试"},"finish_reason":"stop"}]}"#)
         try parser.consume(line: "")
-        XCTAssertEqual(try parser.finish(allowReasoningOnlyProbe: true), "")
+        XCTAssertEqual(try parser.finish(allowIncompleteProbeAnswer: true), "")
         XCTAssertThrowsError(try parser.finish())
     }
 

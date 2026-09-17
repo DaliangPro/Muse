@@ -371,9 +371,9 @@ struct LLMStreamingParser: Sendable {
         }
     }
 
-    /// 只有思考探针可以用“已观察到推理且收到正常结束标志”确认思考开启。
-    /// 题目答案耗尽预算不等于连接中断；正文生成仍须完整返回，缺失结束标志仍报错。
-    mutating func finish(allowReasoningOnlyProbe: Bool = false) throws -> String {
+    /// 思考探针只提取证据，不交付题目答案；正常结束但答案耗尽预算不等于连接中断。
+    /// 没有推理证据仍交给上层差分验证；正文生成及缺失结束标志的流继续严格校验。
+    mutating func finish(allowIncompleteProbeAnswer: Bool = false) throws -> String {
         if !isComplete {
             for payload in events.finish() {
                 try consume(payload: payload)
@@ -382,7 +382,7 @@ struct LLMStreamingParser: Sendable {
         guard isComplete else {
             throw LLMError.truncatedResponse(result.count)
         }
-        if allowReasoningOnlyProbe, reasoningObserved { return result }
+        if allowIncompleteProbeAnswer, reasoningObserved || !result.isEmpty { return result }
         guard !hitOutputTokenLimit else {
             throw LLMError.truncatedResponse(result.count)
         }

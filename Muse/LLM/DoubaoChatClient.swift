@@ -671,9 +671,9 @@ actor DoubaoChatClient: LLMClient {
         }
 
         do {
-            let text = try parser.finish(allowReasoningOnlyProbe: isThinkingProbe)
-            if isThinkingProbe, parser.hitOutputTokenLimit, parser.reasoningObserved {
-                DebugFileLogger.log("LLM[\(model)]: thinking probe confirmed reasoning at token limit; stream_complete=\(parser.isComplete)")
+            let text = try parser.finish(allowIncompleteProbeAnswer: isThinkingProbe)
+            if isThinkingProbe, parser.hitOutputTokenLimit {
+                DebugFileLogger.log("LLM[\(model)]: thinking probe reached token limit; stream_complete=\(parser.isComplete) reasoning=\(parser.reasoningObserved)")
             }
             if !didRecordFirstContent { timing?.record("first_content") }
             timing?.record("stream_finished")
