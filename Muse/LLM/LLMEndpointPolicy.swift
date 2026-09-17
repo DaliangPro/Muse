@@ -354,7 +354,7 @@ struct LLMStreamingParser: Sendable {
     private let maxResponseBytes: Int
     private(set) var isComplete = false
     private(set) var reasoningObserved = false
-    private var hitOutputTokenLimit = false
+    private(set) var hitOutputTokenLimit = false
 
     init(
         maxResponseBytes: Int = defaultMaximumResponseBytes,
@@ -371,7 +371,9 @@ struct LLMStreamingParser: Sendable {
         }
     }
 
-    mutating func finish() throws -> String {
+    /// 只有思考探针可以用“已观察到推理且收到正常结束标志”确认思考开启。
+    /// 题目答案耗尽预算不等于连接中断；正文生成仍须完整返回，缺失结束标志仍报错。
+    mutating func finish(allowReasoningOnlyProbe: Bool = false) throws -> String {
         if !isComplete {
             for payload in events.finish() {
                 try consume(payload: payload)
@@ -380,6 +382,7 @@ struct LLMStreamingParser: Sendable {
         guard isComplete else {
             throw LLMError.truncatedResponse(result.count)
         }
+        if allowReasoningOnlyProbe, reasoningObserved { return result }
         guard !hitOutputTokenLimit else {
             throw LLMError.truncatedResponse(result.count)
         }

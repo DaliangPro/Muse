@@ -2,6 +2,45 @@ import XCTest
 @testable import Muse
 
 final class LLMStreamingParserTests: XCTestCase {
+    func testThinkingProbeAcceptsTokenLimitOnlyWithReasoningAndTerminalEvent() throws {
+        for content in ["", "尚未完成的答案"] {
+            var parser = LLMStreamingParser()
+            let chunk: [String: Any] = ["choices": [["delta": ["reasoning_content": "推理测试", "content": content], "finish_reason": "length"]]]
+            let data = try JSONSerialization.data(withJSONObject: chunk)
+            try parser.consume(line: "data: " + String(decoding: data, as: UTF8.self))
+            try parser.consume(line: "")
+            XCTAssertEqual(try parser.finish(allowReasoningOnlyProbe: true), content)
+            XCTAssertTrue(parser.reasoningObserved)
+            XCTAssertTrue(parser.isComplete)
+            XCTAssertTrue(parser.hitOutputTokenLimit)
+            // 同一响应绝不能通过正常正文交付校验。
+            XCTAssertThrowsError(try parser.finish())
+        }
+    }
+
+    func testThinkingProbeStillRejectsInterruptedReasoningStream() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{"reasoning_content":"推理测试"},"finish_reason":null}]}"#)
+        try parser.consume(line: "")
+        XCTAssertTrue(parser.reasoningObserved)
+        XCTAssertThrowsError(try parser.finish(allowReasoningOnlyProbe: true))
+    }
+
+    func testThinkingProbeRejectsTokenLimitWithoutReasoningEvidence() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{"content":"不完整正文"},"finish_reason":"length"}]}"#)
+        try parser.consume(line: "")
+        XCTAssertThrowsError(try parser.finish(allowReasoningOnlyProbe: true))
+    }
+
+    func testThinkingProbeAllowsCompleteReasoningWithoutFinalAnswer() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{"reasoning_content":"推理测试"},"finish_reason":"stop"}]}"#)
+        try parser.consume(line: "")
+        XCTAssertEqual(try parser.finish(allowReasoningOnlyProbe: true), "")
+        XCTAssertThrowsError(try parser.finish())
+    }
+
     func testDataWithoutSpaceAndDoneAreParsed() throws {
         var parser = LLMStreamingParser()
         try parser.consume(line: #"data:{"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}"#)

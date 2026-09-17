@@ -318,7 +318,8 @@ actor DoubaoChatClient: LLMClient {
                 messages: messages,
                 useStreaming: useStreaming,
                 maxTokens: maxTokens,
-                appliesThinkingControl: false
+                appliesThinkingControl: false,
+                isThinkingProbe: purpose == .probe
             )
         }
 
@@ -330,7 +331,8 @@ actor DoubaoChatClient: LLMClient {
                 messages: messages,
                 useStreaming: useStreaming,
                 maxTokens: maxTokens,
-                appliesThinkingControl: true
+                appliesThinkingControl: true,
+                isThinkingProbe: purpose == .probe
             )
             if purpose == .probe,
                provider.thinkingRequestField(for: config.model).isExplicitlyControllable {
@@ -350,7 +352,8 @@ actor DoubaoChatClient: LLMClient {
                 messages: messages,
                 useStreaming: useStreaming,
                 maxTokens: maxTokens,
-                appliesThinkingControl: false
+                appliesThinkingControl: false,
+                isThinkingProbe: purpose == .probe
             )
             LLMThinkingRuntimeState.rememberOmittedControl(for: signature)
             return result
@@ -368,7 +371,8 @@ actor DoubaoChatClient: LLMClient {
         temperature: Double? = nil,
         responseFormat: LLMResponseFormat = .text,
         reasoningPolicy: ReasoningPolicy = .providerDefault,
-        auditTask: LLMTask? = nil
+        auditTask: LLMTask? = nil,
+        isThinkingProbe: Bool = false
     ) async throws -> LLMExecutionResult {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -400,7 +404,8 @@ actor DoubaoChatClient: LLMClient {
                 ? try await processStreaming(
                     request: request,
                     model: config.model,
-                    requestStartedAt: requestStartedAt
+                    requestStartedAt: requestStartedAt,
+                    isThinkingProbe: isThinkingProbe
                 )
                 : try await processNonStreaming(
                     request: request,
@@ -586,7 +591,8 @@ actor DoubaoChatClient: LLMClient {
     private func processStreaming(
         request: URLRequest,
         model: String,
-        requestStartedAt: ContinuousClock.Instant
+        requestStartedAt: ContinuousClock.Instant,
+        isThinkingProbe: Bool = false
     ) async throws -> LLMExecutionResult {
         let timing = LLMNetworkTiming.current()
         timing?.record("request_start")
@@ -665,7 +671,10 @@ actor DoubaoChatClient: LLMClient {
         }
 
         do {
-            let text = try parser.finish()
+            let text = try parser.finish(allowReasoningOnlyProbe: isThinkingProbe)
+            if isThinkingProbe, parser.hitOutputTokenLimit, parser.reasoningObserved {
+                DebugFileLogger.log("LLM[\(model)]: thinking probe confirmed reasoning at token limit; stream_complete=\(parser.isComplete)")
+            }
             if !didRecordFirstContent { timing?.record("first_content") }
             timing?.record("stream_finished")
             return LLMExecutionResult(
@@ -680,7 +689,7 @@ actor DoubaoChatClient: LLMClient {
                 transport: "stream"
             )
         } catch {
-            DebugFileLogger.log("LLM[\(model)]: stream incomplete lines=\(lineCount)")
+            DebugFileLogger.log("LLM[\(model)]: stream incomplete lines=\(lineCount) terminal=\(parser.isComplete) token_limit=\(parser.hitOutputTokenLimit) reasoning=\(parser.reasoningObserved)")
             throw error
         }
     }
