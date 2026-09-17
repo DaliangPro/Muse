@@ -24,6 +24,12 @@ final class SettingsWindowPresenter {
         openAction()
         NSApp.activate(ignoringOtherApps: true)
         DebugFileLogger.log("openSettingsWindow: single SwiftUI settings scene")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            let visibleCount = NSApp.windows.filter {
+                $0.identifier?.rawValue == "settings" && $0.isVisible
+            }.count
+            DebugFileLogger.log("openSettingsWindow: visible settings count=\(visibleCount)")
+        }
     }
 }
 

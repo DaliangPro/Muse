@@ -584,6 +584,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
                     thinkingFeedbackIsFailure = false
                     recordTestOutcome(.success, provider: provider, config: llmConfig)
                     AppLogger.log("[Settings] LLM test OK (\(provider.rawValue))")
+                    DebugFileLogger.log("[Settings] LLM test OK provider=\(provider.rawValue) model=\(llmConfig.model)")
                 case .adjusted(let mode, let message):
                     thinkingMode = mode
                     lockedThinkingMode = mode
