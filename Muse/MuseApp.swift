@@ -811,7 +811,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openSettingsWindow()
         }
         NSApp.activate(ignoringOtherApps: true)
-        return true
+        // 已自行展示设置窗口，阻止SwiftUI再执行默认重开而另建一扇窗口。
+        return false
     }
 
     private func openSettingsWindow(preferManualWindow: Bool = false) {

@@ -3,7 +3,17 @@ import SwiftUI
 
 @MainActor
 final class SettingsWindowPresenter {
+    static let settingsWindowIdentifier = NSUserInterfaceItemIdentifier("settings")
     private var manualSettingsWindow: NSWindow?
+
+    /// SwiftUI场景和菜单/Dock入口必须复用同一个设置窗口，不能只查手动创建的窗口。
+    static func existingSettingsWindow(in windows: [NSWindow], retained: NSWindow?) -> NSWindow? {
+        let matches = windows.filter { $0.identifier == settingsWindowIdentifier }
+        return matches.first(where: { $0.isKeyWindow })
+            ?? matches.first(where: { $0.isVisible })
+            ?? retained
+            ?? matches.first
+    }
 
     func open(
         preferManualWindow: Bool = false,
@@ -13,16 +23,18 @@ final class SettingsWindowPresenter {
     ) {
         NSApp.setActivationPolicy(.regular)
 
-        if !preferManualWindow, let swiftUIOpenAction {
-            DebugFileLogger.log("openSettingsWindow: SwiftUI openWindow action")
-            swiftUIOpenAction()
+        if let window = Self.existingSettingsWindow(in: NSApp.windows, retained: manualSettingsWindow) {
+            DebugFileLogger.log("openSettingsWindow: reuse existing settings window")
+            manualSettingsWindow = window
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
-        if let manualSettingsWindow {
-            DebugFileLogger.log("openSettingsWindow: reuse manual window")
-            manualSettingsWindow.makeKeyAndOrderFront(nil)
+        if !preferManualWindow, let swiftUIOpenAction {
+            DebugFileLogger.log("openSettingsWindow: SwiftUI openWindow action")
+            swiftUIOpenAction()
             NSApp.activate(ignoringOtherApps: true)
             return
         }
@@ -53,6 +65,7 @@ final class SettingsWindowPresenter {
             defer: false
         )
         DebugFileLogger.log("openSettingsWindow: nswindow ready")
+        window.identifier = Self.settingsWindowIdentifier
         window.title = L("Muse 设置", "Muse Settings")
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
