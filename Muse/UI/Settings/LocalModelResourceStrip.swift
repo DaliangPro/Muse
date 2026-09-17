@@ -180,7 +180,7 @@ struct LocalModelResourceStrip: View, SettingsCardHelpers {
             return asr == .sherpa
                 && (UserDefaults.standard.object(forKey: DefaultsKeys.qwen3FinalEnabled) as? Bool ?? true)
         case "qwen3.5-9b":
-            return KeychainService.selectedLLMProvider == .localQwen
+            return KeychainService.anyPolishUsesLocalModel
         case "punctuation":
             return asr == .sherpa
         default:

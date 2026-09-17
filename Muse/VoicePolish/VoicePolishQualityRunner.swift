@@ -579,11 +579,12 @@ enum VoicePolishQualityRunner {
                 guard keychainStatus == errSecSuccess else {
                     throw RunnerError.noninteractiveKeychainUnavailable(keychainStatus)
                 }
-                let provider = KeychainService.selectedLLMProvider
-                guard let loadedConfig = KeychainService.loadLLMConfig() else {
+                let role = PolishModelRole.resolve(invocation.mode.qualityMode)
+                let provider = KeychainService.selectedPolishProvider(for: role)
+                guard let loadedConfig = KeychainService.loadPolishConfig(for: role) else {
                     throw RunnerError.missingLLMConfig
                 }
-                let config = VoicePolishSettings.modelOverride().map(loadedConfig.withModel) ?? loadedConfig
+                let config = loadedConfig
                 return (provider, config)
             }
             let providerClient = configured.map { LLMProviderRegistry.makeClient(for: $0.provider) }

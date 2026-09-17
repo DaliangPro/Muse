@@ -22,9 +22,9 @@ enum ModelSettingsSummary {
         )
     }
 
-    static func llm() -> ModelSettingsSummaryData {
-        let provider = KeychainService.selectedLLMProvider
-        let config = KeychainService.loadLLMConfig()
+    static func llm(role: PolishModelRole = .standard) -> ModelSettingsSummaryData {
+        let provider = KeychainService.selectedPolishProvider(for: role)
+        let config = KeychainService.loadPolishConfig(for: role)
         let configured = provider == .localQwen ? LocalQwenLLMConfig.isModelAvailable : config != nil
         return ModelSettingsSummaryData(
             provider: provider.displayName,
@@ -68,9 +68,6 @@ enum ModelSettingsSummary {
             return LocalQwenLLMConfig.availableModel?.displayName ?? "Qwen3"
         }
         if let model = config?.model, !model.isEmpty {
-            return model
-        }
-        if let model = KeychainService.loadLLMCredentials(for: provider)?["model"], !model.isEmpty {
             return model
         }
         return L("未设置", "Not set")

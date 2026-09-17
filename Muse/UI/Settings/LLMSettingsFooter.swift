@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct LLMSettingsFooter: View, SettingsCardHelpers {
+    var role: PolishModelRole = .standard
     /// 弹窗场景下取消与右上角关闭重复，置 false 隐藏
     var showsCancel: Bool = true
     let selectedProvider: LLMProvider
@@ -39,7 +40,9 @@ private extension LLMSettingsFooter {
         if selectedProvider == .localQwen {
             return L("本地 Qwen 用于离线文本处理，首次启动会预热模型。", "Local Qwen handles offline text cleanup and warms the model on first start.")
         }
-        return L("适用于各种自定义模式", "Applies to all custom modes")
+        return role == .light
+            ? L("基础纠错与口误修正", "Basic corrections")
+            : L("结构整理与表达打磨", "Structure and wording")
     }
 
     var footerActions: some View {

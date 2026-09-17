@@ -75,8 +75,7 @@ enum VoicePolishSettings {
         defaults.set(data, forKey: DefaultsKeys.voicePolishSceneOverrides)
     }
 
-    /// 可选的同 Provider 语音润色专用模型；空值表示沿用“文本处理”模型。
-    /// API Key 与 endpoint 始终复用已配置 Provider，避免复制凭证或引入第二套模型配置。
+    /// 旧版本模型覆盖值，仅为历史配置和测试兼容保留；新配置由两档独立管理。
     static func modelOverride(defaults: UserDefaults = .standard) -> String? {
         let value = defaults.string(forKey: DefaultsKeys.voicePolishModelOverride)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

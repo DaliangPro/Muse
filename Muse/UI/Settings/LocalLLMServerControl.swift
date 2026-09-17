@@ -49,7 +49,13 @@ enum LocalLLMServerControl {
         }
     }
 
-    static func unloadAndStopIfUnneeded() async -> LocalLLMServerStopResult {
+    static func unloadAndStopIfUnneeded(excluding role: PolishModelRole? = nil) async -> LocalLLMServerStopResult {
+        let otherPolishNeedsServer = PolishModelRole.allCases.contains {
+            $0 != role && KeychainService.selectedPolishProvider(for: $0) == .localQwen
+        }
+        guard !otherPolishNeedsServer, KeychainService.selectedAssetExtractionLLMProvider != .localQwen else {
+            return .keptServerRunning
+        }
         if let port = SenseVoiceServerManager.currentQwen3Port {
             let url = URL(string: "http://127.0.0.1:\(port)/llm/unload")!
             var request = URLRequest(url: url)
@@ -73,7 +79,8 @@ enum LocalLLMServerControl {
     static func stopQwen3IfASRDoesNotNeedIt() async {
         let asrNeedsQwen3 = KeychainService.selectedASRProvider == .sherpa
             && (UserDefaults.standard.object(forKey: DefaultsKeys.qwen3FinalEnabled) as? Bool ?? true)
-        guard !asrNeedsQwen3 else { return }
+        guard !asrNeedsQwen3, !KeychainService.anyPolishUsesLocalModel,
+              KeychainService.selectedAssetExtractionLLMProvider != .localQwen else { return }
 
         await SenseVoiceServerManager.shared.stopQwen3()
     }

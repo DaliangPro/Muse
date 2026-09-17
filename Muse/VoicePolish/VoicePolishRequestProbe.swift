@@ -285,9 +285,9 @@ enum VoicePolishRequestProbe {
                         guard SecKeychainSetUserInteractionAllowed(false) == errSecSuccess else {
                             throw ProbeError.configurationUnavailable
                         }
-                        let provider = KeychainService.selectedLLMProvider
+                        let provider = KeychainService.selectedPolishProvider(for: .light)
                         guard provider == .deepseek else { throw ProbeError.configurationMismatch }
-                        guard let config = KeychainService.loadLLMConfig() else { throw ProbeError.configurationUnavailable }
+                        guard let config = KeychainService.loadPolishConfig(for: .light) else { throw ProbeError.configurationUnavailable }
                         return (provider, config)
                     }, clientFactory: { LLMProviderRegistry.makeClient(for: $0) })
                 print("VOICE_POLISH_REQUEST_PROBE_FINISHED status=\(report.status) attempts=\(report.attemptCount)")

@@ -109,7 +109,7 @@ actor RecognitionSession {
         options: ASRRequestOptions,
         hotwordCount: Int
     ))?
-    private let llmClientFactory: @Sendable () -> any LLMClient
+    private let llmClientFactory: (@Sendable () -> any LLMClient)?
     private let llmConfigLoader: (@Sendable () async -> LLMConfig?)?
     private let voicePolishRecentInputStore: VoicePolishRecentInputContextStore
     private let aliyunReplaySleep: @Sendable (Duration) async throws -> Void
@@ -143,9 +143,7 @@ actor RecognitionSession {
             options: ASRRequestOptions,
             hotwordCount: Int
         ))? = nil,
-        llmClientFactory: @escaping @Sendable () -> any LLMClient = {
-            LLMProviderRegistry.makeClient(for: KeychainService.selectedLLMProvider)
-        },
+        llmClientFactory: (@Sendable () -> any LLMClient)? = nil,
         llmConfigLoader: (@Sendable () async -> LLMConfig?)? = nil,
         voicePolishRecentInputStore: VoicePolishRecentInputContextStore = .shared,
         aliyunReplaySleep: @escaping @Sendable (Duration) async throws -> Void = {
@@ -185,7 +183,10 @@ actor RecognitionSession {
 
     /// Return the appropriate LLM client for the currently selected provider.
     private func currentLLMClient() -> any LLMClient {
-        llmClientFactory()
+        if let llmClientFactory { return llmClientFactory() }
+        return LLMProviderRegistry.makeClient(for: KeychainService.selectedPolishProvider(
+            for: .resolve(currentMode.voicePolishQualityMode)
+        ))
     }
 
     private func loadASRConfigOffActor(for provider: ASRProvider) async -> (any ASRProviderConfig)? {
@@ -205,10 +206,11 @@ actor RecognitionSession {
         if let llmConfigLoader {
             return await llmConfigLoader()
         }
-        let provider = KeychainService.selectedLLMProvider
+        let role = PolishModelRole.resolve(currentMode.voicePolishQualityMode)
+        let provider = KeychainService.selectedPolishProvider(for: role)
         DebugFileLogger.log("LLM config load start provider=\(provider.rawValue)")
         let result: TimedValue<LLMConfig> = await AsyncTimeout.value(.milliseconds(900)) {
-            KeychainService.loadLLMConfig()
+            KeychainService.loadPolishConfig(for: role)
         }
         if result.timedOut {
             DebugFileLogger.log("LLM config load timeout provider=\(provider.rawValue)")
@@ -1501,14 +1503,7 @@ actor RecognitionSession {
                     qualityMode: mode.voicePolishQualityMode ?? .standard,
                     resolvedEntities: resolvedEntities
                 )
-                let voicePolishConfig: LLMConfig
-                if let modelOverride = VoicePolishSettings.modelOverride(
-                    defaults: vocabularyContext.userDefaults
-                ) {
-                    voicePolishConfig = llmConfig.withModel(modelOverride)
-                } else {
-                    voicePolishConfig = llmConfig
-                }
+                let voicePolishConfig = llmConfig
                 let pipeline = VoicePolishPipeline(
                     client: currentLLMClient(),
                     config: voicePolishConfig,
@@ -2387,7 +2382,7 @@ actor RecognitionSession {
         guard isCurrent(sessionID) else { return }
         // Skip speculative LLM for local models — they're fast enough (~0.5s)
         // and would compete for Metal GPU with local ASR.
-        guard KeychainService.selectedLLMProvider != .localQwen else { return }
+        guard KeychainService.selectedPolishProvider(for: .resolve(currentMode.voicePolishQualityMode)) != .localQwen else { return }
 
         speculativeDebounceTask?.cancel()
         let debounceToken = UUID()

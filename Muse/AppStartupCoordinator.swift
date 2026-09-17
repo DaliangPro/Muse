@@ -142,7 +142,7 @@ enum AppStartupCoordinator {
         // 识别（sherpa）、润色（localQwen）、语料提炼（localQwen）——
         // 此前漏了第三个，导致只有提炼用本地模型时服务不启动、提炼必失败
         let needsLocalServer = KeychainService.selectedASRProvider == .sherpa
-            || KeychainService.selectedLLMProvider == .localQwen
+            || KeychainService.anyPolishUsesLocalModel
             || KeychainService.selectedAssetExtractionLLMProvider == .localQwen
         guard needsLocalServer else { return }
 
@@ -161,7 +161,7 @@ enum AppStartupCoordinator {
         // 润色/提炼选了本地千问但模型未下载时，服务即使为 ASR 拉起也无法服务 LLM，
         // 此前会静默失败。这里独立告警，避免运行时润色/提炼无声出错。
         if !LocalQwenLLMConfig.isModelAvailable {
-            if KeychainService.selectedLLMProvider == .localQwen {
+            if KeychainService.anyPolishUsesLocalModel {
                 AppLogger.log("[App] Local Qwen LLM model not downloaded; polish will fail until the model is downloaded")
             }
             if KeychainService.selectedAssetExtractionLLMProvider == .localQwen {

@@ -3,7 +3,8 @@ import SwiftUI
 
 enum ModelSettingsEditor: String, Identifiable {
     case asr
-    case llm
+    case lightPolish
+    case standardPolish
 
     var id: String { rawValue }
 }
@@ -18,8 +19,10 @@ struct ModelSettingsEditorSheet: View {
             switch editor {
             case .asr:
                 ASRSettingsCard(onClose: { dismiss() })
-            case .llm:
-                LLMSettingsCard(onClose: { dismiss() })
+            case .lightPolish:
+                LLMSettingsCard(role: .light, onClose: { dismiss() })
+            case .standardPolish:
+                LLMSettingsCard(role: .standard, onClose: { dismiss() })
             }
         }
         .frame(width: editorWidth, alignment: .topLeading)

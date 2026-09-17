@@ -277,7 +277,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
             Task {
                 let manager = SenseVoiceServerManager.shared
                 await manager.stopSenseVoice()
-                let llmNeedsQwen3 = KeychainService.selectedLLMProvider == .localQwen
+                let llmNeedsQwen3 = KeychainService.anyPolishUsesLocalModel
                 if !llmNeedsQwen3 {
                     await manager.stopQwen3()
                 }

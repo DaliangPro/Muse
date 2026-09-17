@@ -332,22 +332,18 @@ private extension ModeTrialCard {
             return
         }
 
-        guard let llmConfig = KeychainService.loadLLMConfig() else {
+        let role = PolishModelRole.resolve(draftMode.voicePolishQualityMode)
+        guard let llmConfig = KeychainService.loadPolishConfig(for: role) else {
             trialError = L("当前 LLM 没有可用配置", "Current LLM is not configured")
             return
         }
 
-        let provider = KeychainService.selectedLLMProvider
+        let provider = KeychainService.selectedPolishProvider(for: role)
         let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
 
         if draftMode.kind == .voicePolish {
             let trialStartedAt = ContinuousClock.now
-            let voicePolishConfig: LLMConfig
-            if let modelOverride = VoicePolishSettings.modelOverride() {
-                voicePolishConfig = llmConfig.withModel(modelOverride)
-            } else {
-                voicePolishConfig = llmConfig
-            }
+            let voicePolishConfig = llmConfig
             let asrProvider = KeychainService.selectedASRProvider
             let prepared = VoicePolishTerminologyRuntime.prepare(
                 rawText: input,

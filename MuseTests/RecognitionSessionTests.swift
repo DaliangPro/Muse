@@ -6,6 +6,31 @@ final class RecognitionSessionTests: XCTestCase {
         KeychainService.selectedASRProvider = .volcano
     }
 
+    func testProductionConfigurationRoutesLightAndStandardIndependently() async throws {
+        try await KeychainService.withIsolatedPolishSettingsForTestingAsync {
+            let fixture = try RecognitionSessionVocabularyFixture()
+            defer { fixture.cleanup() }
+            for (role, model) in [(PolishModelRole.light, "light-model"), (.standard, "standard-model")] {
+                KeychainService.setSelectedPolishProvider(.bailian, for: role)
+                try KeychainService.savePolishCredentials(for: .bailian, role: role, values: [
+                    "apiKey": "test-key", "model": model, "baseURL": "https://example.com/v1"
+                ])
+            }
+            let source = "明天上午开会。"
+            let client = RecognitionSessionVoicePolishLLM(response: source)
+            let session = RecognitionSession(historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client })
+            let transcript = RecognitionTranscript(confirmedSegments: [source], partialText: "", authoritativeText: source, isFinal: true)
+            for mode in [ProcessingMode.lightPolish, .formalWriting] {
+                let result = await session.postProcessForTesting(rawText: source, transcript: transcript, mode: mode, vocabularyContext: fixture.context)
+                XCTAssertFalse(result?.llmFailed ?? true)
+            }
+            let models = await client.recordedModels()
+            XCTAssertEqual(models, ["light-model", "standard-model"])
+            let requests = await client.recordedRequests()
+            XCTAssertEqual(requests.map(\.task), [.voicePolishRender, .voicePolishStructured])
+        }
+    }
+
     func testInitialStateIsIdle() async {
         let session = makeSession()
         let state = await session.state
@@ -330,7 +355,8 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(payload["canonical_text"] as? String, canonical)
         XCTAssertFalse(request.user.contains("内置整句"))
         let models = await client.recordedModels()
-        XCTAssertEqual(models, ["voice-polish-fast-model"])
+        // 配置加载器已完成按档解析，旧覆盖值不能再次覆盖已选择的模型。
+        XCTAssertEqual(models, ["mock-model"])
     }
 
     func testDirectAndVoicePolishShareGlobalCanonicalAndFixedSnippetBehavior() async throws {

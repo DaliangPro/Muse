@@ -5,6 +5,7 @@ import SwiftUI
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 struct LLMSettingsCard: View, SettingsCardHelpers {
+    let role: PolishModelRole
     let onClose: (() -> Void)?
     /// 底排按钮组量到的实际宽度；输入框与它取齐（左右对齐）
     @State private var footerActionsWidth: CGFloat?
@@ -26,13 +27,9 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     @State private var testTask: Task<Void, Never>?
     @State private var serverStarting = false
     @State private var serverRunning = false
-    @State private var polishModelOverride = VoicePolishSettings.modelOverride() ?? ""
-    @State private var thinkingMode: LLMThinkingMode = .disabled
-    @State private var lockedThinkingMode: LLMThinkingMode?
-    @State private var thinkingFeedback: String?
-    @State private var thinkingFeedbackIsFailure = false
 
-    init(onClose: (() -> Void)? = nil) {
+    init(role: PolishModelRole = .standard, onClose: (() -> Void)? = nil) {
+        self.role = role
         self.onClose = onClose
     }
 
@@ -90,7 +87,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
 
     var body: some View {
         settingsGroupCard(
-            L("文本处理", "Text Processing"),
+            role.title,
             trailing: AnyView(cardTrailing),
             cornerRadius: ModelSettingsStyle.outerCardCornerRadius,
             headerBottomSpacing: ModelSettingsStyle.headerBottomSpacing,
@@ -121,21 +118,6 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
                     controlWidth: inspectorControlWidth
                 )
 
-                settingsInspectorRow(
-                    L("润色模型", "Polish model"),
-                    labelWidth: ModelSettingsStyle.inspectorLabelWidth,
-                    rowHeight: ModelSettingsStyle.inspectorRowHeight,
-                    horizontalPadding: 0
-                ) {
-                    TextField(L("留空跟随文本处理模型", "Use text model if blank"), text: $polishModelOverride)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: inspectorControlWidth)
-                        .disabled(!isEditingLLM)
-                        .help(L("可选，同一服务商下的润色专用模型名。", "Optional polishing model from the same provider."))
-                }
-
-                thinkingModeRows
-
                 // 与 CredentialFieldRow 的只读规则对齐：已存凭证且未进入编辑时
                 // 字段只读，此时选模型无处保存，故同样隐藏取数行
                 if selectedLLMProvider != .localQwen, isEditingLLM || !hasLLMCredentials {
@@ -145,6 +127,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             .zIndex(10)
 
             LLMSettingsFooter(
+                role: role,
                 showsCancel: onClose == nil,
                 selectedProvider: selectedLLMProvider,
                 hasCredentials: hasLLMCredentials,
@@ -184,6 +167,10 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
         .task {
             loadLLMCredentials()
             await checkServerStatus()
+        }
+        .onDisappear {
+            testTask?.cancel()
+            modelFetchTask?.cancel()
         }
         .onChange(of: selectedLLMProvider) { oldProvider, newProvider in
             handleLLMProviderChange(from: oldProvider, to: newProvider)
@@ -248,53 +235,6 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
                 editedFields.insert("model")
             }
         )
-    }
-
-    @ViewBuilder
-    private var thinkingModeRows: some View {
-        settingsInspectorRow(
-            L("深度思考", "Reasoning"),
-            labelWidth: ModelSettingsStyle.inspectorLabelWidth,
-            rowHeight: ModelSettingsStyle.inspectorRowHeight,
-            horizontalPadding: 0
-        ) {
-            LLMThinkingModePicker(
-                mode: thinkingModeSelection,
-                width: inspectorControlWidth,
-                isLocked: isThinkingControlLocked
-            )
-        }
-
-        if let thinkingFeedback {
-            HStack(spacing: 12) {
-                Color.clear
-                    .frame(width: ModelSettingsStyle.inspectorLabelWidth)
-                LLMThinkingFeedbackText(
-                    message: thinkingFeedback,
-                    isFailure: thinkingFeedbackIsFailure
-                )
-                .frame(width: inspectorControlWidth, alignment: .leading)
-            }
-        }
-    }
-
-    private var thinkingModeSelection: Binding<LLMThinkingMode> {
-        Binding(
-            get: { thinkingMode },
-            set: { newMode in
-                guard !isThinkingControlLocked else { return }
-                thinkingMode = newMode
-                invalidateThinkingValidation()
-                if selectedLLMProvider == .localQwen {
-                    persistThinkingMode(newMode)
-                }
-            }
-        )
-    }
-
-    private var isThinkingControlLocked: Bool {
-        if lockedThinkingMode != nil { return true }
-        return selectedLLMProvider != .localQwen && hasStoredLLM && !isEditingLLM
     }
 
     private func fetchModelList() {
@@ -381,7 +321,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
 
     private func stopLocalServer() {
         Task {
-            let result = await LocalLLMServerControl.unloadAndStopIfUnneeded()
+            let result = await LocalLLMServerControl.unloadAndStopIfUnneeded(excluding: role)
             if result == .stoppedServer {
                 serverRunning = false
             }
@@ -396,15 +336,6 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
         isEditingLLM = true
         loadLLMCredentialsForProvider(newProvider)
 
-        if newProvider == .localQwen || hasLLMCredentials {
-            KeychainService.selectedLLMProvider = newProvider
-            if newProvider == .localQwen {
-                Task { await preloadLocalLLM() }
-            } else if oldProvider == .localQwen {
-                stopLocalServer()
-                Task { await LocalLLMServerControl.stopQwen3IfASRDoesNotNeedIt() }
-            }
-        }
     }
 
     private func handleEffectiveValuesChange(
@@ -412,11 +343,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
         to newValues: [String: String]
     ) {
         guard oldValues != newValues else { return }
-        if oldValues["model"] != newValues["model"] {
-            loadThinkingMode(for: selectedLLMProvider)
-        } else {
-            invalidateThinkingValidation()
-        }
+        invalidateConnectionTest()
     }
 
     // MARK: - Data
@@ -436,14 +363,14 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     }
 
     private func loadLLMCredentials() {
-        selectedLLMProvider = KeychainService.selectedLLMProvider
+        selectedLLMProvider = KeychainService.selectedPolishProvider(for: role)
         loadLLMCredentialsForProvider(selectedLLMProvider)
     }
 
     private func loadLLMCredentialsForProvider(_ provider: LLMProvider) {
         testTask?.cancel()
         editedFields = []
-        if let values = KeychainService.loadLLMCredentials(for: provider) {
+        if let values = KeychainService.loadPolishCredentials(for: provider, role: role) {
             savedLLMValues = values
             hasStoredLLM = true
             llmCredentialValues = Self.displayValues(from: values, fields: currentLLMFields)
@@ -457,54 +384,19 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             hasStoredLLM = false
             isEditingLLM = true
         }
-        loadThinkingMode(for: provider)
     }
 
-    private var effectiveModelName: String {
-        if selectedLLMProvider == .localQwen {
-            return LocalQwenLLMConfig.availableModel?.name ?? "qwen3.5-9b"
-        }
-        return (effectiveLLMValues["model"] ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func loadThinkingMode(for provider: LLMProvider) {
-        thinkingMode = KeychainService.loadLLMThinkingMode(
-            role: .textProcessing,
-            provider: provider,
-            model: effectiveModelName
-        )
-        lockedThinkingMode = nil
-        thinkingFeedback = nil
-        thinkingFeedbackIsFailure = false
-        llmTestStatus = .idle
-    }
-
-    private func persistThinkingMode(_ mode: LLMThinkingMode) {
-        KeychainService.saveLLMThinkingMode(
-            mode,
-            role: .textProcessing,
-            provider: selectedLLMProvider,
-            model: effectiveModelName
-        )
-    }
-
-    private func invalidateThinkingValidation() {
+    private func invalidateConnectionTest() {
         testTask?.cancel()
         llmTestStatus = .idle
-        lockedThinkingMode = nil
-        thinkingFeedback = nil
-        thinkingFeedbackIsFailure = false
     }
 
     private func saveLLMCredentials() {
         let values = effectiveLLMValues
-        let previousProvider = KeychainService.selectedLLMProvider
+        let previousProvider = KeychainService.selectedPolishProvider(for: role)
         do {
-            try KeychainService.saveLLMCredentials(for: selectedLLMProvider, values: values)
-            KeychainService.selectedLLMProvider = selectedLLMProvider
-            persistThinkingMode(thinkingMode)
-            VoicePolishSettings.setModelOverride(polishModelOverride)
+            try KeychainService.savePolishCredentials(for: selectedLLMProvider, role: role, values: values)
+            KeychainService.setSelectedPolishProvider(selectedLLMProvider, for: role)
             // REPAIR_PLAN H1 改进①：改选本地模型立即预热引擎
             AppStartupCoordinator.startLocalServerIfNeeded()
             llmCredentialValues = Self.displayValues(from: values, fields: currentLLMFields)
@@ -518,12 +410,14 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             Task { @MainActor in llmTestStatus = .saved }
             // 仅当「换了服务商且弹窗里没测过新商」才作废主页色点；原商仅保存不动连通状态
             if previousProvider != selectedLLMProvider {
-                ModelConnectivityCache.llm = nil
+                ModelConnectivityCache.polish[role] = nil
             }
 
             // Preload local LLM model on save
             if selectedLLMProvider == .localQwen {
                 Task { await preloadLocalLLM() }
+            } else if previousProvider == .localQwen {
+                Task { _ = await LocalLLMServerControl.unloadAndStopIfUnneeded() }
             }
         } catch {
             llmTestStatus = .failed(L("保存失败", "Save failed"))
@@ -533,75 +427,27 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     private func testLLMConnection() {
         testTask?.cancel()
         llmTestStatus = .testing
-        let testValues = effectiveLLMValues
+        let values = effectiveLLMValues
         let provider = selectedLLMProvider
         testTask = Task {
+            let config: LLMConfig?
+            if provider == .localQwen {
+                config = KeychainService.loadPolishConfig(for: role, provider: provider)
+            } else {
+                config = LLMProviderRegistry.configType(for: provider)?.init(credentials: values)?.toLLMConfig().withThinkingMode(.disabled)
+            }
+            guard let config else {
+                recordTestOutcome(.failed(L("配置无效或本地引擎未启动", "Invalid config or local engine stopped")), provider: provider, config: nil)
+                return
+            }
             do {
-                let llmConfig: LLMConfig
-                if provider == .localQwen {
-                    // LLM runs on Qwen3-ASR server (shares Metal GPU lock)
-                    let port = SenseVoiceServerManager.currentQwen3Port ?? SenseVoiceServerManager.currentPort
-                    guard let port else {
-                        guard !Task.isCancelled else { return }
-                        recordTestOutcome(
-                            .failed(L("Qwen3 服务未运行，请先启动", "Qwen3 server not running, start it first")),
-                            provider: provider,
-                            config: nil
-                        )
-                        return
-                    }
-                    llmConfig = LLMConfig(
-                        apiKey: "",
-                        model: effectiveModelName,
-                        baseURL: "http://127.0.0.1:\(port)/v1",
-                        thinkingMode: thinkingMode
-                    )
-                } else {
-                    guard let configType = LLMProviderRegistry.configType(for: provider),
-                          let config = configType.init(credentials: testValues)
-                    else {
-                        guard !Task.isCancelled else { return }
-                        recordTestOutcome(
-                            .failed(L("配置无效", "Invalid config")),
-                            provider: provider,
-                            config: nil
-                        )
-                        return
-                    }
-                    llmConfig = config.toLLMConfig().withThinkingMode(thinkingMode)
-                }
-                let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-                let result = await LLMThinkingModeValidator.validate(
-                    provider: provider,
-                    config: llmConfig,
-                    client: client
-                )
+                try await PolishModelConnectionTester.test(role: role, config: config, client: LLMProviderRegistry.makeClient(for: provider))
                 guard !Task.isCancelled else { return }
-                switch result {
-                case .valid:
-                    lockedThinkingMode = nil
-                    thinkingFeedback = nil
-                    thinkingFeedbackIsFailure = false
-                    recordTestOutcome(.success, provider: provider, config: llmConfig)
-                    AppLogger.log("[Settings] LLM test OK (\(provider.rawValue))")
-                    DebugFileLogger.log("[Settings] LLM test OK provider=\(provider.rawValue) model=\(llmConfig.model)")
-                case .adjusted(let mode, let message):
-                    thinkingMode = mode
-                    lockedThinkingMode = mode
-                    thinkingFeedback = message
-                    thinkingFeedbackIsFailure = false
-                    persistThinkingMode(mode)
-                    let correctedConfig = llmConfig.withThinkingMode(mode)
-                    recordTestOutcome(.success, provider: provider, config: correctedConfig)
-                    AppLogger.log(
-                        "[Settings] LLM thinking adjusted \(llmConfig.thinkingMode.rawValue) -> \(mode.rawValue) (\(provider.rawValue))"
-                    )
-                case .failed(let message):
-                    thinkingFeedback = message
-                    thinkingFeedbackIsFailure = true
-                    recordTestOutcome(.failed(message), provider: provider, config: llmConfig)
-                    AppLogger.log("[Settings] LLM test failed (\(provider.rawValue)): \(message)")
-                }
+                recordTestOutcome(.success, provider: provider, config: config)
+                DebugFileLogger.log("[Settings] polish test OK role=\(role.rawValue) provider=\(provider.rawValue) model=\(config.model)")
+            } catch {
+                guard !Task.isCancelled else { return }
+                recordTestOutcome(.failed(error.localizedDescription), provider: provider, config: config)
             }
         }
     }
@@ -614,12 +460,12 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     ) {
         llmTestStatus = status
         if let config {
-            ModelConnectivityCache.llm = LLMConnectivityCacheEntry(
+            ModelConnectivityCache.polish[role] = LLMConnectivityCacheEntry(
                 signature: LLMConnectivitySignature(provider: provider, config: config),
                 status: status
             )
         } else {
-            ModelConnectivityCache.llm = nil
+            ModelConnectivityCache.polish[role] = nil
         }
     }
 }

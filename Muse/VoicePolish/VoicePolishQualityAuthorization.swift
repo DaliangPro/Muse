@@ -48,7 +48,7 @@ enum VoicePolishQualityAuthorization {
                 throw InvocationError.missingProvider
             }
             provider = requested
-            guard provider == KeychainService.selectedLLMProvider else {
+            guard PolishModelRole.allCases.contains(where: { KeychainService.selectedPolishProvider(for: $0) == provider }) else {
                 throw InvocationError.providerMismatch
             }
         } catch {
@@ -60,7 +60,11 @@ enum VoicePolishQualityAuthorization {
         Task { @MainActor in
             // 系统弹窗可能等待用户；不要阻塞应用主线程。
             let status = await Task.detached {
-                KeychainService.authorizeLLMCredentialAccess(for: provider)
+                for role in PolishModelRole.allCases where KeychainService.selectedPolishProvider(for: role) == provider {
+                    let status = KeychainService.authorizePolishCredentialAccess(for: provider, role: role)
+                    if status != errSecSuccess { return status }
+                }
+                return errSecSuccess
             }.value
             print("VOICE_POLISH_AUTHORIZATION_STATUS provider=\(provider.rawValue) os_status=\(status)")
             NSApp.terminate(nil)

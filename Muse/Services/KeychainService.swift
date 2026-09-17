@@ -521,6 +521,87 @@ enum KeychainService {
         return configType.init(credentials: values)
     }
 
+    static func withIsolatedPolishSettingsForTesting<T>(legacyOverride: String? = nil, _ body: () throws -> T) rethrows -> T {
+        precondition(isRunningTests)
+        let snapshot = withIsolatedTestStorage { $0 }
+        withIsolatedTestStorage { storage in
+            storage.preferences = storage.preferences.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.secureData = storage.secureData.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.preferences[DefaultsKeys.voicePolishModelOverride] = legacyOverride
+        }
+        defer { withIsolatedTestStorage { $0 = snapshot } }
+        return try body()
+    }
+
+    static func withIsolatedPolishSettingsForTestingAsync<T>(legacyOverride: String? = nil, _ body: () async throws -> T) async rethrows -> T {
+        precondition(isRunningTests)
+        let snapshot = withIsolatedTestStorage { $0 }
+        withIsolatedTestStorage { storage in
+            storage.preferences = storage.preferences.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.secureData = storage.secureData.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.preferences[DefaultsKeys.voicePolishModelOverride] = legacyOverride
+        }
+        defer { withIsolatedTestStorage { $0 = snapshot } }
+        return try await body()
+    }
+
+    // 两档独立保存；旧数据只读回退，不执行隐式迁移或覆盖另一档。
+    static func polishStorageKey(role: PolishModelRole, provider: LLMProvider) -> String {
+        "tf_polish_\(role.rawValue)_\(provider.rawValue)"
+    }
+
+    static func selectedPolishProvider(for role: PolishModelRole) -> LLMProvider {
+        preferenceString(forKey: "tf_polish_provider_\(role.rawValue)")
+            .flatMap(LLMProvider.init(rawValue:)) ?? selectedLLMProvider
+    }
+
+    static func setSelectedPolishProvider(_ provider: LLMProvider, for role: PolishModelRole) {
+        setPreference(provider.rawValue, forKey: "tf_polish_provider_\(role.rawValue)")
+    }
+
+    static func loadPolishCredentials(for provider: LLMProvider, role: PolishModelRole) -> [String: String]? {
+        if preferenceString(forKey: polishStorageKey(role: role, provider: provider) + "_saved") != nil {
+            guard let values = loadSecureDictionary(key: polishStorageKey(role: role, provider: provider)) else { return nil }
+            return sanitizeLLMCredentials(values)
+        }
+        guard var values = loadLLMCredentials(for: provider) else { return nil }
+        if provider == selectedLLMProvider, let model = preferenceString(forKey: DefaultsKeys.voicePolishModelOverride)?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            values["model"] = model
+        }
+        return values
+    }
+
+    static func savePolishCredentials(for provider: LLMProvider, role: PolishModelRole, values: [String: String]) throws {
+        let normalized = try normalizedLLMCredentialsForStorage(provider: provider, values: values)
+        lock.lock()
+        defer { lock.unlock() }
+        try saveSecureDictionary(normalized, key: polishStorageKey(role: role, provider: provider))
+        setPreference("1", forKey: polishStorageKey(role: role, provider: provider) + "_saved")
+    }
+
+    static func authorizePolishCredentialAccess(for provider: LLMProvider, role: PolishModelRole) -> OSStatus {
+        guard provider != .localQwen else { return errSecParam }
+        if preferenceString(forKey: polishStorageKey(role: role, provider: provider) + "_saved") != nil {
+            return authorizeCredentialAccess(key: polishStorageKey(role: role, provider: provider))
+        }
+        return authorizeLLMCredentialAccess(for: provider)
+    }
+
+    static func loadPolishConfig(for role: PolishModelRole, provider explicitProvider: LLMProvider? = nil) -> LLMConfig? {
+        let provider = explicitProvider ?? selectedPolishProvider(for: role)
+        if provider == .localQwen {
+            return resolvedLLMConfig(for: provider, role: .textProcessing)?.withThinkingMode(.disabled)
+        }
+        guard let values = loadPolishCredentials(for: provider, role: role),
+              let type = LLMProviderRegistry.configType(for: provider),
+              let config = type.init(credentials: values)?.toLLMConfig() else { return nil }
+        return config.withThinkingMode(.disabled)
+    }
+
+    static var anyPolishUsesLocalModel: Bool {
+        PolishModelRole.allCases.contains { selectedPolishProvider(for: $0) == .localQwen }
+    }
+
     // MARK: - LLM Config convenience (backward compat)
 
     static func saveLLMCredentials(apiKey: String, model: String, baseURL: String = "") throws {

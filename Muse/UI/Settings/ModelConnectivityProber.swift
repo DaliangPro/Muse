@@ -23,8 +23,9 @@ enum ModelConnectivityProber {
 
     static func probeAll() async {
         async let asr: Void = probeASR()
-        async let llm: Void = probeTextProcessing()
-        _ = await (asr, llm)
+        async let light: Void = probePolish(.light)
+        async let standard: Void = probePolish(.standard)
+        _ = await (asr, light, standard)
         AppLogger.log("[ConnectivityProber] 启动连通性探测完成")
         // 通知模型设置页刷新色点（页面可能在探测完成前就已打开）
         NotificationCenter.default.post(name: .modelConnectivityProbed, object: nil)
@@ -52,44 +53,16 @@ enum ModelConnectivityProber {
         }
     }
 
-    private static func probeTextProcessing() async {
-        let llmProvider = KeychainService.selectedLLMProvider
-        let llmConfig = KeychainService.loadLLMConfig()
-        let llmStatus = await probeLLM(provider: llmProvider, config: llmConfig)
-        if let llmConfig {
-            ModelConnectivityCache.llm = LLMConnectivityCacheEntry(
-                signature: LLMConnectivitySignature(provider: llmProvider, config: llmConfig),
-                status: llmStatus
-            )
-        } else {
-            ModelConnectivityCache.llm = nil
-        }
-
-
-    }
-
-    private static func probeLLM(provider: LLMProvider, config: LLMConfig?) async -> SettingsTestStatus {
-        guard let config else {
-            return .failed(provider == .localQwen
-                ? L("本地引擎未启动", "Local engine not running")
-                : L("待配置", "Needs setup"))
-        }
-        let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-        let result = await LLMThinkingModeValidator.validate(
-            provider: provider,
-            config: config,
-            client: client
+    private static func probePolish(_ role: PolishModelRole) async {
+        let provider = KeychainService.selectedPolishProvider(for: role)
+        guard let config = KeychainService.loadPolishConfig(for: role) else { return }
+        let status: SettingsTestStatus
+        do {
+            try await PolishModelConnectionTester.test(role: role, config: config, client: LLMProviderRegistry.makeClient(for: provider))
+            status = .success
+        } catch { status = .failed(error.localizedDescription) }
+        ModelConnectivityCache.polish[role] = LLMConnectivityCacheEntry(
+            signature: LLMConnectivitySignature(provider: provider, config: config), status: status
         )
-        switch result {
-        case .valid:
-            return .success
-        case .adjusted(let mode, _):
-            return .failed(L(
-                "深度思考状态需要调整为“\(mode.displayName)”，请打开模型配置后重新测试",
-                "Reasoning must be set to \(mode.displayName). Open model settings and test again."
-            ))
-        case .failed(let message):
-            return .failed(message)
-        }
     }
 }

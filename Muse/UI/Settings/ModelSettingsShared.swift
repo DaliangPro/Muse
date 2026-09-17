@@ -20,6 +20,7 @@ enum ModelSettingsStyle {
 @MainActor
 enum ModelConnectivityCache {
     static var asr: (provider: ASRProvider, status: SettingsTestStatus)?
+    static var polish: [PolishModelRole: LLMConnectivityCacheEntry] = [:]
     static var llm: LLMConnectivityCacheEntry?
     static var asset: LLMConnectivityCacheEntry?
 }

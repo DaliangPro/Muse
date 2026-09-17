@@ -9,6 +9,7 @@ struct ModeModelStatus: Equatable {
     let title: String
     let serviceKind: ServiceKind
     let isAvailable: Bool
+    var polishRole: PolishModelRole? = nil
 
     var availabilityTitle: String {
         isAvailable ? L("可用", "Available") : L("不可用", "Unavailable")
@@ -19,7 +20,7 @@ struct ModeModelStatus: Equatable {
         case .asr:
             return L("语音识别模型", "Speech model")
         case .llm:
-            return L("文本处理模型", "Text model")
+            return (polishRole ?? .standard).title
         }
     }
 }
@@ -30,16 +31,20 @@ extension ModesSettingsTab {
     }
 
     var selectedLLMProvider: LLMProvider {
-        LLMProvider(rawValue: selectedLLMProviderRaw) ?? KeychainService.selectedLLMProvider
+        KeychainService.selectedPolishProvider(for: .standard)
     }
 
     func currentModelStatus(for mode: ProcessingMode) -> ModeModelStatus {
         let usesLLM = mode.requiresLLM
         if usesLLM {
+            let role = PolishModelRole.resolve(mode.voicePolishQualityMode)
+            let provider = KeychainService.selectedPolishProvider(for: role)
+            let config = KeychainService.loadPolishConfig(for: role)
             return ModeModelStatus(
-                title: currentLLMShortName,
+                title: config?.model ?? provider.displayName,
                 serviceKind: .llm,
-                isAvailable: currentLLMIsAvailable
+                isAvailable: provider == .localQwen ? LocalQwenLLMConfig.isModelAvailable : config != nil,
+                polishRole: role
             )
         }
 
@@ -61,7 +66,7 @@ extension ModesSettingsTab {
         if selectedLLMProvider == .localQwen {
             return LocalQwenLLMConfig.isModelAvailable
         }
-        return KeychainService.loadLLMProviderConfig(for: selectedLLMProvider) != nil
+        return KeychainService.loadPolishConfig(for: .standard) != nil
     }
 
     var currentLLMShortName: String {
