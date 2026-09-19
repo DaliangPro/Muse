@@ -322,6 +322,7 @@ actor RecognitionSession {
 
     // MARK: - Speculative LLM (fire during recording pauses)
 
+    private let lightPolishPrefetch = LightPolishPrefetch()
     private var speculativeLLMTask: Task<String?, Never>?
     private var speculativeLLMSessionID: RecognitionSessionID?
     private var speculativeLLMText: String = ""
@@ -596,6 +597,7 @@ actor RecognitionSession {
             currentConfig = nil
             currentConfigSessionID = nil
         }
+        lightPolishPrefetch.reset(session: sessionID)
         if speculativeLLMSessionID == sessionID || speculativeDebounceSessionID == sessionID {
             resetSpeculativeLLM(sessionID: sessionID)
         }
@@ -900,7 +902,9 @@ actor RecognitionSession {
     /// Switch the processing mode before stopping. Used for cross-mode hotkey stops.
     func switchMode(to mode: ProcessingMode) {
         guard state == .starting || state == .recording else { return }
-        currentMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
+        let resolvedMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
+        if resolvedMode != currentMode { lightPolishPrefetch.invalidate() }
+        currentMode = resolvedMode
     }
 
     // MARK: - Stop
@@ -1513,12 +1517,23 @@ actor RecognitionSession {
                         }
                     }
                 )
+                var prefetched = mode.voicePolishQualityMode == .light
+                    ? lightPolishPrefetch.take(session: sessionID, key: .init(
+                        text: request.fallbackText, requirements: mode.prompt,
+                        provider: KeychainService.selectedPolishProvider(for: .light),
+                        config: voicePolishConfig)) : nil
+                if prefetched != nil {
+                    DebugFileLogger.log("light prefetch: reused completed candidate")
+                }
                 var totalAttempts = 0
                 var pipelineStartedAt = stopT0
                 let result: VoicePolishResult
                 while true {
+                    let readyCandidate = prefetched
+                    prefetched = nil
                     let task = Task {
-                        await pipeline.process(request, startedAt: pipelineStartedAt)
+                        if let readyCandidate { return readyCandidate }
+                        return await pipeline.process(request, startedAt: pipelineStartedAt)
                     }
                     voicePolishTask = task
                     voicePolishTaskSessionID = sessionID
@@ -2244,12 +2259,15 @@ actor RecognitionSession {
             break  // handled above
 
         case .transcript(let transcript):
+            if transcript.composedText != currentTranscript.composedText {
+                lightPolishPrefetch.invalidate()
+            }
             currentTranscript = transcript
             onASREvent?(event)
             logger.info("Transcript updated chars=\(transcript.displayText.count, privacy: .public) segments=\(transcript.confirmedSegments.count, privacy: .public) final=\(transcript.isFinal, privacy: .public)")
             if state == .recording,
                currentMode.requiresLLM,
-               currentMode.kind != .voicePolish {
+               (currentMode.kind != .voicePolish || currentMode.voicePolishQualityMode == .light) {
                 scheduleSpeculativeLLM(sessionID: sessionID)
             }
 
@@ -2404,6 +2422,11 @@ actor RecognitionSession {
 
     private func fireSpeculativeLLM(sessionID: RecognitionSessionID) async {
         guard isCurrent(sessionID), state == .recording else { return }
+        if currentMode.voicePolishQualityMode == .light {
+            await fireLightPolishPrefetch(sessionID: sessionID)
+            return
+        }
+        guard currentMode.kind != .voicePolish else { return }
         let rawText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let text = canonicalText(for: rawText, sessionID: sessionID)
@@ -2444,6 +2467,28 @@ actor RecognitionSession {
         speculativeLLMSessionID = sessionID
     }
 
+    private func fireLightPolishPrefetch(
+        sessionID: RecognitionSessionID,
+        vocabularyContext: VocabularyStorageContext = .production
+    ) async {
+        let raw = currentTranscript.composedText
+        let mode = currentMode
+        let provider = KeychainService.selectedPolishProvider(for: .light)
+        // 本地 ASR 与本地润色共享计算资源，首版仅对云端模型预生成。
+        guard !provider.isLocal,
+              let config = await loadLLMConfigOffActor(),
+              isCurrent(sessionID), state == .recording,
+              currentMode == mode, currentTranscript.composedText == raw,
+              KeychainService.selectedPolishProvider(for: .light) == provider else { return }
+        let source = canonicalText(for: raw, sessionID: sessionID, vocabularyContext: vocabularyContext)
+        let pipeline = VoicePolishEditingPipeline(client: currentLLMClient(), config: config)
+        lightPolishPrefetch.start(session: sessionID, key: .init(
+            text: source, requirements: mode.prompt, provider: provider, config: config
+        )) {
+            await pipeline.processText(source, requirements: mode.prompt, qualityMode: .light)
+        }
+    }
+
     private func cancelSpeculativeLLM(sessionID: RecognitionSessionID) {
         if speculativeDebounceSessionID == sessionID {
             speculativeDebounceTask?.cancel()
@@ -2460,6 +2505,7 @@ actor RecognitionSession {
     }
 
     private func resetSpeculativeLLM(sessionID: RecognitionSessionID? = nil) {
+        lightPolishPrefetch.reset(session: sessionID)
         if sessionID == nil || speculativeDebounceSessionID == sessionID {
             speculativeDebounceTask?.cancel()
             speculativeDebounceTask = nil
@@ -2595,6 +2641,7 @@ actor RecognitionSession {
         // 会话 ID 是本函数的第一项状态修改。此后所有旧回调都会被身份守卫拒绝；
         // 剩余清理均同步摘除共享引用，唯一可能挂起的 disconnect 完全使用局部对象。
         let resetSessionID = currentSessionID
+        lightPolishPrefetch.reset()
         if let resetSessionID, voicePolishChoiceSessionID == resetSessionID {
             resolveVoicePolishChoice(.cancel, sessionID: resetSessionID)
         }
@@ -2732,6 +2779,17 @@ extension RecognitionSession {
             vocabularyContext: vocabularyContext,
             allowsVoicePolishUserChoice: allowsUserChoice
         )
+    }
+
+    /// 使用真实预生成入口，仅绕过麦克风采集和停顿计时。
+    func prefetchLightForTesting(text: String, vocabularyContext: VocabularyStorageContext) async {
+        if currentSessionID == nil { currentSessionID = makeSessionID() }
+        guard let sessionID = currentSessionID else { return }
+        state = .recording
+        currentMode = .lightPolish
+        currentTranscript = RecognitionTranscript(confirmedSegments: [text], partialText: "",
+                                                  authoritativeText: text, isFinal: false)
+        await fireLightPolishPrefetch(sessionID: sessionID, vocabularyContext: vocabularyContext)
     }
 
     func postProcessForTesting(

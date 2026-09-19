@@ -47,7 +47,15 @@ struct VoicePolishEditingPipeline: Sendable {
     }
 
     func process(_ request: VoicePolishRequest) async -> VoicePolishResult {
-        let isLight = request.qualityMode == .light
+        await processText(request.fallbackText,
+                          requirements: request.preferences.additionalRequirements,
+                          qualityMode: request.qualityMode)
+    }
+
+    /// 预生成与正式交付共用同一输入协议、超时及失败处理。
+    func processText(_ source: String, requirements: String,
+                     qualityMode: VoicePolishQualityMode) async -> VoicePolishResult {
+        let isLight = qualityMode == .light
         let route: VoicePolishRoute = isLight ? .fast : .structured
         let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? .seconds(30))
         let attempts = VoicePolishEditingAttempts()
@@ -55,7 +63,7 @@ struct VoicePolishEditingPipeline: Sendable {
         func result(_ text: String?, codes: [VoicePolishValidationCode] = [],
                     reason: VoicePolishFailureReason? = nil) -> VoicePolishResult {
             VoicePolishResult(
-                text: text ?? request.fallbackText,
+                text: text ?? source,
                 detectedRoute: route,
                 executedRoute: route,
                 llmAttemptCount: attempts.finish(),
@@ -66,7 +74,7 @@ struct VoicePolishEditingPipeline: Sendable {
                 repairAttemptCount: 0
             )
         }
-        guard request.qualityMode == .light || request.qualityMode == .standard else {
+        guard qualityMode == .light || qualityMode == .standard else {
             return result(nil, reason: .setupFailed)
         }
         do {
@@ -75,8 +83,8 @@ struct VoicePolishEditingPipeline: Sendable {
                 task: isLight ? .voicePolishRender : .voicePolishStructured,
                 system: isLight ? VoicePolishEditingPrompts.light : VoicePolishEditingPrompts.standard,
                 payload: VoicePolishEditingPrompts.fullTextPayload(
-                    request.fallbackText,
-                    additionalRequirements: request.preferences.additionalRequirements
+                    source,
+                    additionalRequirements: requirements
                 ),
                 deadline: deadline, attempts: attempts
             )

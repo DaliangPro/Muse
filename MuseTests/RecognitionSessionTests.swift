@@ -1124,6 +1124,54 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
     }
 
+    func testLightPrefetchReusesActualPipelineWithoutSecondRequest() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        let raw = "明天下午开会"
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["明天下午开会。"])
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
+            llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") }
+        )
+        await session.prefetchLightForTesting(text: raw, vocabularyContext: fixture.context)
+        try await Task.sleep(for: .milliseconds(100))
+        let before = await client.recordedRequests()
+        XCTAssertEqual(before.count, 1)
+        // 相同档位的停止快捷键可能再次调用 switchMode，不应撤销有效候选。
+        await session.switchMode(to: .lightPolish)
+        let transcript = RecognitionTranscript(confirmedSegments: [raw], partialText: "",
+                                              authoritativeText: raw, isFinal: true)
+        let output = await session.postProcessForTesting(rawText: raw, transcript: transcript,
+            mode: .lightPolish, vocabularyContext: fixture.context)
+        let after = await client.recordedRequests()
+        XCTAssertEqual(after.count, 1, "命中候选不再发送第二次请求")
+        XCTAssertEqual(output?.finalText, "明天下午开会。")
+        await session.forceResetForTesting()
+    }
+
+    func testLightPrefetchFinalCorrectionUsesFreshFullInput() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["周三开会。", "周四开会。"])
+        let session = RecognitionSession(
+            historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
+            llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") }
+        )
+        await session.prefetchLightForTesting(text: "周三开会", vocabularyContext: fixture.context)
+        try await Task.sleep(for: .milliseconds(100))
+        let raw = "周三开会，不对，周四开会"
+        let transcript = RecognitionTranscript(confirmedSegments: [raw], partialText: "",
+                                              authoritativeText: raw, isFinal: true)
+        let output = await session.postProcessForTesting(rawText: raw, transcript: transcript,
+            mode: .lightPolish, vocabularyContext: fixture.context)
+        let calls = await client.recordedRequests()
+        XCTAssertEqual(calls.count, 2)
+        let payload = try Self.voicePolishPayload(from: XCTUnwrap(calls.last))
+        XCTAssertEqual(payload["canonical_text"] as? String, raw)
+        XCTAssertEqual(output?.finalText, "周四开会。")
+        await session.forceResetForTesting()
+    }
+
     func testLightSingleCallKeepsCompleteCanonicalInputAndVerbatimOutput() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
