@@ -557,7 +557,8 @@ enum VoicePolishQualityRunner {
             mode: invocation.mode.rawValue,
             editingPromptVersion: [.light, .standard].contains(invocation.mode)
                 ? VoicePolishEditingPrompts.version : nil,
-            latencyMeasurementScope: "asr_final_fixture_to_output"
+            latencyMeasurementScope: ProcessInfo.processInfo.environment["MUSE_LIGHT_PREFETCH_BENCHMARK_PLAN"] == nil
+                ? "asr_final_fixture_to_output" : "real_model_simulated_transcript_stop_to_output"
         )
 
         do {
@@ -687,8 +688,25 @@ enum VoicePolishQualityRunner {
                     requestProbeBodyPath: requestProbeBodyPath
                 )
                 let pipeline = VoicePolishPipeline(client: auditedClient, config: configured.config)
-                let result = await pipeline.process(request)
-                let elapsed = ContinuousClock.now - startedAt
+                let result: VoicePolishResult
+                let elapsed: Duration
+                if invocation.mode == .light,
+                   let planPath = ProcessInfo.processInfo.environment["MUSE_LIGHT_PREFETCH_BENCHMARK_PLAN"] {
+                    let measured = try await LightPolishBenchmark.run(
+                        planPath: planPath, caseID: input.testInputId, request: request,
+                        client: auditedClient, provider: configured.provider, config: configured.config,
+                        outputPath: invocation.reportPath + ".prefetch.jsonl")
+                    result = measured.result
+                    elapsed = measured.elapsed
+                    // 计时已冻结；等待被取消请求的审计收尾，不算入出稿耗时。
+                    for _ in 0..<100 {
+                        if !(await successCounter.stageResponses()).contains(where: { $0.status == "running" }) { break }
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                } else {
+                    result = await pipeline.process(request)
+                    elapsed = ContinuousClock.now - startedAt
+                }
                 let successfulProviderCallCount = await successCounter.currentCount()
                 expectedProviderReceiptCount += successfulProviderCallCount
                 let actualProviderReceiptCount = try providerAuditReceiptCount(
