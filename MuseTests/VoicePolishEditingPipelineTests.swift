@@ -4,6 +4,33 @@ import XCTest
 final class VoicePolishEditingPipelineTests: XCTestCase {
     private let config = LLMConfig(apiKey: "test-only", model: "configured-model", baseURL: "https://example.invalid")
 
+    func testPrefetchBenchmarkMeasuresHitAndRejectsChangedInput() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("muse-prefetch-benchmark-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let plans: [String: [String: Any]] = [
+            "off": ["enabled": false, "stableMilliseconds": 0],
+            "hit": ["enabled": true, "stableMilliseconds": 1300],
+            "changed": ["enabled": true, "stableMilliseconds": 1300, "preliminaryText": "周三开会"]
+        ]
+        let planURL = directory.appendingPathComponent("plan.json")
+        try JSONSerialization.data(withJSONObject: plans).write(to: planURL)
+        let outputURL = directory.appendingPathComponent("timing.jsonl")
+        for name in ["off", "hit", "changed"] {
+            let client = EditingTestClient([.text("周四开会。"), .text("周四开会。")])
+            let measured = try await LightPolishBenchmark.run(
+                planPath: planURL.path, caseID: name, request: request("周四开会", .light),
+                client: client, provider: .openai, config: config, outputPath: outputURL.path)
+            XCTAssertEqual(measured.result.text, "周四开会。")
+            let calls = await client.requests
+            XCTAssertEqual(calls.count, name == "changed" ? 2 : 1)
+        }
+        let records = try String(contentsOf: outputURL, encoding: .utf8).split(separator: "\n").map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        XCTAssertEqual(records.map { $0["reused"] as? Bool }, [false, true, false])
+    }
+
     func testLightReturnsWordAndStutterCorrectionsWithOnePlainTextRequest() async throws {
         let source = "我我今天按装软件。小李下午有别的事，所以请小周接手。"
         let expected = "我今天安装软件。小李下午有别的事，所以请小周接手。"
