@@ -156,6 +156,9 @@ struct TerminologySettingsTab: View, SettingsCardHelpers {
             }
             .settingsThinScrollIndicators()
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // 筛选或切换后回到首屏，避免惰性词表沿用上一页的可见范围。
+            .id(searchText)
+            .id(selectedPanel)
             // 只让选中块滑动，避免整张词表随段切换一起布局和淡入淡出。
             .animation(nil, value: selectedPanel)
             HStack(spacing: 12) {
