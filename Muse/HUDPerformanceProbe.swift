@@ -10,6 +10,18 @@ enum HUDPerformanceProbe {
     static var lastTimelineDate: Date?
     static var sampling = false
     static var window: NSWindow?
+    static var textSamples: [[String: Double]] = []
+    static var indicatorMounts = 0
+
+    static func recordText(width: CGFloat, presentedWidth: CGFloat, viewport: CGFloat, offset: CGFloat) {
+        guard sampling else { return }
+        textSamples.append(["time": CACurrentMediaTime(), "width": width,
+                            "presented_width": presentedWidth, "viewport": viewport, "offset": offset])
+    }
+
+    static func recordIndicatorMount() {
+        if sampling { indicatorMounts += 1 }
+    }
 
     static func recordFrame(_ date: Date) {
         guard sampling, date != lastTimelineDate else { return }
@@ -57,26 +69,43 @@ enum HUDPerformanceProbe {
         private func run() async {
             running = true
             status = "采样中"
-            state.showFrozenRecordingPreview(text: "今天")
-            try? await Task.sleep(for: .seconds(2))
+            state.stop()
+            try? await Task.sleep(for: .milliseconds(400))
             frames = []
             frames.reserveCapacity(3000)
+            textSamples = []
+            indicatorMounts = 0
             lastTimelineDate = nil
             let start = CACurrentMediaTime()
             let cpuStart = cpuSeconds()
             sampling = true
-            let text = "今天下午三点讨论新版本的发布计划，先检查语音识别，再检查文字输出和窗口动画，最后记录测试结果。"
+            state.showFrozenRecordingPreview(text: "")
+            state.segments = []
+            try? await Task.sleep(for: .seconds(1))
+            let text = String(repeating: "今天下午三点讨论新版本的发布计划，先检查语音识别，再检查文字输出和窗口动画，最后记录测试结果。", count: 5)
             for index in 0..<100 {
-                let count = 2 + index % (text.count - 1)
+                let count = 2 + index * 2 - (index == 65 ? 5 : 0)
                 state.segments = [TranscriptionSegment(text: String(text.prefix(count)), isConfirmed: false)]
                 state.audioLevel.current = Float(0.3 + 0.15 * sin(Double(index) * 0.3))
                 try? await Task.sleep(for: .milliseconds(120))
             }
+            try? await Task.sleep(for: .milliseconds(400))
             sampling = false
             let duration = CACurrentMediaTime() - start
             let cpu = cpuSeconds() - cpuStart
             let intervals = zip(frames.dropFirst(), frames).map { ($0 - $1) * 1000 }.sorted()
+            let stableScroll = zip(textSamples.dropFirst(), textSamples).filter {
+                $0.0["viewport"]! > 400 && abs($0.0["viewport"]! - $0.1["viewport"]!) < 0.01
+                    && $0.0["offset"]! < -1
+            }
+            let intermediateSteps = stableScroll.filter {
+                $0.0["width"] == $0.1["width"] && abs($0.0["offset"]! - $0.1["offset"]!) > 0.01
+            }.count
             let result: [String: Any] = [
+                "indicator_mounts": indicatorMounts,
+                "intermediate_scroll_steps": intermediateSteps,
+                "max_scroll_step_points": stableScroll.map { abs($0.0["offset"]! - $0.1["offset"]!) }.max() ?? 0,
+                "text_samples": textSamples,
                 "duration_seconds": duration, "view_updates": frames.count,
                 "view_updates_per_second": Double(frames.count) / duration,
                 "interval_p50_ms": intervals.isEmpty ? 0 : intervals[intervals.count / 2],
@@ -93,7 +122,6 @@ enum HUDPerformanceProbe {
                     try? data.write(to: url)
                 }
             }
-            state.stop()
             status = String(format: "采样完成：%.1f 次/秒，P95 %.1f ms，CPU %.1f%%",
                             Double(frames.count) / duration,
                             intervals.isEmpty ? 0 : intervals[Int(Double(intervals.count - 1) * 0.95)], cpu / duration * 100)

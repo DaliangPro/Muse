@@ -53,6 +53,9 @@ struct AnimatedRecordingIndicatorCluster<Content: View>: View {
 
             content(activity, time, flow)
         }
+        #if HUD_PERFORMANCE_PROBE
+        .onAppear { HUDPerformanceProbe.recordIndicatorMount() }
+        #endif
     }
 }
 

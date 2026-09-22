@@ -59,7 +59,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private var recordingIconTextGap: CGFloat {
         AppLaunchDebug.hudDemoSpacingTight ? 3.0 : 4.0
     }
-    private var recordingTextTailPadding: CGFloat { 8.0 }
+    private var recordingTextTailPadding: CGFloat { 14.0 }
     private var recordingTrimFadeWidth: CGFloat { 4.0 }
     private var capsuleHeight: CGFloat {
         state.barPhase == .copyFallback ? TF.barFallbackHeight : TF.barHeight
@@ -69,9 +69,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
     private var recordingWidthReserve: CGFloat {
         recordingLeadingInset + recordingIconWidth + recordingIconTextGap + recordingTrailingInset + recordingTextTailPadding
-    }
-    private var isRecordingInitialCircleState: Bool {
-        state.segments.isEmpty && !state.isQwen3OnlyMode
     }
     private var isRecordingLabelOnlyState: Bool {
         state.segments.isEmpty && state.isQwen3OnlyMode
@@ -298,40 +295,17 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var recordingContent: some View {
-        Group {
-            if isRecordingInitialCircleState {
-                AnimatedRecordingIndicatorCluster(
-                    audioLevel: state.audioLevel,
-                    recordingStartDate: state.recordingStartDate
-                ) {
-                    activity, time, flow in
-                    recordingInitialCircleContent(activity: activity, time: time, flow: flow)
-                }
-            } else {
-                recordingExpandedContent
-            }
-        }
-    }
-
-    private func recordingInitialCircleContent(activity: CGFloat, time: TimeInterval, flow: CGFloat) -> some View {
-        ZStack {
-            RecordingGlassInnerGlow(activity: activity, time: time)
-                .frame(width: 44, height: 34)
-
-            RecordingDot(time: time, activity: activity, flow: flow)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var recordingExpandedContent: some View {
-        ZStack(alignment: .leading) {
-            HStack(spacing: 0) {
+        GeometryReader { geometry in
+            // 圆形与展开阶段共用同一个波形，始终贴着当前外壳左侧移动。
+            ZStack(alignment: .leading) {
                 recordingAnimatedWaveZone
 
                 recordingTextZone
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(width: max(0, geometry.size.width - recordingIconWidth
+                                      - recordingLeadingInset - recordingTrailingInset),
+                           height: TF.barHeight, alignment: .leading)
+                    .offset(x: recordingIconWidth + recordingLeadingInset)
             }
-            .padding(.trailing, recordingTrailingInset)
         }
     }
 
@@ -358,15 +332,14 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 .font(TF.hudFontTitle)
                 .floatingBarReadableText(color: barTextColor)
                 .padding(.leading, recordingIconTextGap)
-        } else if !state.segments.isEmpty {
+        } else {
             StreamingHUDText(
                 text: state.transcriptionText,
                 color: barTextColor,
-                leadingFadeWidth: recordingTrimFadeWidth
+                leadingFadeWidth: recordingTrimFadeWidth,
+                trailingFadeWidth: recordingTextTailPadding
             )
             .padding(.leading, recordingIconTextGap)
-            .padding(.trailing, recordingTextTailPadding)
-            .transition(.identity)
         }
     }
 

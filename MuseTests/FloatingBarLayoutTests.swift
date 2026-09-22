@@ -5,6 +5,27 @@ import XCTest
 
 final class FloatingBarLayoutTests: XCTestCase {
     @MainActor
+    func testIncomingEdgeFadesBeforeAndAfterOverflow() throws {
+        for overflow in [false, true] {
+            let view = Color.red
+                .frame(width: 100, height: 40)
+                .mask(HUDTextEdgeMask(leadingFadeWidth: 4, trailingFadeWidth: 14,
+                                      hasLeadingOverflow: overflow))
+            let pixels = try renderPixels(view, width: 100, height: 40)
+            let alpha = { (x: Int) in pixels[(20 * 100 + x) * 4 + 3] }
+            XCTAssertGreaterThan(alpha(70), 250)
+            XCTAssertGreaterThan(alpha(88), alpha(94))
+            XCTAssertGreaterThan(alpha(94), alpha(99))
+            XCTAssertLessThan(alpha(99), 30, "新字进入的一侧应渐隐，而非硬裁切")
+            if overflow {
+                XCTAssertLessThan(alpha(0), 80, "旧文字离开的一侧应渐隐")
+            } else {
+                XCTAssertGreaterThan(alpha(0), 250, "短文本的开头应保持清晰")
+            }
+        }
+    }
+
+    @MainActor
     func testStreamingTextStaysInsideNarrowAndWideViewports() throws {
         for width in [20, 80, 360] {
             for text in ["今天", String(repeating: "连续输入ABC", count: 20) + "最新尾部"] {
