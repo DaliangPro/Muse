@@ -59,10 +59,13 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     /// 按确认稿的圆角、波形光晕和字形轮廓校准；与40pt波形容器独立布局。
     private var recordingTextLeadingInset: CGFloat { 37.0 }
-    private var recordingTrailingInset: CGFloat { 14.0 }
+    // 尾部渐隐区同时承担右侧留白，避免完整尾字之后再叠加一层空白。
+    private var recordingTrailingInset: CGFloat { 0.0 }
     private var recordingIconWidth: CGFloat { 40.0 }
-    private var recordingLabelWidth: CGFloat { 114.0 }
-    private var recordingTextTailPadding: CGFloat { 14.0 }
+    private var recordingLabelWidth: CGFloat {
+        max(TF.barHeight, measureText(L("录音中", "Recording")) + recordingWidthReserve)
+    }
+    private var recordingTextTailPadding: CGFloat { 12.0 }
     private var recordingTrimFadeWidth: CGFloat { 4.0 }
     private var capsuleHeight: CGFloat {
         state.barPhase == .copyFallback ? TF.barFallbackHeight : TF.barHeight

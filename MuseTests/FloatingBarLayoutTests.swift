@@ -6,7 +6,7 @@ import XCTest
 final class FloatingBarLayoutTests: XCTestCase {
     func testSharedProgressDoesNotScrollBeforeTheShellIsFull() {
         for width in stride(from: CGFloat(40), through: 3000, by: 7) {
-            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 65, tailInset: 14)
+            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 49, tailInset: 12)
             XCTAssertGreaterThanOrEqual(layout.capsuleWidth, 40)
             XCTAssertLessThanOrEqual(layout.capsuleWidth, 528)
             if layout.capsuleWidth < 528 {
@@ -14,15 +14,15 @@ final class FloatingBarLayoutTests: XCTestCase {
                                "外壳未展开到上限时，文字不能先向左滚动")
             } else {
                 XCTAssertEqual(layout.presentedTextWidth + layout.textOffset,
-                               layout.textViewportWidth - 14, accuracy: 0.001,
+                               layout.textViewportWidth - 12, accuracy: 0.001,
                                "满宽后，文字进度必须与同一帧的右侧留白对齐")
             }
         }
     }
 
     func testSharedProgressRemainsContinuousAtTheWidthLimit() {
-        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 65, tailInset: 14)
-        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 65, tailInset: 14)
+        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 49, tailInset: 12)
+        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 49, tailInset: 12)
         XCTAssertEqual(after.capsuleWidth - before.capsuleWidth, 0.1, accuracy: 0.001)
         XCTAssertEqual(after.textOffset - before.textOffset, -0.1, accuracy: 0.001)
     }
@@ -32,7 +32,7 @@ final class FloatingBarLayoutTests: XCTestCase {
         for overflow in [false, true] {
             let view = Color.red
                 .frame(width: 100, height: 40)
-                .mask(HUDTextEdgeMask(leadingFadeWidth: 4, trailingFadeWidth: 14,
+                .mask(HUDTextEdgeMask(leadingFadeWidth: 4, trailingFadeWidth: 12,
                                       hasLeadingOverflow: overflow))
             let pixels = try renderPixels(view, width: 100, height: 40)
             let alpha = { (x: Int) in pixels[(20 * 100 + x) * 4 + 3] }
@@ -52,7 +52,8 @@ final class FloatingBarLayoutTests: XCTestCase {
     func testStreamingTextStaysInsideNarrowAndWideViewports() throws {
         for width in [20, 80, 360] {
             for text in ["今天", String(repeating: "连续输入ABC", count: 20) + "最新尾部"] {
-                let view = StreamingHUDText(text: text, color: .red, leadingFadeWidth: 4)
+                let view = StreamingHUDText(text: text, color: .red, leadingFadeWidth: 4,
+                                            trailingFadeWidth: 12)
                     .frame(width: CGFloat(width), height: 40)
                     .frame(width: 600, height: 80)
                 let pixels = try renderPixels(view, width: 600, height: 80)
