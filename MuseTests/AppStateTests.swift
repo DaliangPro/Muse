@@ -197,6 +197,26 @@ final class AppStateTests: XCTestCase {
         XCTAssertFalse(afterCommitResult.shouldAbortSessionAfterEscape)
     }
 
+    func testCompletedPolishDoesNotShowDelayedCanonicalExit() async throws {
+        let appState = AppState(
+            initialModes: ProcessingMode.defaults,
+            voicePolishCanonicalExitDelay: .milliseconds(20)
+        )
+        appState.currentMode = .formalWriting
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.stopRecording()
+        appState.showVoicePolishStage(.polishing)
+        XCTAssertFalse(appState.canUseVoicePolishCanonicalText)
+
+        appState.showProcessingResult("已经完成的润色结果")
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(appState.canUseVoicePolishCanonicalText,
+                       "润色先完成时，迟到的延时任务不能再次显示 Esc 提示")
+        XCTAssertNil(appState.voicePolishStage)
+        XCTAssertNil(appState.voicePolishCanonicalExitMessage)
+    }
+
     func testCanonicalExitRejectionRestoresMouseActionAndShowsRetryState() async {
         let appState = makeCanonicalReadyAppState()
         appState.onUseVoicePolishCanonicalText = { false }

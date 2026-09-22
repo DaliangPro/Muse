@@ -192,6 +192,40 @@ final class FloatingBarLayoutTests: XCTestCase {
     }
 
     @MainActor
+    func testProcessingHUDSizesToSavedPolishLabelAndFallsBackForEmptyLabel() async throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("原生玻璃需要 macOS 26") }
+        _ = NSApplication.shared
+        let defaults = UserDefaults.standard
+        let previousRegistration = defaults.volatileDomain(forName: UserDefaults.registrationDomain)
+        defaults.register(defaults: ["museGlassMinimal": true])
+        defer { defaults.setVolatileDomain(previousRegistration, forName: UserDefaults.registrationDomain) }
+
+        let state = DemoState()
+        state.currentMode = .formalWriting
+        state.barPhase = .processing
+        let host = NSHostingView(rootView: FloatingBarView(state: state)
+            .transaction { $0.disablesAnimations = true })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 180),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        host.frame = NSRect(x: 0, y: 0, width: 700, height: 180)
+        try await settleLayout(host)
+        let defaultWidth = try XCTUnwrap(findGlass(in: host)).bounds.width
+
+        state.currentMode.processingLabel = "正在整理我的口述内容，请稍候"
+        try await settleLayout(host)
+        XCTAssertGreaterThan(try XCTUnwrap(findGlass(in: host)).bounds.width, defaultWidth + 60,
+                             "HUD 应按已保存的自定义文案布局，不能继续使用写死的默认文案")
+
+        state.currentMode.processingLabel = " \n "
+        try await settleLayout(host)
+        XCTAssertEqual(try XCTUnwrap(findGlass(in: host)).bounds.width, defaultWidth, accuracy: 0.5,
+                       "空白旧配置应回退为默认润色文案")
+    }
+
+    @MainActor
     private func settleLayout(_ host: NSView) async throws {
         for _ in 0..<3 {
             host.layoutSubtreeIfNeeded()

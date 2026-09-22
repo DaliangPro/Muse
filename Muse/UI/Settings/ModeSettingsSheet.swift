@@ -49,6 +49,13 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
                 Text(mode.name)
                     .font(TF.settingsFontBodyStrong)
                     .foregroundStyle(TF.settingsText)
+                if mode.kind == .voicePolish {
+                    compactFieldRow(
+                        title: L("润色文案", "Status"),
+                        text: $processingLabel,
+                        prompt: L("正在润色", "Polishing")
+                    )
+                }
             }
             shortcutSection
             triggerSection
@@ -185,6 +192,8 @@ private extension ModeSettingsSheet {
                 var updated = mode
                 if mode.isUserDeletable {
                     updated.name = sanitizedModeName
+                }
+                if mode.isUserDeletable || mode.kind == .voicePolish {
                     updated.processingLabel = sanitizedProcessingLabel
                 }
                 updated.hotkeyCode = hotkeyCode
@@ -213,6 +222,7 @@ private extension ModeSettingsSheet {
                 width: ModeSettingsSheetLayout.fieldWidth,
                 height: ModeSettingsSheetLayout.fieldHeight
             )
+            .accessibilityLabel(title)
         }
         .frame(height: ModeSettingsSheetLayout.fieldHeight)
     }

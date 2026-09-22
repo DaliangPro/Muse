@@ -763,10 +763,11 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var processingLabel: String {
-        guard state.currentMode.kind == .voicePolish else {
-            return state.currentMode.processingLabel
-        }
-        return L("正在润色", "Polishing")
+        let label = state.currentMode.processingLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard label.isEmpty else { return label }
+        return state.currentMode.kind == .voicePolish
+            ? L("正在润色", "Polishing")
+            : L("处理中", "Processing")
     }
 
     private var canonicalExitButtonTitle: String {

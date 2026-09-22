@@ -166,7 +166,7 @@ struct ModeStorage {
 
     /// 各默认模式的「已知默认处理标签」集合：同名称逻辑，自定义标签保留
     private static let knownDefaultLabels: [UUID: Set<String>] = [
-        ProcessingMode.formalWriting.id: ["润色中", "Polishing", "标准润色中", "Standard polishing", "整理中", "Structuring"],
+        ProcessingMode.formalWriting.id: ["正在润色", "润色中", "Polishing", "标准润色中", "Standard polishing", "整理中", "Structuring"],
         ProcessingMode.lightPolishId: ["轻度润色中", "Light polishing"],
         ProcessingMode.promptOptimize.id: ["优化中", "Optimizing"],
         ProcessingMode.translate.id: ["翻译中", "Translating"],

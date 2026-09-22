@@ -186,7 +186,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             // 的附加润色要求，因此新装默认为空。
             prompt: "",
             isBuiltin: true,
-            processingLabel: L("润色中", "Polishing"),
+            processingLabel: L("正在润色", "Polishing"),
             hotkeyCode: 18, hotkeyModifiers: 524288, hotkeyStyle: .toggle
         )
     }
