@@ -107,22 +107,43 @@ struct TerminologySettingsTab: View, SettingsCardHelpers {
     @State private var pendingDeletion: TerminologyEntry?
     @State private var aliyunVocabularySyncNotice: AliyunVocabularySyncNotice?
 
-    private let historyStore = HistoryStore()
+    private let historyStore: HistoryStore
+    private var loadsStoredVocabulary = true
+
+    init() {
+        historyStore = HistoryStore()
+    }
+
+    #if DEBUG
+    /// 原生布局回归使用内存词表，不读取正式词库或纠正记录。
+    init(previewDocument: TerminologyDocument) {
+        historyStore = HistoryStore(path: ":memory:")
+        loadsStoredVocabulary = false
+        _document = State(initialValue: previewDocument)
+        _selectedPanel = State(initialValue: .builtIn)
+    }
+    #endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             panelSwitch
             HStack(spacing: 10) {
-                TextField(L("搜索原文字或替换内容", "Search words or replacements"), text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel(L("搜索词库", "Search vocabulary"))
+                AssetLibrarySearchField(
+                    text: $searchText,
+                    prompt: L("搜索原文字或替换内容", "Search words or replacements"),
+                    fill: TF.settingsCard
+                )
+                .frame(width: 280)
+                .accessibilityLabel(L("搜索词库", "Search vocabulary"))
                 if selectedPanel == .myTerms {
                     SettingsTextButton(L("新增", "Add"), variant: .primary) {
                         editorError = ""
                         editorDraft = TerminologyEditorDraft(entry: nil)
                     }
                 }
+                Spacer(minLength: 0)
             }
+            .animation(nil, value: selectedPanel)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if !loadErrorMessage.isEmpty { failureCard }
@@ -135,6 +156,8 @@ struct TerminologySettingsTab: View, SettingsCardHelpers {
             }
             .settingsThinScrollIndicators()
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // 只让选中块滑动，避免整张词表随段切换一起布局和淡入淡出。
+            .animation(nil, value: selectedPanel)
             HStack(spacing: 12) {
                 Toggle(L("自动记住我改正的词", "Remember corrected words"), isOn: $automaticallyLearnTerms)
                     .toggleStyle(.switch)
@@ -181,7 +204,7 @@ struct TerminologySettingsTab: View, SettingsCardHelpers {
                 pendingLegacyDeletion = nil
             }
         } message: { Text(L("删除后将不再应用这条替换。", "This replacement will no longer apply.")) }
-        .task { await reload() }
+        .task { if loadsStoredVocabulary { await reload() } }
         .onReceive(NotificationCenter.default.publisher(for: .voicePolishAutomaticLearningDidFinish)) { _ in
             Task { await reload() }
         }
@@ -229,7 +252,7 @@ struct TerminologySettingsTab: View, SettingsCardHelpers {
 private extension TerminologySettingsTab {
     var panelSwitch: some View {
         HStack(spacing: 10) {
-            SettingsSwitchGroup(width: nil) {
+            SettingsSwitchGroup(fitsContent: true) {
                 ForEach(TerminologySettingsPanel.allCases, id: \.rawValue) { panel in
                     SettingsSwitchOption(
                         title: panel.title,
@@ -482,18 +505,19 @@ private extension TerminologySettingsTab {
     }
 
     var myTermsCard: some View {
-        settingsGroupCard("", expandVertically: false, showsHeader: false, contentPadding: 12) {
-            VStack(alignment: .leading, spacing: 0) {
+        let entries = unifiedEntries
+        return settingsGroupCard("", expandVertically: false, showsHeader: false, contentPadding: 12) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 HStack {
                     Text(L("原文字 / 常见错法", "Original / mishearing")).frame(maxWidth: .infinity, alignment: .leading)
                     Text(L("替换为 / 正确写法", "Replacement / correct form")).frame(maxWidth: .infinity, alignment: .leading)
                     Color.clear.frame(width: 106, height: 1)
                 }
                 .font(TF.settingsFontCaption).foregroundStyle(TF.settingsTextSecondary).padding(.bottom, 8)
-                if unifiedEntries.isEmpty {
+                if entries.isEmpty {
                     terminologyEmptyState(title: L("暂无匹配词条", "No matching entries"), description: L("点击“新增”，填写原文字和正确内容。", "Add the original text and its correct form."))
                 }
-                ForEach(unifiedEntries) { item in
+                ForEach(entries) { item in
                     HStack(spacing: 12) {
                         Text(item.aliases.isEmpty ? L("尚未设置", "Not set") : item.aliases.joined(separator: "、"))
                             .font(TF.settingsFontBody).foregroundStyle(TF.settingsTextSecondary)
@@ -571,7 +595,8 @@ private extension TerminologySettingsTab {
     }
 
     var discoveriesCard: some View {
-        settingsGroupCard(
+        let discoveries = pendingDiscoveries
+        return settingsGroupCard(
             L("待确认发现", "Discoveries awaiting confirmation"),
             icon: "sparkles.rectangle.stack",
             expandVertically: false
@@ -598,13 +623,13 @@ private extension TerminologySettingsTab {
                     }
                 }
 
-                if pendingDiscoveries.isEmpty {
+                if discoveries.isEmpty {
                     terminologyEmptyState(
                         title: L("没有待确认发现", "No discoveries to review"),
                         description: L("你在识别记录中点击“纠正”后，明确的术语修改可直接确认；重复候选也会汇总到这里。", "Use Correct on a Voice Polish record to confirm a clear term edit; repeated candidates also collect here.")
                     )
                 } else {
-                    ForEach(Array(pendingDiscoveries.enumerated()), id: \.element.id) { index, discovery in
+                    ForEach(Array(discoveries.enumerated()), id: \.element.id) { index, discovery in
                         HStack(spacing: 10) {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 6) {
@@ -638,7 +663,7 @@ private extension TerminologySettingsTab {
                                 confirmDiscovery(discovery)
                             }
                         }
-                        if index < pendingDiscoveries.count - 1 {
+                        if index < discoveries.count - 1 {
                             Rectangle().fill(TF.settingsStroke.opacity(0.5)).frame(height: 1)
                         }
                     }
@@ -659,12 +684,6 @@ private extension TerminologySettingsTab {
         settingsGroupCard(
             L("内置词汇", "Built-in Words"),
             icon: "shippingbox",
-            trailing: AnyView(
-                TextField(L("搜索", "Search"), text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 180)
-                    .accessibilityLabel(L("搜索内置术语", "Search built-in terms"))
-            ),
             expandVertically: false
         ) {
             VStack(alignment: .leading, spacing: 10) {
@@ -772,7 +791,7 @@ private extension TerminologySettingsTab {
         if entries.isEmpty {
             terminologyEmptyState(title: emptyTitle, description: emptyDescription)
         } else {
-            VStack(alignment: .leading, spacing: 0) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
                     terminologyRow(entry, allowsEditing: allowsEditing)
                     if index < entries.count - 1 {

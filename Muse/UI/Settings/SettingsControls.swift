@@ -483,10 +483,17 @@ struct SettingsSelectableRow<Label: View>: View {
 private struct SettingsSegmentNamespaceKey: EnvironmentKey {
     static let defaultValue: Namespace.ID? = nil
 }
+private struct SettingsSegmentFitsContentKey: EnvironmentKey {
+    static let defaultValue = false
+}
 extension EnvironmentValues {
     var settingsSegmentNamespace: Namespace.ID? {
         get { self[SettingsSegmentNamespaceKey.self] }
         set { self[SettingsSegmentNamespaceKey.self] = newValue }
+    }
+    var settingsSegmentFitsContent: Bool {
+        get { self[SettingsSegmentFitsContentKey.self] }
+        set { self[SettingsSegmentFitsContentKey.self] = newValue }
     }
 }
 
@@ -500,6 +507,7 @@ struct SettingsSwitchGroup<Content: View>: View {
     let drawsBackground: Bool
     /// 毛玻璃底（侧栏设置面板用），与侧栏材质一致
     let usesGlassBackground: Bool
+    let fitsContent: Bool
     @ViewBuilder let content: () -> Content
 
     /// 选中块滑动动画的几何命名空间，传给内部各 option
@@ -516,6 +524,7 @@ struct SettingsSwitchGroup<Content: View>: View {
         fill: Color = TF.settingsSegmentTrackFill,
         drawsBackground: Bool = true,
         usesGlassBackground: Bool = false,
+        fitsContent: Bool = false,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.width = width
@@ -525,6 +534,7 @@ struct SettingsSwitchGroup<Content: View>: View {
         self.fill = fill
         self.drawsBackground = drawsBackground
         self.usesGlassBackground = usesGlassBackground
+        self.fitsContent = fitsContent
         self.content = content
     }
 
@@ -536,7 +546,8 @@ struct SettingsSwitchGroup<Content: View>: View {
         }
         .padding(padding)
         .frame(width: width, height: height)
-        .frame(maxWidth: width == nil ? .infinity : nil)
+        .frame(maxWidth: width == nil && !fitsContent ? .infinity : nil)
+        .fixedSize(horizontal: fitsContent && width == nil, vertical: false)
         .background {
             // 段切换/开关轨道取消内凹阴影（2026-06-14 大梁老师拍板）：不要凹槽暗影,纯色平底
             if usesGlassBackground {
@@ -558,6 +569,7 @@ struct SettingsSwitchGroup<Content: View>: View {
             }
         }
         .environment(\.settingsSegmentNamespace, segmentNamespace)
+        .environment(\.settingsSegmentFitsContent, fitsContent)
     }
 }
 
@@ -568,6 +580,7 @@ struct SettingsSwitchOption: View {
     let action: () -> Void
 
     @Environment(\.settingsSegmentNamespace) private var segmentNamespace
+    @Environment(\.settingsSegmentFitsContent) private var fitsContent
 
     var body: some View {
         Button {
@@ -580,7 +593,8 @@ struct SettingsSwitchOption: View {
                 .font(TF.settingsFontControl)
                 .foregroundStyle(isSelected ? TF.settingsText : TF.settingsTextTertiary)
                 .lineLimit(1)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, fitsContent ? SettingsControlSpec.actionHorizontalPadding : 0)
+                .frame(maxWidth: fitsContent ? nil : .infinity, maxHeight: .infinity)
                 .background {
                     if isSelected {
                         segmentHighlight
@@ -589,7 +603,7 @@ struct SettingsSwitchOption: View {
                 .contentShape(RoundedRectangle(cornerRadius: SettingsControlSpec.controlCornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: fitsContent ? nil : .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -603,4 +617,3 @@ struct SettingsSwitchOption: View {
         }
     }
 }
-
