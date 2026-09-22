@@ -395,9 +395,6 @@ private extension ModeTrialCard {
                 resolvedEntities: resolvedEntities
             )
             guard activeTrialID == trialID else { return }
-            let layoutExpectation = VoicePolishLayoutExpectation.infer(
-                from: voicePolishRequest
-            )
             let result = await VoicePolishPipeline(
                 client: client,
                 config: voicePolishConfig
@@ -409,7 +406,6 @@ private extension ModeTrialCard {
             trialOutput = result.text
             trialDiagnostics = voicePolishDiagnostics(
                 result,
-                layoutExpectation: layoutExpectation,
                 elapsedMilliseconds: elapsedMilliseconds
             )
             return
@@ -449,26 +445,13 @@ private extension ModeTrialCard {
 
     func voicePolishDiagnostics(
         _ result: VoicePolishResult,
-        layoutExpectation: VoicePolishLayoutExpectation,
         elapsedMilliseconds: Int64
     ) -> String {
         let calls = L("\(result.llmAttemptCount) 次", "\(result.llmAttemptCount) call(s)")
-        let layout: String
-        switch layoutExpectation.kind {
-        case .sentence:
-            layout = L("普通正文", "Plain text")
-        case .paragraphs:
-            layout = L("自然分段", "Paragraphs")
-        case .numberedList:
-            layout = L("编号列表", "Numbered list")
-        case .bulletList:
-            layout = L("项目列表", "Bullet list")
-        }
-        let validation = result.validationCodes.isEmpty
-            ? L("校验通过", "Validated")
-            : result.validationCodes.map(\.rawValue).joined(separator: ",")
+        // 传输检查不能证明内容或版式合格，输入推断的预期也不是实际成稿版式。
+        let status = result.usedFallback ? L("未完成", "Incomplete") : L("已生成", "Generated")
         let fallback = result.usedFallback ? L(" · 原文回退", " · Fallback") : ""
-        return "\(L("版式", "Layout"))：\(layout) · \(calls) · \(durationText(elapsedMilliseconds)) · \(validation)\(fallback)"
+        return "\(calls) · \(durationText(elapsedMilliseconds)) · \(status)\(fallback)"
     }
 
     func milliseconds(_ duration: Duration) -> Int64 {

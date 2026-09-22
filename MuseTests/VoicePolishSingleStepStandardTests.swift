@@ -38,10 +38,18 @@ final class VoicePolishSingleStepStandardTests: XCTestCase {
         XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
-    func testPromptsKeepAcceptedLightAndApprovedStructureWording() {
-        XCTAssertEqual(VoicePolishEditingPrompts.version, 13)
-        XCTAssertEqual(VoicePolishEditingPrompts.standard,
-            "你是语音输入法的文字编辑。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。把同一事项及其补充合在一起，再按事项分段或列点，保持原有口吻，不扩写。只返回润色后的完整正文。")
+    func testNumberedOutputKeepsRealNewlinesThroughFinalInsertion() async throws {
+        let source = "今天要做三件事。第一写稿，第二剪头发，第三准备视频内容。"
+        let output = "今天要做三件事：\n\n1. 写稿；\n2. 剪头发；\n3. 准备视频内容。"
+        let client = SingleStepStandardClient([.text(output)])
+        let result = await pipeline(client).process(request(source))
+        let inserted = RecognitionSession.finalizeInsertionText(
+            result.text, mode: .formalWriting, isLLMOutput: true
+        )
+        XCTAssertTrue(inserted.utf8.elementsEqual(output.utf8))
+        let calls = await client.requests
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertFalse(result.usedFallback)
     }
 
     func testExplicitRequirementsReachEachModeWithoutAnIntermediateDraft() async throws {
