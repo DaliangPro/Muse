@@ -608,6 +608,7 @@ struct CleanGlassCapsule: View {
     var body: some View {
         CleanGlassSurface(cornerRadius: cornerRadius, style: style, tintColor: tintColor)
             .overlay { content }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
 

@@ -5,6 +5,51 @@ import XCTest
 
 final class FloatingBarLayoutTests: XCTestCase {
     @MainActor
+    func testStreamingTextStaysInsideNarrowAndWideViewports() throws {
+        for width in [20, 80, 360] {
+            for text in ["今天", String(repeating: "连续输入ABC", count: 20) + "最新尾部"] {
+                let view = StreamingHUDText(text: text, color: .red, leadingFadeWidth: 4)
+                    .frame(width: CGFloat(width), height: 40)
+                    .frame(width: 600, height: 80)
+                let pixels = try renderPixels(view, width: 600, height: 80)
+                let left = (600 - width) / 2
+                var inside = 0
+                var outside = 0
+                for y in 0..<80 {
+                    for x in 0..<600 where isRed(pixels, x: x, y: y, width: 600) {
+                        if (left..<(left + width)).contains(x) && (20..<60).contains(y) { inside += 1 }
+                        else { outside += 1 }
+                    }
+                }
+                XCTAssertGreaterThan(inside, 5, "视窗内应保留可见文字")
+                XCTAssertEqual(outside, 0, "文字及其阴影不可越过视窗")
+            }
+        }
+    }
+
+    @MainActor
+    func testGlassClipsOversizedContentToTheCurrentShell() throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("原生玻璃需要 macOS 26") }
+        let view = CleanGlassCapsule(
+            cornerRadius: 20, style: .regular, tintColor: nil,
+            content: AnyView(Color.red.frame(width: 160, height: 60))
+        )
+        .frame(width: 40, height: 40)
+        .frame(width: 200, height: 100)
+        let pixels = try renderPixels(view, width: 200, height: 100)
+        var inside = 0
+        var outside = 0
+        for y in 0..<100 {
+            for x in 0..<200 where isRed(pixels, x: x, y: y, width: 200) {
+                if (80..<120).contains(x) && (30..<70).contains(y) { inside += 1 }
+                else { outside += 1 }
+            }
+        }
+        XCTAssertGreaterThan(inside, 500, "确认内容实际被绘制，避免空图误判通过")
+        XCTAssertEqual(outside, 0, "当前玻璃边界外不应出现内容像素")
+    }
+
+    @MainActor
     func testGlassRespectsOuterSizeWhenIndicatorHasLargerIntrinsicSize() async throws {
         guard #available(macOS 26.0, *) else {
             throw XCTSkip("原生玻璃需要 macOS 26")
@@ -99,6 +144,29 @@ final class FloatingBarLayoutTests: XCTestCase {
             host.layoutSubtreeIfNeeded()
             try await Task.sleep(for: .milliseconds(30))
         }
+    }
+
+    @MainActor
+    private func renderPixels<V: View>(_ view: V, width: Int, height: Int) throws -> [UInt8] {
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 1
+        let image = try XCTUnwrap(renderer.cgImage)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        try pixels.withUnsafeMutableBytes { bytes in
+            let context = try XCTUnwrap(CGContext(
+                data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+            ))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        return pixels
+    }
+
+    private func isRed(_ pixels: [UInt8], x: Int, y: Int, width: Int) -> Bool {
+        let offset = (y * width + x) * 4
+        return pixels[offset] > 150 && pixels[offset + 1] < 80 && pixels[offset + 2] < 80 && pixels[offset + 3] > 150
     }
 
     @available(macOS 26.0, *)

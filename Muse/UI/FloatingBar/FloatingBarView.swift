@@ -79,10 +79,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private var usesSuccessCheckmarkDoneContent: Bool {
         state.feedbackMessage == L("已完成", "Done")
     }
-    private var shouldTrimRecordingText: Bool {
-        recordingPeakWidth >= TF.barWidth
-    }
-
     private var capsuleWidth: CGFloat {
         switch state.barPhase {
         case .preparing:
@@ -363,40 +359,14 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 .floatingBarReadableText(color: barTextColor)
                 .padding(.leading, recordingIconTextGap)
         } else if !state.segments.isEmpty {
-            if shouldTrimRecordingText {
-                Color.clear
-                    .overlay(alignment: .trailing) {
-                        Text(state.transcriptionText)
-                            .font(TF.hudFontTitle)
-                            .floatingBarReadableText(color: barTextColor)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    .mask {
-                        HStack(spacing: 0) {
-                            LinearGradient(
-                                colors: [.clear, .white],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                            .frame(width: recordingTrimFadeWidth)
-                            Rectangle()
-                        }
-                    }
-                    .padding(.leading, recordingIconTextGap)
-                    .padding(.trailing, recordingTextTailPadding)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            } else {
-                Text(state.transcriptionText)
-                    .font(TF.hudFontTitle)
-                    .floatingBarReadableText(color: barTextColor)
-                    .lineLimit(1)
-                    .padding(.leading, recordingIconTextGap)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
+            StreamingHUDText(
+                text: state.transcriptionText,
+                color: barTextColor,
+                leadingFadeWidth: recordingTrimFadeWidth
+            )
+            .padding(.leading, recordingIconTextGap)
+            .padding(.trailing, recordingTextTailPadding)
+            .transition(.identity)
         }
     }
 
