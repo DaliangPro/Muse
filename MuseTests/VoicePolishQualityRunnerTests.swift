@@ -4,6 +4,16 @@ import XCTest
 final class VoicePolishQualityRunnerTests: XCTestCase {
     private let runNonce = String(repeating: "a", count: 64)
 
+    func test预生成执行和计时范围共用当前及旧参数判定() {
+        let new = ["MUSE_POLISH_PREFETCH_BENCHMARK_PLAN": "/tmp/current.json"]
+        let old = ["MUSE_LIGHT_PREFETCH_BENCHMARK_PLAN": "/tmp/legacy.json"]
+        XCTAssertEqual(VoicePolishQualityRunner.prefetchBenchmarkPlan(for: .standard, environment: new), "/tmp/current.json")
+        XCTAssertEqual(VoicePolishQualityRunner.prefetchBenchmarkPlan(for: .standard, environment: old), "/tmp/legacy.json")
+        XCTAssertEqual(VoicePolishQualityRunner.prefetchBenchmarkPlan(for: .standard, environment: new.merging(old) { a, _ in a }), "/tmp/current.json")
+        XCTAssertNil(VoicePolishQualityRunner.prefetchBenchmarkPlan(for: .direct, environment: new))
+        XCTAssertNil(VoicePolishQualityRunner.prefetchBenchmarkPlan(for: .standard, environment: [:]))
+    }
+
     func test普通启动不进入质量跑测() throws {
         XCTAssertNil(try VoicePolishQualityRunner.parseInvocation(arguments: ["Muse"]))
         XCTAssertFalse(VoicePolishQualityRunner.isRequested(arguments: ["Muse"]))
@@ -42,7 +52,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             let observation = try XCTUnwrap(observations.first)
             XCTAssertEqual(observation.requestProbeBodyPath, bodyPath)
             XCTAssertEqual(observation.auditContext, client.context)
-            XCTAssertEqual(observation.request.task, .voicePolishRender)
+            XCTAssertEqual(observation.request.task, .voicePolishStructured)
             XCTAssertNil(VoicePolishProviderAudit.requestProbeBodyPath)
         }
     }
@@ -93,10 +103,10 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             let invocation = try XCTUnwrap(VoicePolishQualityRunner.parseInvocation(
                 arguments: runnerArguments + ["--mode", mode.rawValue]
             ))
-            XCTAssertEqual(invocation.mode, mode)
+            XCTAssertEqual(invocation.mode, mode == .light ? .standard : mode)
         }
         XCTAssertNil(VoicePolishQualityRunner.Mode.direct.qualityMode)
-        XCTAssertEqual(VoicePolishQualityRunner.Mode.light.qualityMode, .light)
+        XCTAssertEqual(VoicePolishQualityRunner.Mode.light.qualityMode, .standard)
         XCTAssertEqual(VoicePolishQualityRunner.Mode.standard.qualityMode, .standard)
         XCTAssertEqual(VoicePolishQualityRunner.Mode.legacyAutomatic.qualityMode, .automatic)
     }

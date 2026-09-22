@@ -40,8 +40,6 @@ final class VoicePolishSingleStepStandardTests: XCTestCase {
 
     func testPromptsKeepAcceptedLightAndApprovedStructureWording() {
         XCTAssertEqual(VoicePolishEditingPrompts.version, 13)
-        XCTAssertEqual(VoicePolishEditingPrompts.light,
-            "你是语音输入法的轻度校对器。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。保持原有表达和顺序，不扩写。只返回润色后的完整正文。")
         XCTAssertEqual(VoicePolishEditingPrompts.standard,
             "你是语音输入法的文字编辑。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。把同一事项及其补充合在一起，再按事项分段或列点，保持原有口吻，不扩写。只返回润色后的完整正文。")
     }
@@ -58,8 +56,8 @@ final class VoicePolishSingleStepStandardTests: XCTestCase {
         let lightCalls = await lightClient.requests
         XCTAssertEqual(calls.count, 1)
         XCTAssertEqual(lightCalls.count, 1)
-        XCTAssertEqual(lightCalls.first?.task, .voicePolishRender)
-        XCTAssertEqual(lightCalls.first?.system, VoicePolishEditingPrompts.light)
+        XCTAssertEqual(lightCalls.first?.task, .voicePolishStructured)
+        XCTAssertEqual(lightCalls.first?.system, VoicePolishEditingPrompts.standard)
         XCTAssertEqual(try payload(XCTUnwrap(lightCalls.first)), [
             "canonical_text": source, "additional_requirements": input.preferences.additionalRequirements
         ])

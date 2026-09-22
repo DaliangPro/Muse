@@ -13,7 +13,13 @@ struct ModeStorage {
     }
 
     func save(_ modes: [ProcessingMode]) throws {
-        try JSONFileStore.writeOrThrow(modes, to: fileURL)
+        // 退出活动列表的旧配置仍留在原文件，避免保存其他设置时丢失用户附加要求。
+        var preserved = modes
+        if case .value(let saved) = JSONFileStore.read([ProcessingMode].self, from: fileURL),
+           !preserved.contains(where: { $0.id == ProcessingMode.lightPolishId }) {
+            preserved += saved.filter { $0.id == ProcessingMode.lightPolishId }
+        }
+        try JSONFileStore.writeOrThrow(preserved, to: fileURL)
     }
 
     /// 核心读取：保留 missing / value / corrupt 三态，供设置页决定是否进入恢复流程。
@@ -36,6 +42,7 @@ struct ModeStorage {
 
         // Migrate legacy built-in flags for default modes, and drop unknown built-ins.
         var result = saved.compactMap { mode -> ProcessingMode? in
+            if mode.id == ProcessingMode.lightPolishId { return nil }
             if mode.id == ProcessingMode.directId {
                 var direct = ProcessingMode.direct
                 direct.name = mode.name
@@ -51,7 +58,7 @@ struct ModeStorage {
             if mode.id == ProcessingMode.translateId {
                 return migrateDefaultMode(mode, fallback: .translate)
             }
-            if mode.id == ProcessingMode.formalWriting.id || mode.id == ProcessingMode.lightPolishId {
+            if mode.id == ProcessingMode.formalWriting.id {
                 var migrated = migrateSeededDefaultPrompt(
                     mode,
                     legacyPrompts: [
@@ -89,12 +96,11 @@ struct ModeStorage {
         let resultIds = Set(result.map(\.id))
         for template in ProcessingMode.builtins where !resultIds.contains(template.id) {
             var builtin = template
-            if builtin.id == ProcessingMode.lightPolishId,
-               let code = builtin.hotkeyCode,
+            if let code = builtin.hotkeyCode,
                result.contains(where: {
                    $0.hotkeyCode == code && ($0.hotkeyModifiers ?? 0) == (builtin.hotkeyModifiers ?? 0)
                }) {
-                // 升级只补全新入口；已有绑定保持不变，用户可随后给轻度配置快捷键。
+                // 补全系统入口时不抢占用户已有快捷键。
                 builtin.hotkeyCode = nil
                 builtin.hotkeyModifiers = nil
             }
@@ -149,9 +155,9 @@ struct ModeStorage {
     /// 重置为当前语言默认名；用户改过的名称（不在集合内）一律保留。
     /// 「Promp优化」是历史 typo 世代的默认名，必须入册否则存量数据不迁移。
     private static let knownDefaultNames: [UUID: Set<String>] = [
-        ProcessingMode.direct.id: ["直出模式", "Direct Output", "正常输出", "Normal Output"],
+        ProcessingMode.direct.id: ["直出", "Direct", "直出模式", "Direct Output", "正常输出", "Normal Output"],
         ProcessingMode.smartDirect.id: ["智能模式", "Smart Mode"],
-        ProcessingMode.formalWriting.id: ["语音润色", "Voice Polish", "标准润色", "Standard Polish", "结构化输出", "Structured Output"],
+        ProcessingMode.formalWriting.id: ["润色", "Polish", "语音润色", "Voice Polish", "标准润色", "Standard Polish", "结构化输出", "Structured Output"],
         ProcessingMode.lightPolishId: ["轻度润色", "Light Polish"],
         ProcessingMode.promptOptimize.id: ["Prompt优化", "Promp优化", "提示词优化", "Prompt Optimizer"],
         ProcessingMode.translate.id: ["英文翻译", "Translation"],

@@ -103,7 +103,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     static var direct: ProcessingMode {
         ProcessingMode(
             id: directId,
-            name: L("正常输出", "Normal Output"), prompt: "", isBuiltin: true,
+            name: L("直出", "Direct"), prompt: "", isBuiltin: true,
             // 默认触发键（2026-07-06 大梁老师）：右 Option 单击开始、再单击结束（toggle）
             hotkeyCode: 61, hotkeyModifiers: 0, hotkeyStyle: .toggle
         )
@@ -123,7 +123,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     /// 产品档位由录音时冻结的模式决定，不读取全局旧质量设置。
     var voicePolishQualityMode: VoicePolishQualityMode? {
         guard kind == .voicePolish else { return nil }
-        return id == Self.lightPolishId ? .light : .standard
+        return .standard
     }
     var isPromptOptimizeMode: Bool {
         kind == .promptOptimize
@@ -181,16 +181,18 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     static var formalWriting: ProcessingMode {
         ProcessingMode(
             id: formalWritingId,
-            name: L("结构化输出", "Structured Output"),
+            name: L("润色", "Polish"),
             // V2 起，默认规则由 VoicePolishPrompts 版本化维护；这里仅保存用户
             // 的附加润色要求，因此新装默认为空。
             prompt: "",
             isBuiltin: true,
-            processingLabel: L("整理中", "Structuring"),
+            processingLabel: L("润色中", "Polishing"),
             hotkeyCode: 18, hotkeyModifiers: 524288, hotkeyStyle: .toggle
         )
     }
 
+    #if DEBUG
+    /// 旧配置回归夹具，不属于活动模式。
     static var lightPolish: ProcessingMode {
         ProcessingMode(
             id: lightPolishId,
@@ -202,6 +204,8 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             hotkeyCode: 21, hotkeyModifiers: 524288, hotkeyStyle: .toggle
         )
     }
+
+    #endif
 
     static var promptOptimize: ProcessingMode {
         ProcessingMode(
@@ -236,6 +240,6 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
-    static var builtins: [ProcessingMode] { [.direct, .lightPolish, .formalWriting] }
-    static var defaults: [ProcessingMode] { [.direct, .lightPolish, .formalWriting, .promptOptimize, .translate, .commandMode] }
+    static var builtins: [ProcessingMode] { [.direct, .formalWriting] }
+    static var defaults: [ProcessingMode] { [.direct, .formalWriting, .promptOptimize, .translate, .commandMode] }
 }

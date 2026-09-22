@@ -322,7 +322,7 @@ actor RecognitionSession {
 
     // MARK: - Speculative LLM (fire during recording pauses)
 
-    private let lightPolishPrefetch = LightPolishPrefetch()
+    private let polishPrefetch = PolishPrefetch()
     private var speculativeLLMTask: Task<String?, Never>?
     private var speculativeLLMSessionID: RecognitionSessionID?
     private var speculativeLLMText: String = ""
@@ -416,10 +416,7 @@ actor RecognitionSession {
         DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
 
         if effectiveMode.kind == .voicePolish {
-            // 轻度管线只接收规范化正文，不读取附近文字；标准模式保留完整上下文。
-            let level: WritingContextLevel = effectiveMode.voicePolishQualityMode == .light
-                ? .metadataOnly
-                : VoicePolishSettings.contextLevel()
+            let level = VoicePolishSettings.contextLevel()
             let capture = writingContextCapture
             writingContextTask = Task { await capture(level) }
             writingContextTaskSessionID = sessionID
@@ -597,7 +594,7 @@ actor RecognitionSession {
             currentConfig = nil
             currentConfigSessionID = nil
         }
-        lightPolishPrefetch.reset(session: sessionID)
+        polishPrefetch.reset(session: sessionID)
         if speculativeLLMSessionID == sessionID || speculativeDebounceSessionID == sessionID {
             resetSpeculativeLLM(sessionID: sessionID)
         }
@@ -903,7 +900,7 @@ actor RecognitionSession {
     func switchMode(to mode: ProcessingMode) {
         guard state == .starting || state == .recording else { return }
         let resolvedMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
-        if resolvedMode != currentMode { lightPolishPrefetch.invalidate() }
+        if resolvedMode != currentMode { polishPrefetch.invalidate() }
         currentMode = resolvedMode
     }
 
@@ -1289,6 +1286,7 @@ actor RecognitionSession {
         var voicePolishPerformance: VoicePolishPerformanceMeasurement?
         let frozenQualityMode = currentMode.voicePolishQualityMode
         var performance = VoicePolishSessionPerformance(stoppedAt: stopT0, asrReadyAt: asrReadyAt)
+        performance.prefetchScheduledCount = polishPrefetch.scheduledCount(session: sessionID)
         var returnedPolishResult = false
         func finalized(_ value: LLMPostProcessingResult) -> LLMPostProcessingResult {
             var value = value
@@ -1318,75 +1316,25 @@ actor RecognitionSession {
             state = .postProcessing
             voicePolishCanonicalOptionSessionID = sessionID
             let mode = currentMode
-            var writingContext: WritingContext
-            if writingContextTaskSessionID == sessionID,
-               let contextTask = writingContextTask {
-                writingContext = await contextTask.value
-                guard isCurrent(sessionID) else {
-                    DebugFileLogger.log("stopRecording: stale voice polish context ignored")
-                    return nil
-                }
-                writingContextTask = nil
-                writingContextTaskSessionID = nil
-            } else {
-                writingContext = WritingContext(
-                    level: mode.voicePolishQualityMode == .light
-                        ? .metadataOnly
-                        : VoicePolishSettings.contextLevel(defaults: vocabularyContext.userDefaults),
-                    safety: .unknown
-                )
-            }
-            let recentInputContextEnabled = VoicePolishSettings.recentInputContextEnabled(
-                defaults: vocabularyContext.userDefaults
-            )
-            let usesRecentInputContext = recentInputContextEnabled
-                && mode.voicePolishQualityMode != .light
-            if usesRecentInputContext {
-                let recentInputs = await voicePolishRecentInputStore.recentInputs(
-                    applicationBundleID: writingContext.applicationBundleID
-                )
-                guard isCurrent(sessionID) else {
-                    DebugFileLogger.log("stopRecording: stale recent voice polish context ignored")
-                    return nil
-                }
-                writingContext = writingContext.includingRecentMuseInputs(recentInputs)
-            }
+            guard let writingContext = await polishWritingContext(
+                sessionID: sessionID, vocabularyContext: vocabularyContext
+            ) else { return nil }
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
             DebugFileLogger.log(
                 "voice polish context scene=\(writingContext.scene.rawValue) level=\(writingContext.level.rawValue) safety=\(writingContext.safety.rawValue) selected=\(writingContext.selectedText?.count ?? 0) before=\(writingContext.textBeforeCursor?.count ?? 0) after=\(writingContext.textAfterCursor?.count ?? 0) recent=\(writingContext.recentMuseInputs.count)"
             )
             VoicePolishContextDiagnostics.record(writingContext)
 
-            let terminologyInput = VoicePolishTerminologyRuntime.prepare(
-                rawText: rawText,
-                // “已捕获但为 nil”也表示录音开始时没有可靠目标，必须保持全局作用域；
-                // 只有旧测试入口完全没有捕获记录时才允许 WritingContext 兜底。
-                applicationBundleIdentifier: terminologyApplicationBundleIdentifier(
-                    for: sessionID,
-                    fallbackBundleIdentifier: writingContext.applicationBundleID
-                ),
-                context: vocabularyContext
+            var prepared = preparePolishRequest(
+                rawText: rawText, transcript: transcript, mode: mode,
+                writingContext: writingContext, durationMs: durationMs,
+                provider: provider, sessionID: sessionID, vocabularyContext: vocabularyContext
             )
-            finalText = terminologyInput.canonicalText
-            let sourceSegmentTexts = transcript.confirmedSegments.filter {
-                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-            let preferredCanonicalSegmentTexts = sourceSegmentTexts.map {
-                VoicePolishTerminologyRuntime.canonicalText(
-                    for: $0,
-                    reusing: terminologyInput
-                )
-            }
+            finalText = prepared.canonicalText
             var envelope: VoiceInputEnvelope?
             repeat {
-                envelope = VoiceInputEnvelope.fromFinalTranscript(
-                    transcript,
-                    rawFinalText: rawText,
-                    canonicalText: finalText,
-                    preferredCanonicalSegmentTexts: preferredCanonicalSegmentTexts,
-                    deterministicCorrections: terminologyInput.projection.corrections,
-                    durationMs: durationMs,
-                    provider: provider
-                )
+                envelope = prepared.request?.input
                 guard envelope == nil, allowsVoicePolishUserChoice else { break }
                 performance.recordSetupFailure()
                 let waitingAt = ContinuousClock.now
@@ -1395,6 +1343,12 @@ actor RecognitionSession {
                 switch choice {
                 case .retry:
                     performance.userRetryCount += 1
+                    prepared = preparePolishRequest(
+                        rawText: rawText, transcript: transcript, mode: mode,
+                        writingContext: writingContext, durationMs: durationMs,
+                        provider: provider, sessionID: sessionID, vocabularyContext: vocabularyContext
+                    )
+                    finalText = prepared.canonicalText
                     continue
                 case .useCanonical:
                     _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
@@ -1463,50 +1417,7 @@ actor RecognitionSession {
                     DebugFileLogger.log("stopRecording: superseded during voice polish config, bailing")
                     return nil
                 }
-                let resolvedEntities = EntityResolver.resolve(
-                    segments: envelope.segments,
-                    lexicon: terminologyInput.projection.personalLexicon,
-                    snippets: terminologyInput.fixedSnippets,
-                    hotwords: [],
-                    context: writingContext
-                )
-                let styleProfile: StyleProfile?
-                // 轻度润色的管线只做一次快速编辑，当前不消费 StyleProfile。
-                // 跳过历史纠正读取可避免停止录音后的一次无效数据库查询；标准润色
-                // 仍保留原有准备路径，便于后续继续使用个性化信息。
-                if mode.voicePolishQualityMode != .light,
-                   VoicePolishSettings.personalizationEnabled(
-                    defaults: vocabularyContext.userDefaults
-                ) {
-                    let corrections = (try? await historyStore.fetchVoicePolishCorrections(
-                        limit: VoicePolishSettings.correctionLimit(
-                            defaults: vocabularyContext.userDefaults
-                        )
-                    )) ?? []
-                    styleProfile = StyleProfileUpdater.mergedProfile(
-                        from: corrections,
-                        scene: writingContext.scene
-                    )
-                } else {
-                    // 关闭后既不读取纠正记录，也不向 payload 携带派生画像。
-                    styleProfile = nil
-                }
-                if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                    return finalized(canonicalVoicePolishResult(
-                        envelope,
-                        vocabularyContext: vocabularyContext
-                    ))
-                }
-                let request = VoicePolishRequest(
-                    input: envelope,
-                    context: writingContext,
-                    preferences: UserPolishPreferences(
-                        additionalRequirements: mode.prompt,
-                        styleProfile: styleProfile
-                    ),
-                    qualityMode: mode.voicePolishQualityMode ?? .standard,
-                    resolvedEntities: resolvedEntities
-                )
+                guard let request = prepared.request else { return nil }
                 let voicePolishConfig = llmConfig
                 let pipeline = VoicePolishPipeline(
                     client: currentLLMClient(),
@@ -1517,13 +1428,13 @@ actor RecognitionSession {
                         }
                     }
                 )
-                var prefetched = mode.voicePolishQualityMode == .light
-                    ? lightPolishPrefetch.take(session: sessionID, key: .init(
-                        text: request.fallbackText, requirements: mode.prompt,
-                        provider: KeychainService.selectedPolishProvider(for: .light),
-                        config: voicePolishConfig)) : nil
+                var prefetched = polishPrefetch.take(session: sessionID, key: .init(
+                    text: request.fallbackText, requirements: request.preferences.additionalRequirements,
+                    provider: KeychainService.selectedPolishProvider(for: .standard),
+                    config: voicePolishConfig))
                 if prefetched != nil {
-                    DebugFileLogger.log("light prefetch: reused completed candidate")
+                    performance.reusedPrefetch = true
+                    DebugFileLogger.log("polish prefetch: reused completed candidate")
                 }
                 var totalAttempts = 0
                 var pipelineStartedAt = stopT0
@@ -1532,7 +1443,10 @@ actor RecognitionSession {
                     let readyCandidate = prefetched
                     prefetched = nil
                     let task = Task {
-                        if let readyCandidate { return readyCandidate }
+                        if let readyCandidate {
+                            // 预生成已另计调度与复用；停止后没有发起正式请求。
+                            return Self.voicePolishResult(readyCandidate, replacingAttemptCount: 0)
+                        }
                         return await pipeline.process(request, startedAt: pipelineStartedAt)
                     }
                     voicePolishTask = task
@@ -1602,7 +1516,7 @@ actor RecognitionSession {
                 // 一旦选择了 pipeline 结果，先通知 HUD 关闭 canonical 出口，再做非关键的
                 // 近期输入记忆；否则该 await 窗口内 UI 仍会展示一个后台已拒绝的动作。
                 onASREvent?(.processingResult(text: result.text))
-                if recentInputContextEnabled, !result.usedFallback {
+                if VoicePolishSettings.recentInputContextEnabled(defaults: vocabularyContext.userDefaults), !result.usedFallback {
                     await voicePolishRecentInputStore.remember(
                         result.text,
                         applicationBundleID: writingContext.applicationBundleID
@@ -2011,13 +1925,13 @@ actor RecognitionSession {
         DebugFileLogger.log("stop: no text recognized, saved to history as \(status)")
     }
 
-    /// 正常输出页把直出和轻度润色合并为一个入口，但识别记录仍需保留实际档位。
+    /// 新记录使用真实执行的基础模式名称。
     private var historyProcessingModeName: String {
         switch currentMode.id {
         case ProcessingMode.directId:
-            return L("直出模式", "Direct Output")
-        case ProcessingMode.lightPolishId:
-            return L("轻度润色", "Light Polish")
+            return L("直出", "Direct")
+        case ProcessingMode.lightPolishId, ProcessingMode.formalWriting.id:
+            return L("润色", "Polish")
         default:
             return currentMode.name
         }
@@ -2260,14 +2174,12 @@ actor RecognitionSession {
 
         case .transcript(let transcript):
             if transcript.composedText != currentTranscript.composedText {
-                lightPolishPrefetch.invalidate()
+                polishPrefetch.invalidate()
             }
             currentTranscript = transcript
             onASREvent?(event)
             logger.info("Transcript updated chars=\(transcript.displayText.count, privacy: .public) segments=\(transcript.confirmedSegments.count, privacy: .public) final=\(transcript.isFinal, privacy: .public)")
-            if state == .recording,
-               currentMode.requiresLLM,
-               (currentMode.kind != .voicePolish || currentMode.voicePolishQualityMode == .light) {
+            if state == .recording, currentMode.requiresLLM {
                 scheduleSpeculativeLLM(sessionID: sessionID)
             }
 
@@ -2422,8 +2334,8 @@ actor RecognitionSession {
 
     private func fireSpeculativeLLM(sessionID: RecognitionSessionID) async {
         guard isCurrent(sessionID), state == .recording else { return }
-        if currentMode.voicePolishQualityMode == .light {
-            await fireLightPolishPrefetch(sessionID: sessionID)
+        if currentMode.kind == .voicePolish {
+            await firePolishPrefetch(sessionID: sessionID)
             return
         }
         guard currentMode.kind != .voicePolish else { return }
@@ -2467,26 +2379,93 @@ actor RecognitionSession {
         speculativeLLMSessionID = sessionID
     }
 
-    private func fireLightPolishPrefetch(
+    private func firePolishPrefetch(
         sessionID: RecognitionSessionID,
         vocabularyContext: VocabularyStorageContext = .production
     ) async {
-        let raw = currentTranscript.composedText
+        let transcript = currentTranscript
+        let raw = transcript.composedText
         let mode = currentMode
-        let provider = KeychainService.selectedPolishProvider(for: .light)
-        // 本地 ASR 与本地润色共享计算资源，首版仅对云端模型预生成。
-        guard !provider.isLocal,
+        let provider = KeychainService.selectedPolishProvider(for: .standard)
+        // 仅云端预生成；与正式路径共享上下文纠错及完整正文构造。
+        guard mode.kind == .voicePolish, !provider.isLocal,
+              let writingContext = await polishWritingContext(
+                sessionID: sessionID, vocabularyContext: vocabularyContext
+              ),
               let config = await loadLLMConfigOffActor(),
               isCurrent(sessionID), state == .recording,
-              currentMode == mode, currentTranscript.composedText == raw,
-              KeychainService.selectedPolishProvider(for: .light) == provider else { return }
-        let source = canonicalText(for: raw, sessionID: sessionID, vocabularyContext: vocabularyContext)
+              currentMode == mode, currentTranscript == transcript,
+              KeychainService.selectedPolishProvider(for: .standard) == provider else { return }
+        let prepared = preparePolishRequest(
+            rawText: raw, transcript: transcript, mode: mode, writingContext: writingContext,
+            durationMs: 0, provider: activeProvider, sessionID: sessionID,
+            vocabularyContext: vocabularyContext
+        )
+        guard let request = prepared.request else { return }
         let pipeline = VoicePolishEditingPipeline(client: currentLLMClient(), config: config)
-        lightPolishPrefetch.start(session: sessionID, key: .init(
-            text: source, requirements: mode.prompt, provider: provider, config: config
+        polishPrefetch.start(session: sessionID, key: .init(
+            text: request.fallbackText, requirements: request.preferences.additionalRequirements,
+            provider: provider, config: config
         )) {
-            await pipeline.processText(source, requirements: mode.prompt, qualityMode: .light)
+            await pipeline.process(request)
         }
+    }
+
+    /// 预生成保留录音开始时捕获的上下文，正式交付再次读取当前近期输入并精确比对正文。
+    private func polishWritingContext(
+        sessionID: RecognitionSessionID, vocabularyContext: VocabularyStorageContext
+    ) async -> WritingContext? {
+        var context: WritingContext
+        if writingContextTaskSessionID == sessionID, let task = writingContextTask {
+            context = await task.value
+        } else {
+            context = WritingContext(
+                level: VoicePolishSettings.contextLevel(defaults: vocabularyContext.userDefaults),
+                safety: .unknown
+            )
+        }
+        guard isCurrent(sessionID) else { return nil }
+        if VoicePolishSettings.recentInputContextEnabled(defaults: vocabularyContext.userDefaults) {
+            let recent = await voicePolishRecentInputStore.recentInputs(
+                applicationBundleID: context.applicationBundleID
+            )
+            guard isCurrent(sessionID) else { return nil }
+            context = context.includingRecentMuseInputs(recent)
+        }
+        return context
+    }
+
+    /// 一处构造最终送给模型的正文，确保词库、分段与授权上下文在预生成和交付间一致。
+    private func preparePolishRequest(
+        rawText: String, transcript: RecognitionTranscript, mode: ProcessingMode,
+        writingContext: WritingContext, durationMs: Int, provider: ASRProvider,
+        sessionID: RecognitionSessionID, vocabularyContext: VocabularyStorageContext
+    ) -> (request: VoicePolishRequest?, canonicalText: String) {
+        let terminology = VoicePolishTerminologyRuntime.prepare(
+            rawText: rawText,
+            applicationBundleIdentifier: terminologyApplicationBundleIdentifier(
+                for: sessionID, fallbackBundleIdentifier: writingContext.applicationBundleID
+            ), context: vocabularyContext
+        )
+        let segments = transcript.confirmedSegments.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.map { VoicePolishTerminologyRuntime.canonicalText(for: $0, reusing: terminology) }
+        guard let envelope = VoiceInputEnvelope.fromFinalTranscript(
+            transcript, rawFinalText: rawText, canonicalText: terminology.canonicalText,
+            preferredCanonicalSegmentTexts: segments,
+            deterministicCorrections: terminology.projection.corrections,
+            durationMs: durationMs, provider: provider
+        ) else { return (nil, terminology.canonicalText) }
+        let entities = EntityResolver.resolve(
+            segments: envelope.segments, lexicon: terminology.projection.personalLexicon,
+            snippets: terminology.fixedSnippets, hotwords: [], context: writingContext
+        )
+        let request = VoicePolishRequest(
+            input: envelope, context: writingContext,
+            preferences: UserPolishPreferences(additionalRequirements: mode.prompt),
+            qualityMode: .standard, resolvedEntities: entities
+        )
+        return (request, terminology.canonicalText)
     }
 
     private func cancelSpeculativeLLM(sessionID: RecognitionSessionID) {
@@ -2505,7 +2484,7 @@ actor RecognitionSession {
     }
 
     private func resetSpeculativeLLM(sessionID: RecognitionSessionID? = nil) {
-        lightPolishPrefetch.reset(session: sessionID)
+        polishPrefetch.reset(session: sessionID)
         if sessionID == nil || speculativeDebounceSessionID == sessionID {
             speculativeDebounceTask?.cancel()
             speculativeDebounceTask = nil
@@ -2641,7 +2620,7 @@ actor RecognitionSession {
         // 会话 ID 是本函数的第一项状态修改。此后所有旧回调都会被身份守卫拒绝；
         // 剩余清理均同步摘除共享引用，唯一可能挂起的 disconnect 完全使用局部对象。
         let resetSessionID = currentSessionID
-        lightPolishPrefetch.reset()
+        polishPrefetch.reset()
         if let resetSessionID, voicePolishChoiceSessionID == resetSessionID {
             resolveVoicePolishChoice(.cancel, sessionID: resetSessionID)
         }
@@ -2782,14 +2761,21 @@ extension RecognitionSession {
     }
 
     /// 使用真实预生成入口，仅绕过麦克风采集和停顿计时。
-    func prefetchLightForTesting(text: String, vocabularyContext: VocabularyStorageContext) async {
+    func prefetchPolishForTesting(
+        text: String, vocabularyContext: VocabularyStorageContext,
+        writingContext: WritingContext? = nil
+    ) async {
         if currentSessionID == nil { currentSessionID = makeSessionID() }
         guard let sessionID = currentSessionID else { return }
         state = .recording
-        currentMode = .lightPolish
+        currentMode = .formalWriting
+        if let writingContext {
+            writingContextTask = Task { writingContext }
+            writingContextTaskSessionID = sessionID
+        }
         currentTranscript = RecognitionTranscript(confirmedSegments: [text], partialText: "",
                                                   authoritativeText: text, isFinal: false)
-        await fireLightPolishPrefetch(sessionID: sessionID, vocabularyContext: vocabularyContext)
+        await firePolishPrefetch(sessionID: sessionID, vocabularyContext: vocabularyContext)
     }
 
     func postProcessForTesting(

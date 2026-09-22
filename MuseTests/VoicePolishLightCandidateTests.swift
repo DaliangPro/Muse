@@ -14,7 +14,7 @@ final class VoicePolishLightCandidateTests: XCTestCase {
             XCTAssertTrue(result.text.utf8.elementsEqual(target.utf8))
             XCTAssertEqual(result.llmAttemptCount, 1)
             XCTAssertEqual(result.repairAttemptCount, 0)
-            XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+            XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
             XCTAssertEqual(calls.first?.options.maxOutputTokens, 2048)
         }
     }

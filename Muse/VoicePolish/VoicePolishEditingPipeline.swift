@@ -23,7 +23,7 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
-/// 两档分别使用各自提示词，直接从完整来源一次生成正文。
+/// 润色直接从完整来源一次生成纠错与结构整理后的正文。
 /// 请求失败保留完整来源，成功正文不再经过程序改写。
 struct VoicePolishEditingPipeline: Sendable {
     private let client: any LLMClient
@@ -55,8 +55,7 @@ struct VoicePolishEditingPipeline: Sendable {
     /// 预生成与正式交付共用同一输入协议、超时及失败处理。
     func processText(_ source: String, requirements: String,
                      qualityMode: VoicePolishQualityMode) async -> VoicePolishResult {
-        let isLight = qualityMode == .light
-        let route: VoicePolishRoute = isLight ? .fast : .structured
+        let route: VoicePolishRoute = .structured
         let deadline = ContinuousClock.now.advanced(by: totalTimeout ?? .seconds(30))
         let attempts = VoicePolishEditingAttempts()
         var draft: String?
@@ -80,8 +79,8 @@ struct VoicePolishEditingPipeline: Sendable {
         do {
             try Task.checkCancellation()
             let output = try await generate(
-                task: isLight ? .voicePolishRender : .voicePolishStructured,
-                system: isLight ? VoicePolishEditingPrompts.light : VoicePolishEditingPrompts.standard,
+                task: .voicePolishStructured,
+                system: VoicePolishEditingPrompts.standard,
                 payload: VoicePolishEditingPrompts.fullTextPayload(
                     source,
                     additionalRequirements: requirements
@@ -144,7 +143,7 @@ struct VoicePolishEditingPipeline: Sendable {
         return response.text
     }
 
-    /// 两档均沿用轻度已验收的交付边界，不用本地语义规则撤销模型纠错。
+    /// 保留传输交付边界，不用本地语义规则撤销模型纠错。
     private static func deliveryFailureCode(_ output: String) -> VoicePolishValidationCode? {
         if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .emptyOutput }
         if VoicePolishCharacterSafety.containsUnsafeCharacters(output) { return .unsafeCharacters }

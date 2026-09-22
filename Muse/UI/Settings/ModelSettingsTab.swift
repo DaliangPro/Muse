@@ -11,7 +11,6 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
         ScrollView {
             VStack(alignment: .leading, spacing: ModelSettingsStyle.cardSpacing) {
                 asrCard
-                PolishModelSummaryCard(role: .light, onEdit: { activeEditor = .lightPolish })
                 PolishModelSummaryCard(role: .standard, onEdit: { activeEditor = .standardPolish })
                 LocalModelResourceStrip()
             }

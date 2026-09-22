@@ -1,7 +1,7 @@
 import Foundation
 
 /// 只由显式质量测试入口调用；真实模型、模拟转写时序，不采集麦克风。
-enum LightPolishBenchmark {
+enum PolishPrefetchBenchmark {
     struct Plan: Decodable {
         let enabled: Bool
         let stableMilliseconds: Int
@@ -16,7 +16,7 @@ enum LightPolishBenchmark {
         guard let plan = plans[caseID], (0...5000).contains(plan.stableMilliseconds) else {
             throw CocoaError(.coderInvalidValue)
         }
-        let cache = LightPolishPrefetch()
+        let cache = PolishPrefetch()
         let session = RecognitionSessionID(rawValue: 1)
         let pipeline = VoicePolishEditingPipeline(client: client, config: config)
         let requirements = request.preferences.additionalRequirements
@@ -28,7 +28,7 @@ enum LightPolishBenchmark {
             startedPrefetch = true
             cache.start(session: session, key: .init(text: preliminary, requirements: requirements,
                         provider: provider, config: config)) {
-                await pipeline.processText(preliminary, requirements: requirements, qualityMode: .light)
+                await pipeline.processText(preliminary, requirements: requirements, qualityMode: .standard)
             }
             try await Task.sleep(for: .milliseconds(plan.stableMilliseconds - 800))
         } else {

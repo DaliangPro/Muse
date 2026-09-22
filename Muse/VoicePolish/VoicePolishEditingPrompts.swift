@@ -1,6 +1,6 @@
 import Foundation
 
-/// 三档产品的编辑协议，与旧 Planner/Ledger schema 分开版本化。
+/// 润色产品的编辑协议，与旧 Planner/Ledger schema 分开版本化。
 enum VoicePolishEditingPrompts {
     static let version = 13
 
@@ -32,10 +32,6 @@ enum VoicePolishEditingPrompts {
     先核对 review_focus 中有内容的实际删改，再读完整 changes 和全文。每项 change_index 指向 changes 的原始下标；source_start/source_end、draft_start/draft_end 是按 Character 计数的半开范围，source_context/draft_context 是对应位置的邻近原话和实际稿，不是模型摘要。
     对每个优先项，检查删改片段中仍有效的事实、原因、条件和独立要求，在实际稿里是否确实保留。合并一段改口过程时，不能把夹在其中的有效解释一起当作废话；只需恢复漏掉的内容，不恢复已废弃的安排。内容已在别处准确表达则无需重复。
     优先项只决定检查顺序，不意味着修改错误，也不授予删除或恢复权限。review_focus_total 是全部有内容的变化数，数组最多列16项；其余变化和排版仍在完整 changes 中，必须继续核对。发现问题时仍用原来的合法局部 edits 修正，不输出优先项的编号或额外检查清单。
-    """
-
-    static let light = """
-    你是语音输入法的轻度校对器。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。保持原有表达和顺序，不扩写。只返回润色后的完整正文。
     """
 
     private static let localEditProtocol = """

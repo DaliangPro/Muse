@@ -46,13 +46,13 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
             if mode.isUserDeletable {
                 fieldsSection
             } else {
-                Text(NormalOutputSettings.isNormal(mode) ? L("正常输出", "Normal Output") : mode.name)
+                Text(mode.name)
                     .font(TF.settingsFontBodyStrong)
                     .foregroundStyle(TF.settingsText)
             }
             shortcutSection
             triggerSection
-            if NormalOutputSettings.isNormal(mode) || mode.kind == .voicePolish {
+            if (mode.kind == .direct) || mode.kind == .voicePolish {
                 DisclosureGroup(L("上下文与隐私", "Context & privacy")) {
                     OutputContextSettings(context: $contextRaw, recentInput: $recentInput)
                         .padding(.top, 8)
@@ -190,7 +190,7 @@ private extension ModeSettingsSheet {
                 updated.hotkeyCode = hotkeyCode
                 updated.hotkeyModifiers = hotkeyModifiers
                 updated.hotkeyStyle = hotkeyStyle
-                if NormalOutputSettings.isNormal(mode) || mode.kind == .voicePolish {
+                if (mode.kind == .direct) || mode.kind == .voicePolish {
                     VoicePolishSettings.setContextLevel(WritingContextLevel(rawValue: contextRaw) ?? .nearbyText)
                     VoicePolishSettings.setRecentInputContextEnabled(recentInput)
                 }

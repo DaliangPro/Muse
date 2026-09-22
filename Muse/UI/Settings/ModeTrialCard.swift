@@ -385,22 +385,11 @@ private extension ModeTrialCard {
                 hotwords: [],
                 context: trialContext
             )
-            let styleProfile: StyleProfile?
-            if VoicePolishSettings.personalizationEnabled() {
-                let store = HistoryStore()
-                let corrections = (try? await store.fetchVoicePolishCorrections(
-                    limit: VoicePolishSettings.correctionLimit()
-                )) ?? []
-                styleProfile = StyleProfileUpdater.mergedProfile(from: corrections, scene: .unknown)
-            } else {
-                styleProfile = nil
-            }
             let voicePolishRequest = VoicePolishRequest(
                 input: envelope,
                 context: trialContext,
                 preferences: UserPolishPreferences(
-                    additionalRequirements: draftMode.prompt,
-                    styleProfile: styleProfile
+                    additionalRequirements: draftMode.prompt
                 ),
                 qualityMode: draftMode.voicePolishQualityMode ?? .standard,
                 resolvedEntities: resolvedEntities

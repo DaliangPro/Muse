@@ -4,7 +4,6 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
     @Environment(AppState.self) private var appState
     @AppStorage(DefaultsKeys.selectedASRProvider) var selectedASRProviderRaw = ASRProvider.volcano.rawValue
     @AppStorage(DefaultsKeys.selectedLLMProvider) var selectedLLMProviderRaw = LLMProvider.doubao.rawValue
-    @AppStorage(NormalOutputSettings.preferenceKey) private var normalUsesLightPolish = false
     @State private var modes: [ProcessingMode] = ModeStorage().load()
     @State private var selectedModeId: UUID?
     @State private var deletingModeId: UUID?
@@ -25,12 +24,6 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
             VStack(alignment: .leading, spacing: 0) {
                 modeWorkspace(workbenchHeight: workbenchHeight)
             }
-        }
-        .onChange(of: normalUsesLightPolish) { _, light in
-            if NormalOutputSettings.isNormal(appState.currentMode), appState.barPhase == .hidden {
-                appState.currentMode = NormalOutputSettings.resolve(appState.currentMode, in: modes, light: light)
-            }
-            NotificationCenter.default.post(name: .modesDidChange, object: nil)
         }
         .onAppear {
             if selectedModeId == nil {
@@ -73,12 +66,12 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
 
 private extension ModesSettingsTab {
     var visibleModes: [ProcessingMode] {
-        NormalOutputSettings.visibleModes(in: modes, light: normalUsesLightPolish)
+        modes
     }
 
     var selectedMode: ProcessingMode? {
         guard let mode = modes.first(where: { $0.id == selectedModeId }) else { return nil }
-        return NormalOutputSettings.resolve(mode, in: modes, light: normalUsesLightPolish)
+        return VoiceInputModes.resolve(mode, in: modes)
     }
 
     func modeWorkspace(workbenchHeight: CGFloat) -> some View {
@@ -157,7 +150,7 @@ private extension ModesSettingsTab {
 
             if let mode = selectedMode {
                 ModeSettingsButton(modeName: mode.name) {
-                    configuringModeId = NormalOutputSettings.isNormal(mode) ? ProcessingMode.directId : mode.id
+                    configuringModeId = mode.id
                 }
                 if mode.isUserDeletable {
                     ModeDeleteButton(modeName: mode.name) { deletingModeId = mode.id }
@@ -178,16 +171,7 @@ private extension ModesSettingsTab {
                 triggerFrame: $modePickerTriggerFrame
             )
 
-            if let mode = selectedMode, NormalOutputSettings.isNormal(mode) {
-                SettingsSwitchGroup(width: nil) {
-                    SettingsSwitchOption(title: L("直出", "Direct"), isSelected: !normalUsesLightPolish) {
-                        normalUsesLightPolish = false
-                    }
-                    SettingsSwitchOption(title: L("轻度润色", "Light Polish"), isSelected: normalUsesLightPolish) {
-                        normalUsesLightPolish = true
-                    }
-                }
-            }
+
         }
     }
 
@@ -216,7 +200,6 @@ private extension ModesSettingsTab {
         let normalizedModifiers = modifiers ?? 0
         return modes.firstIndex { mode in
             mode.id != excludedModeId &&
-            mode.id != ProcessingMode.lightPolishId &&
             mode.hotkeyCode == code &&
             (mode.hotkeyModifiers ?? 0) == normalizedModifiers
         }
@@ -234,9 +217,6 @@ private extension ModesSettingsTab {
     }
 
     func saveModeSettings(_ updated: ProcessingMode) {
-        if NormalOutputSettings.isNormal(updated), let index = modes.firstIndex(where: { $0.id == ProcessingMode.lightPolishId }) {
-            modes[index].hotkeyStyle = updated.hotkeyStyle
-        }
         if let code = updated.hotkeyCode,
            let conflictIndex = modeIndex(
                 matchingHotkeyCode: code,
@@ -262,7 +242,7 @@ private extension ModesSettingsTab {
         NotificationCenter.default.post(name: .modesDidChange, object: nil)
 
         if let updatedCurrentMode = modes.first(where: { $0.id == appState.currentMode.id }) {
-            appState.currentMode = NormalOutputSettings.resolve(updatedCurrentMode, in: modes, light: normalUsesLightPolish)
+            appState.currentMode = updatedCurrentMode
         } else if let fallback = modes.first {
             appState.currentMode = fallback
         }

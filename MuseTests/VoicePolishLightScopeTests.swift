@@ -15,7 +15,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
             XCTAssertEqual(result.text, expected)
             XCTAssertEqual(result.llmAttemptCount, 1)
             XCTAssertEqual(result.repairAttemptCount, 0)
-            XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+            XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         }
     }
 
@@ -33,7 +33,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
         let (result, calls) = await run(source, [target])
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, target)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         XCTAssertEqual(result.repairAttemptCount, 0)
         let first = try XCTUnwrap(calls.first)
         let object = try payload(first)
@@ -49,7 +49,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
         XCTAssertEqual(result.text, target)
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         let first = try XCTUnwrap(calls.first)
         XCTAssertEqual(try payload(first)["canonical_text"] as? String, source)
     }

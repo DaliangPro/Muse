@@ -1,15 +1,18 @@
 import Foundation
 
 enum PolishModelRole: String, CaseIterable, Identifiable, Sendable {
+    // 仅用于旧存储键的兼容读取；活动模型只有 standard。
     case light
     case standard
 
+    static let allCases: [Self] = [.standard]
+
     var id: String { rawValue }
     var title: String {
-        self == .light ? L("轻度润色模型", "Light Polish Model") : L("标准润色模型", "Standard Polish Model")
+        L("润色模型", "Polish Model")
     }
     static func resolve(_ quality: VoicePolishQualityMode?) -> Self {
-        quality == .light ? .light : .standard
+        .standard
     }
 }
 
@@ -18,7 +21,7 @@ enum PolishModelConnectionTester {
     static func test(role: PolishModelRole, config: LLMConfig, client: any LLMClient) async throws {
         let response = try await client.generate(LLMRequest(
             context: .connectivityProbe,
-            task: role == .light ? .voicePolishRender : .voicePolishStructured,
+            task: .voicePolishStructured,
             system: "只返回用户提供的文字，不要解释。",
             user: "连接正常",
             options: LLMGenerationOptions(temperature: 0, maxOutputTokens: 64, reasoningPolicy: .disabled)

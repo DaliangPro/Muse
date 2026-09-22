@@ -2,12 +2,12 @@ import XCTest
 @testable import Muse
 
 @MainActor
-final class LightPolishPrefetchTests: XCTestCase {
+final class PolishPrefetchTests: XCTestCase {
     private let session = RecognitionSessionID(rawValue: 1)
 
     private func key(_ text: String = "周四开会", requirements: String = "",
                      model: String = "test", endpoint: String = "https://example.invalid",
-                     credential: String = "test") -> LightPolishPrefetch.Key {
+                     credential: String = "test") -> PolishPrefetch.Key {
         .init(text: text, requirements: requirements, provider: .openai,
               config: .init(apiKey: credential, model: model, baseURL: endpoint))
     }
@@ -23,7 +23,7 @@ final class LightPolishPrefetchTests: XCTestCase {
     }
 
     func testCompletedCandidateIsConsumedOnlyOnce() async throws {
-        let cache = LightPolishPrefetch()
+        let cache = PolishPrefetch()
         cache.start(session: session, key: key()) { Self.result() }
         try await settle()
         XCTAssertEqual(cache.take(session: session, key: key())?.text, "周四开会。")
@@ -35,7 +35,7 @@ final class LightPolishPrefetchTests: XCTestCase {
                             key(model: "other"), key(endpoint: "https://other.invalid"),
                             key(credential: "changed")]
         for other in alternatives {
-            let cache = LightPolishPrefetch()
+            let cache = PolishPrefetch()
             cache.start(session: session, key: key()) { Self.result() }
             try await settle()
             XCTAssertNil(cache.take(session: session, key: other))
@@ -43,7 +43,7 @@ final class LightPolishPrefetchTests: XCTestCase {
     }
 
     func testUnfinishedCandidateDoesNotBlockAndLateCompletionCannotReturn() async throws {
-        let cache = LightPolishPrefetch()
+        let cache = PolishPrefetch()
         cache.start(session: session, key: key()) {
             try? await Task.sleep(for: .seconds(1))
             return Self.result()
@@ -54,14 +54,14 @@ final class LightPolishPrefetchTests: XCTestCase {
     }
 
     func testFailedCandidateFallsBackToNormalPath() async throws {
-        let cache = LightPolishPrefetch()
+        let cache = PolishPrefetch()
         cache.start(session: session, key: key()) { Self.result(failed: true) }
         try await settle()
         XCTAssertNil(cache.take(session: session, key: key()))
     }
 
     func testDuplicateAndThirdRequestAreNotSent() async throws {
-        let cache = LightPolishPrefetch()
+        let cache = PolishPrefetch()
         let calls = PrefetchCallCounter()
         let generate: @Sendable () async -> VoicePolishResult = {
             await calls.increment()
@@ -82,7 +82,7 @@ final class LightPolishPrefetchTests: XCTestCase {
     }
 
     func testResetAndNewSessionRejectOldResult() async throws {
-        let cache = LightPolishPrefetch()
+        let cache = PolishPrefetch()
         cache.start(session: session, key: key()) { Self.result() }
         try await settle()
         let next = RecognitionSessionID(rawValue: 2)

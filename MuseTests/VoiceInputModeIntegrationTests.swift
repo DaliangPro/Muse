@@ -2,16 +2,16 @@ import XCTest
 @testable import Muse
 
 final class VoiceInputModeIntegrationTests: XCTestCase {
-    func testThreeSystemModesHaveStableDistinctSemanticsAndPreserveExistingShortcuts() {
+    func testTwoSystemModesHaveStableDistinctSemanticsAndPreserveExistingShortcuts() {
         let modes = ProcessingMode.builtins
         XCTAssertEqual(modes.map(\.id), [
-            ProcessingMode.directId, ProcessingMode.lightPolishId, ProcessingMode.formalWriting.id,
+            ProcessingMode.directId, ProcessingMode.formalWriting.id,
         ])
         XCTAssertTrue(modes.allSatisfy(\.isProtectedSystemMode))
         XCTAssertTrue(modes.allSatisfy { !$0.isUserDeletable })
         XCTAssertFalse(ProcessingMode.direct.requiresLLM)
         XCTAssertNil(ProcessingMode.direct.voicePolishQualityMode)
-        XCTAssertEqual(ProcessingMode.lightPolish.voicePolishQualityMode, .light)
+        XCTAssertEqual(ProcessingMode.lightPolish.voicePolishQualityMode, .standard)
         XCTAssertEqual(ProcessingMode.formalWriting.voicePolishQualityMode, .standard)
         XCTAssertEqual(ProcessingMode.formalWriting.id.uuidString, "7FC0076F-A85E-454B-8789-47A2F15A6E2F")
         XCTAssertEqual(ProcessingMode.formalWriting.hotkeyCode, 18)
@@ -44,8 +44,8 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
         XCTAssertEqual(restored.hotkeyModifiers, standard.hotkeyModifiers)
         XCTAssertEqual(restored.hotkeyStyle, .hold)
         XCTAssertTrue(restored.isBuiltin)
-        XCTAssertEqual(loaded.filter { $0.id == ProcessingMode.lightPolishId }.count, 1)
-        XCTAssertEqual(loaded.first { $0.id == ProcessingMode.lightPolishId }?.hotkeyCode, 21)
+        XCTAssertEqual(loaded.filter { $0.id == ProcessingMode.lightPolishId }.count, 0)
+        XCTAssertNil(loaded.first { $0.id == ProcessingMode.lightPolishId })
         XCTAssertEqual(try Data(contentsOf: file), original, "加载迁移不得写回用户配置")
     }
 
@@ -75,7 +75,7 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
         light.name = "我的快速纠错"
         light.prompt = "保留语气词。"
         let decoded = try JSONDecoder().decode(ProcessingMode.self, from: JSONEncoder().encode(light))
-        XCTAssertEqual(decoded.voicePolishQualityMode, .light)
+        XCTAssertEqual(decoded.voicePolishQualityMode, .standard)
         XCTAssertEqual(decoded.prompt, light.prompt)
 
         let impostor = ProcessingMode(
@@ -92,7 +92,7 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
             await session.setState(acceptingState)
             await session.switchMode(to: .lightPolish)
             var mode = await session.currentModeForTesting()
-            XCTAssertEqual(mode.id, ProcessingMode.lightPolishId)
+            XCTAssertEqual(mode.id, ProcessingMode.formalWriting.id)
             await session.switchMode(to: .formalWriting)
             mode = await session.currentModeForTesting()
             XCTAssertEqual(mode.id, ProcessingMode.formalWriting.id)
@@ -139,16 +139,13 @@ final class VoiceInputModeIntegrationTests: XCTestCase {
             )
             XCTAssertEqual(result?.finalText, source, mode.name)
             let requests = await client.recordedRequests()
-            if let expectedMode = mode.voicePolishQualityMode {
+            if mode.voicePolishQualityMode != nil {
                 XCTAssertEqual(result?.processedText, source, mode.name)
                 XCTAssertFalse(result?.llmFailed ?? true, mode.name)
                 XCTAssertEqual(result?.historyStatus, "voice_polish_success", mode.name)
                 XCTAssertEqual(requests.count, 1, mode.name)
-                XCTAssertEqual(requests.map(\.task), expectedMode == .light
-                    ? [.voicePolishRender] : [.voicePolishStructured], mode.name)
-                XCTAssertEqual(requests.map(\.system), expectedMode == .light
-                    ? [VoicePolishEditingPrompts.light]
-                    : [VoicePolishEditingPrompts.standard], mode.name)
+                XCTAssertEqual(requests.map(\.task), [.voicePolishStructured], mode.name)
+                XCTAssertEqual(requests.map(\.system), [VoicePolishEditingPrompts.standard], mode.name)
                 for request in requests {
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: String])
                     XCTAssertEqual(payload, ["canonical_text": source], mode.name)

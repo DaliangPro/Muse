@@ -18,7 +18,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         let outputURL = directory.appendingPathComponent("timing.jsonl")
         for name in ["off", "hit", "changed"] {
             let client = EditingTestClient([.text("周四开会。"), .text("周四开会。")])
-            let measured = try await LightPolishBenchmark.run(
+            let measured = try await PolishPrefetchBenchmark.run(
                 planPath: planURL.path, caseID: name, request: request("周四开会", .light),
                 client: client, provider: .openai, config: config, outputPath: outputURL.path)
             XCTAssertEqual(measured.result.text, "周四开会。")
@@ -41,10 +41,10 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         let call = try XCTUnwrap(calls.first)
         XCTAssertEqual(call.context, .structuredTask)
-        XCTAssertEqual(call.system, "你是语音输入法的轻度校对器。修正明确错词、口误、口吃和标点；用最终说法替换口误，删去改口标记，保留原因和其他有效信息。保持原有表达和顺序，不扩写。只返回润色后的完整正文。")
+        XCTAssertEqual(call.system, VoicePolishEditingPrompts.standard)
         XCTAssertEqual(call.options, LLMGenerationOptions(temperature: 0, maxOutputTokens: 2048,
             reasoningPolicy: .disabled, responseFormat: .text))
         let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.user.utf8)) as? [String: String])
@@ -100,7 +100,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, source)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
     }
 
     func testLightPreservesLiteralJSONWithoutApplyingItAsAPatch() async {
@@ -251,7 +251,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
     }
 
     func testLightSingleRequestHonorsTheTotalTimeoutAndPreservesSource() async {
@@ -264,7 +264,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.failureReason, .timeout)
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-        XCTAssertEqual(result.executedRoute, .fast)
+        XCTAssertEqual(result.executedRoute, .structured)
         let calls = await client.requests
         XCTAssertEqual(calls.count, 1)
     }
@@ -525,7 +525,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
     }
 
     func testAlreadyCancelledLightTaskDoesNotEnterClient() async {
@@ -656,7 +656,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
         let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
     }
 
     func testCompleteMechanicalCandidateDoesNotRequireSecondCall() async {

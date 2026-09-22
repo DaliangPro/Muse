@@ -149,7 +149,7 @@ private final class VoicePolishQualityRunnerAppDelegate: NSObject, NSApplication
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let appState = AppState(
-        initialModes: InteractiveTestRuntime.isEnabled ? [.direct, .lightPolish] : nil
+        initialModes: InteractiveTestRuntime.isEnabled ? [.direct, .formalWriting] : nil
     )
     let appUpdater = AppUpdater()
     private let holdHotkeyStopFallbackDelay: Duration = .milliseconds(120)
@@ -514,7 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func startInteractiveLightRecording() {
-        startInteractiveRecording(mode: .lightPolish)
+        startInteractiveRecording(mode: .formalWriting)
     }
 
     @objc private func startInteractiveStandardRecording() {
@@ -605,10 +605,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func registerHotkeys(for provider: ASRProvider) {
         guard !InteractiveTestRuntime.isEnabled else { return }
         let availableModes = appState.availableModes
-        let visibleModes = NormalOutputSettings.visibleModes(
-            in: availableModes, light: NormalOutputSettings.usesLightPolish()
-        )
-        let modes = ASRProviderRegistry.supportedModes(from: visibleModes, for: provider)
+        let modes = ASRProviderRegistry.supportedModes(from: availableModes, for: provider)
         let bindings: [ModeBinding] = modes.compactMap { mode in
             guard let code = mode.hotkeyCode else { return nil }
             let modifiers = CGEventFlags(rawValue: mode.hotkeyModifiers ?? 0)
@@ -638,7 +635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let selectedProvider = KeychainService.selectedASRProvider
                     let resolvedMode = ASRProviderRegistry.resolvedMode(for: capturedMode, provider: selectedProvider)
                     let storedMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
-                    let effectiveMode = NormalOutputSettings.resolve(storedMode, in: availableModes, light: NormalOutputSettings.usesLightPolish())
+                    let effectiveMode = VoiceInputModes.resolve(storedMode, in: availableModes)
                     MainActor.assumeIsolated { self.hotkeyManager.isSessionActive = true }
                     AppLogger.log("[Muse] >>> HOTKEY: Record START (mode: \(effectiveMode.name))")
                     DebugFileLogger.log("hotkey record start mode=\(effectiveMode.name)")
@@ -668,7 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let selectedProvider = KeychainService.selectedASRProvider
             let resolvedMode = ASRProviderRegistry.resolvedMode(for: newMode, provider: selectedProvider)
             let storedMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
-            let effectiveMode = NormalOutputSettings.resolve(storedMode, in: availableModes, light: NormalOutputSettings.usesLightPolish())
+            let effectiveMode = VoiceInputModes.resolve(storedMode, in: availableModes)
             AppLogger.log("[Muse] >>> HOTKEY: Cross-mode stop → \(effectiveMode.name)")
             DebugFileLogger.log("hotkey cross-mode stop → \(effectiveMode.name)")
             Task { @MainActor in

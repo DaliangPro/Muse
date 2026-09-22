@@ -5,7 +5,7 @@ final class VoicePolishHistoryPresentationTests: XCTestCase {
     func testHistoryShowsRecordedModeNamesWithoutGuessingLegacyModes() {
         XCTAssertEqual(
             historyRecord(mode: ProcessingMode.direct.name).processingModeDisplayName,
-            L("直出模式", "Direct Output")
+            L("直出", "Direct")
         )
         XCTAssertEqual(
             historyRecord(mode: ProcessingMode.direct.name, status: "voice_polish_success").processingModeDisplayName,

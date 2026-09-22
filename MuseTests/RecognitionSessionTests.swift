@@ -6,7 +6,7 @@ final class RecognitionSessionTests: XCTestCase {
         KeychainService.selectedASRProvider = .volcano
     }
 
-    func testProductionConfigurationRoutesLightAndStandardIndependently() async throws {
+    func testLegacyLightAndPolishUseStandardConfiguration() async throws {
         try await KeychainService.withIsolatedPolishSettingsForTestingAsync {
             let fixture = try RecognitionSessionVocabularyFixture()
             defer { fixture.cleanup() }
@@ -25,9 +25,9 @@ final class RecognitionSessionTests: XCTestCase {
                 XCTAssertFalse(result?.llmFailed ?? true)
             }
             let models = await client.recordedModels()
-            XCTAssertEqual(models, ["light-model", "standard-model"])
+            XCTAssertEqual(models, ["standard-model", "standard-model"])
             let requests = await client.recordedRequests()
-            XCTAssertEqual(requests.map(\.task), [.voicePolishRender, .voicePolishStructured])
+            XCTAssertEqual(requests.map(\.task), [.voicePolishStructured, .voicePolishStructured])
         }
     }
 
@@ -253,7 +253,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(state, .recording)
     }
 
-    func testVoicePolishWaitsForFinalTranscriptAndCallsLLMWithEmptyRequirements() async throws {
+    func testPolishPrefetchCannotReplaceTheChangedFinalTranscript() async throws {
         let source = "明天下午三点开会。"
         let client = RecognitionSessionVoicePolishLLM(response: source)
         let session = RecognitionSession(
@@ -277,7 +277,7 @@ final class RecognitionSessionTests: XCTestCase {
         )))
         try await Task.sleep(for: .milliseconds(900))
         let speculativeCount = await client.requestCount()
-        XCTAssertEqual(speculativeCount, 0)
+        XCTAssertEqual(speculativeCount, 1)
 
         let finalTranscript = RecognitionTranscript(
             confirmedSegments: [source],
@@ -295,12 +295,10 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.llmFailed, false)
         XCTAssertEqual(result?.historyStatus, "voice_polish_success")
         let requests = await client.recordedRequests()
-        XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.map(\.task), [.voicePolishStructured])
-        for request in requests {
-            XCTAssertEqual(try Self.voicePolishPayload(from: request) as? [String: String],
-                           ["canonical_text": source])
-        }
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.map(\.task), [.voicePolishStructured, .voicePolishStructured])
+        XCTAssertEqual(try Self.voicePolishPayload(from: XCTUnwrap(requests.first))["canonical_text"] as? String, "明天下午")
+        XCTAssertEqual(try Self.voicePolishPayload(from: XCTUnwrap(requests.last))["canonical_text"] as? String, source)
     }
 
     func testVoicePolishUsesCanonicalTextAndCompleteEffectiveSnippetRules() async throws {
@@ -1124,7 +1122,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
     }
 
-    func testLightPrefetchReusesActualPipelineWithoutSecondRequest() async throws {
+    func testPolishPrefetchReusesActualPipelineWithoutSecondRequest() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let raw = "明天下午开会"
@@ -1133,7 +1131,7 @@ final class RecognitionSessionTests: XCTestCase {
             historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
             llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") }
         )
-        await session.prefetchLightForTesting(text: raw, vocabularyContext: fixture.context)
+        await session.prefetchPolishForTesting(text: raw, vocabularyContext: fixture.context)
         try await Task.sleep(for: .milliseconds(100))
         let before = await client.recordedRequests()
         XCTAssertEqual(before.count, 1)
@@ -1145,11 +1143,15 @@ final class RecognitionSessionTests: XCTestCase {
             mode: .lightPolish, vocabularyContext: fixture.context)
         let after = await client.recordedRequests()
         XCTAssertEqual(after.count, 1, "命中候选不再发送第二次请求")
+        XCTAssertEqual(after.first?.system, VoicePolishEditingPrompts.standard)
+        XCTAssertEqual(output?.performance?.prefetchScheduledCount, 1)
+        XCTAssertEqual(output?.performance?.reusedPrefetch, true)
+        XCTAssertEqual(output?.performance?.llmAttemptCount, 0)
         XCTAssertEqual(output?.finalText, "明天下午开会。")
         await session.forceResetForTesting()
     }
 
-    func testLightPrefetchFinalCorrectionUsesFreshFullInput() async throws {
+    func testPolishPrefetchFinalCorrectionUsesFreshFullInput() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: ["周三开会。", "周四开会。"])
@@ -1157,7 +1159,7 @@ final class RecognitionSessionTests: XCTestCase {
             historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
             llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") }
         )
-        await session.prefetchLightForTesting(text: "周三开会", vocabularyContext: fixture.context)
+        await session.prefetchPolishForTesting(text: "周三开会", vocabularyContext: fixture.context)
         try await Task.sleep(for: .milliseconds(100))
         let raw = "周三开会，不对，周四开会"
         let transcript = RecognitionTranscript(confirmedSegments: [raw], partialText: "",
@@ -1170,6 +1172,46 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(payload["canonical_text"] as? String, raw)
         XCTAssertEqual(output?.finalText, "周四开会。")
         await session.forceResetForTesting()
+    }
+
+    func testPrefetchAndDeliveryShareContextCorrectionsAndRejectChangedContext() async throws {
+        let fixture = try RecognitionSessionVocabularyFixture()
+        defer { fixture.cleanup() }
+        VoicePolishSettings.setRecentInputContextEnabled(true, defaults: fixture.context.userDefaults)
+        let app = "com.example.prefetch"
+        let raw = "缪斯这次更新先发测试组。"
+        let corrected = "Muse这次更新先发测试组。"
+        let context = WritingContext(applicationBundleID: app, scene: .chat,
+                                     level: .metadataOnly, safety: .safe)
+        for contextChanges in [false, true] {
+            let recent = VoicePolishRecentInputContextStore()
+            await recent.remember("Muse 的长语音测试刚刚结束。无关事项：客户预算九万元。", applicationBundleID: app)
+            let client = RecognitionSessionScriptedVoicePolishLLM(responses: [corrected, raw])
+            let session = RecognitionSession(
+                historyStore: HistoryStore(path: ":memory:"), llmClientFactory: { client },
+                llmConfigLoader: { LLMConfig(apiKey: "test", model: "mock", baseURL: "https://example.com/v1") },
+                voicePolishRecentInputStore: recent
+            )
+            await session.prefetchPolishForTesting(text: raw, vocabularyContext: fixture.context,
+                                                   writingContext: context)
+            try await Task.sleep(for: .milliseconds(100))
+            let finalContext = contextChanges
+                ? WritingContext(applicationBundleID: app, scene: .chat, level: .metadataOnly, safety: .unknown)
+                : context
+            let result = await session.postProcessForTesting(
+                rawText: raw,
+                transcript: RecognitionTranscript(confirmedSegments: [raw], partialText: "", authoritativeText: raw, isFinal: true),
+                mode: .formalWriting, writingContext: finalContext, vocabularyContext: fixture.context
+            )
+            let calls = await client.recordedRequests()
+            XCTAssertEqual(calls.count, contextChanges ? 2 : 1)
+            XCTAssertEqual(try Self.voicePolishPayload(from: XCTUnwrap(calls.first))["canonical_text"] as? String, corrected)
+            XCTAssertEqual(try Self.voicePolishPayload(from: XCTUnwrap(calls.last))["canonical_text"] as? String,
+                           contextChanges ? raw : corrected)
+            XCTAssertEqual(result?.finalText, contextChanges ? raw : corrected)
+            XCTAssertEqual(result?.performance?.reusedPrefetch, !contextChanges)
+            await session.forceResetForTesting()
+        }
     }
 
     func testLightSingleCallKeepsCompleteCanonicalInputAndVerbatimOutput() async throws {
@@ -1193,7 +1235,7 @@ final class RecognitionSessionTests: XCTestCase {
         let calls = await client.recordedRequests()
         XCTAssertEqual(calls.count, 1)
         let call = try XCTUnwrap(calls.first)
-        XCTAssertEqual(call.task, .voicePolishRender)
+        XCTAssertEqual(call.task, .voicePolishStructured)
         let payload = try Self.voicePolishPayload(from: call)
         XCTAssertEqual(Set(payload.keys), ["canonical_text"])
         XCTAssertEqual(payload["canonical_text"] as? String, canonical)
@@ -1258,7 +1300,7 @@ final class RecognitionSessionTests: XCTestCase {
                 let result = await boundedCompletion(pending, session: session) ?? nil
                 XCTAssertNil(result)
                 let sample = try XCTUnwrap(VoicePolishPerformanceStore.samples(defaults: vocabulary.userDefaults).last)
-                XCTAssertEqual(sample.qualityMode, .light)
+                XCTAssertEqual(sample.qualityMode, .standard)
                 XCTAssertEqual(sample.firstAutomaticOutcome, .fallback)
                 XCTAssertEqual(sample.resolvedOutcome, .cancelled)
                 XCTAssertEqual(sample.userRetryCount, 0)

@@ -117,7 +117,7 @@ struct WritingContext: Sendable, Equatable, Codable {
 }
 
 enum VoicePolishQualityMode: String, Codable, CaseIterable, Sendable, Equatable {
-    /// 用户通过输入模式明确选择的两档润色。
+    /// 当前润色固定使用标准能力；light 仅用于旧调用和历史数据兼容。
     case light
     case standard
     /// 以下值仅保留旧数据与既有管线回归兼容，生产入口按输入模式传递新档位。

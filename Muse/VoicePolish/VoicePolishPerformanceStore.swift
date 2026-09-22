@@ -21,6 +21,8 @@ struct VoicePolishPerformanceMeasurement: Sendable, Equatable {
     let decisionWaitMilliseconds: Int
     var stopLatencyMilliseconds: Int?
     var asrReadyLatencyMilliseconds: Int?
+    var prefetchScheduledCount = 0
+    var reusedPrefetch = false
 
     init(
         outcome: VoicePolishPerformanceOutcome,
@@ -84,6 +86,8 @@ struct VoicePolishSessionPerformance {
     let asrReadyAt: ContinuousClock.Instant
     var decisionWait: Duration = .zero
     var userRetryCount = 0
+    var prefetchScheduledCount = 0
+    var reusedPrefetch = false
     private(set) var firstOutcome: VoicePolishPerformanceOutcome?
     private(set) var firstAttempts: Int?
     private(set) var firstRepairs: Int?
@@ -116,7 +120,7 @@ struct VoicePolishSessionPerformance {
         outcome: VoicePolishPerformanceOutcome,
         at finishedAt: ContinuousClock.Instant = .now
     ) -> VoicePolishPerformanceMeasurement {
-        VoicePolishPerformanceMeasurement(
+        var measurement = VoicePolishPerformanceMeasurement(
             outcome: outcome, route: route, llmAttemptCount: totalAttempts,
             firstAutomaticOutcome: firstOutcome,
             firstAutomaticLLMAttemptCount: firstAttempts,
@@ -126,6 +130,9 @@ struct VoicePolishSessionPerformance {
             stopLatencyMilliseconds: Self.milliseconds(finishedAt - stoppedAt - decisionWait),
             asrReadyLatencyMilliseconds: Self.milliseconds(finishedAt - asrReadyAt - decisionWait)
         )
+        measurement.prefetchScheduledCount = prefetchScheduledCount
+        measurement.reusedPrefetch = reusedPrefetch
+        return measurement
     }
 
     private static func milliseconds(_ duration: Duration) -> Int {
@@ -154,6 +161,9 @@ struct VoicePolishPerformanceSample: Codable, Sendable, Equatable {
     var repairAttemptCount: Int? = nil
     var decisionWaitMilliseconds: Int? = nil
     var asrReadyLatencyMilliseconds: Int? = nil
+    /// 预生成的调度数与复用情况独立于正式交付路径尝试数，旧样本保持未知。
+    var prefetchScheduledCount: Int? = nil
+    var reusedPrefetch: Bool? = nil
 
     var resolvedOutcome: VoicePolishPerformanceOutcome {
         outcome ?? (usedFallback ? .fallback : .success)
@@ -246,7 +256,9 @@ enum VoicePolishPerformanceStore {
             userRetryCount: measurement.userRetryCount,
             repairAttemptCount: measurement.repairAttemptCount,
             decisionWaitMilliseconds: measurement.decisionWaitMilliseconds,
-            asrReadyLatencyMilliseconds: measurement.asrReadyLatencyMilliseconds
+            asrReadyLatencyMilliseconds: measurement.asrReadyLatencyMilliseconds,
+            prefetchScheduledCount: measurement.prefetchScheduledCount,
+            reusedPrefetch: measurement.reusedPrefetch
         )
         let storage = SendableDefaults(value: defaults)
         lock.withLock { _ in

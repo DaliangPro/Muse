@@ -102,7 +102,7 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
         let source = "先别发送，等我确认。"
         let (result, calls) = await run(source, [source], mode: .light)
         assertSuccess(result, calls: calls, text: source, attempts: 1, repairs: 0)
-        XCTAssertEqual(calls.map(\.task), [.voicePolishRender])
+        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
         for call in calls { XCTAssertNil(try payload(call)["layout_segments"]) }
     }
 

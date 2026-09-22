@@ -39,9 +39,9 @@ final class PolishModelConfigurationTests: XCTestCase {
             KeychainService.setSelectedPolishProvider(.bailian, for: .standard)
             try KeychainService.savePolishCredentials(for: .deepseek, role: .light, values: credentials("fast", "key-a"))
             try KeychainService.savePolishCredentials(for: .bailian, role: .standard, values: credentials("standard", "key-b"))
-            XCTAssertEqual(KeychainService.selectedPolishProvider(for: .resolve(.light)), .deepseek)
+            XCTAssertEqual(KeychainService.selectedPolishProvider(for: .resolve(.light)), .bailian)
             XCTAssertEqual(KeychainService.selectedPolishProvider(for: .resolve(.standard)), .bailian)
-            XCTAssertEqual(KeychainService.loadPolishConfig(for: .resolve(.light))?.model, "fast")
+            XCTAssertEqual(KeychainService.loadPolishConfig(for: .resolve(.light))?.model, "standard")
             XCTAssertEqual(KeychainService.loadPolishConfig(for: .resolve(.standard))?.model, "standard")
             XCTAssertEqual(PolishModelRole.resolve(nil), .standard)
         }

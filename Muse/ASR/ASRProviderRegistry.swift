@@ -141,7 +141,7 @@ enum ASRProviderRegistry {
         provider: ASRProvider,
         capabilities: ASRProviderCapabilities
     ) -> ProcessingMode {
-        supports(mode, for: provider, capabilities: capabilities) ? mode : .direct
+        supports(mode, for: provider, capabilities: capabilities) ? VoiceInputModes.resolve(mode) : .direct
     }
 
     /// 显式固定回退优先级，避免依赖 `allCases` 的声明顺序。

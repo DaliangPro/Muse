@@ -25,7 +25,7 @@ struct HistoryRecord: Identifiable, Hashable, Sendable {
             if status.hasPrefix("voice_polish_") {
                 return L("轻度润色", "Light Polish")
             }
-            return L("直出模式", "Direct Output")
+            return L("直出", "Direct")
         }
         return processingMode
     }

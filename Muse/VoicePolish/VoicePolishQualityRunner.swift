@@ -163,6 +163,15 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
 enum VoicePolishQualityRunner {
     private static let reportSchemaVersion = 5
 
+    /// 计时范围和执行分支共用一个判定，兼容旧环境变量但优先使用当前名称。
+    static func prefetchBenchmarkPlan(
+        for mode: Mode, environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        guard mode == .standard || mode == .light else { return nil }
+        return environment["MUSE_POLISH_PREFETCH_BENCHMARK_PLAN"]
+            ?? environment["MUSE_LIGHT_PREFETCH_BENCHMARK_PLAN"]
+    }
+
     enum Mode: String, CaseIterable {
         case direct
         case light
@@ -173,7 +182,7 @@ enum VoicePolishQualityRunner {
         var qualityMode: VoicePolishQualityMode? {
             switch self {
             case .direct: return nil
-            case .light: return .light
+            case .light: return .standard
             case .standard: return .standard
             case .legacyAutomatic: return .automatic
             }
@@ -498,7 +507,7 @@ enum VoicePolishQualityRunner {
                   parsed != .legacyAutomatic else {
                 throw RunnerError.invalidMode(value(after: "--mode") ?? "缺失")
             }
-            mode = parsed
+            mode = parsed == .light ? .standard : parsed
         } else {
             mode = .legacyAutomatic
         }
@@ -557,7 +566,7 @@ enum VoicePolishQualityRunner {
             mode: invocation.mode.rawValue,
             editingPromptVersion: [.light, .standard].contains(invocation.mode)
                 ? VoicePolishEditingPrompts.version : nil,
-            latencyMeasurementScope: ProcessInfo.processInfo.environment["MUSE_LIGHT_PREFETCH_BENCHMARK_PLAN"] == nil
+            latencyMeasurementScope: prefetchBenchmarkPlan(for: invocation.mode) == nil
                 ? "asr_final_fixture_to_output" : "real_model_simulated_transcript_stop_to_output"
         )
 
@@ -671,7 +680,7 @@ enum VoicePolishQualityRunner {
                 let canonicalInput = request.fallbackText
                 let successCounter = VoicePolishProviderAuditSuccessCounter()
                 let requestProbeBodyPath: String?
-                if invocation.mode == .light,
+                if invocation.mode == .standard,
                    ProcessInfo.processInfo.environment["MUSE_QUALITY_CAPTURE_LIGHT_REQUEST_BODY"] == "1" {
                     // 路径随客户端进入真正的 generate，跨越管线内部的 detached 超时任务。
                     requestProbeBodyPath = URL(fileURLWithPath: invocation.reportPath).deletingLastPathComponent()
@@ -690,9 +699,8 @@ enum VoicePolishQualityRunner {
                 let pipeline = VoicePolishPipeline(client: auditedClient, config: configured.config)
                 let result: VoicePolishResult
                 let elapsed: Duration
-                if invocation.mode == .light,
-                   let planPath = ProcessInfo.processInfo.environment["MUSE_LIGHT_PREFETCH_BENCHMARK_PLAN"] {
-                    let measured = try await LightPolishBenchmark.run(
+                if let planPath = prefetchBenchmarkPlan(for: invocation.mode) {
+                    let measured = try await PolishPrefetchBenchmark.run(
                         planPath: planPath, caseID: input.testInputId, request: request,
                         client: auditedClient, provider: configured.provider, config: configured.config,
                         outputPath: invocation.reportPath + ".prefetch.jsonl")
@@ -1306,6 +1314,6 @@ enum VoicePolishQualityRunner {
               let mode = Mode(rawValue: arguments[index + 1]), mode != .legacyAutomatic else {
             return "invalid"
         }
-        return mode.rawValue
+        return (mode == .light ? Mode.standard : mode).rawValue
     }
 }

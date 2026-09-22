@@ -116,7 +116,7 @@ final class AppState {
             ?? modes.first
             ?? .direct
         currentMode = initialModes == nil
-            ? NormalOutputSettings.resolve(initialMode, in: modes, light: NormalOutputSettings.usesLightPolish())
+            ? VoiceInputModes.resolve(initialMode, in: modes)
             : initialMode
         self.voicePolishCanonicalExitDelay = voicePolishCanonicalExitDelay
     }

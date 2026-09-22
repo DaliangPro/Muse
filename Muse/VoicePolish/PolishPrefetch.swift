@@ -2,7 +2,7 @@ import Foundation
 import os
 
 /// 仅驻留内存，不记录正文或凭据；调用方只可交付完整匹配的成功候选。
-final class LightPolishPrefetch: Sendable {
+final class PolishPrefetch: Sendable {
     struct Key: Equatable, Sendable {
         let text: String
         let requirements: String
@@ -13,6 +13,7 @@ final class LightPolishPrefetch: Sendable {
         private let endpoint: String
         private let credential: String
         private let thinking: LLMThinkingMode
+        private let promptVersion = VoicePolishEditingPrompts.version
 
         init(text: String, requirements: String, provider: LLMProvider, config: LLMConfig) {
             self.text = text
@@ -57,7 +58,7 @@ final class LightPolishPrefetch: Sendable {
                   !value.attempted.contains(key) else { return }
             value.invalidate()
             value.attempted.append(key)
-            DebugFileLogger.log("light prefetch: scheduled attempt=\(value.attempted.count)")
+            DebugFileLogger.log("polish prefetch: scheduled attempt=\(value.attempted.count)")
             value.key = key
             let token = UUID()
             value.token = token
@@ -79,11 +80,16 @@ final class LightPolishPrefetch: Sendable {
         state.withLock { $0.invalidate() }
     }
 
+    /// 调度数量单独统计，不能当作 Provider 已接收的请求数。
+    func scheduledCount(session: RecognitionSessionID) -> Int {
+        state.withLock { $0.session == session ? $0.attempted.count : 0 }
+    }
+
     func take(session: RecognitionSessionID, key: Key) -> VoicePolishResult? {
         state.withLock { value in
             guard value.session == session else { return nil }
             let result = value.key == key ? value.completed : nil
-            DebugFileLogger.log("light prefetch: stop attempts=\(value.attempted.count) reused=\(result != nil)")
+            DebugFileLogger.log("polish prefetch: stop attempts=\(value.attempted.count) reused=\(result != nil)")
             value.invalidate()
             return result
         }
