@@ -68,7 +68,9 @@ private struct VoiceInputDemo: View {
         // 不加任何额外阴影（2026-07-09 大梁老师：要与真实一模一样）——真实悬浮窗
         // hasShadow=false，悬浮条自带内置阴影，组件本体即真实观感
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { demoState.startQuickModeDemo() }
+        .background(WindowActivityObserver { active in
+            if active { demoState.startQuickModeDemo() } else { demoState.stop() }
+        })
         .onDisappear { demoState.stop() }
     }
 }
@@ -100,7 +102,9 @@ private struct PolishDemo: View {
                  textColor: TF.settingsText, accent: showPolished)
                 .opacity(showPolished ? 1 : 0.45)
         }
-        .onAppear { start() }
+        .background(WindowActivityObserver { active in
+            if active { start() } else { task?.cancel(); task = nil }
+        })
         .onDisappear { task?.cancel() }
     }
 

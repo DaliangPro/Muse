@@ -362,8 +362,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 .font(TF.hudFontTitle)
                 .floatingBarReadableText(color: barTextColor)
                 .padding(.leading, recordingIconTextGap)
-                .contentTransition(.opacity)
-                .animation(TF.hudTextFlow, value: state.transcriptionText)
         } else if !state.segments.isEmpty {
             if shouldTrimRecordingText {
                 Color.clear
@@ -373,7 +371,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
                             .floatingBarReadableText(color: barTextColor)
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
-                            .contentTransition(.opacity)
                     }
                     .mask {
                         HStack(spacing: 0) {
@@ -390,7 +387,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     .padding(.trailing, recordingTextTailPadding)
                     .allowsHitTesting(false)
                     .transition(.opacity)
-                    .animation(TF.hudTextFlow, value: state.transcriptionText)
             } else {
                 Text(state.transcriptionText)
                     .font(TF.hudFontTitle)
@@ -400,8 +396,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .allowsHitTesting(false)
                     .transition(.opacity)
-                    .contentTransition(.opacity)
-                    .animation(TF.hudTextFlow, value: state.transcriptionText)
             }
         }
     }

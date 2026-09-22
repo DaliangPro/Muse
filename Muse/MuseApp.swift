@@ -4,6 +4,10 @@ import SwiftUI
 @main
 enum MuseMain {
     static func main() {
+        #if HUD_PERFORMANCE_PROBE
+        HUDPerformanceProbe.runApplication()
+        return
+        #endif
         do {
             // 必须先于 AppDelegate 的历史库、模式与设置初始化，隔离失败时不能回退日常目录。
             try InteractiveTestRuntime.bootstrap()

@@ -431,5 +431,4 @@ enum TF {
     static let hudVisibility = Animation.spring(response: 0.42, dampingFraction: 0.88, blendDuration: 0.12)
     static let hudMorph = Animation.spring(response: 0.32, dampingFraction: 0.90, blendDuration: 0.08)
     static let hudWidthFlow = Animation.spring(response: 0.26, dampingFraction: 0.94, blendDuration: 0.04)
-    static let hudTextFlow = Animation.easeOut(duration: 0.18)
 }
