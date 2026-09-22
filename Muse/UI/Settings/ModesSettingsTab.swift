@@ -146,8 +146,6 @@ private extension ModesSettingsTab {
             modeWorkspaceLeft
                 .zIndex(20)
 
-            Spacer(minLength: 16)
-
             if let mode = selectedMode {
                 ModeSettingsButton(modeName: mode.name) {
                     configuringModeId = mode.id
@@ -156,6 +154,8 @@ private extension ModesSettingsTab {
                     ModeDeleteButton(modeName: mode.name) { deletingModeId = mode.id }
                 }
             }
+
+            Spacer(minLength: 16)
         }
         .padding(.leading, ModeSettingsLayout.modeToolbarLeadingInset)
         .padding(.trailing, ModeSettingsLayout.modeToolbarTrailingInset)
