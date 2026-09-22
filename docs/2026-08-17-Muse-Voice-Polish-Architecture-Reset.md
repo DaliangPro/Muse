@@ -12,7 +12,7 @@ PolishModelRole 的活动角色只有 standard，继续使用原存储键与既�
 
 直出沿用识别和词库纠正链路，零润色调用。润色通过 RecognitionSession.preparePolishRequest 共用分段规范化、词库投影和 EntityResolver 授权纠错，最终 canonical_text 与 additional_requirements 进入 VoicePolishEditingPipeline，一次 voicePolishStructured 请求输出完整正文。
 
-使用明确要求事项归拢、枚举逐项换行与自然分段的标准提示词和协议版本 14，temperature=0、thinking 禁用、文本响应、2,048 输出 tokens、既有 30 秒请求边界。传输失败、空输出、危险字符、过大或截断响应沿用恢复出口；模型成功正文不经第二轮程序改写。UI 显式重试是新的有界请求。
+使用明确要求纠错后按事项归拢、枚举逐项换行与自然分段的标准提示词和协议版本 15；排版不得改变责任归属或逻辑关系，普通改口的旧值不得放进括号带回。temperature=0、thinking 禁用、文本响应、2,048 输出 tokens、既有 30 秒请求边界。传输失败、空输出、危险字符、过大或截断响应沿用恢复出口；模型成功正文不经第二轮程序改写。UI 显式重试是新的有界请求。
 
 当前模型不消费 StyleProfile，正式停止阶段移除相应历史查询和计算；已授权上下文仍参与本地实体纠错。旧 Ledger 和离线诊断组件继续作为历史回归代码，活动语音入口使用统一成稿路径。
 
