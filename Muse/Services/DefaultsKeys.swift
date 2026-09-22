@@ -17,6 +17,7 @@ enum DefaultsKeys {
     static let language = "tf_language"
     static let showDockIcon = "tf_showDockIcon"
     static let preserveClipboard = "tf_preserveClipboard"
+    static let hudStyle = "tf_hudStyle"
     static let hasCompletedSetup = "tf_hasCompletedSetup"
     static let didInitialLoginItemSetup = "tf_didInitialLoginItemSetup"
     static let defaultHotkeyStyle = "tf_defaultHotkeyStyle"

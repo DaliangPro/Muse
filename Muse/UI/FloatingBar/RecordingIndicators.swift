@@ -4,18 +4,20 @@ import SwiftUI
 
 struct PreparingDot: View {
 
+    var color: Color = TF.recording
+
     @State private var rotation = 0.0
 
     var body: some View {
         ZStack {
             Circle()
-                .stroke(TF.recording.opacity(0.16), lineWidth: 1.6)
+                .stroke(color.opacity(0.16), lineWidth: 1.6)
                 .frame(width: 16, height: 16)
 
             Circle()
                 .trim(from: 0.16, to: 0.76)
                 .stroke(
-                    TF.recording,
+                    color,
                     style: StrokeStyle(lineWidth: 1.8, lineCap: .round)
                 )
                 .frame(width: 16, height: 16)
@@ -64,12 +66,15 @@ struct RecordingDot: View {
     let time: Double
     let activity: CGFloat
     let flow: CGFloat
+    var style: HUDStyle = .appleNative
 
     var body: some View {
         Canvas(rendersAsynchronously: true) { context, size in
-            var glow = context
-            glow.translateBy(x: (size.width - 30) / 2, y: (size.height - 20) / 2)
-            drawSoftGlow(in: glow)
+            if style == .appleNative {
+                var glow = context
+                glow.translateBy(x: (size.width - 30) / 2, y: (size.height - 20) / 2)
+                drawSoftGlow(in: glow)
+            }
             var stripes = context
             stripes.translateBy(x: (size.width - 24) / 2, y: (size.height - 14.2) / 2)
             drawStripes(in: stripes)
@@ -113,6 +118,10 @@ struct RecordingDot: View {
             let rect = CGRect(x: startX + CGFloat(index) * (barWidth + gap), y: (height - barHeight) / 2,
                               width: barWidth, height: barHeight)
             let path = Path(roundedRect: rect, cornerRadius: barWidth / 2)
+            if style == .ink {
+                context.fill(path, with: .color(InkHUDPalette.accent))
+                continue
+            }
             mask.addPath(path)
             let drift = Double(flow) * 0.18 + Double(index) * 0.03
             let distance = abs(CGFloat(index) - flow * 4)
@@ -126,6 +135,7 @@ struct RecordingDot: View {
                     .opacity(0.92 + drift * 0.06),
             ]), startPoint: CGPoint(x: rect.midX, y: rect.minY), endPoint: CGPoint(x: rect.midX, y: rect.maxY)))
         }
+        guard style == .appleNative else { return }
         var highlight = context
         highlight.clip(to: mask)
         highlight.blendMode = .screen

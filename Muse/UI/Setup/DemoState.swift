@@ -50,6 +50,17 @@ final class DemoState {
         }
     }
 
+    /// 样式面板按需播放一轮，结束后停在录音预览，避免持续后台循环。
+    func playQuickModeDemoOnce() {
+        stop()
+        demoTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runOneCycle()
+            guard !Task.isCancelled else { return }
+            self.showFrozenRecordingPreview(text: L("把此刻的想法，清晰留下来", "Keep this thought, clearly"))
+        }
+    }
+
     /// Stops all timers and resets state.
     func stop() {
         demoTask?.cancel()

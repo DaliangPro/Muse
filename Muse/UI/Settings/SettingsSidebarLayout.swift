@@ -33,10 +33,10 @@ enum SettingsSidebarLayout {
     static let settingsPanelBottomInset: CGFloat = 8
     static let settingsPanelTextColor = TF.settingsTextSecondary
 
-    /// 重构面板（2026-07-06 大梁老师）：点选图标按钮的行高与行距（外观 / 语言 / 三开关共 5 行）
+    /// 外观、语言、HUD 样式与三个开关，共六行。
     static let settingsPanelOptionHeight: CGFloat = 26
     static let settingsPanelOptionSpacing: CGFloat = 5
-    static let settingsPanelOptionRowCount: CGFloat = 5
+    static let settingsPanelOptionRowCount: CGFloat = 6
 
     static var settingsPanelHeight: CGFloat {
         settingsPanelTopInset

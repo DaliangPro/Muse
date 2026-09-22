@@ -47,6 +47,10 @@ extension FloatingBarState {
 struct FloatingBarView<S: FloatingBarState>: View {
 
     let state: S
+    var styleOverride: HUDStyle? = nil
+    @AppStorage(DefaultsKeys.hudStyle) private var savedHUDStyle = HUDStyle.appleNative.rawValue
+
+    private var hudStyle: HUDStyle { styleOverride ?? HUDStyle.resolved(savedHUDStyle) }
 
     /// 保留小幅回改时的外壳宽度，并在进入恢复阶段时复用。
     @State private var recordingPeakWidth: CGFloat = TF.barHeight
@@ -141,7 +145,9 @@ struct FloatingBarView<S: FloatingBarState>: View {
         HUDRecordingMotion(logicalWidth: recordingMotionTargetWidth,
                            widthReserve: recordingWidthReserve, tailInset: recordingTextTailPadding) { layout in
             Group {
-                if #available(macOS 26.0, *) {
+                if hudStyle == .ink {
+                    inkCapsuleCore
+                } else if #available(macOS 26.0, *) {
                     liquidCapsuleCore(recordingLayout: layout)
                 } else {
                     legacyCapsuleCore
@@ -158,6 +164,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var capsuleShadowColor: Color {
+        if hudStyle == .ink { return .clear }
         if #available(macOS 26.0, *), nativeGlassVariant == .clearCore || nativeGlassVariant == .minimalRegular {
             return Color.black.opacity(0.08)
         }
@@ -165,6 +172,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var capsuleShadowRadius: CGFloat {
+        if hudStyle == .ink { return 0 }
         if #available(macOS 26.0, *), nativeGlassVariant == .clearCore || nativeGlassVariant == .minimalRegular {
             return 10
         }
@@ -172,10 +180,24 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var capsuleShadowYOffset: CGFloat {
+        if hudStyle == .ink { return 0 }
         if #available(macOS 26.0, *), nativeGlassVariant == .clearCore || nativeGlassVariant == .minimalRegular {
             return 5
         }
         return 4
+    }
+
+    private var inkCapsuleCore: some View {
+        ZStack {
+            InkHUDSurface(cornerRadius: capsuleCornerRadius)
+            styledBarContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
+    }
+
+    private var styledBarContent: some View {
+        barContent.environment(\.hudStyle, hudStyle)
     }
 
     private var legacyCapsuleCore: some View {
@@ -183,7 +205,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
             capsuleSurface
             capsuleOverlay
 
-            barContent
+            styledBarContent
                 .animation(TF.hudMorph, value: state.barPhase)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay { capsuleBorder }
@@ -200,7 +222,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     style: UserDefaults.standard.bool(forKey: "museGlassClearStyle") ? .clear : .regular,
                     tintColor: nil,
                     content: AnyView(
-                        barContent
+                        styledBarContent
                             .animation(TF.hudMorph, value: state.barPhase)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     )
@@ -239,7 +261,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     tintColor: nativeGlassTintColor,
                     phase: state.barPhase,
                     content: AnyView(
-                        barContent
+                        styledBarContent
                             // 旧玻璃路径有独立宿主，需要把同一帧布局显式传入。
                             .environment(\.hudRecordingLayout, recordingLayout)
                             .animation(TF.hudMorph, value: state.barPhase)
@@ -300,7 +322,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     private var preparingContent: some View {
         HStack(spacing: 0) {
-            PreparingDot()
+            PreparingDot(color: hudStyle == .ink ? InkHUDPalette.accent : TF.recording)
         }
         .frame(maxWidth: .infinity)
     }
@@ -326,10 +348,12 @@ struct FloatingBarView<S: FloatingBarState>: View {
             recordingStartDate: state.recordingStartDate
         ) { activity, time, flow in
             ZStack(alignment: .leading) {
-                RecordingGlassInnerGlow(activity: activity, time: time)
-                    .frame(width: 76, height: 34)
+                if hudStyle == .appleNative {
+                    RecordingGlassInnerGlow(activity: activity, time: time)
+                        .frame(width: 76, height: 34)
+                }
 
-                RecordingDot(time: time, activity: activity, flow: flow)
+                RecordingDot(time: time, activity: activity, flow: flow, style: hudStyle)
                     .frame(width: TF.barHeight, height: TF.barHeight, alignment: .center)
             }
             .frame(width: recordingIconWidth + recordingLeadingInset, height: TF.barHeight, alignment: .leading)
@@ -712,7 +736,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var barTextColor: Color {
-        Color.white.opacity(0.98)
+        hudStyle == .ink ? InkHUDPalette.text : Color.white.opacity(0.98)
     }
 
     // MARK: - Phase Transitions

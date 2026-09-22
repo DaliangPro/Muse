@@ -18,6 +18,7 @@ struct SettingsSidebarView: View {
     @State private var isSettingsControlHovered = false
     @State private var hoveredTab: SettingsTab?
     @State private var settingsPanelFrame = CGRect.zero
+    @State private var showsHUDStylePicker = false
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -53,6 +54,7 @@ struct SettingsSidebarView: View {
         // 侧栏配色对齐使用引导（2026-07-06 大梁老师）：改用 settingsSidebarTint 实色，
         // 与引导侧栏完全一致，取代原毛玻璃方案。
         .background(TF.settingsSidebarTint)
+        .sheet(isPresented: $showsHUDStylePicker) { HUDStylePicker() }
         .settingsDismissOnOutsideClick(
             isActive: isSettingsPanelOpen,
             allowedFrames: [settingsPanelFrame]
@@ -95,7 +97,11 @@ private extension SettingsSidebarView {
                     showDockIcon: $showDockIcon,
                     launchAtLogin: $launchAtLogin,
                     preserveClipboard: $preserveClipboard,
-                    onLaunchAtLoginChanged: onLaunchAtLoginChanged
+                    onLaunchAtLoginChanged: onLaunchAtLoginChanged,
+                    onShowHUDStylePicker: {
+                        closeSettingsPanel(animated: false)
+                        showsHUDStylePicker = true
+                    }
                 )
                     .padding(.horizontal, SettingsSidebarLayout.settingsPanelHorizontalInset)
                     .padding(.top, SettingsSidebarLayout.settingsPanelTopInset)
