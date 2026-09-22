@@ -616,12 +616,19 @@ struct CleanGlassCapsule: NSViewRepresentable {
         glass.tintColor = tintColor
 
         let host = NSHostingView(rootView: content)
+        // HUD 尺寸由外层状态决定，内部图形不能反向撑大玻璃。
+        host.sizingOptions = []
         host.wantsLayer = true
         host.layer?.backgroundColor = NSColor.clear.cgColor
         host.autoresizingMask = [.width, .height]
         glass.contentView = host
         context.coordinator.host = host
         return glass
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSGlassEffectView, context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else { return nil }
+        return CGSize(width: width, height: height)
     }
 
     func updateNSView(_ glass: NSGlassEffectView, context: Context) {

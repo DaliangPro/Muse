@@ -38,7 +38,7 @@ struct AnimatedRecordingIndicatorCluster<Content: View>: View {
     let content: (_ activity: CGFloat, _ time: TimeInterval, _ flow: CGFloat) -> Content
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+        TimelineView(.animation) { timeline in
             let time = max(
                 0,
                 timeline.date.timeIntervalSinceReferenceDate
@@ -69,7 +69,7 @@ struct RecordingDot: View {
             FlowingWaveStripes(time: time, activity: activity, flow: flow)
                 .frame(width: 24.0, height: 14.2)
         }
-        .frame(width: 44, height: 44)
+        .frame(width: TF.barHeight, height: TF.barHeight)
     }
 }
 
