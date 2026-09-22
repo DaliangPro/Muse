@@ -118,16 +118,14 @@ struct RecordingDot: View {
             let rect = CGRect(x: startX + CGFloat(index) * (barWidth + gap), y: (height - barHeight) / 2,
                               width: barWidth, height: barHeight)
             let path = Path(roundedRect: rect, cornerRadius: barWidth / 2)
-            if style == .ink {
-                context.fill(path, with: .color(InkHUDPalette.accent))
-                continue
-            }
             mask.addPath(path)
             let drift = Double(flow) * 0.18 + Double(index) * 0.03
             let distance = abs(CGFloat(index) - flow * 4)
             var bar = context
-            bar.addFilter(.shadow(color: Color(red: 0.18, green: 0.96, blue: 0.84)
-                .opacity(max(0.16, 0.31 - Double(distance) * 0.045)), radius: 3.8))
+            if style == .appleNative {
+                bar.addFilter(.shadow(color: Color(red: 0.18, green: 0.96, blue: 0.84)
+                    .opacity(max(0.16, 0.31 - Double(distance) * 0.045)), radius: 3.8))
+            }
             bar.fill(path, with: .linearGradient(Gradient(colors: [
                 Color(red: 0.12, green: 0.72, blue: 1).opacity(0.90 - drift * 0.20),
                 Color(red: 0.08, green: 0.90, blue: 0.94),
