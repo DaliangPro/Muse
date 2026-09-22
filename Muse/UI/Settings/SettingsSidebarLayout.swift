@@ -12,6 +12,16 @@ enum SettingsSidebarLayout {
     static let navItemTextFont = TF.settingsFontNavigation
     static let navItemSelectedTextFont = TF.settingsFontNavigationSelected
 
+    /// 同一个连续区域接收鼠标位置，行间隙延续上一行，跨行不经过空高亮。
+    static func navigationTab(at location: CGPoint) -> SettingsTab? {
+        let tabs = SettingsTab.allCases
+        let stride = navItemHeight + navItemSpacing
+        let height = CGFloat(tabs.count) * stride - navItemSpacing
+        guard location.x >= 0, location.x < controlWidth,
+              location.y >= 0, location.y < height else { return nil }
+        return tabs[Int(location.y / stride)]
+    }
+
     static let settingsLeadingInset: CGFloat = SettingsLayout.sidebarLeadingInset
     static let settingsBottomInset: CGFloat = 12
     static let settingsControlWidth: CGFloat = SettingsLayout.sidebarControlWidth

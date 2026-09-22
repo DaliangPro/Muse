@@ -27,15 +27,17 @@ struct SettingsSidebarView: View {
                         navItem(tab)
                     }
                 }
-                .padding(.leading, SettingsSidebarLayout.leadingInset)
-                .padding(.top, SettingsSidebarLayout.navTopInset)
-                .onHover { isHovering in
-                    if !isHovering {
-                        withAnimation(.easeOut(duration: 0.10)) {
-                            hoveredTab = nil
-                        }
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let location):
+                        updateHoveredTab(SettingsSidebarLayout.navigationTab(at: location))
+                    case .ended:
+                        updateHoveredTab(nil)
                     }
                 }
+                .padding(.leading, SettingsSidebarLayout.leadingInset)
+                .padding(.top, SettingsSidebarLayout.navTopInset)
                 .zIndex(0)
 
                 Spacer()
@@ -78,8 +80,6 @@ private extension SettingsSidebarView {
             if tab == .about {
                 onSelectAbout()
             }
-        } onHoverActive: {
-            updateHoveredTab(tab)
         }
     }
 
@@ -165,11 +165,10 @@ private extension SettingsSidebarView {
         }
     }
 
-    func updateHoveredTab(_ tab: SettingsTab) {
+    func updateHoveredTab(_ tab: SettingsTab?) {
         guard hoveredTab != tab else { return }
-        withAnimation(.easeOut(duration: 0.10)) {
-            hoveredTab = tab
-        }
+        // 单一位置来源直接更新高亮，避免多个进入/离开动画互相打断。
+        hoveredTab = tab
     }
 
     func updateSettingsControlHover(_ isHovering: Bool) {

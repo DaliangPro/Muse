@@ -11,7 +11,6 @@ struct SettingsSidebarNavItem: View {
     let cornerRadius: CGFloat
     let controlWidth: CGFloat
     let action: () -> Void
-    let onHoverActive: () -> Void
 
     private var foreground: Color {
         if isActive {
@@ -65,14 +64,5 @@ struct SettingsSidebarNavItem: View {
             .contentShape(shape)
         }
         .frame(width: controlWidth, height: SettingsSidebarLayout.navItemHeight, alignment: .leading)
-        .onHover { isHovering in
-            guard isHovering else { return }
-            onHoverActive()
-        }
-        .onContinuousHover { phase in
-            if case .active = phase {
-                onHoverActive()
-            }
-        }
     }
 }
