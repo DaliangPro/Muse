@@ -70,7 +70,7 @@ enum HUDPerformanceProbe {
             running = true
             status = "采样中"
             state.stop()
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: .seconds(1))
             frames = []
             frames.reserveCapacity(3000)
             textSamples = []
@@ -83,11 +83,24 @@ enum HUDPerformanceProbe {
             state.segments = []
             try? await Task.sleep(for: .seconds(1))
             let text = String(repeating: "今天下午三点讨论新版本的发布计划，先检查语音识别，再检查文字输出和窗口动画，最后记录测试结果。", count: 5)
-            for index in 0..<100 {
+            let burstScenario = Bundle.main.object(forInfoDictionaryKey: "HUDProbeScenario") as? String == "burst"
+            if burstScenario {
+                for _ in 0..<6 {
+                    state.segments = []
+                    try? await Task.sleep(for: .milliseconds(500))
+                    for count in [2, 4, 7, 11, 16, 24, 38, 64, 80, 100] {
+                        state.segments = [TranscriptionSegment(text: String(text.prefix(count)), isConfirmed: false)]
+                        try? await Task.sleep(for: .milliseconds(35))
+                    }
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+            } else {
+              for index in 0..<100 {
                 let count = 2 + index * 2 - (index == 65 ? 5 : 0)
                 state.segments = [TranscriptionSegment(text: String(text.prefix(count)), isConfirmed: false)]
                 state.audioLevel.current = Float(0.3 + 0.15 * sin(Double(index) * 0.3))
                 try? await Task.sleep(for: .milliseconds(120))
+              }
             }
             try? await Task.sleep(for: .milliseconds(400))
             sampling = false
@@ -102,6 +115,7 @@ enum HUDPerformanceProbe {
                 $0.0["width"] == $0.1["width"] && abs($0.0["offset"]! - $0.1["offset"]!) > 0.01
             }.count
             let result: [String: Any] = [
+                "scenario": burstScenario ? "burst" : "steady",
                 "indicator_mounts": indicatorMounts,
                 "intermediate_scroll_steps": intermediateSteps,
                 "max_scroll_step_points": stableScroll.map { abs($0.0["offset"]! - $0.1["offset"]!) }.max() ?? 0,

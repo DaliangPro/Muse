@@ -12,33 +12,28 @@ struct StreamingHUDText: View {
         // 与 HUD 字号一致；在正文变化时计算，不在逐帧波形里测量。
         let textWidth = ceil((text as NSString).size(withAttributes: [.font: TF.hudNSFontTitle]).width)
         StreamingHUDTextPresentation(
-            text: text, color: color, textWidth: textWidth, presentedWidth: textWidth,
+            text: text, color: color, textWidth: textWidth,
             leadingFadeWidth: leadingFadeWidth, trailingFadeWidth: trailingFadeWidth
         )
-        .animation(TF.hudWidthFlow, value: textWidth)
         .allowsHitTesting(false)
     }
 }
 
-private struct StreamingHUDTextPresentation: View, Animatable {
+private struct StreamingHUDTextPresentation: View {
+    @Environment(\.hudRecordingLayout) private var layout
     let text: String
     let color: Color
     let textWidth: CGFloat
-    var presentedWidth: CGFloat
     let leadingFadeWidth: CGFloat
     let trailingFadeWidth: CGFloat
 
-    var animatableData: CGFloat {
-        get { presentedWidth }
-        set { presentedWidth = newValue }
-    }
-
     var body: some View {
         GeometryReader { geometry in
-            let viewportWidth = max(0, geometry.size.width)
+            let viewportWidth = layout?.textViewportWidth ?? max(0, geometry.size.width)
+            let presentedWidth = layout?.presentedTextWidth ?? textWidth
             // 尾端预留完整的渐隐区，停下后最后一个字能完全进入清晰区域。
             let tailInset = min(trailingFadeWidth, viewportWidth / 2)
-            let offset = min(0, viewportWidth - tailInset - presentedWidth)
+            let offset = layout?.textOffset ?? min(0, viewportWidth - tailInset - presentedWidth)
             #if HUD_PERFORMANCE_PROBE
             let _ = HUDPerformanceProbe.recordText(width: textWidth, presentedWidth: presentedWidth,
                                                    viewport: viewportWidth, offset: offset)

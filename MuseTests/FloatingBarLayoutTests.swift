@@ -4,6 +4,29 @@ import XCTest
 @testable import Muse
 
 final class FloatingBarLayoutTests: XCTestCase {
+    func testSharedProgressDoesNotScrollBeforeTheShellIsFull() {
+        for width in stride(from: CGFloat(40), through: 3000, by: 7) {
+            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 75, tailInset: 14)
+            XCTAssertGreaterThanOrEqual(layout.capsuleWidth, 40)
+            XCTAssertLessThanOrEqual(layout.capsuleWidth, 528)
+            if layout.capsuleWidth < 528 {
+                XCTAssertEqual(layout.textOffset, 0, accuracy: 0.001,
+                               "外壳未展开到上限时，文字不能先向左滚动")
+            } else {
+                XCTAssertEqual(layout.presentedTextWidth + layout.textOffset,
+                               layout.textViewportWidth - 14, accuracy: 0.001,
+                               "满宽后，文字进度必须与同一帧的右侧留白对齐")
+            }
+        }
+    }
+
+    func testSharedProgressRemainsContinuousAtTheWidthLimit() {
+        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 75, tailInset: 14)
+        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 75, tailInset: 14)
+        XCTAssertEqual(after.capsuleWidth - before.capsuleWidth, 0.1, accuracy: 0.001)
+        XCTAssertEqual(after.textOffset - before.textOffset, -0.1, accuracy: 0.001)
+    }
+
     @MainActor
     func testIncomingEdgeFadesBeforeAndAfterOverflow() throws {
         for overflow in [false, true] {
@@ -157,6 +180,15 @@ final class FloatingBarLayoutTests: XCTestCase {
         XCTAssertEqual(collapsed.bounds.height, sharedHeight, accuracy: 0.5)
         XCTAssertEqual(collapsed.convert(collapsed.bounds, to: host).midY, sharedCenterY, accuracy: 0.5)
         XCTAssertEqual(collapsed.cornerRadius, collapsed.bounds.height / 2, accuracy: 0.5)
+
+        state.segments = [TranscriptionSegment(text: String(repeating: "快速长文本", count: 30), isConfirmed: false)]
+        try await settleLayout(host)
+        XCTAssertEqual(try XCTUnwrap(findGlass(in: host)).bounds.width, TF.barWidth, accuracy: 0.5)
+        state.barPhase = .processing
+        try await settleLayout(host)
+        let processing = try XCTUnwrap(findGlass(in: host))
+        XCTAssertLessThan(processing.bounds.width, TF.barWidth, "进入处理阶段不能沿用未截断的长文本宽度")
+        XCTAssertEqual(processing.bounds.height, 40, accuracy: 0.5)
     }
 
     @MainActor

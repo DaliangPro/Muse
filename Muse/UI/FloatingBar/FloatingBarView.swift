@@ -48,7 +48,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     let state: S
 
-    /// High-water mark: only grows during recording, never shrinks (prevents ASR correction jitter)
+    /// 保留小幅回改时的外壳宽度，并在进入恢复阶段时复用。
     @State private var recordingPeakWidth: CGFloat = TF.barHeight
     @State private var processingStartDate: Date?
     @State private var doneStartDate: Date?
@@ -75,6 +75,15 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
     private var usesSuccessCheckmarkDoneContent: Bool {
         state.feedbackMessage == L("已完成", "Done")
+    }
+    private var recordingMotionTargetWidth: CGFloat {
+        guard !state.segments.isEmpty else { return state.isQwen3OnlyMode ? 124 : TF.barHeight }
+        let needed = measureText(state.transcriptionText) + recordingWidthReserve
+        if needed < recordingPeakWidth, recordingPeakWidth - needed <= 30 {
+            return recordingPeakWidth
+        }
+        // 直接跟随正文，不等 onChange 再触发第二次更新；动画完成前不截到最大条宽。
+        return needed
     }
     private var capsuleWidth: CGFloat {
         switch state.barPhase {
@@ -119,15 +128,9 @@ struct FloatingBarView<S: FloatingBarState>: View {
             let textWidth = measureText(newText)
             let needed = recordingTargetWidth(for: textWidth)
             if needed > recordingPeakWidth {
-                // Widen smoothly while streaming so the shell doesn't "jump" on every ASR update.
-                withAnimation(TF.hudWidthFlow) {
-                    recordingPeakWidth = needed
-                }
+                recordingPeakWidth = needed
             } else if recordingPeakWidth - needed > 30 {
-                // Large correction (hotword etc.): allow shrink
-                withAnimation(TF.hudWidthFlow) {
-                    recordingPeakWidth = needed
-                }
+                recordingPeakWidth = needed
             }
         }
     }
@@ -135,17 +138,23 @@ struct FloatingBarView<S: FloatingBarState>: View {
     // MARK: - Capsule Container
 
     private var capsuleBar: some View {
-        Group {
-            if #available(macOS 26.0, *) {
-                liquidCapsuleCore
-            } else {
-                legacyCapsuleCore
+        HUDRecordingMotion(logicalWidth: recordingMotionTargetWidth,
+                           widthReserve: recordingWidthReserve, tailInset: recordingTextTailPadding) { layout in
+            Group {
+                if #available(macOS 26.0, *) {
+                    liquidCapsuleCore(recordingLayout: layout)
+                } else {
+                    legacyCapsuleCore
+                }
             }
+            .frame(width: state.barPhase == .recording ? layout.capsuleWidth : capsuleWidth,
+                   height: capsuleHeight)
+            .shadow(color: capsuleShadowColor, radius: capsuleShadowRadius, x: 0, y: capsuleShadowYOffset)
+            .animation(TF.hudMorph, value: state.barPhase)
+            .animation(TF.hudWidthFlow, value: state.barPhase == .recording
+                       ? nil : CGSize(width: capsuleWidth, height: capsuleHeight))
         }
-        .frame(width: capsuleWidth, height: capsuleHeight)
-        .shadow(color: capsuleShadowColor, radius: capsuleShadowRadius, x: 0, y: capsuleShadowYOffset)
-        .animation(TF.hudMorph, value: state.barPhase)
-        .animation(TF.hudWidthFlow, value: CGSize(width: capsuleWidth, height: capsuleHeight))
+        .animation(TF.hudWidthFlow, value: recordingMotionTargetWidth)
     }
 
     private var capsuleShadowColor: Color {
@@ -176,14 +185,14 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
             barContent
                 .animation(TF.hudMorph, value: state.barPhase)
-                .frame(width: capsuleWidth, height: capsuleHeight)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay { capsuleBorder }
                 .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
         }
     }
 
     @available(macOS 26.0, *)
-    private var liquidCapsuleCore: some View {
+    private func liquidCapsuleCore(recordingLayout: HUDRecordingLayout) -> some View {
         return Group {
             if nativeGlassVariant == .minimalRegular {
                 CleanGlassCapsule(
@@ -231,6 +240,8 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     phase: state.barPhase,
                     content: AnyView(
                         barContent
+                            // 旧玻璃路径有独立宿主，需要把同一帧布局显式传入。
+                            .environment(\.hudRecordingLayout, recordingLayout)
                             .animation(TF.hudMorph, value: state.barPhase)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
