@@ -6,7 +6,7 @@ import XCTest
 final class FloatingBarLayoutTests: XCTestCase {
     func testSharedProgressDoesNotScrollBeforeTheShellIsFull() {
         for width in stride(from: CGFloat(40), through: 3000, by: 7) {
-            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 75, tailInset: 14)
+            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 65, tailInset: 14)
             XCTAssertGreaterThanOrEqual(layout.capsuleWidth, 40)
             XCTAssertLessThanOrEqual(layout.capsuleWidth, 528)
             if layout.capsuleWidth < 528 {
@@ -21,8 +21,8 @@ final class FloatingBarLayoutTests: XCTestCase {
     }
 
     func testSharedProgressRemainsContinuousAtTheWidthLimit() {
-        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 75, tailInset: 14)
-        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 75, tailInset: 14)
+        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 65, tailInset: 14)
+        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 65, tailInset: 14)
         XCTAssertEqual(after.capsuleWidth - before.capsuleWidth, 0.1, accuracy: 0.001)
         XCTAssertEqual(after.textOffset - before.textOffset, -0.1, accuracy: 0.001)
     }

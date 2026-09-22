@@ -40,7 +40,6 @@ enum InkHUDPalette {
     static let surface = Color(red: 0.11, green: 0.115, blue: 0.125)
     static let border = Color(red: 0.28, green: 0.285, blue: 0.30)
     static let text = Color(red: 0.96, green: 0.95, blue: 0.92)
-    static let accent = Color(red: 0.89, green: 0.71, blue: 0.44)
 }
 
 /// 实心底与细描边；内部区域始终完全不透明。

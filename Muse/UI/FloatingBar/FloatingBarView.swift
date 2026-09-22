@@ -57,12 +57,11 @@ struct FloatingBarView<S: FloatingBarState>: View {
     @State private var processingStartDate: Date?
     @State private var doneStartDate: Date?
 
-    private var recordingLeadingInset: CGFloat { 3.0 }
+    /// 按确认稿的圆角、波形光晕和字形轮廓校准；与40pt波形容器独立布局。
+    private var recordingTextLeadingInset: CGFloat { 37.0 }
     private var recordingTrailingInset: CGFloat { 14.0 }
     private var recordingIconWidth: CGFloat { 40.0 }
-    private var recordingIconTextGap: CGFloat {
-        AppLaunchDebug.hudDemoSpacingTight ? 3.0 : 4.0
-    }
+    private var recordingLabelWidth: CGFloat { 114.0 }
     private var recordingTextTailPadding: CGFloat { 14.0 }
     private var recordingTrimFadeWidth: CGFloat { 4.0 }
     private var capsuleHeight: CGFloat {
@@ -72,7 +71,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
         state.barPhase == .copyFallback ? 20 : capsuleHeight / 2
     }
     private var recordingWidthReserve: CGFloat {
-        recordingLeadingInset + recordingIconWidth + recordingIconTextGap + recordingTrailingInset + recordingTextTailPadding
+        recordingTextLeadingInset + recordingTrailingInset + recordingTextTailPadding
     }
     private var isRecordingLabelOnlyState: Bool {
         state.segments.isEmpty && state.isQwen3OnlyMode
@@ -81,7 +80,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
         state.feedbackMessage == L("已完成", "Done")
     }
     private var recordingMotionTargetWidth: CGFloat {
-        guard !state.segments.isEmpty else { return state.isQwen3OnlyMode ? 124 : TF.barHeight }
+        guard !state.segments.isEmpty else { return state.isQwen3OnlyMode ? recordingLabelWidth : TF.barHeight }
         let needed = measureText(state.transcriptionText) + recordingWidthReserve
         if needed < recordingPeakWidth, recordingPeakWidth - needed <= 30 {
             return recordingPeakWidth
@@ -95,7 +94,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
             return TF.barHeight
         case .recording:
             if state.segments.isEmpty {
-                return state.isQwen3OnlyMode ? 124 : TF.barHeight
+                return state.isQwen3OnlyMode ? recordingLabelWidth : TF.barHeight
             }
             return recordingPeakWidth
         case .processing:
@@ -322,7 +321,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     private var preparingContent: some View {
         HStack(spacing: 0) {
-            PreparingDot(color: hudStyle == .ink ? InkHUDPalette.accent : TF.recording)
+            PreparingDot(color: TF.recording)
         }
         .frame(maxWidth: .infinity)
     }
@@ -334,10 +333,10 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 recordingAnimatedWaveZone
 
                 recordingTextZone
-                    .frame(width: max(0, geometry.size.width - recordingIconWidth
-                                      - recordingLeadingInset - recordingTrailingInset),
+                    .frame(width: max(0, geometry.size.width - recordingTextLeadingInset
+                                      - recordingTrailingInset),
                            height: TF.barHeight, alignment: .leading)
-                    .offset(x: recordingIconWidth + recordingLeadingInset)
+                    .offset(x: recordingTextLeadingInset)
             }
         }
     }
@@ -356,7 +355,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 RecordingDot(time: time, activity: activity, flow: flow, style: hudStyle)
                     .frame(width: TF.barHeight, height: TF.barHeight, alignment: .center)
             }
-            .frame(width: recordingIconWidth + recordingLeadingInset, height: TF.barHeight, alignment: .leading)
+            .frame(width: recordingIconWidth, height: TF.barHeight, alignment: .leading)
         }
     }
 
@@ -366,7 +365,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
             Text(L("录音中", "Recording"))
                 .font(TF.hudFontTitle)
                 .floatingBarReadableText(color: barTextColor)
-                .padding(.leading, recordingIconTextGap)
         } else {
             StreamingHUDText(
                 text: state.transcriptionText,
@@ -374,7 +372,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 leadingFadeWidth: recordingTrimFadeWidth,
                 trailingFadeWidth: recordingTextTailPadding
             )
-            .padding(.leading, recordingIconTextGap)
         }
     }
 
