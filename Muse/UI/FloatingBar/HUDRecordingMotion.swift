@@ -14,17 +14,6 @@ struct HUDRecordingLayout {
     }
 }
 
-private struct HUDRecordingLayoutKey: EnvironmentKey {
-    static let defaultValue: HUDRecordingLayout? = nil
-}
-
-extension EnvironmentValues {
-    var hudRecordingLayout: HUDRecordingLayout? {
-        get { self[HUDRecordingLayoutKey.self] }
-        set { self[HUDRecordingLayoutKey.self] = newValue }
-    }
-}
-
 struct HUDRecordingMotion<Content: View>: View, Animatable {
     var logicalWidth: CGFloat
     let widthReserve: CGFloat
@@ -39,7 +28,6 @@ struct HUDRecordingMotion<Content: View>: View, Animatable {
     var body: some View {
         let layout = HUDRecordingLayout(logicalWidth: logicalWidth, widthReserve: widthReserve, tailInset: tailInset)
         content(layout)
-            .environment(\.hudRecordingLayout, layout)
             // 外壳、遮罩、文字使用同一帧的值，不再对各个子视图重复插值。
             .transaction { $0.animation = nil }
     }

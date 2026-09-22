@@ -6,7 +6,7 @@ import XCTest
 final class FloatingBarLayoutTests: XCTestCase {
     func testSharedProgressDoesNotScrollBeforeTheShellIsFull() {
         for width in stride(from: CGFloat(40), through: 3000, by: 7) {
-            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 49, tailInset: 12)
+            let layout = HUDRecordingLayout(logicalWidth: width, widthReserve: 53, tailInset: 12)
             XCTAssertGreaterThanOrEqual(layout.capsuleWidth, 40)
             XCTAssertLessThanOrEqual(layout.capsuleWidth, 528)
             if layout.capsuleWidth < 528 {
@@ -21,8 +21,8 @@ final class FloatingBarLayoutTests: XCTestCase {
     }
 
     func testSharedProgressRemainsContinuousAtTheWidthLimit() {
-        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 49, tailInset: 12)
-        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 49, tailInset: 12)
+        let before = HUDRecordingLayout(logicalWidth: 527.9, widthReserve: 53, tailInset: 12)
+        let after = HUDRecordingLayout(logicalWidth: 528.1, widthReserve: 53, tailInset: 12)
         XCTAssertEqual(after.capsuleWidth - before.capsuleWidth, 0.1, accuracy: 0.001)
         XCTAssertEqual(after.textOffset - before.textOffset, -0.1, accuracy: 0.001)
     }
@@ -33,7 +33,7 @@ final class FloatingBarLayoutTests: XCTestCase {
             let view = Color.red
                 .frame(width: 100, height: 40)
                 .mask(HUDTextEdgeMask(leadingFadeWidth: 4, trailingFadeWidth: 12,
-                                      hasLeadingOverflow: overflow))
+                                      hasLeadingOverflow: overflow, viewportWidth: 100))
             let pixels = try renderPixels(view, width: 100, height: 40)
             let alpha = { (x: Int) in pixels[(20 * 100 + x) * 4 + 3] }
             XCTAssertGreaterThan(alpha(70), 250)
@@ -68,6 +68,36 @@ final class FloatingBarLayoutTests: XCTestCase {
                 }
                 XCTAssertGreaterThan(inside, 5, "视窗内应保留可见文字")
                 XCTAssertEqual(outside, 0, "文字及其阴影不可越过视窗")
+            }
+        }
+    }
+
+    @MainActor
+    func testBurstTextUsesTheCurrentShellFrameForClippingAndFade() throws {
+        // 新正文可以一次到达很长；显示范围必须仍停在本帧外壳内。
+        let burst = String(repeating: "快速输入ABC，", count: 20)
+        for progress in [CGFloat(40), 66, 90, 164, 320, 527.5, 528, 690, 1200] {
+            let layout = HUDRecordingLayout(logicalWidth: progress, widthReserve: 53, tailInset: 12)
+            let view = StreamingHUDText(text: burst, color: .red, leadingFadeWidth: 4,
+                                        trailingFadeWidth: 12, recordingLayout: layout)
+                .frame(width: layout.textViewportWidth, height: 40, alignment: .leading)
+                .offset(x: 37)
+                .frame(width: 600, height: 80, alignment: .leading)
+            let pixels = try renderPixels(view, width: 600, height: 80)
+            var inside = 0
+            var outside = 0
+            for y in 0..<80 {
+                for x in 0..<600 where isRed(pixels, x: x, y: y, width: 600) {
+                    if x >= 37 && CGFloat(x) < layout.capsuleWidth - 4 && (20..<60).contains(y) {
+                        inside += 1
+                    } else {
+                        outside += 1
+                    }
+                }
+            }
+            XCTAssertEqual(outside, 0, "快速出字不可超过本帧外壳及4pt外侧安全留白：\(progress)")
+            if layout.textViewportWidth > 20 {
+                XCTAssertGreaterThan(inside, 5, "确保每一段展开及满宽滚动都实际绘制了文字")
             }
         }
     }

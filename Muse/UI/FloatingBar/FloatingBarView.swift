@@ -59,8 +59,8 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     /// 按确认稿的圆角、波形光晕和字形轮廓校准；与40pt波形容器独立布局。
     private var recordingTextLeadingInset: CGFloat { 37.0 }
-    // 尾部渐隐区同时承担右侧留白，避免完整尾字之后再叠加一层空白。
-    private var recordingTrailingInset: CGFloat { 0.0 }
+    // 尾字后保留12pt渐隐与4pt外侧空白，按可见字形校准右侧留白。
+    private var recordingTrailingInset: CGFloat { 4.0 }
     private var recordingIconWidth: CGFloat { 40.0 }
     private var recordingLabelWidth: CGFloat {
         max(TF.barHeight, measureText(L("录音中", "Recording")) + recordingWidthReserve)
@@ -148,15 +148,16 @@ struct FloatingBarView<S: FloatingBarState>: View {
                            widthReserve: recordingWidthReserve, tailInset: recordingTextTailPadding) { layout in
             Group {
                 if hudStyle == .ink {
-                    inkCapsuleCore
+                    inkCapsuleCore(recordingLayout: layout)
                 } else if #available(macOS 26.0, *) {
                     liquidCapsuleCore(recordingLayout: layout)
                 } else {
-                    legacyCapsuleCore
+                    legacyCapsuleCore(recordingLayout: layout)
                 }
             }
             .frame(width: state.barPhase == .recording ? layout.capsuleWidth : capsuleWidth,
                    height: capsuleHeight)
+            .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
             .shadow(color: capsuleShadowColor, radius: capsuleShadowRadius, x: 0, y: capsuleShadowYOffset)
             .animation(TF.hudMorph, value: state.barPhase)
             .animation(TF.hudWidthFlow, value: state.barPhase == .recording
@@ -189,25 +190,25 @@ struct FloatingBarView<S: FloatingBarState>: View {
         return 4
     }
 
-    private var inkCapsuleCore: some View {
+    private func inkCapsuleCore(recordingLayout: HUDRecordingLayout) -> some View {
         ZStack {
             InkHUDSurface(cornerRadius: capsuleCornerRadius)
-            styledBarContent
+            styledBarContent(recordingLayout: recordingLayout)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
     }
 
-    private var styledBarContent: some View {
-        barContent.environment(\.hudStyle, hudStyle)
+    private func styledBarContent(recordingLayout: HUDRecordingLayout) -> some View {
+        barContent(recordingLayout: recordingLayout).environment(\.hudStyle, hudStyle)
     }
 
-    private var legacyCapsuleCore: some View {
+    private func legacyCapsuleCore(recordingLayout: HUDRecordingLayout) -> some View {
         ZStack {
             capsuleSurface
             capsuleOverlay
 
-            styledBarContent
+            styledBarContent(recordingLayout: recordingLayout)
                 .animation(TF.hudMorph, value: state.barPhase)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay { capsuleBorder }
@@ -224,7 +225,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     style: UserDefaults.standard.bool(forKey: "museGlassClearStyle") ? .clear : .regular,
                     tintColor: nil,
                     content: AnyView(
-                        styledBarContent
+                        styledBarContent(recordingLayout: recordingLayout)
                             .animation(TF.hudMorph, value: state.barPhase)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     )
@@ -263,9 +264,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     tintColor: nativeGlassTintColor,
                     phase: state.barPhase,
                     content: AnyView(
-                        styledBarContent
-                            // 旧玻璃路径有独立宿主，需要把同一帧布局显式传入。
-                            .environment(\.hudRecordingLayout, recordingLayout)
+                        styledBarContent(recordingLayout: recordingLayout)
                             .animation(TF.hudMorph, value: state.barPhase)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
@@ -279,7 +278,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     // MARK: - Content by Phase
 
     @ViewBuilder
-    private var barContent: some View {
+    private func barContent(recordingLayout: HUDRecordingLayout) -> some View {
         switch state.barPhase {
         case .preparing:
             preparingContent
@@ -288,7 +287,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     removal: .opacity
                 ))
         case .recording:
-            recordingContent
+            recordingContent(layout: recordingLayout)
                 .transition(.asymmetric(
                     insertion: .offset(x: 6).combined(with: .opacity),
                     removal: .offset(x: -4).combined(with: .opacity)
@@ -329,19 +328,16 @@ struct FloatingBarView<S: FloatingBarState>: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var recordingContent: some View {
-        GeometryReader { geometry in
-            // 圆形与展开阶段共用同一个波形，始终贴着当前外壳左侧移动。
-            ZStack(alignment: .leading) {
-                recordingAnimatedWaveZone
-
-                recordingTextZone
-                    .frame(width: max(0, geometry.size.width - recordingTextLeadingInset
-                                      - recordingTrailingInset),
-                           height: TF.barHeight, alignment: .leading)
-                    .offset(x: recordingTextLeadingInset)
-            }
+    private func recordingContent(layout: HUDRecordingLayout) -> some View {
+        // 外壳、文字视窗与渐隐直接消费同一动画帧，不再通过几何回调另取尺寸。
+        ZStack(alignment: .leading) {
+            recordingAnimatedWaveZone
+            recordingTextZone(layout: layout)
+                .frame(width: layout.textViewportWidth, height: TF.barHeight, alignment: .leading)
+                .offset(x: recordingTextLeadingInset)
         }
+        .frame(width: layout.capsuleWidth, height: TF.barHeight, alignment: .leading)
+        .clipped()
     }
 
     private var recordingAnimatedWaveZone: some View {
@@ -363,7 +359,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     @ViewBuilder
-    private var recordingTextZone: some View {
+    private func recordingTextZone(layout: HUDRecordingLayout) -> some View {
         if isRecordingLabelOnlyState {
             Text(L("录音中", "Recording"))
                 .font(TF.hudFontTitle)
@@ -373,7 +369,8 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 text: state.transcriptionText,
                 color: barTextColor,
                 leadingFadeWidth: recordingTrimFadeWidth,
-                trailingFadeWidth: recordingTextTailPadding
+                trailingFadeWidth: recordingTextTailPadding,
+                recordingLayout: layout
             )
         }
     }
