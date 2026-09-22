@@ -49,7 +49,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     let state: S
 
     /// High-water mark: only grows during recording, never shrinks (prevents ASR correction jitter)
-    @State private var recordingPeakWidth: CGFloat = TF.barInitialDiameter
+    @State private var recordingPeakWidth: CGFloat = TF.barHeight
     @State private var processingStartDate: Date?
     @State private var doneStartDate: Date?
 
@@ -62,12 +62,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private var recordingTextTailPadding: CGFloat { 8.0 }
     private var recordingTrimFadeWidth: CGFloat { 4.0 }
     private var capsuleHeight: CGFloat {
-        if state.barPhase == .copyFallback { return TF.barFallbackHeight }
-        if state.barPhase == .preparing
-            || (state.barPhase == .recording && isRecordingInitialCircleState) {
-            return TF.barInitialDiameter
-        }
-        return TF.barHeight
+        state.barPhase == .copyFallback ? TF.barFallbackHeight : TF.barHeight
     }
     private var capsuleCornerRadius: CGFloat {
         state.barPhase == .copyFallback ? 20 : capsuleHeight / 2
@@ -91,10 +86,10 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private var capsuleWidth: CGFloat {
         switch state.barPhase {
         case .preparing:
-            return TF.barInitialDiameter
+            return TF.barHeight
         case .recording:
             if state.segments.isEmpty {
-                return state.isQwen3OnlyMode ? 124 : TF.barInitialDiameter
+                return state.isQwen3OnlyMode ? 124 : TF.barHeight
             }
             return recordingPeakWidth
         case .processing:
@@ -157,7 +152,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
         .frame(width: capsuleWidth, height: capsuleHeight)
         .shadow(color: capsuleShadowColor, radius: capsuleShadowRadius, x: 0, y: capsuleShadowYOffset)
         .animation(TF.hudMorph, value: state.barPhase)
-        // 圆形展开时宽高共用一个弹簧，避免两个不同步的变形过程。
         .animation(TF.hudWidthFlow, value: CGSize(width: capsuleWidth, height: capsuleHeight))
     }
 
@@ -778,11 +772,11 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private func handlePhaseChange(_ phase: FloatingBarPhase) {
         switch phase {
         case .preparing:
-            recordingPeakWidth = TF.barInitialDiameter
+            recordingPeakWidth = TF.barHeight
             processingStartDate = nil
             doneStartDate = nil
         case .recording:
-            recordingPeakWidth = TF.barInitialDiameter
+            recordingPeakWidth = TF.barHeight
         case .processing:
             processingStartDate = Date()
             doneStartDate = nil

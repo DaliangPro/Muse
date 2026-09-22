@@ -36,7 +36,7 @@ final class FloatingBarLayoutTests: XCTestCase {
     }
 
     @MainActor
-    func testRecordingCircleRemainsRoundBeforeAndAfterTextExpansion() async throws {
+    func testCircleAndExpandedBarKeepTheSameHeightAndCenterLine() async throws {
         guard #available(macOS 26.0, *) else {
             throw XCTSkip("原生玻璃需要 macOS 26")
         }
@@ -47,7 +47,7 @@ final class FloatingBarLayoutTests: XCTestCase {
         defer { defaults.setVolatileDomain(previousRegistration, forName: UserDefaults.registrationDomain) }
 
         let state = DemoState()
-        state.barPhase = .recording
+        state.barPhase = .preparing
         let host = NSHostingView(rootView: FloatingBarView(state: state)
             .transaction { $0.disablesAnimations = true })
         let window = NSWindow(
@@ -58,23 +58,38 @@ final class FloatingBarLayoutTests: XCTestCase {
         host.frame = NSRect(x: 0, y: 0, width: 600, height: 180)
 
         try await settleLayout(host)
+        let preparing = try XCTUnwrap(findGlass(in: host))
+        XCTAssertEqual(preparing.bounds.width, 40, accuracy: 0.5)
+        XCTAssertEqual(preparing.bounds.height, preparing.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(preparing.cornerRadius, 20, accuracy: 0.5)
+        let sharedHeight = preparing.bounds.height
+        let sharedCenterY = preparing.convert(preparing.bounds, to: host).midY
+
+        state.barPhase = .recording
+        try await settleLayout(host)
         let initial = try XCTUnwrap(findGlass(in: host))
-        XCTAssertEqual(initial.bounds.width, 48, accuracy: 0.5)
+        XCTAssertEqual(initial.bounds.width, 40, accuracy: 0.5)
         XCTAssertEqual(initial.bounds.height, initial.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(initial.bounds.height, sharedHeight, accuracy: 0.5)
+        XCTAssertEqual(initial.convert(initial.bounds, to: host).midY, sharedCenterY, accuracy: 0.5)
         XCTAssertEqual(initial.cornerRadius, initial.bounds.height / 2, accuracy: 0.5)
 
         state.segments = [TranscriptionSegment(text: "今天下午三点讨论新版本", isConfirmed: false)]
         try await settleLayout(host)
         let expanded = try XCTUnwrap(findGlass(in: host))
         XCTAssertEqual(expanded.bounds.height, 40, accuracy: 0.5)
+        XCTAssertEqual(expanded.bounds.height, sharedHeight, accuracy: 0.5)
+        XCTAssertEqual(expanded.convert(expanded.bounds, to: host).midY, sharedCenterY, accuracy: 0.5)
         XCTAssertGreaterThan(expanded.bounds.width, expanded.bounds.height)
         XCTAssertEqual(expanded.cornerRadius, expanded.bounds.height / 2, accuracy: 0.5)
 
         state.segments = []
         try await settleLayout(host)
         let collapsed = try XCTUnwrap(findGlass(in: host))
-        XCTAssertEqual(collapsed.bounds.width, 48, accuracy: 0.5)
+        XCTAssertEqual(collapsed.bounds.width, 40, accuracy: 0.5)
         XCTAssertEqual(collapsed.bounds.height, collapsed.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(collapsed.bounds.height, sharedHeight, accuracy: 0.5)
+        XCTAssertEqual(collapsed.convert(collapsed.bounds, to: host).midY, sharedCenterY, accuracy: 0.5)
         XCTAssertEqual(collapsed.cornerRadius, collapsed.bounds.height / 2, accuracy: 0.5)
     }
 
