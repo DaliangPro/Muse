@@ -418,7 +418,7 @@ enum TF {
     // MARK: Floating Bar
 
     static let barWidth: CGFloat = 528
-    static let barHeight: CGFloat = 48
+    static let barHeight: CGFloat = 40
     static let barFallbackWidth: CGFloat = 432
     static let barFallbackMinWidth: CGFloat = 320
     static let barFallbackHeight: CGFloat = 132
