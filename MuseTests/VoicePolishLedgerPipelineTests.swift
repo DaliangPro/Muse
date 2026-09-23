@@ -1,0 +1,3930 @@
+import XCTest
+@testable import Muse
+
+final class VoicePolishLedgerPipelineTests: XCTestCase {
+    private let config = LLMConfig(
+        apiKey: "test",
+        model: "mock-model",
+        baseURL: "https://example.com/v1"
+    )
+
+    private func productionLedgerPipeline(
+        _ client: any LLMClient,
+        config: LLMConfig? = nil
+    ) -> VoicePolishPipeline {
+        VoicePolishPipeline(
+            client: client,
+            config: config ?? self.config,
+            ledgerMinimumCharacterCount: 0
+        )
+    }
+
+    func testDailyLongTextUsesPlannerWriterAndColdReviewer() async throws {
+        let source = dailySource("本周课程交接")
+        let request = makeRequest(source)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let draft = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).map {
+            VoicePolishLedgerDraftFragment(
+                id: "f_\($0.0.id)",
+                unitIds: [$0.0.id],
+                text: $0.1.text.replacingOccurrences(
+                    of: "，清理口述重复后再形成自然段",
+                    with: "，并整理为自然表达"
+                )
+            )
+        })
+        let finalText = draft.fragments.map(\.text).joined(separator: "\n\n")
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan),
+            try encoded(draft),
+            try encoded(measurementReview(units: Array(plan.units.suffix(4)), spans: spans)),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.executedRoute, .deep)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        let requests = await client.requests()
+        XCTAssertEqual(
+            requests.map(\.task),
+            [.voicePolishAnalyze, .voicePolishRender, .voicePolishAnalyze]
+        )
+        XCTAssertEqual(requests[0].options.responseFormat, .jsonObject)
+        XCTAssertEqual(requests[1].options.responseFormat, .jsonObject)
+        XCTAssertTrue(requests.allSatisfy { $0.options.reasoningPolicy == .disabled })
+    }
+
+    func test多个意图单元可以连续成段且继续逐项核对() async throws {
+        let request = makeRequest("明天把初稿给我。数字不能漏核对。后天再讨论发布。", scene: .document)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let document = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).enumerated().map { index, pair in
+            VoicePolishLedgerDraftFragment(
+                id: "f_\(pair.0.id)", unitIds: [pair.0.id], text: pair.1.text,
+                paragraphBreakBefore: index != 1
+            )
+        })
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document), try encoded(passReview())])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "明天把初稿给我。数字不能漏核对。\n\n后天再讨论发布。")
+        XCTAssertEqual(result.llmAttemptCount, 3)
+    }
+
+    func test连续改口的半点时间可通过且旧整点不再算作残留() async throws {
+        let source = "会议改到周三上午十点不对周四上午十点哎十点半才对地点还是三号会议室"
+        let finalText = "会议改到周四上午十点半，地点还是三号会议室。"
+        let request = makeRequest(source, scene: .workChat)
+        let ids = evidenceSpanIDs(for: request)
+        var plan = ledger(unit: VoicePolishLedgerUnit(
+            id: "u1", kind: "action", deliveryRole: "recipient_content", finalMeaning: finalText,
+            sourceSpanIds: ids, status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        ))
+        plan.corrections = [
+            .init(subject: "会议", oldValue: "周三上午十点", finalValue: "周四上午十点", oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only"),
+            .init(subject: "会议", oldValue: "周四上午十点", finalValue: "十点半", oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only"),
+        ]
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(finalText)), try encoded(passReview(checkIDs: ["measurement_u1", "correction_1", "correction_2"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)))])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes) \(String(describing: result.plannerValidationTrace))")
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        for wrong in ["会议改到周四上午十点，地点还是三号会议室。", "会议改到周三上午十点半，地点还是三号会议室。"] {
+            let rejectedClient = LedgerScriptedLLM(responses: [
+                try encoded(plan), try encoded(draft(wrong)), try encoded(passReview(checkIDs: ["measurement_u1", "correction_1", "correction_2"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))),
+                try encoded(draft(wrong)), try encoded(passReview(checkIDs: ["measurement_u1", "correction_1", "correction_2"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))),
+            ])
+            let rejected = await productionLedgerPipeline(rejectedClient).process(request)
+            XCTAssertTrue(rejected.usedFallback, "冷复核即使误放行，时钟事实仍须阻断：\(wrong)")
+        }
+    }
+
+    func test金额年份与引用的安全格式化不触发误拦() throws {
+        let acceptedPairs = [
+            ("报名费为二百六十元。", "报名费为260元。"),
+            ("调研一下二零二六年主流工具。", "调研2026年主流工具。"),
+            ("不要因为内容长就把这一块概括掉。", "保留这一部分的全部内容。"),
+            ("连续说两遍真的很难要保留。", "连续说两遍“真的很难”要保留。"),
+        ]
+        for (source, finalMeaning) in acceptedPairs {
+            let request = makeRequest(source)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let plan = ledger(unit: .init(id: "u1", kind: "claim", deliveryRole: "recipient_content", finalMeaning: finalMeaning,
+                sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+            XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+                verifiedMappings: [], requiredLogicCues: [], scene: .document), source)
+        }
+    }
+
+    func test新金额是旧金额字面前缀时仍必须替换旧值() throws {
+        let request = makeRequest("预算先按一万六千八准备，我改一下最终预算是一万六。", scene: .document)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let ids = spans.map(\.id)
+        var plan = ledger(unit: .init(id: "u1", kind: "action", deliveryRole: "recipient_content",
+            finalMeaning: "预算按一万六千八准备。", sourceSpanIds: ids,
+            status: "replace", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        plan.corrections = [.init(subject: "预算", oldValue: "一万六千八", finalValue: "一万六", oldSpanIds: ids,
+            finalSpanIds: ids, renderingPolicy: "final_only")]
+        XCTAssertThrowsError(try validated(plan, for: request))
+        plan.units[0].finalMeaning = "预算按一万六准备。"
+        let result = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .document)
+        XCTAssertEqual(result.units[0].finalMeaning, "预算按一万六准备。")
+    }
+
+    func test非逐字的半点改口不能借其他日期补全() throws {
+        let source = "会议改到周三上午十点不对周四上午十点哎十点半才对地点还是三号会议室"
+        let request = makeRequest(source, scene: .workChat)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let ids = spans.map(\.id)
+        var plan = ledger(unit: .init(id: "u1", kind: "action", deliveryRole: "recipient_content",
+            finalMeaning: "会议改到周四上午十点半，地点还是三号会议室。", sourceSpanIds: ids,
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        plan.corrections = [.init(subject: "会议", oldValue: "周三上午十点", finalValue: "周四上午十点半",
+            oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only")]
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .workChat))
+        plan.corrections = [.init(subject: "会议", oldValue: "周三上午十点", finalValue: "周五上午十点半",
+            oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only")]
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .workChat))
+        let changedSource = "会议改到周三上午十点不对周四上午十点不对周五上午十点哎十点半才对"
+        let changedSpans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: makeRequest(changedSource))
+        plan.units[0].finalMeaning = "会议改到周四上午十点半。"
+        plan.corrections = [.init(subject: "会议", oldValue: "周三上午十点", finalValue: "周四上午十点半",
+            oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only")]
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: changedSpans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .workChat), "不能越过更晚出现的日期承接半点时间")
+    }
+
+    func test减少误拦不能放行金额状态反转跨对象更正或借用其他事项日期() throws {
+        let pairs = [
+            ("未到账100元。", "到账100元。", "", "", ""),
+            ("昨天公告预算100元，今天退款50元。", "昨天公告预算100元，今天更正为50元。", "预算", "100元", "50元"),
+            ("会议原定周三上午十点，培训安排周四上午十点，会议时间改成十点半，日期不变。",
+             "会议改到周四上午十点半，培训仍在周四上午十点。", "会议", "周三上午十点", "周四上午十点半"),
+        ]
+        for (source, finalText, subject, oldValue, finalValue) in pairs {
+            let request = makeRequest(source)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let ids = spans.map(\.id)
+            var plan = ledger(finalMeaning: finalText, spanIDs: ids)
+            if !subject.isEmpty {
+                plan.corrections = [.init(subject: subject, oldValue: oldValue, finalValue: finalValue,
+                    oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: subject == "预算" ? "announce_change" : "final_only")]
+            }
+            if subject == "会议" {
+                XCTAssertThrowsError(try validated(plan, for: request))
+            } else {
+                assertSemanticRejectionIsRequired(plan, spans: spans)
+            }
+        }
+    }
+
+    func test金额中的额不是口头填充词() async throws {
+        let source = (1...8).map { "第\($0)部分的预算金额和核对进度都要如实记录，不能擅自新增人物或承诺。" }.joined()
+        let request = makeRequest(source)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let document = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).map {
+            .init(id: "f_\($0.0.id)", unitIds: [$0.0.id], text: $0.1.text)
+        })
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document), try encoded(passReview())])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+    }
+
+    func test更正通知保留旧价新价退款并拒绝错误退款额() async throws {
+        let source = "更正通知：报名费二百六十元写错了，更正为二百一十元；按旧价交费的退五十元。"
+        let finalText = "更正通知：报名费原写为260元，正确为210元。已按旧价交费的，会退50元。"
+        let request = makeRequest(source, scene: .workChat)
+        let ids = evidenceSpanIDs(for: request)
+        var plan = ledger(unit: .init(id: "u1", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: source, sourceSpanIds: ids,
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        plan.corrections = [.init(subject: "报名费", oldValue: "二百六十元", finalValue: "二百一十元",
+            oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "announce_change")]
+        _ = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan,
+            spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request),
+            verifiedMappings: [], requiredLogicCues: [], scene: .workChat)
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(finalText)), try encoded(passReview(checkIDs: ["measurement_u1", "correction_1"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)))])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback, "\(result.validationCodes) \(String(describing: result.plannerValidationTrace))")
+        XCTAssertEqual(result.text, finalText)
+        let wrong = finalText.replacingOccurrences(of: "退50元", with: "退60元")
+        let rejectedClient = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(wrong)),
+            try encoded(passReview(checkIDs: ["measurement_u1", "correction_1"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))), try encoded(draft(wrong)), try encoded(passReview(checkIDs: ["measurement_u1", "correction_1"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)))])
+        let rejected = await productionLedgerPipeline(rejectedClient).process(request)
+        XCTAssertTrue(rejected.usedFallback)
+    }
+
+    func test仅过滤已排除的编辑片段且继续拒绝未知重复和缺失正文() async throws {
+        let request = makeRequest("帮我写一封邮件。会议最终安排在周四上午。", scene: .email)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(spans: spans)
+        plan.units[0].deliveryRole = "editor_directive"
+        plan.units[0].status = "remove"
+        plan.units[0].surfaceTokens = [spans[0].text]
+        plan.structure = .init(kind: "paragraphs", orderedUnitIds: ["u2"])
+        let editor = VoicePolishLedgerDraftFragment(id: "f_u1", unitIds: ["u1"], text: spans[0].text)
+        let body = VoicePolishLedgerDraftFragment(id: "f_u2", unitIds: ["u2"], text: spans[1].text)
+        let document = VoicePolishLedgerDraftDocument(fragments: [editor, body])
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document),
+            try encoded(passReview(checkIDs: ["source_role_u1"], spans: [spans[0]]))])
+        let result = await productionLedgerPipeline(client).process(request)
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, spans[1].text)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+
+        let unknown = VoicePolishLedgerDraftFragment(id: "f_unknown", unitIds: ["unknown"], text: "额外正文。")
+        for fragments in [[body, unknown], [body, body], [editor]] {
+            let invalid = try encoded(VoicePolishLedgerDraftDocument(fragments: fragments))
+            let rejectedClient = LedgerScriptedLLM(responses: [try encoded(plan), invalid, invalid])
+            let rejected = await productionLedgerPipeline(rejectedClient).process(request)
+            XCTAssertTrue(rejected.usedFallback)
+        }
+    }
+
+    func testRecipientSurfaceTokensAreLocallyIgnoredInsteadOfTriggeringPlanRepair() async throws {
+        let source = "明天开会，请团队准时参加，不要迟到。"
+        let finalText = source
+        let request = makeRequest(source, scene: .workChat)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: finalText,
+            sourceSpanIds: evidenceSpanIDs(for: request),
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: ["请团队准时参加"]
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(finalText)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        XCTAssertNil(result.plannerValidationTrace)
+    }
+
+    func testWriterCannotOmitAnyDailyLongTextUnit() async throws {
+        let request = makeRequest(dailySource("漏项检查"))
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let incomplete = VoicePolishLedgerDraftDocument(fragments: zip(plan.units.dropLast(), spans).map {
+            VoicePolishLedgerDraftFragment(id: "f_\($0.0.id)", unitIds: [$0.0.id], text: $0.1.text)
+        })
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan),
+            try encoded(incomplete),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testNonCommitmentCannotBecomeCertainNonOccurrence() async throws {
+        let source = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let wrong = "周五上午先发内部试看，我们不会在周五对外发布。"
+        let repaired = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let request = makeRequest(source)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "周五上午先发内部试看，邮件里不要承诺周五对外发布",
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: ["周五上午"],
+            surfaceTokens: []
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(wrong)),
+            try encoded(passReview()),
+            try encoded(draft(repaired)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        let requests = await client.requests()
+        XCTAssertTrue(requests[3].user.contains("不得改成事情确定不会发生"))
+    }
+
+    func testPlannerKeepsNonCommitmentOutOfCorrectionRelations() {
+        XCTAssertTrue(
+            VoicePolishLedgerPrompts.planner.contains(
+                "不要承诺/不能保证/不要假设/禁止"
+            )
+        )
+        XCTAssertTrue(
+            VoicePolishLedgerPrompts.plannerRepair.contains(
+                "correction_subject_not_bound_to_old_value"
+            )
+        )
+        XCTAssertTrue(
+            VoicePolishLedgerPrompts.plannerRepair.contains(
+                "必须删除对应伪 correction"
+            )
+        )
+    }
+
+    func testVerifiedContextEntityMissingTriggersTargetedRepair() async throws {
+        let source = "项目名按北城研究写。"
+        let repaired = "项目名统一使用北辰研究。"
+        let entity = ResolvedEntity(
+            surfaceText: "北城研究",
+            canonical: "北辰研究",
+            sourceSegmentIDs: ["s1"],
+            candidateSource: .authorizedContext,
+            confidence: 0.98
+        )
+        let request = makeRequest(source, scene: .aiPrompt, resolvedEntities: [entity])
+        let spanIDs = evidenceSpanIDs(for: request)
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(finalMeaning: "项目名按北城研究写", spanIDs: spanIDs)),
+            try encoded(draft("比较五款语音输入工具。")),
+            try encoded(passReview()),
+            try encoded(draft(repaired)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        let requests = await client.requests()
+        XCTAssertTrue(requests[0].user.contains("北辰研究"))
+        XCTAssertTrue(requests[3].user.contains("恢复已确认的标准实体"))
+    }
+
+    func testVerifiedContextMappingIsNotDuplicatedAsSourceCorrection() throws {
+        let source = "项目名我口述成北城研究，但选中的标题是准的，按标题写。"
+        let entity = ResolvedEntity(
+            surfaceText: "北城研究",
+            canonical: "北辰研究",
+            sourceSegmentIDs: ["s1"],
+            candidateSource: .authorizedContext,
+            confidence: 0.98
+        )
+        let request = makeRequest(source, scene: .aiPrompt, resolvedEntities: [entity])
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let mappings = VoicePolishLedgerIntegrityValidator.verifiedMappings(
+            request: request,
+            spans: spans
+        )
+        let spanIDs = spans.map(\.id)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "项目名使用北辰研究", sourceSpanIds: spanIDs,
+                status: "replace", modality: "confirmed",
+                exactTokens: ["北辰研究"], surfaceTokens: []
+            )],
+            corrections: [VoicePolishLedgerCorrection(
+                subject: "项目名", oldValue: "北城研究", finalValue: "北辰研究",
+                oldSpanIds: spanIDs, finalSpanIds: spanIDs,
+                renderingPolicy: "final_only"
+            )],
+            conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+            contextMappings: mappings,
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: mappings,
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )
+
+        XCTAssertTrue(validated.corrections.isEmpty)
+        XCTAssertEqual(validated.contextMappings, mappings)
+        XCTAssertEqual(validated.units[0].finalMeaning, "项目名使用北辰研究")
+    }
+
+    func testInvalidContextAliasCorrectionIsDroppedInsteadOfForcingPlanRepair() throws {
+        let source = "项目名我口述成北城研究，但选中的标题是准的，按标题写。"
+        let entity = ResolvedEntity(
+            surfaceText: "北城研究", canonical: "北辰研究", sourceSegmentIDs: ["s1"],
+            candidateSource: .authorizedContext, confidence: 0.98
+        )
+        let request = makeRequest(source, scene: .aiPrompt, resolvedEntities: [entity])
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let mappings = VoicePolishLedgerIntegrityValidator.verifiedMappings(
+            request: request,
+            spans: spans
+        )
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "项目名：北辰研究", sourceSpanIds: spans.map(\.id),
+                status: "replace", modality: "confirmed", exactTokens: ["北辰研究"],
+                surfaceTokens: []
+            )],
+            corrections: [VoicePolishLedgerCorrection(
+                subject: "项目名", oldValue: "北城研究", finalValue: "按选中标题",
+                oldSpanIds: spans.map(\.id), finalSpanIds: spans.map(\.id),
+                renderingPolicy: "final_only"
+            )],
+            conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: mappings,
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )
+
+        XCTAssertTrue(validated.corrections.isEmpty)
+        XCTAssertTrue(validated.units[0].finalMeaning.contains("北辰研究"))
+    }
+
+    func testAIPromptUnitWithInventedFactFallsBackToItsOwnSourceEvidence() throws {
+        let request = makeRequest("目标是比较五款工具。", scene: .aiPrompt)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "目标是比较五款工具，预算 999 元。",
+                sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed",
+                exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )
+
+        XCTAssertEqual(validated.units[0].finalMeaning, spans[0].text)
+        XCTAssertFalse(validated.units[0].finalMeaning.contains("999"))
+    }
+
+    func testSelectedAIPromptTitleSurvivesWhenItsInstructionUnitIsRemoved() throws {
+        let source = "项目名我口述成北城研究，但选中的标题是准的，按标题写。目标是比较五款工具。"
+        let entity = ResolvedEntity(
+            surfaceText: "北城研究",
+            canonical: "北辰研究",
+            sourceSegmentIDs: ["s1"],
+            candidateSource: .authorizedContext,
+            confidence: 0.98
+        )
+        let request = makeRequest(source, scene: .aiPrompt, resolvedEntities: [entity])
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 2)
+        let mappings = VoicePolishLedgerIntegrityValidator.verifiedMappings(
+            request: request,
+            spans: spans
+        )
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                VoicePolishLedgerUnit(
+                    id: "editor", kind: "constraint", deliveryRole: "editor_directive",
+                    finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "remove",
+                    modality: "confirmed", exactTokens: [], surfaceTokens: ["按标题写"]
+                ),
+                VoicePolishLedgerUnit(
+                    id: "goal", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: spans[1].text, sourceSpanIds: [spans[1].id], status: "keep",
+                    modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+            ],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: ["goal"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: mappings,
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )
+
+        let titleUnit = try XCTUnwrap(validated.units.first {
+            $0.deliveryRole == "recipient_content" && $0.finalMeaning.contains("北辰研究")
+        })
+        XCTAssertEqual(titleUnit.exactTokens, ["北辰研究"])
+        XCTAssertEqual(validated.structure.orderedUnitIds.first, titleUnit.id)
+        XCTAssertEqual(validated.contextMappings, mappings)
+    }
+
+    func testCurrentAIPromptEditingInstructionIsRemovedFromRecipientStructure() throws {
+        let source = "帮我把研究要求整理成可直接给 AI 的 Prompt。先别开始研究，只整理任务。目标是比较五款工具。"
+        let request = makeRequest(source, scene: .aiPrompt)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 3)
+        let editor = VoicePolishLedgerUnit(
+            id: "editor", kind: "constraint", deliveryRole: "recipient_content",
+            finalMeaning: "先别开始研究，只整理任务", sourceSpanIds: [spans[0].id, spans[1].id],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        let goal = VoicePolishLedgerUnit(
+            id: "goal", kind: "action", deliveryRole: "recipient_content",
+            finalMeaning: "目标是比较五款工具", sourceSpanIds: [spans[2].id],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        var plan = VoicePolishIntentLedger(
+            audience: [], units: [editor, goal], corrections: [], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "ai_prompt", orderedUnitIds: ["editor", "goal"]
+            )
+        )
+
+        XCTAssertThrowsError(try validated(plan, for: request))
+        plan.units[0].deliveryRole = "editor_directive"
+        plan.units[0].status = "remove"
+        plan.units[0].surfaceTokens = ["先别开始研究，只整理任务"]
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )
+
+        XCTAssertEqual(validated.units[0].deliveryRole, "editor_directive")
+        XCTAssertEqual(validated.units[0].status, "remove")
+        XCTAssertEqual(validated.units[0].surfaceTokens, ["先别开始研究，只整理任务"])
+        XCTAssertEqual(validated.structure.orderedUnitIds, ["goal"])
+    }
+
+    func testFailedConfirmationStopsAfterFiveCallsWithoutLegacyRetry() async throws {
+        let source = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let wrong = "周五上午先发内部试看，我们不会在周五对外发布。"
+        let request = makeRequest(source)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "周五上午先发内部试看，邮件里不要承诺周五对外发布",
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "not_promised",
+            exactTokens: ["周五上午"],
+            surfaceTokens: []
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(wrong)),
+            try encoded(passReview()),
+            try encoded(draft(wrong)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        XCTAssertEqual(result.failureReason, .validationFailed)
+        XCTAssertTrue(result.validationCodes.contains(.semanticDecisionUnverified))
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 5)
+    }
+
+    func test复杂短句按语义风险路由简单问句保持轻量() {
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            "如果还是不行，让他把系统版本和错误截图发过来。",
+            scene: .customerSupport
+        )))
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            "跟团队说会议改到周四下午。",
+            scene: .workChat
+        )))
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            "只有客户确认，才能对外发布。",
+            scene: .workChat
+        )))
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            "不要覆盖安装，建议先跑测试。",
+            scene: .workChat
+        )))
+        XCTAssertFalse(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            "你到哪了",
+            scene: .chat
+        )))
+        let riskyMedium = "如果还是不行，让他把系统版本、错误截图、复现步骤和最近一次操作时间发过来，"
+            + "同时说明不要承诺当天一定解决，只需确认我们已经收到并会继续排查，明天下午前再同步一次进展。"
+        XCTAssertGreaterThanOrEqual(riskyMedium.count, 80)
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            riskyMedium,
+            scene: .customerSupport
+        )))
+        XCTAssertTrue(VoicePolishLedgerPipeline.shouldUse(for: makeRequest(
+            dailySource("日常长文路由"),
+            scene: .document
+        )))
+    }
+
+    func testMissingConditionalCueIsRecoveredLocallyWithoutPlannerRetry() async throws {
+        let source = "如果还是不行，让他把系统版本和错误截图发过来。"
+        let request = makeRequest(source, scene: .customerSupport)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "如果问题仍未解决，请发送系统版本和错误截图",
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        )
+        let invalid = ledger(unit: unit)
+        let finalText = "如果问题仍未解决，请把系统版本和错误截图发给我们。"
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(invalid),
+            try encoded(draft(finalText)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.llmAttemptCount, 3)
+        let requests = await client.requests()
+        XCTAssertEqual(
+            requests.map(\.task),
+            [.voicePolishAnalyze, .voicePolishRender, .voicePolishAnalyze]
+        )
+    }
+
+    func testPlannerFailureReportsStableEvidenceDiagnostic() async throws {
+        let request = makeRequest(dailySource("证据诊断"))
+        let initiallyInvalid = VoicePolishIntentLedger(
+            audience: [],
+            units: [],
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [],
+            dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: [])
+        )
+        let repairedButInvalid = ledger(unit: VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "整理证据诊断",
+            sourceSpanIds: ["不存在的证据"],
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        ))
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(initiallyInvalid),
+            try encoded(repairedButInvalid),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.failureReason, .validationFailed)
+        XCTAssertEqual(
+            result.plannerValidationTrace,
+            VoicePolishPlannerValidationTrace(
+                initialCode: "units_empty",
+                repairedCode: "unit_identity_enum_or_source_span_invalid"
+            )
+        )
+        XCTAssertEqual(result.llmAttemptCount, 2)
+    }
+
+    func testPlannerInvalidJSONReportsStableDecodeTrace() async throws {
+        let request = makeRequest(dailySource("JSON 诊断"))
+        let client = LedgerScriptedLLM(responses: ["{}", "{}"])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(
+            result.plannerValidationTrace,
+            VoicePolishPlannerValidationTrace(
+                initialCode: "ledger_json_decode_failed",
+                repairedCode: "ledger_json_decode_failed"
+            )
+        )
+    }
+
+    func testDictatedSymbolMappingIsAppliedBeforeReview() async throws {
+        let source = "执行scripts斜杠package短横线app点sh，然后检查codesign。"
+        let request = makeRequest(source, scene: .code)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "执行打包脚本，然后检查codesign",
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        )
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [unit],
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [],
+            dictatedSymbolMappings: [VoicePolishLedgerTokenMapping(
+                alias: "scripts斜杠package短横线app点sh",
+                canonical: "scripts/package-app.sh",
+                sourceSpanIds: spanIDs,
+                transform: "spoken_ascii_symbols"
+            )],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan),
+            try encoded(draft("执行scripts斜杠package短横线app点sh，然后检查codesign。")),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "执行scripts/package-app.sh，然后检查codesign。")
+        XCTAssertEqual(result.llmAttemptCount, 3)
+    }
+
+    func testValidatedTokenMappingsCanBackUnitMeaningAndExactTokens() throws {
+        let source = "检查 Voice Pol ish 后执行scripts斜杠package短横线app点sh。"
+        let request = makeRequest(source, scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let spanIDs = spans.map(\.id)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: "检查 VoicePolish 后执行 scripts/package-app.sh。",
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: ["VoicePolish", "scripts/package-app.sh"],
+            surfaceTokens: []
+        )
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [unit],
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [VoicePolishLedgerTokenMapping(
+                alias: "Voice Pol ish",
+                canonical: "VoicePolish",
+                sourceSpanIds: spanIDs,
+                transform: "remove_internal_ascii_whitespace"
+            )],
+            dictatedSymbolMappings: [VoicePolishLedgerTokenMapping(
+                alias: "scripts斜杠package短横线app点sh",
+                canonical: "scripts/package-app.sh",
+                sourceSpanIds: spanIDs,
+                transform: "spoken_ascii_symbols"
+            )],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        )
+
+        XCTAssertEqual(validated.units[0].exactTokens, ["VoicePolish", "scripts/package-app.sh"])
+    }
+
+    func testValidatedTokenMappingCannotBackAnotherSourceSpan() throws {
+        let request = makeRequest("检查 Voice Pol ish。然后执行测试。", scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 2)
+        let units = [
+            VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            ),
+            VoicePolishLedgerUnit(
+                id: "u2", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "执行 VoicePolish 测试。", sourceSpanIds: [spans[1].id],
+                status: "keep", modality: "confirmed", exactTokens: ["VoicePolish"],
+                surfaceTokens: []
+            ),
+        ]
+        let plan = VoicePolishIntentLedger(
+            audience: [], units: units, corrections: [], conditionals: [],
+            technicalTokenMappings: [VoicePolishLedgerTokenMapping(
+                alias: "Voice Pol ish", canonical: "VoicePolish",
+                sourceSpanIds: [spans[0].id], transform: "remove_internal_ascii_whitespace"
+            )],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "paragraphs", orderedUnitIds: units.map(\.id)
+            )
+        )
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        ))
+    }
+
+    func testValidatedTokenMappingCannotFanOutCanonicalAcrossRedundantSpans() throws {
+        let request = makeRequest("检查 Voice Pol ish。然后执行测试。", scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 2)
+        let units = [
+            VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            ),
+            VoicePolishLedgerUnit(
+                id: "u2", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "执行 VoicePolish 测试。", sourceSpanIds: [spans[1].id],
+                status: "keep", modality: "confirmed", exactTokens: ["VoicePolish"],
+                surfaceTokens: []
+            ),
+        ]
+        let plan = VoicePolishIntentLedger(
+            audience: [], units: units, corrections: [], conditionals: [],
+            technicalTokenMappings: [VoicePolishLedgerTokenMapping(
+                alias: "Voice Pol ish", canonical: "VoicePolish",
+                sourceSpanIds: spans.map(\.id), transform: "remove_internal_ascii_whitespace"
+            )],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "paragraphs", orderedUnitIds: units.map(\.id)
+            )
+        )
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        ))
+    }
+
+    func testSpokenCLIMappingsBackRealTestAndBuildCommands() throws {
+        for (source, alias, canonical) in [
+            (
+                "执行swift test双横线filter VoicePolishPipelineTests。",
+                "swift test双横线filter VoicePolishPipelineTests",
+                "swift test --filter VoicePolishPipelineTests"
+            ),
+            (
+                "执行swift build短横线c release。",
+                "swift build短横线c release",
+                "swift build -c release"
+            ),
+        ] {
+            let request = makeRequest(source, scene: .code)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let spanIDs = spans.map(\.id)
+            let plan = VoicePolishIntentLedger(
+                audience: [],
+                units: [VoicePolishLedgerUnit(
+                    id: "u1", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "执行\(canonical)。", sourceSpanIds: spanIDs,
+                    status: "keep", modality: "confirmed", exactTokens: [canonical],
+                    surfaceTokens: []
+                )],
+                corrections: [], conditionals: [], technicalTokenMappings: [],
+                dictatedSymbolMappings: [VoicePolishLedgerTokenMapping(
+                    alias: alias, canonical: canonical, sourceSpanIds: spanIDs,
+                    transform: "spoken_cli_symbols"
+                )],
+                contextMappings: [],
+                structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+            )
+
+            XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+                plan,
+                spans: spans,
+                verifiedMappings: [],
+                requiredLogicCues: [],
+                scene: .code
+            ))
+        }
+    }
+
+    func testCanonicalNumberCanReformatButCannotInventExactFormatUnitOrCurrency() throws {
+        let request = makeRequest("预算最后通过的是一万六。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let spanIDs = spans.map(\.id)
+        func plan(finalMeaning: String, exactTokens: [String]) -> VoicePolishIntentLedger {
+            ledger(unit: VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: finalMeaning, sourceSpanIds: spanIDs, status: "keep",
+                modality: "confirmed", exactTokens: exactTokens, surfaceTokens: []
+            ))
+        }
+
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(finalMeaning: "预算最后通过的是16000。", exactTokens: []),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(finalMeaning: "预算最后通过的是16000。", exactTokens: ["16000"]),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+
+        let normalized = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(finalMeaning: "预算最后通过的是16000元。", exactTokens: []),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        )
+        XCTAssertEqual(normalized.units[0].finalMeaning, "预算最后通过的是16000。")
+
+        let reordered = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(finalMeaning: "最终通过的预算是16000元。", exactTokens: []),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        )
+        XCTAssertEqual(reordered.units[0].finalMeaning, "最终通过的预算是16000。")
+    }
+
+    func testLedgerRejectsAddedRemovedSwappedUnitsAndCurrencies() throws {
+        let rejectedPairs = [
+            ("工期是三十天。", "工期是30年。"),
+            ("预算是一万六元。", "预算是16000美元。"),
+            ("工期是三十天。", "工期是30。"),
+            ("预算是$16000。", "预算是￥16000。"),
+            ("预算是1.6万美元。", "预算是16000元。"),
+            ("工期30天，预算30元。", "工期30元，预算30天。"),
+            ("工期30天，预算30元。", "预算30天，工期30元。"),
+            ("工期30天，预算40元。", "工期30天。"),
+            ("预算16000元。", "预算待定。"),
+            ("30天交付。", "质保期30天。"),
+            ("30天交付。", "30天质保。"),
+            ("研发预算30元，运营预算30元。", "预算30元，预算30元。"),
+        ]
+        for (pairIndex, pair) in rejectedPairs.enumerated() {
+            let (source, finalMeaning) = pair
+            let request = makeRequest(source)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let plan = ledger(unit: VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: finalMeaning, sourceSpanIds: spans.map(\.id), status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            ))
+
+            if [5, 6, 9, 10].contains(pairIndex) {
+                assertSemanticRejectionIsRequired(plan, spans: spans)
+            } else {
+                XCTAssertThrowsError(try validated(plan, for: request), source)
+            }
+        }
+
+        let acceptedPairs = [
+            ("工期是三十天。", "工期是30日。"),
+            ("预算是$16000。", "预算是16000美元。"),
+            ("预算是1.6万美元。", "预算是16000美元。"),
+            ("预算是美元16000。", "预算是$16000。"),
+            ("预算是人民币16000。", "预算是￥16000。"),
+            ("工期30天，预算30元。", "预算30元，工期30天。"),
+            ("项目周期30天。", "工期30天。"),
+            ("预计工期30天。", "工期预计为30天。"),
+            ("发布日期是2026-08-28。", "发布日期是2026年8月28日。"),
+        ]
+        for (source, finalMeaning) in acceptedPairs {
+            let request = makeRequest(source)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let plan = ledger(unit: VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: finalMeaning, sourceSpanIds: spans.map(\.id), status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            ))
+
+            XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+                plan,
+                spans: spans,
+                verifiedMappings: [],
+                requiredLogicCues: [],
+                scene: .document
+            ), "\(source) -> \(finalMeaning)")
+        }
+    }
+
+    func testExplicitMeasurementCorrectionMayRemoveOnlyItsOldValue() throws {
+        let spans = [
+            VoicePolishEvidenceSpan(
+                id: "old", segmentID: "s1", start: 0, end: 8,
+                text: "工期原定三十天。", digest: "old"
+            ),
+            VoicePolishEvidenceSpan(
+                id: "final", segmentID: "s2", start: 8, end: 19,
+                text: "不对，最终工期改为二十天。", digest: "final"
+            ),
+        ]
+        let unit = VoicePolishLedgerUnit(
+            id: "u1", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "最终工期为20天。", sourceSpanIds: ["old", "final"],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        let correction = VoicePolishLedgerCorrection(
+            subject: "工期", oldValue: "三十天", finalValue: "二十天",
+            oldSpanIds: ["old"], finalSpanIds: ["final"], renderingPolicy: "final_only"
+        )
+        let correctedPlan = VoicePolishIntentLedger(
+            audience: [], units: [unit], corrections: [correction], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            correctedPlan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+
+        let unprovenPlan = VoicePolishIntentLedger(
+            audience: [], units: [unit], corrections: [], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            unprovenPlan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+
+        let wrongSubject = VoicePolishLedgerCorrection(
+            subject: "上海项目工期", oldValue: "三十天", finalValue: "二十天",
+            oldSpanIds: ["old"], finalSpanIds: ["final"], renderingPolicy: "final_only"
+        )
+        let wrongSubjectPlan = VoicePolishIntentLedger(
+            audience: [], units: [unit], corrections: [wrongSubject], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+        assertSemanticRejectionIsRequired(wrongSubjectPlan, spans: spans)
+
+        let finalBelongsToAnotherSubjectSpans = [
+            VoicePolishEvidenceSpan(
+                id: "beijing", segmentID: "s1", start: 0, end: 12,
+                text: "北京项目工期原定30天。", digest: "beijing"
+            ),
+            VoicePolishEvidenceSpan(
+                id: "shanghai", segmentID: "s2", start: 12, end: 24,
+                text: "不对，上海项目工期确定为20天。", digest: "shanghai"
+            ),
+        ]
+        let finalBelongsToAnotherSubject = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: "上海项目工期为20天。",
+                sourceSpanIds: ["beijing", "shanghai"], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [VoicePolishLedgerCorrection(
+                subject: "北京项目工期", oldValue: "30天", finalValue: "20天",
+                oldSpanIds: ["beijing"], finalSpanIds: ["shanghai"],
+                renderingPolicy: "final_only"
+            )],
+            conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+        assertSemanticRejectionIsRequired(finalBelongsToAnotherSubject, spans: finalBelongsToAnotherSubjectSpans)
+
+        let omittedSubjectSpans = [VoicePolishEvidenceSpan(
+            id: "s1", segmentID: "s1", start: 0, end: 18,
+            text: "工期先定30天，不对，改成20天。", digest: "s1"
+        )]
+        let omittedSubjectPlan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: "工期改为20天。", sourceSpanIds: ["s1"], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [VoicePolishLedgerCorrection(
+                subject: "工期", oldValue: "30天", finalValue: "20天",
+                oldSpanIds: ["s1"], finalSpanIds: ["s1"], renderingPolicy: "final_only"
+            )],
+            conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            omittedSubjectPlan,
+            spans: omittedSubjectSpans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+
+        let unpunctuatedSpans = [VoicePolishEvidenceSpan(
+            id: "s1", segmentID: "s1", start: 0, end: 33,
+            text: "分析销售表先看最近十二个月不对我们数据只有九个月那就分析全部九个月",
+            digest: "s1"
+        )]
+        let unpunctuatedPlan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "分析全部 9 个月数据。", sourceSpanIds: ["s1"],
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [VoicePolishLedgerCorrection(
+                subject: "销售表分析范围", oldValue: "十二个月", finalValue: "九个月",
+                oldSpanIds: ["s1"], finalSpanIds: ["s1"], renderingPolicy: "final_only"
+            )],
+            conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            unpunctuatedPlan,
+            spans: unpunctuatedSpans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        ))
+
+        let interveningSubjectSpans = [VoicePolishEvidenceSpan(
+            id: "s1", segmentID: "s1", start: 0, end: 34,
+            text: "北京项目工期30天，上海项目工期40天，不对，改成20天。",
+            digest: "s1"
+        )]
+        let wrongDistantCarryPlan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: "北京项目工期20天，上海项目工期40天。",
+                sourceSpanIds: ["s1"], status: "keep", modality: "confirmed",
+                exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [VoicePolishLedgerCorrection(
+                subject: "北京项目工期", oldValue: "30天", finalValue: "20天",
+                oldSpanIds: ["s1"], finalSpanIds: ["s1"], renderingPolicy: "final_only"
+            )],
+            conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+        )
+        assertSemanticRejectionIsRequired(wrongDistantCarryPlan, spans: interveningSubjectSpans)
+    }
+
+    func testDeclaredStepCountUpdateRewritesOldTotalFromRecipientUnit() throws {
+        let source = "部署要做三步第一跑swift test第二跑swift build短横线c release第三执行scripts斜杠package短横线app点sh等一下还有一步要检查codesign所以一共四步最后再启动应用"
+        let request = makeRequest(source, scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let allSpanIDs = spans.map(\.id)
+        let correction = VoicePolishLedgerCorrection(
+            subject: "部署步骤数", oldValue: "三步", finalValue: "四步",
+            oldSpanIds: allSpanIDs, finalSpanIds: allSpanIDs,
+            renderingPolicy: "final_only"
+        )
+        var plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                VoicePolishLedgerUnit(
+                    id: "header", kind: "claim", deliveryRole: "recipient_content",
+                    finalMeaning: "部署要做三步。", sourceSpanIds: allSpanIDs,
+                    status: "replace", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "test", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "运行 swift test。", sourceSpanIds: allSpanIDs,
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "build", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "运行 swift build -c release。", sourceSpanIds: allSpanIDs,
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "package", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "执行 scripts/package-app.sh。", sourceSpanIds: allSpanIDs,
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "sign", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "检查 codesign。", sourceSpanIds: allSpanIDs,
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "launch", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "完成四步后再启动应用。", sourceSpanIds: allSpanIDs,
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+            ],
+            corrections: [correction], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "mixed",
+                orderedUnitIds: ["header", "test", "build", "package", "sign", "launch"],
+                numberedUnitIds: ["test", "build", "package", "sign"]
+            )
+        )
+
+        XCTAssertThrowsError(try validated(plan, for: request))
+        plan.units[0].finalMeaning = "部署要做四步。"
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        )
+
+        XCTAssertEqual(validated.units[0].finalMeaning, "部署要做四步。")
+        XCTAssertEqual(validated.structure.numberedUnitIds, ["test", "build", "package", "sign"])
+    }
+
+    func testDeclaredStepCountRepairsToMixedListWithoutNumberingLaunchAction() async throws {
+        let source = "部署要做三步第一跑swift test第二跑swift build短横线c release第三执行scripts斜杠package短横线app点sh等一下还有一步要检查codesign所以一共四步最后再启动应用"
+        let request = makeRequest(source, scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let allSpanIDs = spans.map(\.id)
+        let correction = VoicePolishLedgerCorrection(
+            subject: "部署步骤数", oldValue: "三步", finalValue: "四步",
+            oldSpanIds: allSpanIDs, finalSpanIds: allSpanIDs,
+            renderingPolicy: "final_only"
+        )
+        func unit(_ id: String, _ meaning: String, kind: String = "action")
+            -> VoicePolishLedgerUnit {
+            VoicePolishLedgerUnit(
+                id: id, kind: kind, deliveryRole: "recipient_content",
+                finalMeaning: meaning, sourceSpanIds: allSpanIDs,
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )
+        }
+        let wrongPlan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                unit("old", "部署要做三步", kind: "claim"),
+                unit("test", "第一跑 swift test"),
+                unit("build", "第二跑 swift build -c release"),
+                unit("package", "第三执行 scripts/package-app.sh"),
+                unit("sign", "还有一步要检查 codesign"),
+                unit("total", "所以一共四步", kind: "claim"),
+                unit("launch", "最后再启动应用"),
+            ],
+            corrections: [correction], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "numbered_list",
+                orderedUnitIds: ["old", "test", "build", "package", "sign", "total", "launch"]
+            )
+        )
+        let repairedPlan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                unit("header", "部署共四步", kind: "claim"),
+                unit("test", "运行 swift test"),
+                unit("build", "运行 swift build -c release"),
+                unit("package", "执行 scripts/package-app.sh"),
+                unit("sign", "检查 codesign"),
+                unit("launch", "完成四步后再启动应用"),
+                VoicePolishLedgerUnit(
+                    id: "process", kind: "style", deliveryRole: "editor_directive",
+                    finalMeaning: "删除旧三步声明和补充过程", sourceSpanIds: allSpanIDs,
+                    status: "remove", modality: "confirmed", exactTokens: [],
+                    surfaceTokens: ["等一下还有一步"]
+                ),
+            ],
+            corrections: [correction], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "mixed",
+                orderedUnitIds: ["header", "test", "build", "package", "sign", "launch"],
+                numberedUnitIds: ["test", "build", "package", "sign"]
+            )
+        )
+        let draft = VoicePolishLedgerDraftDocument(fragments: [
+            VoicePolishLedgerDraftFragment(id: "f_header", unitIds: ["header"], text: "部署共四步："),
+            VoicePolishLedgerDraftFragment(id: "f_test", unitIds: ["test"], text: "运行 swift test"),
+            VoicePolishLedgerDraftFragment(id: "f_build", unitIds: ["build"], text: "运行 swift build -c release"),
+            VoicePolishLedgerDraftFragment(id: "f_package", unitIds: ["package"], text: "执行 scripts/package-app.sh"),
+            VoicePolishLedgerDraftFragment(id: "f_sign", unitIds: ["sign"], text: "检查 codesign"),
+            VoicePolishLedgerDraftFragment(id: "f_launch", unitIds: ["launch"], text: "完成后再启动应用。"),
+        ])
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(wrongPlan),
+            try encoded(repairedPlan),
+            try encoded(draft),
+            try encoded(passReview(checkIDs: ["correction_1", "source_role_process"], spans: spans)),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 4)
+        XCTAssertEqual(
+            result.text,
+            "部署共四步：\n\n1. 运行 swift test\n2. 运行 swift build -c release\n3. 执行 scripts/package-app.sh\n4. 检查 codesign\n\n完成后再启动应用。"
+        )
+        XCTAssertFalse(result.text.contains("三步"))
+        let requests = await client.requests()
+        XCTAssertTrue(requests[1].user.contains("recipient_unit_retains_superseded_value"))
+        XCTAssertTrue((requests[1].system ?? "").contains("numbered_unit_ids"))
+    }
+
+    func testAudienceSurfaceTokenAndDirectModeCanBeMechanicallyRecovered() throws {
+        let source = "我想给团队发一封完整的交接邮件。"
+        let request = makeRequest(source, scene: .email)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [VoicePolishLedgerAudience(
+                text: "团队", sourceSpanIds: spans.map(\.id), surfaceTokens: [],
+                deliveryMode: "recipient"
+            )],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "向团队发送完整交接邮件", sourceSpanIds: spans.map(\.id),
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .email
+        )
+
+        XCTAssertEqual(validated.audience.first?.surfaceTokens, ["团队"])
+        XCTAssertEqual(validated.audience.first?.deliveryMode, "direct_address")
+    }
+
+    func testSupersededOldNumberInstructionBecomesEditorDirective() throws {
+        let source = "预算最开始有人提一万六千八，我这里更正一下，不对，最后通过的是一万六，旧数字不要写进纪要。"
+        let request = makeRequest(source)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let correction = VoicePolishLedgerCorrection(
+            subject: "预算", oldValue: "一万六千八", finalValue: "一万六",
+            oldSpanIds: spans.map(\.id), finalSpanIds: spans.map(\.id),
+            renderingPolicy: "final_only"
+        )
+        var plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                VoicePolishLedgerUnit(
+                    id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                    finalMeaning: "最终通过的预算是16000元。",
+                    sourceSpanIds: spans.map(\.id), status: "replace", modality: "confirmed",
+                    exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "u2", kind: "constraint", deliveryRole: "recipient_content",
+                    finalMeaning: "旧数字一万六千八不要写进纪要。",
+                    sourceSpanIds: spans.map(\.id), status: "keep", modality: "prohibited",
+                    exactTokens: [], surfaceTokens: []
+                ),
+            ],
+            corrections: [correction], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1", "u2"])
+        )
+
+        XCTAssertThrowsError(try validated(plan, for: request))
+        plan.units[1].deliveryRole = "editor_directive"
+        plan.units[1].status = "remove"
+        plan.units[1].surfaceTokens = ["旧数字不要写进纪要"]
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        )
+
+        XCTAssertEqual(validated.structure.orderedUnitIds, ["u1"])
+        XCTAssertEqual(validated.units.first(where: { $0.id == "u2" })?.deliveryRole, "editor_directive")
+        XCTAssertEqual(validated.units.first(where: { $0.id == "u1" })?.finalMeaning, "最终通过的预算是16000。")
+    }
+
+    func testBackwardCancellationInsideOneSegmentMayUseFinalSubject() throws {
+        let spans = [
+            VoicePolishEvidenceSpan(
+                id: "final", segmentID: "s1", start: 0, end: 12,
+                text: "录制安排在周三下午。", digest: "final"
+            ),
+            VoicePolishEvidenceSpan(
+                id: "old", segmentID: "s1", start: 12, end: 30,
+                text: "原来说周二录，这个取消。", digest: "old"
+            ),
+        ]
+        let correction = VoicePolishLedgerCorrection(
+            subject: "录制安排", oldValue: "周二", finalValue: "周三下午",
+            oldSpanIds: ["old"], finalSpanIds: ["final"], renderingPolicy: "final_only"
+        )
+        let finalUnit = VoicePolishLedgerUnit(
+            id: "u1", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "录制安排在周三下午。", sourceSpanIds: ["final"],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        let oldUnit = VoicePolishLedgerUnit(
+            id: "u2", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "原来说周二录，这个取消。", sourceSpanIds: ["old"],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        var plan = VoicePolishIntentLedger(
+            audience: [], units: [finalUnit, oldUnit], corrections: [correction], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1", "u2"])
+        )
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan, spans: spans, verifiedMappings: [], requiredLogicCues: [], scene: .email))
+        plan.units[1].deliveryRole = "editor_directive"
+        plan.units[1].status = "remove"
+        plan.units[1].surfaceTokens = ["原来说周二录，这个取消。"]
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .email
+        )
+        XCTAssertEqual(validated.structure.orderedUnitIds, ["u1"])
+        XCTAssertEqual(
+            validated.units.first(where: { $0.id == "u2" })?.deliveryRole,
+            "editor_directive"
+        )
+
+        let crossSegment = [
+            spans[0],
+            VoicePolishEvidenceSpan(
+                id: "old", segmentID: "s2", start: 12, end: 30,
+                text: "原来说周二录，这个取消。", digest: "old"
+            ),
+        ]
+        assertSemanticRejectionIsRequired(plan, spans: crossSegment, scene: .email)
+    }
+
+    func testMeasurementCorrectionKeepsSameValueBoundToAnotherSubject() throws {
+        let spans = [
+            VoicePolishEvidenceSpan(
+                id: "old", segmentID: "s1", start: 0, end: 22,
+                text: "北京项目工期30天，上海项目工期先按30天。", digest: "old"
+            ),
+            VoicePolishEvidenceSpan(
+                id: "final", segmentID: "s2", start: 22, end: 38,
+                text: "不对，上海项目工期最终改为20天。", digest: "final"
+            ),
+        ]
+        let correction = VoicePolishLedgerCorrection(
+            subject: "上海项目工期", oldValue: "30天", finalValue: "20天",
+            oldSpanIds: ["old"], finalSpanIds: ["final"], renderingPolicy: "final_only"
+        )
+        func plan(_ finalMeaning: String) -> VoicePolishIntentLedger {
+            let unit = VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: finalMeaning, sourceSpanIds: ["old", "final"],
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )
+            return VoicePolishIntentLedger(
+                audience: [], units: [unit], corrections: [correction], conditionals: [],
+                technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+                structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: ["u1"])
+            )
+        }
+
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan("北京项目工期30天，上海项目工期最终为20天。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan("上海项目工期最终为20天。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+    }
+
+    func testOneEvidenceSpanMaySplitMeasurementsAcrossRecipientUnitsWithoutLosingCoverage() throws {
+        let spans = [VoicePolishEvidenceSpan(
+            id: "s1", segmentID: "s1", start: 0, end: 14,
+            text: "工期30天，预算40元。", digest: "s1"
+        )]
+        let duration = VoicePolishLedgerUnit(
+            id: "duration", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "工期为30天。", sourceSpanIds: ["s1"], status: "keep",
+            modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        let budget = VoicePolishLedgerUnit(
+            id: "budget", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "预算为40元。", sourceSpanIds: ["s1"], status: "keep",
+            modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        func plan(_ units: [VoicePolishLedgerUnit]) -> VoicePolishIntentLedger {
+            VoicePolishIntentLedger(
+                audience: [], units: units, corrections: [], conditionals: [],
+                technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+                structure: VoicePolishLedgerStructure(
+                    kind: "paragraphs",
+                    orderedUnitIds: units.map(\.id)
+                )
+            )
+        }
+
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan([duration, budget]),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan([duration]),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        ))
+    }
+
+    func testExcludedMeasurementDoesNotExemptOtherRecipientFactsInSameSpan() throws {
+        let spans = [VoicePolishEvidenceSpan(
+            id: "s1", segmentID: "s1", start: 0, end: 34,
+            text: "工期30天，预算40元，内部成本50元不要对外披露。", digest: "s1"
+        )]
+        let excluded = VoicePolishLedgerUnit(
+            id: "excluded", kind: "constraint", deliveryRole: "excluded_content",
+            finalMeaning: "内部成本50元不得对外披露", sourceSpanIds: ["s1"],
+            status: "remove", modality: "prohibited", exactTokens: [],
+            surfaceTokens: ["内部成本50元"]
+        )
+        func plan(_ recipientMeaning: String) -> VoicePolishIntentLedger {
+            let recipient = VoicePolishLedgerUnit(
+                id: "recipient", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: recipientMeaning, sourceSpanIds: ["s1"], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )
+            return VoicePolishIntentLedger(
+                audience: [], units: [recipient, excluded], corrections: [], conditionals: [],
+                technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+                structure: VoicePolishLedgerStructure(
+                    kind: "paragraphs",
+                    orderedUnitIds: ["recipient"]
+                )
+            )
+        }
+
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan("工期30天，预算40元。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .customerSupport
+        ))
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan("工期30天。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .customerSupport
+        ))
+    }
+
+    func testRepeatedBareMeasurementCannotExcludeRecipientRelation() throws {
+        let spans = [VoicePolishEvidenceSpan(
+            id: "s1", segmentID: "s1", start: 0, end: 32,
+            text: "客户工期30天，内部保留期30天不要对外披露。", digest: "s1"
+        )]
+        let recipient = VoicePolishLedgerUnit(
+            id: "recipient", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "已收到。", sourceSpanIds: ["s1"], status: "keep",
+            modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        func plan(excludedToken: String, recipientMeaning: String) -> VoicePolishIntentLedger {
+            let recipientUnit = VoicePolishLedgerUnit(
+                id: recipient.id, kind: recipient.kind, deliveryRole: recipient.deliveryRole,
+                finalMeaning: recipientMeaning, sourceSpanIds: recipient.sourceSpanIds,
+                status: recipient.status, modality: recipient.modality,
+                exactTokens: recipient.exactTokens, surfaceTokens: recipient.surfaceTokens
+            )
+            let excluded = VoicePolishLedgerUnit(
+                id: "excluded", kind: "constraint", deliveryRole: "excluded_content",
+                finalMeaning: "内部保留期30天不得对外披露", sourceSpanIds: ["s1"],
+                status: "remove", modality: "prohibited", exactTokens: [],
+                surfaceTokens: [excludedToken]
+            )
+            return VoicePolishIntentLedger(
+                audience: [], units: [recipientUnit, excluded], corrections: [],
+                conditionals: [], technicalTokenMappings: [], dictatedSymbolMappings: [],
+                contextMappings: [],
+                structure: VoicePolishLedgerStructure(
+                    kind: "paragraphs", orderedUnitIds: ["recipient"]
+                )
+            )
+        }
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(excludedToken: "30天", recipientMeaning: "已收到。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .customerSupport
+        ))
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(excludedToken: "内部保留期30天", recipientMeaning: "客户工期30天。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .customerSupport
+        ))
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(excludedToken: "内部保留期", recipientMeaning: "客户工期30天。"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .customerSupport
+        ))
+    }
+
+    func testDateExtractorIgnoresDateLikeSubstringInsideIdentifier() {
+        let segments = [RecognitionSegment(
+            id: "s1",
+            text: "版本标识 build2026-08-28rc1，发布日期2026-08-28已确认。",
+            startTimeMs: 0,
+            endTimeMs: 1_000,
+            confidence: 1,
+            isFinal: true
+        )]
+        let dateFacts = ProtectedFactExtractor.extract(from: segments).filter { $0.kind == .date }
+
+        XCTAssertEqual(dateFacts.count, 1)
+        XCTAssertEqual(dateFacts.first?.canonicalValue, "2026-08-28")
+    }
+
+    func testInitialPlannerTransientFailureRetriesSameModelOnce() async throws {
+        let source = "明天开会，请团队准时参加，不要迟到。"
+        let request = makeRequest(source, scene: .workChat)
+        let validPlan = ledger(finalMeaning: source, spanIDs: evidenceSpanIDs(for: request))
+        let client = LedgerTransientPlannerLLM(responses: [
+            try encoded(validPlan),
+            try encoded(draft(source)),
+            try encoded(passReview()),
+        ])
+        let selected = LLMConfig(
+            apiKey: "test",
+            model: "deepseek-v4-flash",
+            baseURL: "https://api.deepseek.com"
+        )
+
+        let result = await productionLedgerPipeline(client, config: selected).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, source)
+        XCTAssertEqual(result.llmAttemptCount, 4)
+        let requestCount = await client.requestCount()
+        let models = await client.models()
+        XCTAssertEqual(requestCount, 4)
+        XCTAssertEqual(models, Array(repeating: "deepseek-v4-flash", count: 4))
+        let requests = await client.requests()
+        XCTAssertEqual(requests.first?.options.maxOutputTokens, 8_192)
+    }
+
+    func testInitialPlannerRetriesRealTransportAndServerFailuresButNotAuthentication() async throws {
+        let source = "明天开会，请团队准时参加，不要迟到。"
+        let request = makeRequest(source, scene: .workChat)
+        let validPlan = ledger(finalMeaning: source, spanIDs: evidenceSpanIDs(for: request))
+        let successfulResponses = [
+            try encoded(validPlan),
+            try encoded(draft(source)),
+            try encoded(passReview()),
+        ]
+
+        for failure in [
+            LedgerTransientFailure.networkConnectionLost,
+            LedgerTransientFailure.requestRejected503,
+        ] {
+            let client = LedgerTransientPlannerLLM(
+                responses: successfulResponses,
+                initialFailure: failure
+            )
+            let result = await productionLedgerPipeline(client).process(request)
+            XCTAssertFalse(result.usedFallback)
+            XCTAssertEqual(result.llmAttemptCount, 4)
+            let requestCount = await client.requestCount()
+            XCTAssertEqual(requestCount, 4)
+        }
+
+        let unauthorized = LedgerTransientPlannerLLM(
+            responses: successfulResponses,
+            initialFailure: .requestRejected401
+        )
+        let failed = await productionLedgerPipeline(unauthorized).process(request)
+        XCTAssertTrue(failed.usedFallback)
+        XCTAssertEqual(failed.llmAttemptCount, 1)
+        let unauthorizedRequestCount = await unauthorized.requestCount()
+        XCTAssertEqual(unauthorizedRequestCount, 1)
+
+        let legacyUnauthorized = LedgerTransientPlannerLLM(
+            responses: successfulResponses,
+            initialFailure: .requestFailed401
+        )
+        let legacyFailed = await productionLedgerPipeline(legacyUnauthorized).process(request)
+        XCTAssertTrue(legacyFailed.usedFallback)
+        XCTAssertEqual(legacyFailed.llmAttemptCount, 1)
+        let legacyUnauthorizedRequestCount = await legacyUnauthorized.requestCount()
+        XCTAssertEqual(legacyUnauthorizedRequestCount, 1)
+    }
+
+    func testTransientPlannerRetryStillLeavesRoomForTargetedRepairAndConfirmation() async throws {
+        let source = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let wrong = "周五上午先发内部试看，我们不会在周五对外发布。"
+        let repaired = "周五上午先发内部试看，邮件里不要承诺周五对外发布。"
+        let request = makeRequest(source)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: source,
+            sourceSpanIds: evidenceSpanIDs(for: request),
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: ["周五上午"],
+            surfaceTokens: []
+        )
+        let client = LedgerTransientPlannerLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(wrong)),
+            try encoded(passReview()),
+            try encoded(draft(repaired)),
+            try encoded(passReview()),
+        ], initialFailure: .networkConnectionLost)
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 6)
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 6)
+    }
+
+    func testTransientPlannerRetryAndSchemaRepairShareOneRecoverySlot() async throws {
+        let source = "明天开会，请团队准时参加，不要迟到。"
+        let request = makeRequest(source, scene: .workChat)
+        let invalidPlan = VoicePolishIntentLedger(
+            audience: [], units: [], corrections: [], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: [])
+        )
+        let client = LedgerTransientPlannerLLM(responses: [try encoded(invalidPlan)])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertTrue(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 2)
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(
+            result.plannerValidationTrace,
+            VoicePolishPlannerValidationTrace(initialCode: "units_empty", repairedCode: nil)
+        )
+    }
+
+    func testLongSingleSegmentBecomesBoundedEvidenceSpans() {
+        let request = makeRequest(dailySource("证据范围"))
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+
+        XCTAssertGreaterThan(spans.count, 1)
+        XCTAssertEqual(spans.map(\.text).joined(), request.input.fallbackText)
+        XCTAssertTrue(spans.allSatisfy { $0.text.count <= 180 })
+        XCTAssertEqual(spans.first?.start, 0)
+        XCTAssertEqual(spans.last?.end, request.input.fallbackText.count)
+    }
+
+    func testLedgerRespectsSelectedModelForGenerationAndReview() {
+        let flash = LLMConfig(
+            apiKey: "test",
+            model: "deepseek-v4-flash",
+            baseURL: "https://api.deepseek.com"
+        )
+        XCTAssertEqual(
+            VoicePolishLedgerPipeline.qualityConfig(for: flash).model,
+            "deepseek-v4-flash"
+        )
+        XCTAssertEqual(
+            VoicePolishLedgerPipeline.reviewConfig(for: flash).model,
+            "deepseek-v4-flash"
+        )
+
+        let custom = LLMConfig(
+            apiKey: "test",
+            model: "deepseek-v4-flash",
+            baseURL: "https://gateway.example.com/v1"
+        )
+        XCTAssertEqual(
+            VoicePolishLedgerPipeline.qualityConfig(for: custom).model,
+            "deepseek-v4-flash"
+        )
+        XCTAssertEqual(
+            VoicePolishLedgerPipeline.reviewConfig(for: custom).model,
+            "deepseek-v4-flash"
+        )
+    }
+
+    func testOfficialDeepSeekKeepsSelectedModelAcrossColdReview() async throws {
+        let source = "不要承诺周五发布。"
+        let request = makeRequest(source)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "constraint",
+            deliveryRole: "recipient_content",
+            finalMeaning: source,
+            sourceSpanIds: spans.map(\.id),
+            status: "keep",
+            modality: "not_promised",
+            exactTokens: [],
+            surfaceTokens: []
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(source)),
+            try encoded(passReview()),
+        ])
+        let official = LLMConfig(
+            apiKey: "test",
+            model: "deepseek-v4-flash",
+            baseURL: "https://api.deepseek.com"
+        )
+
+        let result = await productionLedgerPipeline(client, config: official).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        let models = await client.models()
+        XCTAssertEqual(models, Array(repeating: "deepseek-v4-flash", count: 3))
+    }
+
+    func testPlannerCannotInventLowercaseTechnicalJoin() throws {
+        let request = makeRequest("执行 git status，然后反馈结果。", scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "action",
+            deliveryRole: "recipient_content",
+            finalMeaning: request.input.fallbackText,
+            sourceSpanIds: spans.map(\.id),
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        )
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [unit],
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [VoicePolishLedgerTokenMapping(
+                alias: "git status",
+                canonical: "gitstatus",
+                sourceSpanIds: spans.map(\.id),
+                transform: "remove_internal_ascii_whitespace"
+            )],
+            dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        )
+        XCTAssertTrue(validated.technicalTokenMappings.isEmpty)
+    }
+
+    func testTechnicalJoinRejectsVersionsButAcceptsClearlySplitIdentifier() throws {
+        func plan(
+            source: String,
+            alias: String,
+            canonical: String
+        ) throws -> (VoicePolishIntentLedger, [VoicePolishEvidenceSpan]) {
+            let request = makeRequest(source, scene: .code)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let unit = VoicePolishLedgerUnit(
+                id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                finalMeaning: source, sourceSpanIds: spans.map(\.id), status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )
+            return (VoicePolishIntentLedger(
+                audience: [], units: [unit], corrections: [], conditionals: [],
+                technicalTokenMappings: [VoicePolishLedgerTokenMapping(
+                    alias: alias, canonical: canonical, sourceSpanIds: spans.map(\.id),
+                    transform: "remove_internal_ascii_whitespace"
+                )],
+                dictatedSymbolMappings: [], contextMappings: [],
+                structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+            ), spans)
+        }
+
+        for (source, alias, canonical) in [
+            ("请使用 Swift 6 复测。", "Swift 6", "Swift6"),
+            ("请使用 Node 20 复测。", "Node 20", "Node20"),
+            ("请检查 Claude Code 配置。", "Claude Code", "ClaudeCode"),
+        ] {
+            let (ledger, spans) = try plan(source: source, alias: alias, canonical: canonical)
+            let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+                ledger,
+                spans: spans,
+                verifiedMappings: [],
+                requiredLogicCues: [],
+                scene: .code
+            )
+            XCTAssertTrue(validated.technicalTokenMappings.isEmpty)
+        }
+
+        let (valid, validSpans) = try plan(
+            source: "请检查 Voice Pol ish 的调用链。",
+            alias: "Voice Pol ish",
+            canonical: "VoicePolish"
+        )
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            valid,
+            spans: validSpans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        ))
+    }
+
+    func testLocalTokenMappingsRecoverRealCoreCodeInputsDespitePlannerArrays() throws {
+        for (source, finalMeaning, exactTokens) in [
+            (
+                "记录一个bug在Muse斜杠VoicePolish斜杠VoicePolishPipeline点swift里长文本超过两千零四十八token的时候会回退原文复现命令是swift test双横线filter VoicePolishPipelineTests先别改路径和命令",
+                "记录长文本超过2048 token时回退原文的问题，路径为 Muse/VoicePolish/VoicePolishPipeline.swift，复现命令为 swift test --filter VoicePolishPipelineTests。",
+                ["Muse/VoicePolish/VoicePolishPipeline.swift", "swift test --filter VoicePolishPipelineTests"]
+            ),
+            (
+                "部署要做四步第一跑swift test第二跑swift build短横线c release第三执行scripts斜杠package短横线app点sh第四检查codesign最后再启动应用",
+                "部署检查包括 swift test、swift build -c release、scripts/package-app.sh 和 codesign，完成后再启动应用。",
+                ["swift test", "swift build -c release", "scripts/package-app.sh", "codesign"]
+            ),
+        ] {
+            let request = makeRequest(source, scene: .code)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let unit = VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: finalMeaning, sourceSpanIds: spans.map(\.id), status: "keep",
+                modality: "confirmed", exactTokens: exactTokens, surfaceTokens: []
+            )
+            let plannerInventedMappings = [VoicePolishLedgerTokenMapping(
+                alias: "git status", canonical: "gitstatus",
+                sourceSpanIds: spans.map(\.id), transform: "remove_internal_ascii_whitespace"
+            )]
+            let plan = VoicePolishIntentLedger(
+                audience: [], units: [unit], corrections: [], conditionals: [],
+                technicalTokenMappings: plannerInventedMappings,
+                dictatedSymbolMappings: [], contextMappings: [],
+                structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+            )
+
+            let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+                plan,
+                spans: spans,
+                verifiedMappings: [],
+                requiredLogicCues: [],
+                scene: .code
+            )
+            XCTAssertTrue(validated.technicalTokenMappings.isEmpty)
+            XCTAssertFalse(validated.dictatedSymbolMappings.isEmpty)
+            XCTAssertEqual(validated.units[0].exactTokens, exactTokens)
+        }
+    }
+
+    func testPartialExactTokensCollapseToFullVerifiedPathAndCommand() throws {
+        let source = "记录一个bug在Muse斜杠VoicePolish斜杠VoicePolishPipeline点swift里，复现命令是swift test双横线filter VoicePolishPipelineTests。"
+        let request = makeRequest(source, scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "在 Muse/VoicePolish/VoicePolishPipeline.swift 中记录问题，并运行 swift test --filter VoicePolishPipelineTests。",
+                sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed",
+                exactTokens: ["VoicePolishPipeline.swift", "--filter"], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        )
+
+        XCTAssertEqual(Set(validated.units[0].exactTokens), Set([
+            "Muse/VoicePolish/VoicePolishPipeline.swift",
+            "swift test --filter VoicePolishPipelineTests",
+        ]))
+    }
+
+    func testAmbiguousPartialExactTokenCannotChooseBetweenTwoCommands() throws {
+        let request = makeRequest(
+            "先执行swift test双横线filter VoicePolishPipelineTests。再执行swift test双横线filter VoicePolishCoreTests。",
+            scene: .code
+        )
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 2)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "依次执行 swift test --filter VoicePolishPipelineTests 和 swift test --filter VoicePolishCoreTests。",
+                sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed",
+                exactTokens: ["--filter"], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .code
+        ))
+    }
+
+    func testOnlyIfAndCannotThenRequireSourceBoundConditionals() throws {
+        let request = makeRequest("只有客户确认，才能发布。不能完成复核，就继续等待。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let cues = VoicePolishLedgerIntegrityValidator.requiredLogicCues(
+            source: request.input.fallbackText,
+            spans: spans
+        )
+        XCTAssertEqual(cues.count, 2)
+        let units = spans.enumerated().map { index, span in
+            VoicePolishLedgerUnit(
+                id: "u\(index + 1)", kind: "constraint", deliveryRole: "recipient_content",
+                finalMeaning: span.text, sourceSpanIds: [span.id], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )
+        }
+        let invalid = VoicePolishIntentLedger(
+            audience: [], units: units, corrections: [],
+            conditionals: cues.enumerated().map { index, cue in
+                let wrongSpan = spans[(index + 1) % spans.count].id
+                return VoicePolishLedgerConditional(
+                    id: "c\(index + 1)", cueIds: [cue.id],
+                    operatorKind: cue.operatorKind,
+                    condition: VoicePolishLedgerCondition(
+                        subject: "条件", predicate: "成立", polarity: true,
+                        sourceSpanIds: [wrongSpan]
+                    ),
+                    consequences: [VoicePolishLedgerConsequence(
+                        action: "执行", polarity: true, sourceSpanIds: [wrongSpan]
+                    )]
+                )
+            },
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "paragraphs", orderedUnitIds: units.map(\.id))
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            invalid,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: cues,
+            scene: .document
+        )
+        XCTAssertEqual(validated.conditionals.map(\.cueIds), cues.map { [$0.id] })
+        XCTAssertEqual(validated.conditionals.map(\.operatorKind), cues.map(\.operatorKind))
+        XCTAssertEqual(validated.conditionals.map { $0.condition.subject }, cues.map(\.text))
+    }
+
+    func testConditionalMeaningCannotBeInventedInsideAValidSourceSpan() throws {
+        let request = makeRequest("只有客户确认，才能发布。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let cues = VoicePolishLedgerIntegrityValidator.requiredLogicCues(
+            source: request.input.fallbackText,
+            spans: spans
+        )
+        let unit = VoicePolishLedgerUnit(
+            id: "u1", kind: "constraint", deliveryRole: "recipient_content",
+            finalMeaning: request.input.fallbackText, sourceSpanIds: [spans[0].id],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+        )
+        func plan(subject: String, predicate: String, action: String) -> VoicePolishIntentLedger {
+            VoicePolishIntentLedger(
+                audience: [], units: [unit], corrections: [],
+                conditionals: [VoicePolishLedgerConditional(
+                    id: "c1", cueIds: [cues[0].id],
+                    operatorKind: "only_if",
+                    condition: VoicePolishLedgerCondition(
+                        subject: subject, predicate: predicate, polarity: true,
+                        sourceSpanIds: [spans[0].id]
+                    ),
+                    consequences: [VoicePolishLedgerConsequence(
+                        action: action, polarity: true, sourceSpanIds: [spans[0].id]
+                    )]
+                )],
+                technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+                structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+            )
+        }
+
+        let recovered = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(subject: "老板", predicate: "批准", action: "删除数据库"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: cues,
+            scene: .document
+        )
+        XCTAssertEqual(recovered.conditionals[0].condition.subject, cues[0].text)
+        XCTAssertFalse(recovered.conditionals[0].condition.subject.contains("老板"))
+        let sourceBound = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan(subject: "客户", predicate: "确认", action: "发布"),
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: cues,
+            scene: .document
+        )
+        XCTAssertEqual(sourceBound.conditionals[0].condition.subject, "客户")
+    }
+
+    func testConditionalOperatorIsFixedByLocalCue() throws {
+        let request = makeRequest("只有客户确认，才能发布。如果客户确认，就发送通知。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let cues = VoicePolishLedgerIntegrityValidator.requiredLogicCues(
+            source: request.input.fallbackText,
+            spans: spans
+        )
+        XCTAssertEqual(cues.map(\.operatorKind), ["only_if", "if_then"])
+
+        let units = spans.enumerated().map { index, span in
+            VoicePolishLedgerUnit(
+                id: "u\(index + 1)", kind: "constraint", deliveryRole: "recipient_content",
+                finalMeaning: span.text, sourceSpanIds: [span.id], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )
+        }
+        let wrong = VoicePolishIntentLedger(
+            audience: [], units: units, corrections: [],
+            conditionals: [
+                VoicePolishLedgerConditional(
+                    id: "c1", cueIds: [cues[0].id], operatorKind: "if_then",
+                    condition: VoicePolishLedgerCondition(
+                        subject: "客户", predicate: "确认", polarity: true,
+                        sourceSpanIds: [spans[0].id]
+                    ),
+                    consequences: [VoicePolishLedgerConsequence(
+                        action: "发布", polarity: true, sourceSpanIds: [spans[0].id]
+                    )]
+                ),
+                VoicePolishLedgerConditional(
+                    id: "c2", cueIds: [cues[1].id], operatorKind: "if_then",
+                    condition: VoicePolishLedgerCondition(
+                        subject: "客户", predicate: "确认", polarity: true,
+                        sourceSpanIds: [spans[1].id]
+                    ),
+                    consequences: [VoicePolishLedgerConsequence(
+                        action: "发送通知", polarity: true, sourceSpanIds: [spans[1].id]
+                    )]
+                ),
+            ],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "paragraphs", orderedUnitIds: units.map(\.id)
+            )
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            wrong,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: cues,
+            scene: .document
+        )
+        XCTAssertEqual(validated.conditionals.map(\.operatorKind), ["only_if", "if_then"])
+        XCTAssertEqual(validated.conditionals.map { $0.condition.subject }, cues.map(\.text))
+    }
+
+    func testAIPromptAddsWriterUnitForSourceBackedConditionalSpanOnly() throws {
+        let request = makeRequest(
+            "目标是比较工具。如果套餐有地区差异，就分别写清楚。",
+            scene: .aiPrompt
+        )
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let cues = VoicePolishLedgerIntegrityValidator.requiredLogicCues(
+            source: request.input.fallbackText,
+            spans: spans
+        )
+        XCTAssertEqual(spans.count, 2)
+        XCTAssertEqual(cues.count, 1)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [],
+            conditionals: [VoicePolishLedgerConditional(
+                id: "c1", cueIds: [cues[0].id], operatorKind: "if_then",
+                condition: VoicePolishLedgerCondition(
+                    subject: "套餐", predicate: "有地区差异", polarity: true,
+                    sourceSpanIds: [spans[1].id]
+                ),
+                consequences: [VoicePolishLedgerConsequence(
+                    action: "分别写清楚", polarity: true, sourceSpanIds: [spans[1].id]
+                )]
+            )],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: ["u1"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: cues,
+            scene: .aiPrompt
+        )
+
+        XCTAssertEqual(validated.units.count, 2)
+        let conditionalUnit = try XCTUnwrap(validated.units.first {
+            $0.sourceSpanIds == [spans[1].id]
+        })
+        XCTAssertEqual(conditionalUnit.deliveryRole, "recipient_content")
+        XCTAssertEqual(conditionalUnit.finalMeaning, spans[1].text)
+        XCTAssertEqual(validated.structure.orderedUnitIds, ["u1", conditionalUnit.id])
+        XCTAssertEqual(validated.structure.numberedUnitIds, [])
+    }
+
+    func testAIPromptStillRejectsUncoveredNonConditionalSpan() throws {
+        let request = makeRequest(
+            "目标是比较工具。如果套餐有地区差异，就分别写清楚。另外说明收费方式。",
+            scene: .aiPrompt
+        )
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let cues = VoicePolishLedgerIntegrityValidator.requiredLogicCues(
+            source: request.input.fallbackText,
+            spans: spans
+        )
+        XCTAssertEqual(spans.count, 3)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "keep",
+                modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [],
+            conditionals: [VoicePolishLedgerConditional(
+                id: "c1", cueIds: [cues[0].id], operatorKind: "if_then",
+                condition: VoicePolishLedgerCondition(
+                    subject: "套餐", predicate: "有地区差异", polarity: true,
+                    sourceSpanIds: [spans[1].id]
+                ),
+                consequences: [VoicePolishLedgerConsequence(
+                    action: "分别写清楚", polarity: true, sourceSpanIds: [spans[1].id]
+                )]
+            )],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: ["u1"])
+        )
+
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: cues,
+            scene: .aiPrompt
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("source_spans_without_unit"))
+        }
+    }
+
+    func testUnitKindCanBeMechanicallyRecoveredButUnsafeRoleStillFails() throws {
+        let request = makeRequest("先别开始研究，只整理任务。", scene: .aiPrompt)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let editor = VoicePolishLedgerUnit(
+            id: "u1", kind: "editor_directive", deliveryRole: "editor_directive",
+            finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "remove",
+            modality: "confirmed", exactTokens: [], surfaceTokens: ["先别开始研究"]
+        )
+        let validPlan = VoicePolishIntentLedger(
+            audience: [], units: [editor], corrections: [], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: [])
+        )
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            validPlan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )) { error in
+            // 纯 editor 计划仍因没有任何收件人正文而失败，但不再因 kind 枚举失败。
+            XCTAssertFalse(String(describing: error).contains("unit_identity_enum"))
+        }
+
+        var unsafeUnit = editor
+        unsafeUnit.deliveryRole = "internal_note"
+        let unsafePlan = VoicePolishIntentLedger(
+            audience: [], units: [unsafeUnit], corrections: [], conditionals: [],
+            technicalTokenMappings: [], dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "ai_prompt", orderedUnitIds: [])
+        )
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            unsafePlan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .aiPrompt
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("unit_identity_enum"))
+        }
+    }
+
+    func testExcludedContextAliasDoesNotBecomeRequiredOutput() throws {
+        let request = makeRequest(
+            "给客户回复已收到，但内部北城研究不要告诉客户",
+            resolvedEntities: [ResolvedEntity(
+                surfaceText: "北城研究",
+                canonical: "北辰研究",
+                sourceSegmentIDs: ["s1"],
+                candidateSource: .authorizedContext,
+                confidence: 0.99
+            )]
+        )
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 1)
+        let plan = VoicePolishIntentLedger(
+            audience: [VoicePolishLedgerAudience(
+                text: "客户", sourceSpanIds: [spans[0].id], surfaceTokens: ["客户"],
+                deliveryMode: "direct_address"
+            )],
+            units: [
+                VoicePolishLedgerUnit(
+                    id: "u1", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "给客户回复已收到", sourceSpanIds: [spans[0].id],
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "u2", kind: "constraint", deliveryRole: "excluded_content",
+                    finalMeaning: "内部北城研究不要告诉客户", sourceSpanIds: [spans[0].id],
+                    status: "remove", modality: "prohibited", exactTokens: [],
+                    surfaceTokens: ["北城研究"]
+                ),
+            ],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+        let mappings = VoicePolishLedgerIntegrityValidator.verifiedMappings(request: request, spans: spans)
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: mappings,
+            requiredLogicCues: [],
+            scene: .document
+        )
+
+        XCTAssertTrue(validated.contextMappings.isEmpty)
+        XCTAssertTrue(VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: "已收到。",
+            request: request,
+            ledger: validated,
+            spans: spans
+        ).isEmpty)
+    }
+
+    func testGroupDirectAddressCannotLoseRecipientCompletely() throws {
+        let request = makeRequest("跟团队说会议改到周四下午")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [VoicePolishLedgerAudience(
+                text: "团队", sourceSpanIds: spans.map(\.id), surfaceTokens: ["团队"],
+                deliveryMode: "direct_address"
+            )],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "会议改到周四下午", sourceSpanIds: spans.map(\.id),
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .workChat
+        )
+
+        XCTAssertTrue(VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: "会议改到周四下午。",
+            request: request,
+            ledger: validated,
+            spans: spans
+        ).contains(where: { $0.type == "wrong_relation" }))
+        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: "大家，会议改到周四下午。",
+            request: request,
+            ledger: validated,
+            spans: spans
+        ).contains(where: { $0.type == "wrong_relation" }))
+    }
+
+    func testCustomerDirectAddressRejectsBackstageRelayWording() throws {
+        let request = makeRequest("给客户回一下这个功能需要先开权限")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [VoicePolishLedgerAudience(
+                text: "客户", sourceSpanIds: spans.map(\.id), surfaceTokens: ["客户"],
+                deliveryMode: "direct_address"
+            )],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "这个功能需要先开权限", sourceSpanIds: spans.map(\.id),
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .customerSupport
+        )
+
+        XCTAssertTrue(VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: "给客户回一下这个功能需要先开权限。",
+            request: request,
+            ledger: validated,
+            spans: spans
+        ).contains(where: { $0.type == "task_layer" }))
+        XCTAssertTrue(VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: "这个功能需要先开权限。",
+            request: request,
+            ledger: validated,
+            spans: spans
+        ).isEmpty)
+    }
+
+    func testRecipientWrongRoleCanBeLocallyReviewedWithoutChangingCustomerFacts() async throws {
+        let request = makeRequest("给客户回一下这个功能需要先开权限", scene: .customerSupport)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [VoicePolishLedgerAudience(
+                text: "客户", sourceSpanIds: spans.map(\.id), surfaceTokens: ["客户"],
+                deliveryMode: "direct_address"
+            )],
+            units: [VoicePolishLedgerUnit(
+                id: "u1", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: "这个功能需要先开权限", sourceSpanIds: spans.map(\.id),
+                status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+            )],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+        let styleOpinion = VoicePolishReviewerResult(
+            verdict: "repair",
+            issues: [VoicePolishReviewerIssue(
+                type: "wrong_role", severity: "major", unitIds: ["u1"],
+                sourceSpanIds: spans.map(\.id), draftSpan: "请先开启权限",
+                repairInstruction: "把‘请’改成更直接的口吻。"
+            )],
+            semanticChecks: passReview(checkIDs: ["audience_context"], spans: spans).semanticChecks
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan),
+            try encoded(draft("请先开启权限。")),
+            try encoded(styleOpinion),
+            try encoded(draft("请先开启权限。")),
+            try encoded(passReview(checkIDs: ["audience_context"], spans: spans)),
+        ])
+
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+
+        XCTAssertEqual(result.text, "请先开启权限。")
+        XCTAssertEqual(result.attempts, 5)
+        XCTAssertNil(result.failureStage)
+    }
+
+    func test内部承诺边界误写成客户命令必须修复且复核仍失败时不得放行() async throws {
+        let request = makeRequest("给客户回复，别先答应赔偿，费用还没确认。", scene: .customerSupport)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let finalText = "费用还没确认，暂不承诺赔偿。"
+        var plan = ledger(finalMeaning: finalText, spanIDs: spans.map(\.id))
+        plan.audience = [.init(text: "客户", sourceSpanIds: spans.map(\.id), surfaceTokens: ["客户"], deliveryMode: "direct_address")]
+        _ = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .customerSupport)
+        let wrong = "先不要答应赔偿，费用还没确认。"
+        let wrongRole = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "wrong_role", severity: "major", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
+            draftSpan: "先不要答应赔偿", repairInstruction: "这是给写作者的要求，改为直接告知客户费用尚未确认，不能承诺赔偿。")],
+            semanticChecks: [.init(checkId: "audience_context", verdict: "unsupported",
+                evidence: spans.map { .init(spanId: $0.id, text: $0.text) })])
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(wrong)),
+            try encoded(wrongRole), try encoded(draft(finalText)),
+            try encoded(passReview(checkIDs: ["audience_context"], spans: spans))])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+        XCTAssertEqual(result.text, finalText)
+        XCTAssertEqual(result.attempts, 5)
+        XCTAssertNil(result.failureStage)
+
+        let rejectedClient = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(wrong)),
+            try encoded(wrongRole), try encoded(draft(wrong)), try encoded(wrongRole)])
+        let rejected = await VoicePolishLedgerPipeline(client: rejectedClient, config: config).process(request)
+        XCTAssertNotNil(rejected.failureStage)
+        XCTAssertNotEqual(rejected.text, wrong)
+    }
+
+    func testStructureDropsNonRecipientDirectiveIDsButStillOrdersEveryRecipientUnit() throws {
+        let request = makeRequest("整理会议通知，语气自然。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                VoicePolishLedgerUnit(
+                    id: "u1", kind: "action", deliveryRole: "recipient_content",
+                    finalMeaning: "整理会议通知", sourceSpanIds: spans.map(\.id),
+                    status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "u2", kind: "style", deliveryRole: "style_directive",
+                    finalMeaning: "语气自然", sourceSpanIds: spans.map(\.id),
+                    status: "keep", modality: "confirmed", exactTokens: [],
+                    surfaceTokens: ["语气自然"]
+                ),
+            ],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1", "u2"])
+        )
+
+        let validated = try VoicePolishLedgerIntegrityValidator.validatedLedger(
+            plan,
+            spans: spans,
+            verifiedMappings: [],
+            requiredLogicCues: [],
+            scene: .document
+        )
+
+        XCTAssertEqual(validated.structure.orderedUnitIds, ["u1"])
+    }
+
+    func testLongOriginalTextCannotBeReportedAsPolished() async throws {
+        let request = makeRequest(dailySource("原样假成功"))
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let original = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).map {
+            VoicePolishLedgerDraftFragment(id: "f_\($0.0.id)", unitIds: [$0.0.id], text: $0.1.text)
+        })
+        let repaired = VoicePolishLedgerDraftDocument(fragments: original.fragments.map {
+            var fragment = $0
+            fragment.text = fragment.text.replacingOccurrences(
+                of: "，清理口述重复后再形成自然段",
+                with: "，并整理为自然表达"
+            )
+            return fragment
+        })
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan), try encoded(original), try encoded(measurementReview(units: Array(plan.units.suffix(4)), spans: spans)),
+            try encoded(repaired), try encoded(measurementReview(units: Array(plan.units.suffix(4)), spans: spans)),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        XCTAssertNotEqual(result.text.replacingOccurrences(of: "\n", with: ""), request.input.fallbackText)
+    }
+
+    func testNearOriginalLongDraftWithOralScaffoldingCannotPass() async throws {
+        let source = (1...8).map { index in
+            "第\(index)部分，嗯，我们已经核对了负责人、时间边界和待确认事项，然后的话还要把各自的下一步说明清楚，怎么说呢，就是说只改一个标点仍然不算完整成稿。"
+        }.joined()
+        let request = makeRequest(source)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        let nearOriginal = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).map {
+            VoicePolishLedgerDraftFragment(
+                id: "f_\($0.0.id)", unitIds: [$0.0.id],
+                text: $0.1.text.replacingOccurrences(of: "第1部分，", with: "第1部分：")
+            )
+        })
+        let repaired = VoicePolishLedgerDraftDocument(fragments: zip(plan.units, spans).map {
+            VoicePolishLedgerDraftFragment(
+                id: "f_\($0.0.id)", unitIds: [$0.0.id],
+                text: $0.1.text
+                    .replacingOccurrences(of: "嗯，", with: "")
+                    .replacingOccurrences(of: "然后的话", with: "随后")
+                    .replacingOccurrences(of: "怎么说呢，", with: "")
+                    .replacingOccurrences(of: "就是说", with: "")
+            )
+        })
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan), try encoded(nearOriginal), try encoded(passReview()),
+            try encoded(repaired), try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        XCTAssertFalse(result.text.contains("然后的话"))
+        XCTAssertFalse(result.text.contains("怎么说呢"))
+    }
+
+    func testReviewerIssueWithoutSourceEvidenceCannotTriggerBlindRepair() async throws {
+        let source = "不要照抄证据不足的复核问题。"
+        let request = makeRequest(source)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let malformedReview = VoicePolishReviewerResult(
+            verdict: "repair",
+            issues: [VoicePolishReviewerIssue(
+                type: "missing",
+                severity: "major",
+                unitIds: ["u1"],
+                sourceSpanIds: [],
+                draftSpan: nil,
+                repairInstruction: "补充没有来源锚点的内容"
+            )]
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(finalMeaning: source, spanIDs: spanIDs)),
+            try encoded(draft(source)),
+            try encoded(malformedReview),
+        ])
+
+        let result = await VoicePolishLedgerPipeline(
+            client: client,
+            config: config
+        ).process(request)
+
+        XCTAssertTrue(result.text == nil)
+        XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.failureStage, .reviewing)
+    }
+
+    func testReviewerWrongRoleCannotLetRecipientContentDisappearAsEditorDirective() async throws {
+        let source = "第一项确认课程定位。第二项请团队周五前提交截图。"
+        let request = makeRequest(source, scene: .workChat)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 2)
+        let plan = VoicePolishIntentLedger(
+            audience: [],
+            units: [
+                VoicePolishLedgerUnit(
+                    id: "u1", kind: "claim", deliveryRole: "recipient_content",
+                    finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: "keep",
+                    modality: "confirmed", exactTokens: [], surfaceTokens: []
+                ),
+                VoicePolishLedgerUnit(
+                    id: "u2", kind: "action", deliveryRole: "editor_directive",
+                    finalMeaning: spans[1].text, sourceSpanIds: [spans[1].id], status: "remove",
+                    modality: "confirmed", exactTokens: [], surfaceTokens: ["提交截图"]
+                ),
+            ],
+            corrections: [], conditionals: [], technicalTokenMappings: [],
+            dictatedSymbolMappings: [], contextMappings: [],
+            structure: VoicePolishLedgerStructure(kind: "sentence", orderedUnitIds: ["u1"])
+        )
+        let wrongRoleReview = VoicePolishReviewerResult(
+            verdict: "repair",
+            issues: [VoicePolishReviewerIssue(
+                type: "wrong_role",
+                severity: "major",
+                unitIds: ["u2"],
+                sourceSpanIds: [spans[1].id],
+                draftSpan: nil,
+                repairInstruction: "这是面向团队的真实行动要求，不能作为幕后指令删除。"
+            )], semanticChecks: [.init(checkId: "source_role_u2", verdict: "unsupported",
+                evidence: [.init(spanId: spans[1].id, text: spans[1].text)])]
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(plan),
+            try encoded(draft("第一项确认课程定位。")),
+            try encoded(wrongRoleReview),
+            try encoded(draft(source)),
+            try encoded(passReview()),
+        ])
+
+        let result = await VoicePolishLedgerPipeline(
+            client: client,
+            config: config
+        ).process(request)
+
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .reviewing)
+        XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.validationCodes, [.semanticDecisionUnverified])
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 3)
+    }
+
+    func test正文角色被误标删除时角色问题不能被忽略或局部假修复() async throws {
+        let source = "会议最终安排在周四上午。小陈仍要补齐截图。"
+        let request = makeRequest(source, scene: .workChat)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(spans: spans)
+        plan.units[1].status = "remove"
+        plan.structure = .init(kind: "paragraphs", orderedUnitIds: ["u1"])
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "wrong_role", severity: "major", unitIds: ["u2"], sourceSpanIds: [spans[1].id],
+            draftSpan: nil, repairInstruction: "截图行动仍有效，不能因为 status=remove 而删除正文。")],
+            semanticChecks: [.init(checkId: "source_role_u2", verdict: "unsupported",
+                evidence: [.init(spanId: spans[1].id, text: spans[1].text)])])
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(spans[0].text)),
+            try encoded(review)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .reviewing)
+        XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.validationCodes, [.semanticDecisionUnverified])
+    }
+
+    func testSourceBoundPercentageCannotDisappearFromDraft() async throws {
+        let source = "原计划灰度 10%，今晚不要上线，明早再决定。"
+        let wrong = "今晚不要上线，明早再决定。"
+        let repaired = "原计划灰度 10%，今晚不要上线，明早再决定。"
+        let request = makeRequest(source, scene: .workChat)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "claim",
+            deliveryRole: "recipient_content",
+            finalMeaning: source,
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(wrong)),
+            try encoded(passReview(checkIDs: ["measurement_u1"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))),
+            try encoded(draft(repaired)),
+            try encoded(passReview(checkIDs: ["measurement_u1"], spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, repaired)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        let requests = await client.requests()
+        XCTAssertEqual(requests.count, 5)
+        let repairRequest = requests.dropFirst(3).first
+        XCTAssertTrue(
+            repairRequest?.user.contains("10%") == true
+                || repairRequest?.user.contains("10 %") == true
+        )
+    }
+
+    func testFirstPersonDraftCannotBecomeUserInstructionLayer() async throws {
+        let source = "灵建这个名字还没确认，先保留，别替我猜。"
+        let wrong = "灵建这个名字还没确认，先保留，别替用户猜测。"
+        let request = makeRequest(source, scene: .workChat)
+        let spanIDs = evidenceSpanIDs(for: request)
+        let unit = VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "constraint",
+            deliveryRole: "recipient_content",
+            finalMeaning: source,
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "pending",
+            exactTokens: [],
+            surfaceTokens: []
+        )
+        let client = LedgerScriptedLLM(responses: [
+            try encoded(ledger(unit: unit)),
+            try encoded(draft(wrong)),
+            try encoded(passReview()),
+            try encoded(draft(source)),
+            try encoded(passReview()),
+        ])
+
+        let result = await productionLedgerPipeline(client).process(request)
+
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, source)
+        XCTAssertEqual(result.llmAttemptCount, 5)
+        let requests = await client.requests()
+        XCTAssertTrue(requests[3].user.contains("第一人称"))
+    }
+
+    func testLedgerHasOneBoundedTotalDeadline() async {
+        let request = makeRequest(dailySource("总时限"))
+        let client = LedgerScriptedLLM(responses: [])
+
+        let result = await VoicePolishLedgerPipeline(
+            client: client,
+            config: config,
+            totalTimeout: .seconds(1)
+        ).process(request)
+
+        XCTAssertEqual(result.failureReason, .timeout)
+        XCTAssertEqual(result.attempts, 1)
+        let requestCount = await client.requestCount()
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    func test取消旧安排必须保留独立原因且不能本地整句删除() throws {
+        let request = makeRequest("录制安排在周三下午。原来说周二录，这个取消，因为真实截图还没补齐。", scene: .email)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let finalSpan = try XCTUnwrap(spans.first { $0.text.contains("周三") })
+        let oldSpan = try XCTUnwrap(spans.first { $0.text.contains("周二") })
+        var plan = ledger(finalMeaning: "录制安排在周三下午。", spanIDs: [finalSpan.id])
+        plan.units.append(.init(id: "u2", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "原来说周二录，这个取消，因为真实截图还没补齐。", sourceSpanIds: [oldSpan.id],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        plan.structure = .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2"])
+        plan.corrections = [.init(subject: "录制安排", oldValue: "周二", finalValue: "周三下午",
+                                 oldSpanIds: [oldSpan.id], finalSpanIds: [finalSpan.id], renderingPolicy: "final_only")]
+        XCTAssertThrowsError(try validated(plan, for: request)) { error in
+            XCTAssertTrue(String(describing: error).contains("recipient_unit_retains_superseded_value"))
+        }
+        let oldIndex = try XCTUnwrap(plan.units.firstIndex { $0.id == "u2" })
+        plan.units[oldIndex].finalMeaning = "真实截图还没补齐。"
+        let repaired = try validated(plan, for: request)
+        XCTAssertEqual(repaired.units[oldIndex].deliveryRole, "recipient_content")
+        XCTAssertEqual(repaired.units[oldIndex].status, "keep")
+        XCTAssertEqual(repaired.units[oldIndex].finalMeaning, "真实截图还没补齐。")
+        XCTAssertTrue(repaired.structure.orderedUnitIds.contains(plan.units[oldIndex].id))
+        XCTAssertEqual(repaired.units[0].finalMeaning, "录制安排在周三下午。")
+        XCTAssertEqual(repaired.corrections.first?.finalValue, "周三下午")
+    }
+
+    func test数字关系即使词面相同也必须重新提供来源复核() throws {
+        let request = makeRequest("北京项目预算不超过100元。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "北京项目预算100元。", spanIDs: spans.map(\.id))
+        plan.pendingSemanticChecks = []
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(checked.pendingSemanticChecks?.map(\.id), ["measurement_u1"])
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(passReview(), ledger: checked, spans: spans))
+        let proof = VoicePolishSourceQuote(spanId: spans[0].id, text: spans[0].text)
+        for answer in [
+            VoicePolishSemanticCheckResult(checkId: "measurement_u1", verdict: "unsupported", evidence: [proof]),
+            VoicePolishSemanticCheckResult(checkId: "measurement_u1", verdict: "supported", evidence: [.init(spanId: spans[0].id, text: "预算200元")]),
+            VoicePolishSemanticCheckResult(checkId: "measurement_u1", verdict: "supported", evidence: [.init(spanId: "other", text: spans[0].text)]),
+        ] {
+            let review = VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: [answer])
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(review, ledger: checked, spans: spans))
+        }
+        plan.units[0].finalMeaning = "北京项目预算不超过100元。"
+        let faithful = try validated(plan, for: request)
+        let supported = VoicePolishSemanticCheckResult(checkId: "measurement_u1", verdict: "supported", evidence: [proof])
+        let complete = VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: [supported])
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(complete, ledger: faithful, spans: spans))
+        let duplicate = VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: [supported, supported])
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(duplicate, ledger: faithful, spans: spans))
+    }
+
+    func test更正关系必须独立核对且币种和凭空金额仍硬拒绝() throws {
+        let request = makeRequest("昨天公告报名费260元，今天更正为210元，已交的退50元。")
+        let ids = evidenceSpanIDs(for: request)
+        var plan = ledger(finalMeaning: "报名费由260元更正为210元，已交的退50元。", spanIDs: ids)
+        plan.corrections = [.init(subject: "报名费", oldValue: "260元", finalValue: "210元", oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "announce_change")]
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(Set(checked.pendingSemanticChecks?.map(\.id) ?? []), ["measurement_u1", "correction_1"])
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(passReview(), ledger: checked, spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)))
+        for meaning in ["报名费由260元更正为210美元，已交的退50元。", "报名费由260元更正为210元，已交的退500元。"] {
+            plan.units[0].finalMeaning = meaning
+            XCTAssertThrowsError(try validated(plan, for: request), meaning)
+        }
+    }
+
+    func test不保证标签不能把禁止推断强制改成不承诺() throws {
+        let request = makeRequest("不能因为官网写了支持就说真实效果很好。")
+        var plan = ledger(finalMeaning: request.fallbackText, spanIDs: evidenceSpanIDs(for: request))
+        plan.units[0].kind = "constraint"
+        plan.units[0].modality = "not_promised"
+        let checked = try validated(plan, for: request)
+        let issues = VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: request.fallbackText, request: request, ledger: checked,
+            spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        )
+        XCTAssertFalse(issues.contains { $0.type == "wrong_modality" })
+    }
+
+    func test候选意图误删不保证时仍按原始来源拦截() throws {
+        let request = makeRequest("不能保证周五修好。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "周五会修好。", spanIDs: spans.map(\.id))
+        plan.units[0].modality = "not_promised"
+        let checked = try validated(plan, for: request)
+        let issues = VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: "周五会修好。", request: request, ledger: checked, spans: spans)
+        XCTAssertTrue(issues.contains { $0.type == "wrong_modality" })
+    }
+
+    func test冷复核发现被排除正文的Missing必须阻断() async throws {
+        let request = makeRequest("明天录制。真实截图还没补齐。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "明天录制。", spanIDs: spans.map(\.id))
+        plan.units.append(.init(id: "u2", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "真实截图还没补齐。", sourceSpanIds: spans.map(\.id),
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        let removedIndex = try XCTUnwrap(plan.units.firstIndex { $0.finalMeaning.contains("截图") })
+        let removedID = plan.units[removedIndex].id
+        plan.units[removedIndex].deliveryRole = "editor_directive"
+        plan.units[removedIndex].status = "remove"
+        plan.units[removedIndex].surfaceTokens = ["真实截图还没补齐"]
+        plan.structure = .init(kind: "sentence", orderedUnitIds: plan.units.filter { $0.id != removedID }.map(\.id))
+        let doc = draft("明天录制。", unitID: try XCTUnwrap(plan.structure.orderedUnitIds.first))
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "missing", severity: "major", unitIds: [removedID], sourceSpanIds: plan.units[removedIndex].sourceSpanIds,
+            draftSpan: nil, repairInstruction: "恢复仍有效的截图未补齐状态。"
+        )], semanticChecks: [.init(checkId: "source_role_\(removedID)", verdict: "unsupported",
+            evidence: spans.map { .init(spanId: $0.id, text: $0.text) })])
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(doc), try encoded(review)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.attempts, 3)
+        XCTAssertEqual(result.validationCodes, [.semanticDecisionUnverified])
+        let requests = await client.requests()
+        let payload = try XCTUnwrap(requests.last?.user)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        XCTAssertNil(object["intent_ledger"])
+        let index = try XCTUnwrap(object["source_unit_index"] as? [[String: Any]])
+        XCTAssertEqual(index.count, plan.units.count)
+        XCTAssertTrue(index.allSatisfy { Set($0.keys) == ["unit_id", "source_span_ids"] })
+        XCTAssertTrue(payload.contains("真实截图还没补齐"))
+    }
+
+    func test修复后的确认不能沿用第一次数字关系答案() async throws {
+        let request = makeRequest("预算100元，先不要开始。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
+            draftSpan: "预算100元，先不要开始。", repairInstruction: "调整停顿，保留两项约束。"
+        )], semanticChecks: [.init(checkId: "measurement_u1", verdict: "supported", evidence: spans.map {
+            .init(spanId: $0.id, text: $0.text)
+        })])
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(request.fallbackText)),
+            try encoded(review), try encoded(draft("预算100元。先不要开始。")), try encoded(passReview())])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.attempts, 5)
+        XCTAssertEqual(result.failureStage, .confirming)
+        XCTAssertTrue(result.validationCodes.contains(.semanticDecisionUnverified))
+    }
+
+    func test人数和无单位预算关系不能没有必答复核() throws {
+        for (source, final) in [("甲组3人，乙组5人。", "甲组5人，乙组3人。"),
+                                ("研发预算一万六，运营预算两万。", "研发预算两万，运营预算一万六。") ] {
+            let request = makeRequest(source)
+            let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+            let plan = ledger(finalMeaning: final, spanIDs: spans.map(\.id))
+            assertSemanticRejectionIsRequired(plan, spans: spans)
+        }
+    }
+
+    func test关系证据不能仅引用标点或孤立金额() throws {
+        let request = makeRequest("昨天公告预算100元，今天退款50元。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        plan.corrections = [.init(subject: "预算", oldValue: "100元", finalValue: "50元",
+            oldSpanIds: spans.map(\.id), finalSpanIds: spans.map(\.id), renderingPolicy: "announce_change")]
+        let checked = try validated(plan, for: request)
+        for text in ["。", "100元", "50元"] {
+            let answers = (checked.pendingSemanticChecks ?? []).map { check in
+                VoicePolishSemanticCheckResult(checkId: check.id, verdict: "supported",
+                    evidence: check.sourceSpanIds.map { .init(spanId: $0, text: text) })
+            }
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                .init(verdict: "pass", issues: [], semanticChecks: answers), ledger: checked, spans: spans))
+        }
+    }
+
+    func test编辑说明与预算同单元时必须先拆分而非整单元删除() throws {
+        let request = makeRequest("帮我整理成 Prompt。先别开始研究，只整理任务，预算100元。报告要写建议。", scene: .aiPrompt)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(spans: spans)
+        XCTAssertThrowsError(try validated(plan, for: request)) { error in
+            XCTAssertTrue(String(describing: error).contains("recipient_unit_contains_editor_process"))
+        }
+    }
+
+    func test改口旧值不能由不相邻来源片段拼出() throws {
+        let texts = ["预算1", "其他事项先保留", "00元", "最终预算80元"]
+        let spans = texts.enumerated().map { index, text in
+            VoicePolishEvidenceSpan(id: "s\(index)", segmentID: "s\(index)",
+                start: index * 20, end: index * 20 + text.count, text: text, digest: "test")
+        }
+        var plan = ledger(spans: spans)
+        plan.corrections = [.init(subject: "预算", oldValue: "100元", finalValue: "80元",
+            oldSpanIds: ["s0", "s2"], finalSpanIds: ["s3"], renderingPolicy: "final_only")]
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .document)) { error in
+            XCTAssertEqual(String(describing: error), "correction_value_not_found_in_its_source_span")
+        }
+    }
+
+    func test合并单元仍须保留另一个事项的同值而非一概当旧值() throws {
+        for otherAmount in ["100元", "一百元"] {
+            let texts = ["甲原来预算100元，这个取消，最终80元。", "乙预算\(otherAmount)不变。"]
+            let spans = texts.enumerated().map { index, text in
+                VoicePolishEvidenceSpan(id: "s\(index)", segmentID: "s\(index)",
+                    start: index * 20, end: index * 20 + text.count, text: text, digest: "test")
+            }
+            var plan = ledger(finalMeaning: "甲预算80元，乙预算100元不变。", spanIDs: spans.map(\.id))
+            plan.corrections = [.init(subject: "甲预算", oldValue: "100元", finalValue: "80元",
+                oldSpanIds: ["s0"], finalSpanIds: ["s0"], renderingPolicy: "final_only")]
+            let checked = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+                verifiedMappings: [], requiredLogicCues: [], scene: .document)
+            XCTAssertEqual(checked.units[0].finalMeaning, "甲预算80元，乙预算100元不变。")
+            XCTAssertEqual(Set(checked.pendingSemanticChecks?.map(\.id) ?? []), ["measurement_u1", "correction_1"])
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(passReview(), ledger: checked, spans: spans))
+        }
+    }
+
+    func test最终人数不能掩盖临时人员说明被删除() throws {
+        let request = makeRequest("团队前面说十八个人，后面解释有两个人只是临时帮忙，所以固定团队实际是十六个人；去年活动是十八位参与者，第二轮再复核。")
+        let ids = evidenceSpanIDs(for: request)
+        var plan = ledger(finalMeaning: "固定团队是十六个人，另有两个人只是临时帮忙；去年活动十八位参与者，第二轮再复核。", spanIDs: ids)
+        plan.corrections = [.init(subject: "团队", oldValue: "十八个人", finalValue: "十六个人",
+            oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only")]
+        XCTAssertNoThrow(try validated(plan, for: request))
+        plan.units[0].finalMeaning = "固定团队是十六个人；去年活动十八位参与者，第二轮再复核。"
+        XCTAssertThrowsError(try validated(plan, for: request)) { error in
+            XCTAssertTrue(String(describing: error).contains("ledger_measurement_coverage_invalid"))
+        }
+    }
+
+    func test人数允许等值量词但不能变成时长或裸数() throws {
+        let request = makeRequest("甲组3人，乙组5位。")
+        let ids = evidenceSpanIDs(for: request)
+        XCTAssertNoThrow(try validated(ledger(finalMeaning: "甲组三位，乙组五个人。", spanIDs: ids), for: request))
+        XCTAssertNoThrow(try validated(ledger(finalMeaning: "甲组三名成员，乙组五名成员。", spanIDs: ids), for: request))
+        for wrong in ["甲组3天，乙组5位。", "甲组3，乙组5位。", "甲组3人。"] {
+            XCTAssertThrowsError(try validated(ledger(finalMeaning: wrong, spanIDs: ids), for: request), wrong)
+        }
+    }
+
+    func test名次序位不当成人数但人数仍需保留() throws {
+        let request = makeRequest("第一名是小李，第一位发言的是小张；另有两名临时人员协助。")
+        let ids = evidenceSpanIDs(for: request)
+        let correct = "冠军是小李，首位发言的是小张；另有两个人临时协助。"
+        XCTAssertNoThrow(try validated(ledger(finalMeaning: correct, spanIDs: ids), for: request))
+        XCTAssertThrowsError(try validated(ledger(finalMeaning: "冠军是小李，首位发言的是小张。", spanIDs: ids), for: request))
+    }
+
+    func test人数单位不能截进后续词语() throws {
+        for (source, output) in [
+            ("这是一个人工智能应用。", "这是一款人工智能应用。"),
+            ("有两个人才培养项目。", "有两项人才培养项目。"),
+            ("这里有三个人名。", "这里有三个姓名。"),
+        ] {
+            let request = makeRequest(source)
+            XCTAssertNoThrow(try validated(ledger(finalMeaning: output,
+                spanIDs: evidenceSpanIDs(for: request)), for: request), source)
+        }
+    }
+
+    func test四步清单中的第三步不是已废弃的总数三步() throws {
+        let source = "部署要做三步，第一检查，第二构建，第三打包，等一下还有一步签名，所以一共四步。"
+        let request = makeRequest(source, scene: .code)
+        let ids = evidenceSpanIDs(for: request)
+        let texts = ["第一步：检查。", "第二步：构建。", "第三步：打包。", "第四步：签名。"]
+        var plan = ledger(finalMeaning: source, spanIDs: ids)
+        plan.units = texts.enumerated().map { index, text in
+            .init(id: "u\(index + 1)", kind: "action", deliveryRole: "recipient_content",
+                finalMeaning: text, sourceSpanIds: ids, status: "keep", modality: "confirmed",
+                exactTokens: [], surfaceTokens: [])
+        }
+        plan.structure = .init(kind: "numbered_list", orderedUnitIds: plan.units.map(\.id))
+        plan.corrections = [.init(subject: "部署步骤数", oldValue: "三步", finalValue: "四步",
+            oldSpanIds: ids, finalSpanIds: ids, renderingPolicy: "final_only")]
+        let checked = try validated(plan, for: request)
+        let issues = VoicePolishLedgerIntegrityValidator.deterministicIssues(output: texts.joined(separator: "\n"),
+            request: request, ledger: checked, spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))
+        XCTAssertFalse(issues.contains { $0.type == "obsolete_retained" })
+        for prefix in ["第 三 步", "第 3 步", "第\t3 步"] {
+            let formatted = texts.joined(separator: "\n").replacingOccurrences(of: "第三步", with: prefix)
+            let formattedIssues = VoicePolishLedgerIntegrityValidator.deterministicIssues(output: formatted,
+                request: request, ledger: checked, spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request))
+            XCTAssertFalse(formattedIssues.contains { $0.type == "obsolete_retained" }, formatted)
+        }
+        for wrong in ["部署共三步。", "部署共3步。"] {
+            plan.units[0].finalMeaning = wrong
+            XCTAssertThrowsError(try validated(plan, for: request), wrong)
+        }
+    }
+
+    func test正文第三方不能被词面强制变成另一个收件人() throws {
+        let request = makeRequest("跟大家说资料已备好，遇到问题别告诉他一定能解决。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "大家，资料已备好，遇到问题别告诉他一定能解决。", spanIDs: spans.map(\.id))
+        plan.audience = [.init(text: "大家", sourceSpanIds: spans.map(\.id),
+            surfaceTokens: ["大家"], deliveryMode: "direct_address")]
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(checked.audience.map(\.text), ["大家"])
+        XCTAssertTrue(checked.pendingSemanticChecks?.contains { $0.id == "audience_context" } == true)
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            passReview(), ledger: checked, spans: spans))
+    }
+
+    func test跨片受众检查必须绑定原始片段且拒绝空来源支持() throws {
+        let texts = ["🙂跟客", "户说我们会回复。"]
+        let spans = texts.enumerated().map { index, text in
+            VoicePolishEvidenceSpan(id: "s\(index)", segmentID: "s\(index)",
+                start: index == 0 ? 0 : texts[0].count,
+                end: index == 0 ? text.count : texts[0].count + text.count,
+                text: text, digest: "test")
+        }
+        let plan = ledger(finalMeaning: "我们会回复。", spanIDs: spans.map(\.id))
+        let checked = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+            verifiedMappings: [], requiredLogicCues: [], scene: .document)
+        let audience = try XCTUnwrap(checked.pendingSemanticChecks?.first { $0.id == "audience_context" })
+        XCTAssertEqual(Set(audience.sourceSpanIds), Set(spans.map(\.id)))
+        XCTAssertEqual(audience.unitIds, ["u1"])
+        XCTAssertEqual(Set(audience.requiredEvidence?.map(\.text) ?? []), Set(texts))
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            passReview(checkIDs: ["audience_context"], spans: spans), ledger: checked, spans: spans))
+        let emptySupport = passReview(checkIDs: ["audience_context"], spans: [])
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            emptySupport, ledger: checked, spans: spans))
+        var emptyLedger = checked
+        emptyLedger.pendingSemanticChecks = [.init(id: "audience_context", kind: "audience_relation",
+            claim: "待核对受众", unitIds: [], sourceSpanIds: [], requiredEvidence: [])]
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            emptySupport, ledger: emptyLedger, spans: spans))
+    }
+
+    func test有来源的不支持结论可修复但必须重新确认() async throws {
+        let request = makeRequest("预算不得超过100元。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        let wrong = "预算至少100元。"
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "wrong_relation", severity: "major", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
+            draftSpan: wrong, repairInstruction: "恢复预算上限，不得改成下限。"
+        )], semanticChecks: [.init(checkId: "measurement_u1", verdict: "unsupported",
+                                  evidence: spans.map { .init(spanId: $0.id, text: $0.text) })])
+        let unresolvedConfirmation = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "wrong_relation", severity: "major", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
+            draftSpan: request.fallbackText, repairInstruction: "复核仍不支持该上限表达，请再次核对来源。"
+        )], semanticChecks: review.semanticChecks)
+        for confirm in [passReview(checkIDs: ["measurement_u1"], spans: spans), unresolvedConfirmation] {
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(wrong)),
+                try encoded(review), try encoded(draft(request.fallbackText)), try encoded(confirm)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertEqual(result.attempts, 5)
+            if confirm.verdict == "pass" {
+                XCTAssertEqual(result.text, request.fallbackText)
+            } else {
+                XCTAssertNil(result.text)
+                XCTAssertEqual(result.failureStage, .confirming)
+            }
+        }
+        let checked = try validated(plan, for: request)
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(review,
+            ledger: checked, spans: spans))
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(review,
+            ledger: checked, spans: spans, allowRepairFindings: true))
+        for unlinked in [VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: review.semanticChecks),
+                         VoicePolishReviewerResult(verdict: "repair", issues: [], semanticChecks: review.semanticChecks)] {
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(unlinked,
+                ledger: checked, spans: spans, allowRepairFindings: true))
+        }
+    }
+
+    func test已识别收件人仍必须核对后续片段的承诺主体() throws {
+        let request = makeRequest("给客户回复我们还在检查。费用还没确认，先别答应赔偿。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "我们还在检查。费用尚未确认，暂不能承诺赔偿。", spanIDs: spans.map(\.id))
+        plan.audience = [.init(text: "客户", sourceSpanIds: [spans[0].id],
+            surfaceTokens: ["客户"], deliveryMode: "direct_address")]
+        let checked = try validated(plan, for: request)
+        let check = try XCTUnwrap(checked.pendingSemanticChecks?.first { $0.id == "audience_context" })
+        XCTAssertEqual(Set(check.sourceSpanIds), Set(spans.map(\.id)))
+        XCTAssertEqual(Set(check.requiredEvidence?.map(\.text) ?? []), Set(spans.map(\.text)))
+        XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            passReview(), ledger: checked, spans: spans))
+        XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+            passReview(checkIDs: [check.id], spans: spans), ledger: checked, spans: spans))
+    }
+
+    func test所有非正文处置都必须回答混合来源事实是否保留() throws {
+        let request = makeRequest("把想法整理成青禾交接页的需求说明。可以查找资料。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        for (role, status) in [("editor_directive", "remove"), ("style_directive", "keep"),
+                               ("excluded_content", "remove"), ("recipient_content", "remove")] {
+            var plan = ledger(finalMeaning: "可以查找资料。", spanIDs: spans.map(\.id))
+            plan.units.append(.init(id: "u2", kind: "claim", deliveryRole: role,
+                finalMeaning: spans[0].text, sourceSpanIds: [spans[0].id], status: status,
+                modality: "confirmed", exactTokens: ["青禾交接页"],
+                surfaceTokens: role == "recipient_content" ? [] : [spans[0].text]))
+            plan.pendingSemanticChecks = []
+            let checked = try validated(plan, for: request)
+            let check = try XCTUnwrap(checked.pendingSemanticChecks?.first { $0.id == "source_role_u2" })
+            XCTAssertEqual(check.kind, "source_disposition")
+            XCTAssertEqual(check.unitIds, ["u2"])
+            XCTAssertTrue(check.requiredEvidence?.contains { $0.text.contains("青禾交接页") } == true)
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                passReview(), ledger: checked, spans: spans), role)
+            let unsupported = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+                type: "missing", severity: "major", unitIds: ["u2"], sourceSpanIds: [spans[0].id],
+                draftSpan: nil, repairInstruction: "恢复需求对象名。"
+            )], semanticChecks: [.init(checkId: check.id, verdict: "unsupported",
+                                      evidence: [.init(spanId: spans[0].id, text: spans[0].text)])])
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                unsupported, ledger: checked, spans: spans), role)
+        }
+    }
+
+    func test只改钟点保留原日期和另一活动具体安排() throws {
+        let request = makeRequest("会议原定周三上午十点，培训安排周四上午十点。会议时间改成十点半，日期不变。培训安排也不变。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        XCTAssertEqual(spans.count, 3)
+        var plan = ledger(finalMeaning: "会议安排在周三上午十点半。", spanIDs: [spans[0].id, spans[1].id])
+        plan.units.append(.init(id: "u2", kind: "claim", deliveryRole: "recipient_content",
+            finalMeaning: "培训仍安排在周四上午十点。", sourceSpanIds: [spans[0].id, spans[2].id],
+            status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: []))
+        plan.structure = .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2"])
+        plan.corrections = [.init(subject: "会议", oldValue: "周三上午十点", finalValue: "十点半",
+            oldSpanIds: [spans[0].id], finalSpanIds: [spans[1].id], renderingPolicy: "final_only")]
+        let checked = try validated(plan, for: request)
+        let issues = VoicePolishLedgerIntegrityValidator.deterministicIssues(
+            output: plan.units.map(\.finalMeaning).joined(), request: request, ledger: checked, spans: spans)
+        XCTAssertTrue(issues.isEmpty, "\(issues)")
+        plan.units[0].finalMeaning = "会议安排在周三上午十点。"
+        XCTAssertThrowsError(try validated(plan, for: request))
+    }
+
+    func test命令在整篇出现仍必须在本步骤修复后重新确认() async throws {
+        let request = makeRequest("先跑swift test，再跑swift build。", scene: .code)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: "跑swift test。", spanIDs: spans.map(\.id))
+        plan.units[0].exactTokens = ["swift test"]
+        plan.units.append(.init(id: "u2", kind: "action", deliveryRole: "recipient_content",
+            finalMeaning: "跑swift build。", sourceSpanIds: spans.map(\.id), status: "keep",
+            modality: "confirmed", exactTokens: ["swift build"], surfaceTokens: []))
+        plan.structure = .init(kind: "numbered_list", orderedUnitIds: ["u1", "u2"])
+        let shifted = VoicePolishLedgerDraftDocument(fragments: [
+            .init(id: "f_u1", unitIds: ["u1"], text: "部署步骤如下："),
+            .init(id: "f_u2", unitIds: ["u2"], text: "跑swift test，再跑swift build。"),
+        ])
+        let fixed = VoicePolishLedgerDraftDocument(fragments: plan.units.map {
+            .init(id: "f_\($0.id)", unitIds: [$0.id], text: $0.finalMeaning)
+        })
+        for patch in [fixed, shifted] {
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(shifted),
+                try encoded(passReview()), try encoded(patch), try encoded(passReview())])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertEqual(result.attempts, 5)
+            if patch == fixed {
+                XCTAssertEqual(result.text, "1. 跑swift test。\n2. 跑swift build。")
+            } else {
+                XCTAssertNil(result.text)
+                XCTAssertEqual(result.failureStage, .confirming)
+            }
+            let requests = await client.requests()
+            let repair = try XCTUnwrap(requests.first { $0.task == .voicePolishRepair })
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(repair.user.utf8)) as? [String: Any])
+            XCTAssertEqual(Set(payload["allowed_fragment_ids"] as? [String] ?? []), ["f_u1", "f_u2"])
+        }
+    }
+
+    func test片段技术标识不能被其他同版本名称冒充() {
+        var plan = ledger(finalMeaning: "检查api/v2/query。")
+        plan.units[0].exactTokens = ["api/v2/query"]
+        let wrong = draft("检查other/v2/query。")
+        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(document: wrong, ledger: plan).isEmpty)
+        XCTAssertTrue(VoicePolishLedgerIntegrityValidator.fragmentBindingIssues(
+            document: draft("检查api/v2/query。"), ledger: plan).isEmpty)
+    }
+
+    func test轻微排版的概括引文可按有效单元修复但不能跳过确认() async throws {
+        let request = makeRequest("说明背景，再说明安排。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u1"], sourceSpanIds: spans.map(\.id),
+            draftSpan: "说明背景……说明安排", repairInstruction: "同一主题连续成句。"
+        )])
+        for confirm in [passReview(), review] {
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(request.fallbackText)),
+                try encoded(review), try encoded(draft("先说明背景，再说明安排。")), try encoded(confirm)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertEqual(result.attempts, 5)
+            XCTAssertEqual(result.text != nil, confirm.verdict == "pass")
+            if confirm.verdict != "pass" { XCTAssertEqual(result.failureStage, .confirming) }
+            let requests = await client.requests()
+            let repair = try XCTUnwrap(requests.first { $0.task == .voicePolishRepair })
+            XCTAssertTrue(repair.user.contains("同一主题连续成句"))
+            XCTAssertFalse(repair.user.contains("说明背景……说明安排"))
+        }
+    }
+
+    func test事实错误及无效定位不能借排版引文容错放行() async throws {
+        let request = makeRequest("说明背景，再说明安排。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let plan = ledger(finalMeaning: request.fallbackText, spanIDs: spans.map(\.id))
+        let variants: [(String, String, [String], [String], String)] = [
+            ("style_shift", "major", ["u1"], spans.map(\.id), "修复事实。"),
+            ("wrong_role", "minor", ["u1"], spans.map(\.id), "修复角色。"),
+            ("missing", "major", ["u1"], spans.map(\.id), "恢复事实。"),
+            ("style_shift", "minor", ["unknown"], spans.map(\.id), "调整排版。"),
+            ("style_shift", "minor", ["u1"], ["unknown"], "调整排版。"),
+            ("style_shift", "minor", ["u1"], spans.map(\.id), ""),
+        ]
+        for (type, severity, units, sourceIDs, instruction) in variants {
+            let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+                type: type, severity: severity, unitIds: units, sourceSpanIds: sourceIDs,
+                draftSpan: "说明背景……说明安排", repairInstruction: instruction
+            )])
+            let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(draft(request.fallbackText)),
+                try encoded(review)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+            XCTAssertNil(result.text)
+            XCTAssertEqual(result.attempts, 3)
+            XCTAssertEqual(result.failureStage, .reviewing)
+            XCTAssertTrue(result.validationCodes.contains(.invalidStructuredResponse))
+        }
+    }
+
+    func test全来源复核可引用完整非文字片段但不能拿标点代替正文证据() throws {
+        for separator in ["\n", "\n\n", "！？", "🙂"] {
+            let texts = ["给客户回复。", separator, "我们还在核实。"]
+            var offset = 0
+            let spans = texts.enumerated().map { index, text -> VoicePolishEvidenceSpan in
+                defer { offset += text.count }
+                return .init(id: "s\(index + 1)", segmentID: "s\(index + 1)",
+                    start: offset, end: offset + text.count, text: text, digest: "test")
+            }
+            var plan = ledger(finalMeaning: "我们还在核实。", spanIDs: ["s1", "s3"])
+            plan.units.append(.init(id: "u2", kind: "style", deliveryRole: "style_directive",
+                finalMeaning: "处理分隔符", sourceSpanIds: ["s2"], status: "remove", modality: "confirmed",
+                exactTokens: [], surfaceTokens: [separator]))
+            let checked = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+                verifiedMappings: [], requiredLogicCues: [], scene: .customerSupport)
+            let checks = try XCTUnwrap(checked.pendingSemanticChecks)
+            XCTAssertEqual(Set(checks.map(\.id)), ["audience_context", "source_role_u2"])
+            let answers = checks.map { check in
+                VoicePolishSemanticCheckResult(checkId: check.id, verdict: "supported", evidence: spans.filter {
+                    check.sourceSpanIds.contains($0.id)
+                }.map { .init(spanId: $0.id, text: $0.text) })
+            }
+            let supported = VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: answers)
+            XCTAssertNoThrow(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                supported, ledger: checked, spans: spans), separator)
+            for (spanID, invalidQuote) in [("s1", "。"), ("s2", ""), ("s2", String(separator.dropLast()))] {
+                let badAnswers = answers.map { answer in
+                    VoicePolishSemanticCheckResult(checkId: answer.checkId, verdict: answer.verdict,
+                        evidence: answer.evidence.map { quote in
+                            quote.spanId == spanID ? .init(spanId: spanID, text: invalidQuote) : quote
+                        })
+                }
+                XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                    .init(verdict: "pass", issues: [], semanticChecks: badAnswers), ledger: checked, spans: spans))
+            }
+            var otherKind = checked
+            otherKind.pendingSemanticChecks = checks.map { check in
+                .init(id: check.id, kind: "measurement", claim: check.claim, unitIds: check.unitIds,
+                    sourceSpanIds: check.sourceSpanIds, requiredEvidence: check.requiredEvidence)
+            }
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                supported, ledger: otherKind, spans: spans))
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                passReview(), ledger: checked, spans: spans))
+            let unsupported = answers.map {
+                VoicePolishSemanticCheckResult(checkId: $0.checkId, verdict: "unsupported", evidence: $0.evidence)
+            }
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                .init(verdict: "pass", issues: [], semanticChecks: unsupported), ledger: checked, spans: spans,
+                allowRepairFindings: true))
+        }
+    }
+
+    func test排版补丁可以去除程序生成的错误单号且保留全部正文() async throws {
+        let fixture = try layoutRepairFixture()
+        for stepWording in ["两步", "两个步骤"] {
+            var fragment = fixture.document.fragments[1]
+            fragment.text = fragment.text.replacingOccurrences(of: "两步", with: stepWording)
+            let patch = VoicePolishLedgerDraftPatch(
+                fragments: [fragment],
+                structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: [])
+            )
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(fixture.review), try encoded(patch), try encoded(passReview(checkIDs: ["measurement_u2"], spans: [fixture.spans[1]]))])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertEqual(result.text, fixture.document.fragments.map(\.text).joined(separator: "\n\n").replacingOccurrences(of: "两步", with: stepWording),
+                           "\(result.failureStage as Any) \(result.validationCodes)")
+            XCTAssertEqual(result.attempts, 5)
+            let requests = await client.requests()
+            let repairPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(requests.dropFirst(3).first).user.utf8)) as? [String: Any])
+            XCTAssertEqual(repairPayload["allowed_structure_unit_ids"] as? [String], ["u2"])
+            XCTAssertEqual(repairPayload["allowed_fragment_ids"] as? [String], ["f_u2"])
+            let confirmPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(requests.dropFirst(4).first).user.utf8)) as? [String: Any])
+            XCTAssertEqual(confirmPayload["rendered_text"] as? String, result.text)
+            XCTAssertFalse((confirmPayload["rendered_text"] as? String ?? "").contains("1. "))
+        }
+    }
+
+    func test仅全局排版问题可以改变整篇段落形式() async throws {
+        let fixture = try layoutRepairFixture()
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u1", "u2", "u3"], sourceSpanIds: fixture.spans.map(\.id),
+            draftSpan: nil, repairInstruction: "调整整篇的段落排版，保留全部内容。"
+        )], semanticChecks: fixture.review.semanticChecks)
+        for kind in ["sentence", "paragraphs"] {
+            let patch = VoicePolishLedgerDraftPatch(fragments: fixture.document.fragments,
+                structure: .init(kind: kind, orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []))
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(review), try encoded(patch),
+                try encoded(passReview(checkIDs: ["measurement_u2"], spans: [fixture.spans[1]]))])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertEqual(result.text, fixture.document.fragments.map(\.text).joined(separator: kind == "sentence" ? "" : "\n\n"))
+            XCTAssertEqual(result.attempts, 5)
+        }
+    }
+
+    func test旧文本补丁仍需确认且不能伪装已经去除程序编号() async throws {
+        let fixture = try layoutRepairFixture()
+        let textOnly = VoicePolishLedgerDraftDocument(fragments: [fixture.document.fragments[1]])
+        let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+            try encoded(fixture.review), try encoded(textOnly), try encoded(fixture.review)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .confirming)
+        XCTAssertEqual(result.attempts, 5)
+        XCTAssertTrue(result.rejectedDraft?.contains("1. 操作分为两步") == true)
+    }
+
+    func test排版补丁不能重排漏掉正文或修改无关单元编号() async throws {
+        let fixture = try layoutRepairFixture()
+        let variants: [VoicePolishLedgerStructure] = [
+            .init(kind: "sentence", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u3", "u2", "u1"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2"], numberedUnitIds: []),
+            .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u1"]),
+            .init(kind: "numbered_list", orderedUnitIds: ["u1", "u2", "u3"]),
+            .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u2", "u2"]),
+            .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["unknown"]),
+            .init(kind: "unknown", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []),
+            .init(kind: "paragraphs", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u2"]),
+        ]
+        for structure in variants {
+            let patch = VoicePolishLedgerDraftPatch(fragments: [fixture.document.fragments[1]], structure: structure)
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(fixture.review), try encoded(patch)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertNil(result.text, "\(structure)")
+            XCTAssertEqual(result.failureStage, .repairing, "\(structure)")
+            XCTAssertEqual(result.attempts, 4, "\(structure)")
+        }
+    }
+
+    func test非排版问题不能提交结构补丁() async throws {
+        let fixture = try layoutRepairFixture()
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "missing", severity: "major", unitIds: ["u2"], sourceSpanIds: fixture.plan.units[1].sourceSpanIds,
+            draftSpan: nil, repairInstruction: "恢复完整操作要求。"
+        )], semanticChecks: fixture.review.semanticChecks)
+        let patch = VoicePolishLedgerDraftPatch(fragments: [fixture.document.fragments[1]],
+            structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []))
+        let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+            try encoded(review), try encoded(patch)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .repairing)
+        XCTAssertEqual(result.attempts, 4)
+        let requests = await client.requests()
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(requests.dropFirst(3).first).user.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["allowed_structure_unit_ids"] as? [String], [])
+    }
+
+    func test排版修好之后仍然检查错误数字和复核拒绝() async throws {
+        let fixture = try layoutRepairFixture()
+        for wrongNumber in [false, true] {
+            var fragment = fixture.document.fragments[1]
+            if wrongNumber { fragment.text = fragment.text.replacingOccurrences(of: "2分钟", with: "3分钟") }
+            let patch = VoicePolishLedgerDraftPatch(fragments: [fragment],
+                structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: []))
+            let stillRejected = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+                type: "style_shift", severity: "minor", unitIds: ["u2"], sourceSpanIds: fixture.plan.units[1].sourceSpanIds,
+                draftSpan: nil, repairInstruction: "仍需调整当前操作要求的表达。"
+            )], semanticChecks: fixture.review.semanticChecks)
+            let client = LedgerScriptedLLM(responses: [try encoded(fixture.plan), try encoded(fixture.document),
+                try encoded(fixture.review), try encoded(patch), try encoded(wrongNumber ? passReview(checkIDs: ["measurement_u2"], spans: [fixture.spans[1]]) : stillRejected)])
+            let result = await VoicePolishLedgerPipeline(client: client, config: config).process(fixture.request)
+            XCTAssertNil(result.text)
+            XCTAssertEqual(result.failureStage, .confirming)
+            XCTAssertEqual(result.attempts, 5)
+        }
+    }
+
+    func test排版补丁不能删除明确更新后的步骤总数() async throws {
+        let request = makeRequest("步骤原来是两步，补充后共三步：核对来源、检查数字、确认名称。")
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        let meanings = ["步骤共三步。", "核对来源。", "检查数字。", "确认名称。"]
+        var plan = ledger(finalMeaning: meanings[0], spanIDs: spans.map(\.id))
+        plan.units = meanings.enumerated().map { index, text in
+            .init(id: "u\(index + 1)", kind: "action", deliveryRole: "recipient_content", finalMeaning: text,
+                  sourceSpanIds: spans.map(\.id), status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: [])
+        }
+        plan.corrections = [.init(subject: "步骤", oldValue: "两步", finalValue: "三步",
+            oldSpanIds: spans.map(\.id), finalSpanIds: spans.map(\.id), renderingPolicy: "final_only")]
+        plan.structure = .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3", "u4"], numberedUnitIds: ["u2", "u3", "u4"])
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(checked.pendingSemanticChecks?.map(\.id), ["correction_1"])
+        let document = VoicePolishLedgerDraftDocument(fragments: plan.units.map {
+            .init(id: "f_\($0.id)", unitIds: [$0.id], text: $0.finalMeaning, paragraphBreakBefore: true)
+        })
+        var review = passReview(checkIDs: ["correction_1"], spans: spans)
+        review = .init(verdict: "repair", issues: [.init(type: "style_shift", severity: "minor", unitIds: ["u2"],
+            sourceSpanIds: spans.map(\.id), draftSpan: "1. 核对来源。", repairInstruction: "调整这个编号。")],
+            semanticChecks: review.semanticChecks)
+        let patch = VoicePolishLedgerDraftPatch(fragments: [document.fragments[1]],
+            structure: .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3", "u4"], numberedUnitIds: ["u3", "u4"]))
+        let client = LedgerScriptedLLM(responses: [try encoded(plan), try encoded(document), try encoded(review), try encoded(patch)])
+        let result = await VoicePolishLedgerPipeline(client: client, config: config).process(request)
+        XCTAssertNil(result.text)
+        XCTAssertEqual(result.failureStage, .repairing)
+        XCTAssertEqual(result.attempts, 4)
+    }
+
+    private func layoutRepairFixture() throws -> (
+        request: VoicePolishRequest, spans: [VoicePolishEvidenceSpan], plan: VoicePolishIntentLedger,
+        document: VoicePolishLedgerDraftDocument, review: VoicePolishReviewerResult
+    ) {
+        let meanings = ["这个功能需要先开启权限。", "操作分为两步，预计耗时2分钟：打开辅助功能，然后完全退出软件再重新打开。", "准备系统版本和错误截图。"]
+        let request = makeRequest(meanings.joined(), scene: .customerSupport)
+        let spans = VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request)
+        var plan = ledger(finalMeaning: meanings[0], spanIDs: spans.map(\.id))
+        plan.units = meanings.enumerated().map { index, text in
+            .init(id: "u\(index + 1)", kind: "action", deliveryRole: "recipient_content", finalMeaning: text,
+                  sourceSpanIds: spans.filter { $0.text == text }.map(\.id), status: "keep", modality: "confirmed", exactTokens: [], surfaceTokens: [])
+        }
+        plan.structure = .init(kind: "mixed", orderedUnitIds: ["u1", "u2", "u3"], numberedUnitIds: ["u2"])
+        let checked = try validated(plan, for: request)
+        XCTAssertEqual(checked.pendingSemanticChecks?.map(\.id), ["measurement_u2"])
+        let document = VoicePolishLedgerDraftDocument(fragments: plan.units.map {
+            .init(id: "f_\($0.id)", unitIds: [$0.id], text: $0.finalMeaning, paragraphBreakBefore: true)
+        })
+        let review = VoicePolishReviewerResult(verdict: "repair", issues: [.init(
+            type: "style_shift", severity: "minor", unitIds: ["u2"], sourceSpanIds: plan.units[1].sourceSpanIds,
+            draftSpan: "1. \(meanings[1])", repairInstruction: "去掉程序生成的单独编号，保留完整操作说明。"
+        )], semanticChecks: passReview(checkIDs: ["measurement_u2"], spans: [spans[1]]).semanticChecks)
+        return (request, spans, plan, document, review)
+    }
+
+    private func validated(_ plan: VoicePolishIntentLedger, for request: VoicePolishRequest) throws -> VoicePolishIntentLedger {
+        try VoicePolishLedgerIntegrityValidator.validatedLedger(plan,
+            spans: VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request),
+            verifiedMappings: [], requiredLogicCues: [], scene: request.context.scene)
+    }
+
+    private func makeRequest(
+        _ source: String,
+        scene: WritingScene = .document,
+        resolvedEntities: [ResolvedEntity] = []
+    ) -> VoicePolishRequest {
+        VoicePolishRequest(
+            input: VoiceInputEnvelope(
+                providerFinalText: source,
+                segments: [RecognitionSegment(
+                    id: "s1",
+                    text: source,
+                    startTimeMs: 0,
+                    endTimeMs: 8_000,
+                    confidence: 0.98,
+                    isFinal: true
+                )],
+                durationMs: 8_000,
+                provider: .volcano
+            ),
+            context: WritingContext(scene: scene, level: .metadataOnly, safety: .unknown),
+            preferences: UserPolishPreferences(additionalRequirements: ""),
+            qualityMode: .automatic,
+            resolvedEntities: resolvedEntities
+        )
+    }
+
+    private func ledger(
+        finalMeaning: String,
+        spanIDs: [String] = ["s1"]
+    ) -> VoicePolishIntentLedger {
+        ledger(unit: VoicePolishLedgerUnit(
+            id: "u1",
+            kind: "claim",
+            deliveryRole: "recipient_content",
+            finalMeaning: finalMeaning,
+            sourceSpanIds: spanIDs,
+            status: "keep",
+            modality: "confirmed",
+            exactTokens: [],
+            surfaceTokens: []
+        ))
+    }
+
+    private func ledger(unit: VoicePolishLedgerUnit) -> VoicePolishIntentLedger {
+        VoicePolishIntentLedger(
+            audience: [],
+            units: [unit],
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [],
+            dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "paragraphs",
+                orderedUnitIds: [unit.id]
+            )
+        )
+    }
+
+    private func ledger(spans: [VoicePolishEvidenceSpan]) -> VoicePolishIntentLedger {
+        let units = spans.enumerated().map { index, span in
+            VoicePolishLedgerUnit(
+                id: "u\(index + 1)",
+                kind: "claim",
+                deliveryRole: "recipient_content",
+                finalMeaning: span.text,
+                sourceSpanIds: [span.id],
+                status: "keep",
+                modality: "confirmed",
+                exactTokens: [],
+                surfaceTokens: []
+            )
+        }
+        return VoicePolishIntentLedger(
+            audience: [],
+            units: units,
+            corrections: [],
+            conditionals: [],
+            technicalTokenMappings: [],
+            dictatedSymbolMappings: [],
+            contextMappings: [],
+            structure: VoicePolishLedgerStructure(
+                kind: "paragraphs",
+                orderedUnitIds: units.map(\.id)
+            )
+        )
+    }
+
+    private func draft(
+        _ text: String,
+        unitID: String = "u1"
+    ) -> VoicePolishLedgerDraftDocument {
+        VoicePolishLedgerDraftDocument(fragments: [VoicePolishLedgerDraftFragment(
+            id: "f_\(unitID)",
+            unitIds: [unitID],
+            text: text
+        )])
+    }
+
+    private func measurementReview(units: [VoicePolishLedgerUnit], spans: [VoicePolishEvidenceSpan]) -> VoicePolishReviewerResult {
+        VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: units.map { unit in
+            .init(checkId: "measurement_\(unit.id)", verdict: "supported", evidence: spans.filter {
+                unit.sourceSpanIds.contains($0.id)
+            }.map { .init(spanId: $0.id, text: $0.text) })
+        })
+    }
+
+    private func passReview(checkIDs: [String] = [], spans: [VoicePolishEvidenceSpan] = []) -> VoicePolishReviewerResult {
+        VoicePolishReviewerResult(verdict: "pass", issues: [], semanticChecks: checkIDs.map { id in
+            VoicePolishSemanticCheckResult(checkId: id, verdict: "supported", evidence: spans.map {
+                VoicePolishSourceQuote(spanId: $0.id, text: $0.text)
+            })
+        })
+    }
+
+    /// 关系反例可以进入待核对状态，但无回答或明确不支持都不能得到成功稿。
+    /// 数字/币种无来源类反例继续使用原有 XCTAssertThrowsError 硬门禁。
+    private func assertSemanticRejectionIsRequired(
+        _ plan: VoicePolishIntentLedger, spans: [VoicePolishEvidenceSpan],
+        scene: WritingScene = .document, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        do {
+            let checked = try VoicePolishLedgerIntegrityValidator.validatedLedger(plan, spans: spans,
+                verifiedMappings: [], requiredLogicCues: [], scene: scene)
+            let pending = checked.pendingSemanticChecks ?? []
+            XCTAssertFalse(pending.isEmpty, file: file, line: line)
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                passReview(), ledger: checked, spans: spans), file: file, line: line)
+            let rejected = VoicePolishReviewerResult(verdict: "unsafe", issues: [], semanticChecks: pending.map { check in
+                VoicePolishSemanticCheckResult(checkId: check.id, verdict: "unsupported", evidence: spans.filter {
+                    check.sourceSpanIds.contains($0.id)
+                }.map { .init(spanId: $0.id, text: $0.text) })
+            })
+            XCTAssertThrowsError(try VoicePolishLedgerIntegrityValidator.validateSemanticReview(
+                rejected, ledger: checked, spans: spans), file: file, line: line)
+        } catch {
+            XCTFail("此处应由独立语义复核拒绝；意外提前失败：\(error)", file: file, line: line)
+        }
+    }
+
+    private func encoded<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return String(decoding: try encoder.encode(value), as: UTF8.self)
+    }
+
+    private func evidenceSpanIDs(for request: VoicePolishRequest) -> [String] {
+        VoicePolishLedgerIntegrityValidator.evidenceSpans(for: request).map(\.id)
+    }
+
+    private func dailySource(_ focus: String) -> String {
+        ([focus] + (1...16).map {
+            "第\($0)部分需要保留原始事实、负责人、时间边界和待确认状态，清理口述重复后再形成自然段。"
+        }).joined()
+    }
+
+}
+
+private actor LedgerScriptedLLM: LLMClient {
+    private var responses: [String]
+    private var recorded: [LLMRequest] = []
+    private var configuredModels: [String] = []
+
+    init(responses: [String]) {
+        self.responses = responses
+    }
+
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        recorded.append(request)
+        configuredModels.append(config.model)
+        guard !responses.isEmpty else { throw LedgerScriptedLLMError.noResponse }
+        return LLMResponse(text: responses.removeFirst(), model: config.model)
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
+        _ = text
+        _ = prompt
+        _ = context
+        _ = config
+        throw LedgerScriptedLLMError.noResponse
+    }
+
+    func warmUp(baseURL: String) async { _ = baseURL }
+
+    func requests() -> [LLMRequest] { recorded }
+    func requestCount() -> Int { recorded.count }
+    func models() -> [String] { configuredModels }
+}
+
+private enum LedgerTransientFailure: Sendable {
+    case requestFailed503
+    case requestFailed401
+    case requestRejected503
+    case requestRejected401
+    case networkConnectionLost
+}
+
+private actor LedgerTransientPlannerLLM: LLMClient {
+    private var responses: [String]
+    private let initialFailure: LedgerTransientFailure
+    private var recorded: [LLMRequest] = []
+    private var configuredModels: [String] = []
+    private var failedOnce = false
+
+    init(
+        responses: [String],
+        initialFailure: LedgerTransientFailure = .requestFailed503
+    ) {
+        self.responses = responses
+        self.initialFailure = initialFailure
+    }
+
+    func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
+        recorded.append(request)
+        configuredModels.append(config.model)
+        if !failedOnce {
+            failedOnce = true
+            switch initialFailure {
+            case .requestFailed503:
+                throw LLMError.requestFailed(503)
+            case .requestFailed401:
+                throw LLMError.requestFailed(401)
+            case .requestRejected503:
+                throw LLMError.requestRejected(503, "service unavailable")
+            case .requestRejected401:
+                throw LLMError.requestRejected(401, "unauthorized")
+            case .networkConnectionLost:
+                throw URLError(.networkConnectionLost)
+            }
+        }
+        guard !responses.isEmpty else { throw LedgerScriptedLLMError.noResponse }
+        return LLMResponse(text: responses.removeFirst(), model: config.model)
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        context: LLMRequestContext,
+        config: LLMConfig
+    ) async throws -> String {
+        _ = text
+        _ = prompt
+        _ = context
+        _ = config
+        throw LedgerScriptedLLMError.noResponse
+    }
+
+    func warmUp(baseURL: String) async { _ = baseURL }
+
+    func requestCount() -> Int { recorded.count }
+    func models() -> [String] { configuredModels }
+    func requests() -> [LLMRequest] { recorded }
+}
+
+private enum LedgerScriptedLLMError: Error {
+    case noResponse
+}

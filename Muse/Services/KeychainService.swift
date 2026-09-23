@@ -5,6 +5,7 @@ import Security
 enum KeychainService {
 
     private static let lock = NSLock()
+    private static let llmThinkingPreferenceLock = NSLock()
     private static let keychainServiceName = "pro.daliang.muse.credentials"
 
     /// XCTest 进程不得读取真实 Application Support、UserDefaults 或系统钥匙串。
@@ -26,6 +27,25 @@ enum KeychainService {
 
     static var isUsingIsolatedTestStorage: Bool { isRunningTests }
 
+    @TaskLocal private static var interactiveReadOnlyTestScope = false
+
+    /// 交互测试只复用指定服务的现有凭据，不允许改动共享钥匙串或历史凭据文件。
+    private static var isCredentialReadOnly: Bool {
+        InteractiveTestRuntime.isEnabled || (isRunningTests && interactiveReadOnlyTestScope)
+    }
+
+    /// 只在 XCTest 的内存后端模拟交互测试限制，不打开真实系统存储。
+    static func withInteractiveCredentialReadOnlyForTesting<T>(
+        _ body: () throws -> T
+    ) rethrows -> T {
+        precondition(isRunningTests)
+        return try $interactiveReadOnlyTestScope.withValue(true, operation: body)
+    }
+
+    private static func mayReadCredential(key: String) -> Bool {
+        !isCredentialReadOnly || key == "tf_asr_volcano" || key == "tf_llm_deepseek"
+    }
+
     private static func withIsolatedTestStorage<T>(
         _ body: (inout IsolatedTestStorage) throws -> T
     ) rethrows -> T {
@@ -41,6 +61,7 @@ enum KeychainService {
     // MARK: - Core read/write (now supports nested objects)
 
     private static func loadAll() -> [String: Any] {
+        guard !isCredentialReadOnly else { return [:] }
         if isRunningTests {
             return withIsolatedTestStorage { $0.legacyValues }
         }
@@ -51,6 +72,7 @@ enum KeychainService {
     }
 
     private static func saveAll(_ dict: [String: Any]) throws {
+        guard !isCredentialReadOnly else { throw KeychainError.saveFailed(errSecReadOnly) }
         if isRunningTests {
             withIsolatedTestStorage { $0.legacyValues = dict }
             return
@@ -81,6 +103,7 @@ enum KeychainService {
     }
 
     private static func saveSecureData(_ data: Data, key: String) throws {
+        guard !isCredentialReadOnly else { throw KeychainError.saveFailed(errSecReadOnly) }
         if isRunningTests {
             withIsolatedTestStorage { $0.secureData[key] = data }
             return
@@ -106,6 +129,7 @@ enum KeychainService {
     }
 
     private static func loadSecureData(key: String) -> Data? {
+        guard mayReadCredential(key: key) else { return nil }
         if isRunningTests {
             return withIsolatedTestStorage { $0.secureData[key] }
         }
@@ -129,6 +153,7 @@ enum KeychainService {
 
     @discardableResult
     private static func deleteSecureData(key: String) -> Bool {
+        guard !isCredentialReadOnly else { return false }
         if isRunningTests {
             return withIsolatedTestStorage {
                 $0.secureData.removeValue(forKey: key) != nil
@@ -327,6 +352,38 @@ enum KeychainService {
         "tf_llm_\(provider.rawValue)"
     }
 
+    /// 专用 CLI 授权入口的一次读取。由系统征求当前制品的访问许可；不修改
+    /// ACL、不回退到文件、不返回凭据。常规录音及质量跑测不调用此方法。
+    static func authorizeLLMCredentialAccess(for provider: LLMProvider) -> OSStatus {
+        guard provider != .localQwen else { return errSecParam }
+        return authorizeCredentialAccess(key: llmStorageKey(for: provider))
+    }
+
+    /// 交互测试菜单的显式授权入口；只返回状态，不向调用方暴露凭据。
+    static func authorizeASRCredentialAccess(for provider: ASRProvider) -> OSStatus {
+        guard provider == .volcano || provider == .aliyun else { return errSecParam }
+        return authorizeCredentialAccess(key: asrStorageKey(for: provider))
+    }
+
+    private static func authorizeCredentialAccess(key: String) -> OSStatus {
+        guard mayReadCredential(key: key) else { return errSecAuthFailed }
+        if isRunningTests {
+            return withIsolatedTestStorage {
+                $0.secureData[key] == nil ? errSecItemNotFound : errSecSuccess
+            }
+        }
+        let interactionStatus = SecKeychainSetUserInteractionAllowed(true)
+        guard interactionStatus == errSecSuccess else { return interactionStatus }
+        defer { SecKeychainSetUserInteractionAllowed(false) }
+
+        var query = keychainQuery(for: key)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var data: CFTypeRef?
+        // 仅在进程内接收并丢弃结果；系统确认可能持久记录本制品的访问许可。
+        return SecItemCopyMatching(query as CFDictionary, &data)
+    }
+
     private static func sanitizeLLMCredentials(_ values: [String: String]) -> [String: String] {
         var sanitized = values
         for key in ["apiKey", "model", "baseURL"] {
@@ -358,6 +415,86 @@ enum KeychainService {
         "tf_assetExtractionModelOverride_\(provider.rawValue)"
     }
 
+    private static let llmThinkingModesPreferenceKey = "tf_llmThinkingModes"
+
+    private static func llmThinkingModeStorageKey(
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) -> String {
+        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = [role.rawValue, provider.rawValue, normalizedModel].joined(separator: "\u{1F}")
+        return Data(identity.utf8).base64EncodedString()
+    }
+
+    private static func loadLLMThinkingModeDictionary() -> [String: String] {
+        guard let raw = preferenceString(forKey: llmThinkingModesPreferenceKey),
+              let data = raw.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return [:] }
+        return values
+    }
+
+    static func loadLLMThinkingMode(
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) -> LLMThinkingMode {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            return provider.defaultThinkingMode(for: trimmedModel)
+        }
+
+        llmThinkingPreferenceLock.lock()
+        defer { llmThinkingPreferenceLock.unlock() }
+        let key = llmThinkingModeStorageKey(role: role, provider: provider, model: trimmedModel)
+        guard let raw = loadLLMThinkingModeDictionary()[key],
+              let mode = LLMThinkingMode(rawValue: raw)
+        else { return provider.defaultThinkingMode(for: trimmedModel) }
+        return mode
+    }
+
+    static func saveLLMThinkingMode(
+        _ mode: LLMThinkingMode,
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return }
+
+        llmThinkingPreferenceLock.lock()
+        defer { llmThinkingPreferenceLock.unlock() }
+        var values = loadLLMThinkingModeDictionary()
+        let key = llmThinkingModeStorageKey(role: role, provider: provider, model: trimmedModel)
+        values[key] = mode.rawValue
+        guard let data = try? JSONEncoder().encode(values),
+              let raw = String(data: data, encoding: .utf8)
+        else { return }
+        setPreference(raw, forKey: llmThinkingModesPreferenceKey)
+    }
+
+    static func removeLLMThinkingMode(
+        role: LLMConfigurationRole,
+        provider: LLMProvider,
+        model: String
+    ) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return }
+
+        llmThinkingPreferenceLock.lock()
+        defer { llmThinkingPreferenceLock.unlock() }
+        var values = loadLLMThinkingModeDictionary()
+        let key = llmThinkingModeStorageKey(role: role, provider: provider, model: trimmedModel)
+        values.removeValue(forKey: key)
+        if values.isEmpty {
+            removePreference(forKey: llmThinkingModesPreferenceKey)
+        } else if let data = try? JSONEncoder().encode(values),
+                  let raw = String(data: data, encoding: .utf8) {
+            setPreference(raw, forKey: llmThinkingModesPreferenceKey)
+        }
+    }
+
     static func saveLLMCredentials(for provider: LLMProvider, values: [String: String]) throws {
         let normalized = try normalizedLLMCredentialsForStorage(provider: provider, values: values)
         lock.lock()
@@ -384,6 +521,87 @@ enum KeychainService {
         return configType.init(credentials: values)
     }
 
+    static func withIsolatedPolishSettingsForTesting<T>(legacyOverride: String? = nil, _ body: () throws -> T) rethrows -> T {
+        precondition(isRunningTests)
+        let snapshot = withIsolatedTestStorage { $0 }
+        withIsolatedTestStorage { storage in
+            storage.preferences = storage.preferences.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.secureData = storage.secureData.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.preferences[DefaultsKeys.voicePolishModelOverride] = legacyOverride
+        }
+        defer { withIsolatedTestStorage { $0 = snapshot } }
+        return try body()
+    }
+
+    static func withIsolatedPolishSettingsForTestingAsync<T>(legacyOverride: String? = nil, _ body: () async throws -> T) async rethrows -> T {
+        precondition(isRunningTests)
+        let snapshot = withIsolatedTestStorage { $0 }
+        withIsolatedTestStorage { storage in
+            storage.preferences = storage.preferences.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.secureData = storage.secureData.filter { !$0.key.hasPrefix("tf_polish_") }
+            storage.preferences[DefaultsKeys.voicePolishModelOverride] = legacyOverride
+        }
+        defer { withIsolatedTestStorage { $0 = snapshot } }
+        return try await body()
+    }
+
+    // 两档独立保存；旧数据只读回退，不执行隐式迁移或覆盖另一档。
+    static func polishStorageKey(role: PolishModelRole, provider: LLMProvider) -> String {
+        "tf_polish_\(role.rawValue)_\(provider.rawValue)"
+    }
+
+    static func selectedPolishProvider(for role: PolishModelRole) -> LLMProvider {
+        preferenceString(forKey: "tf_polish_provider_\(role.rawValue)")
+            .flatMap(LLMProvider.init(rawValue:)) ?? selectedLLMProvider
+    }
+
+    static func setSelectedPolishProvider(_ provider: LLMProvider, for role: PolishModelRole) {
+        setPreference(provider.rawValue, forKey: "tf_polish_provider_\(role.rawValue)")
+    }
+
+    static func loadPolishCredentials(for provider: LLMProvider, role: PolishModelRole) -> [String: String]? {
+        if preferenceString(forKey: polishStorageKey(role: role, provider: provider) + "_saved") != nil {
+            guard let values = loadSecureDictionary(key: polishStorageKey(role: role, provider: provider)) else { return nil }
+            return sanitizeLLMCredentials(values)
+        }
+        guard var values = loadLLMCredentials(for: provider) else { return nil }
+        if provider == selectedLLMProvider, let model = preferenceString(forKey: DefaultsKeys.voicePolishModelOverride)?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            values["model"] = model
+        }
+        return values
+    }
+
+    static func savePolishCredentials(for provider: LLMProvider, role: PolishModelRole, values: [String: String]) throws {
+        let normalized = try normalizedLLMCredentialsForStorage(provider: provider, values: values)
+        lock.lock()
+        defer { lock.unlock() }
+        try saveSecureDictionary(normalized, key: polishStorageKey(role: role, provider: provider))
+        setPreference("1", forKey: polishStorageKey(role: role, provider: provider) + "_saved")
+    }
+
+    static func authorizePolishCredentialAccess(for provider: LLMProvider, role: PolishModelRole) -> OSStatus {
+        guard provider != .localQwen else { return errSecParam }
+        if preferenceString(forKey: polishStorageKey(role: role, provider: provider) + "_saved") != nil {
+            return authorizeCredentialAccess(key: polishStorageKey(role: role, provider: provider))
+        }
+        return authorizeLLMCredentialAccess(for: provider)
+    }
+
+    static func loadPolishConfig(for role: PolishModelRole, provider explicitProvider: LLMProvider? = nil) -> LLMConfig? {
+        let provider = explicitProvider ?? selectedPolishProvider(for: role)
+        if provider == .localQwen {
+            return resolvedLLMConfig(for: provider, role: .textProcessing)?.withThinkingMode(.disabled)
+        }
+        guard let values = loadPolishCredentials(for: provider, role: role),
+              let type = LLMProviderRegistry.configType(for: provider),
+              let config = type.init(credentials: values)?.toLLMConfig() else { return nil }
+        return config.withThinkingMode(.disabled)
+    }
+
+    static var anyPolishUsesLocalModel: Bool {
+        PolishModelRole.allCases.contains { selectedPolishProvider(for: $0) == .localQwen }
+    }
+
     // MARK: - LLM Config convenience (backward compat)
 
     static func saveLLMCredentials(apiKey: String, model: String, baseURL: String = "") throws {
@@ -394,12 +612,16 @@ enum KeychainService {
 
     /// Load LLMConfig for the currently selected provider.
     static func loadLLMConfig() -> LLMConfig? {
-        resolvedLLMConfig(for: selectedLLMProvider)
+        resolvedLLMConfig(for: selectedLLMProvider, role: .textProcessing)
     }
 
     static func loadAssetExtractionLLMConfig() -> LLMConfig? {
         let provider = selectedAssetExtractionLLMProvider
-        return resolvedLLMConfig(for: provider, modelOverride: loadAssetExtractionModelOverride(for: provider))
+        return resolvedLLMConfig(
+            for: provider,
+            role: .assetExtraction,
+            modelOverride: loadAssetExtractionModelOverride(for: provider)
+        )
     }
 
     static func saveAssetExtractionModelOverride(_ model: String?, for provider: LLMProvider) throws {
@@ -426,6 +648,7 @@ enum KeychainService {
 
     private static func resolvedLLMConfig(
         for provider: LLMProvider,
+        role: LLMConfigurationRole,
         modelOverride: String? = nil
     ) -> LLMConfig? {
         if provider == .localQwen {
@@ -439,13 +662,25 @@ enum KeychainService {
             guard let port else { return nil }
             let trimmedOverride = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let model = trimmedOverride.isEmpty ? "qwen3.5-9b" : trimmedOverride
-            return LLMConfig(apiKey: "", model: model, baseURL: "http://127.0.0.1:\(port)/v1")
+            let thinkingMode = loadLLMThinkingMode(role: role, provider: provider, model: model)
+            return LLMConfig(
+                apiKey: "",
+                model: model,
+                baseURL: "http://127.0.0.1:\(port)/v1",
+                thinkingMode: thinkingMode
+            )
         }
 
         guard let config = loadLLMProviderConfig(for: provider)?.toLLMConfig() else { return nil }
         let trimmedOverride = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trimmedOverride.isEmpty else { return config }
-        return LLMConfig(apiKey: config.apiKey, model: trimmedOverride, baseURL: config.baseURL)
+        let model = trimmedOverride.isEmpty ? config.model : trimmedOverride
+        let thinkingMode = loadLLMThinkingMode(role: role, provider: provider, model: model)
+        return LLMConfig(
+            apiKey: config.apiKey,
+            model: model,
+            baseURL: config.baseURL,
+            thinkingMode: thinkingMode
+        )
     }
 
     // MARK: - Migration (call once at app launch)
@@ -453,7 +688,7 @@ enum KeychainService {
     /// Migrate legacy flat keys to provider-grouped format,
     /// move Application Support directory, and migrate UserDefaults from old bundle ID.
     static func migrateIfNeeded() {
-        guard !isRunningTests else { return }
+        guard !isCredentialReadOnly, !isRunningTests else { return }
         migrateAppSupportDirectory()
         migrateKeychainService()
         migrateUserDefaults()
@@ -481,7 +716,8 @@ enum KeychainService {
             AppLogger.log("[KeychainService] Migrated legacy ASR credentials to tf_asr_volcano")
         }
 
-        // （原 aliyun→bailian 凭证迁移随两厂商一并移除，REPAIR_PLAN G1）
+        // 旧 aliyun→bailian 凭证格式与当前百炼 API Key 配置不兼容，不自动迁移；
+        // 用户在设置页保存后会写入新的 tf_asr_aliyun 钥匙串项。
 
         // Migrate LLM: tf_llmEndpointId → tf_llmModel
         if let endpointId = dict["tf_llmEndpointId"] as? String, !endpointId.isEmpty,

@@ -11,6 +11,7 @@ struct SettingsSidebarSettingsPanel: View {
     @Binding var launchAtLogin: Bool
     @Binding var preserveClipboard: Bool
     let onLaunchAtLoginChanged: (Bool) -> Void
+    let onShowHUDStylePicker: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -41,6 +42,10 @@ struct SettingsSidebarSettingsPanel: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: rowHeight)
+
+            fillButton(L("HUD 样式", "HUD Style"), on: false) {
+                onShowHUDStylePicker()
+            }
 
             Rectangle()
                 .fill(TF.settingsSidebarText.opacity(0.14))

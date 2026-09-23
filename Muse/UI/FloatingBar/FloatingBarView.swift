@@ -15,9 +15,27 @@ protocol FloatingBarState: AnyObject, Observable {
     var recordingStartDate: Date? { get }
     var copyFallbackWasCopied: Bool { get }
     var preserveProcessingWidthForCopyFallback: Bool { get }
+    var voicePolishStage: VoicePolishStage? { get }
+    var canUseVoicePolishCanonicalText: Bool { get }
+    var isRequestingVoicePolishCanonicalText: Bool { get }
+    var voicePolishCanonicalExitMessage: String? { get }
+    var isVoicePolishUnavailable: Bool { get }
+    var isRetryingVoicePolish: Bool { get }
+    var voicePolishUnavailableMessage: String? { get }
     /// True when recording without SenseVoice streaming (Qwen3-only).
     var isQwen3OnlyMode: Bool { get }
     func copyFallbackToClipboard()
+    func useVoicePolishCanonicalText()
+    func retryVoicePolish()
+}
+
+extension FloatingBarState {
+    var isRequestingVoicePolishCanonicalText: Bool { false }
+    var voicePolishCanonicalExitMessage: String? { nil }
+    var isVoicePolishUnavailable: Bool { false }
+    var isRetryingVoicePolish: Bool { false }
+    var voicePolishUnavailableMessage: String? { nil }
+    func retryVoicePolish() {}
 }
 
 /// Dark-themed floating transcription bar with smooth morphing between states.
@@ -29,31 +47,34 @@ protocol FloatingBarState: AnyObject, Observable {
 struct FloatingBarView<S: FloatingBarState>: View {
 
     let state: S
+    var styleOverride: HUDStyle? = nil
+    @AppStorage(DefaultsKeys.hudStyle) private var savedHUDStyle = HUDStyle.appleNative.rawValue
 
-    /// High-water mark: only grows during recording, never shrinks (prevents ASR correction jitter)
+    private var hudStyle: HUDStyle { styleOverride ?? HUDStyle.resolved(savedHUDStyle) }
+
+    /// 保留小幅回改时的外壳宽度，并在进入恢复阶段时复用。
     @State private var recordingPeakWidth: CGFloat = TF.barHeight
     @State private var processingStartDate: Date?
     @State private var doneStartDate: Date?
 
-    private var recordingLeadingInset: CGFloat { 3.0 }
-    private var recordingTrailingInset: CGFloat { 14.0 }
+    /// 按确认稿的圆角、波形光晕和字形轮廓校准；与40pt波形容器独立布局。
+    private var recordingTextLeadingInset: CGFloat { 37.0 }
+    // 尾字后保留12pt渐隐与4pt外侧空白，按可见字形校准右侧留白。
+    private var recordingTrailingInset: CGFloat { 4.0 }
     private var recordingIconWidth: CGFloat { 40.0 }
-    private var recordingIconTextGap: CGFloat {
-        AppLaunchDebug.hudDemoSpacingTight ? 3.0 : 4.0
+    private var recordingLabelWidth: CGFloat {
+        max(TF.barHeight, measureText(L("录音中", "Recording")) + recordingWidthReserve)
     }
-    private var recordingTextTailPadding: CGFloat { 8.0 }
+    private var recordingTextTailPadding: CGFloat { 12.0 }
     private var recordingTrimFadeWidth: CGFloat { 4.0 }
     private var capsuleHeight: CGFloat {
         state.barPhase == .copyFallback ? TF.barFallbackHeight : TF.barHeight
     }
     private var capsuleCornerRadius: CGFloat {
-        state.barPhase == .copyFallback ? 20 : TF.barHeight / 2
+        state.barPhase == .copyFallback ? 20 : capsuleHeight / 2
     }
     private var recordingWidthReserve: CGFloat {
-        recordingLeadingInset + recordingIconWidth + recordingIconTextGap + recordingTrailingInset + recordingTextTailPadding
-    }
-    private var isRecordingInitialCircleState: Bool {
-        state.segments.isEmpty && !state.isQwen3OnlyMode
+        recordingTextLeadingInset + recordingTrailingInset + recordingTextTailPadding
     }
     private var isRecordingLabelOnlyState: Bool {
         state.segments.isEmpty && state.isQwen3OnlyMode
@@ -61,17 +82,22 @@ struct FloatingBarView<S: FloatingBarState>: View {
     private var usesSuccessCheckmarkDoneContent: Bool {
         state.feedbackMessage == L("已完成", "Done")
     }
-    private var shouldTrimRecordingText: Bool {
-        recordingPeakWidth >= TF.barWidth
+    private var recordingMotionTargetWidth: CGFloat {
+        guard !state.segments.isEmpty else { return state.isQwen3OnlyMode ? recordingLabelWidth : TF.barHeight }
+        let needed = measureText(state.transcriptionText) + recordingWidthReserve
+        if needed < recordingPeakWidth, recordingPeakWidth - needed <= 30 {
+            return recordingPeakWidth
+        }
+        // 直接跟随正文，不等 onChange 再触发第二次更新；动画完成前不截到最大条宽。
+        return needed
     }
-
     private var capsuleWidth: CGFloat {
         switch state.barPhase {
         case .preparing:
             return TF.barHeight
         case .recording:
             if state.segments.isEmpty {
-                return state.isQwen3OnlyMode ? 124 : TF.barHeight
+                return state.isQwen3OnlyMode ? recordingLabelWidth : TF.barHeight
             }
             return recordingPeakWidth
         case .processing:
@@ -108,15 +134,9 @@ struct FloatingBarView<S: FloatingBarState>: View {
             let textWidth = measureText(newText)
             let needed = recordingTargetWidth(for: textWidth)
             if needed > recordingPeakWidth {
-                // Widen smoothly while streaming so the shell doesn't "jump" on every ASR update.
-                withAnimation(TF.hudWidthFlow) {
-                    recordingPeakWidth = needed
-                }
+                recordingPeakWidth = needed
             } else if recordingPeakWidth - needed > 30 {
-                // Large correction (hotword etc.): allow shrink
-                withAnimation(TF.hudWidthFlow) {
-                    recordingPeakWidth = needed
-                }
+                recordingPeakWidth = needed
             }
         }
     }
@@ -124,21 +144,30 @@ struct FloatingBarView<S: FloatingBarState>: View {
     // MARK: - Capsule Container
 
     private var capsuleBar: some View {
-        Group {
-            if #available(macOS 26.0, *) {
-                liquidCapsuleCore
-            } else {
-                legacyCapsuleCore
+        HUDRecordingMotion(logicalWidth: recordingMotionTargetWidth,
+                           widthReserve: recordingWidthReserve, tailInset: recordingTextTailPadding) { layout in
+            Group {
+                if hudStyle == .ink {
+                    inkCapsuleCore(recordingLayout: layout)
+                } else if #available(macOS 26.0, *) {
+                    liquidCapsuleCore(recordingLayout: layout)
+                } else {
+                    legacyCapsuleCore(recordingLayout: layout)
+                }
             }
+            .frame(width: state.barPhase == .recording ? layout.capsuleWidth : capsuleWidth,
+                   height: capsuleHeight)
+            .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
+            .shadow(color: capsuleShadowColor, radius: capsuleShadowRadius, x: 0, y: capsuleShadowYOffset)
+            .animation(TF.hudMorph, value: state.barPhase)
+            .animation(TF.hudWidthFlow, value: state.barPhase == .recording
+                       ? nil : CGSize(width: capsuleWidth, height: capsuleHeight))
         }
-        .frame(width: capsuleWidth, height: capsuleHeight)
-        .shadow(color: capsuleShadowColor, radius: capsuleShadowRadius, x: 0, y: capsuleShadowYOffset)
-        .animation(TF.hudMorph, value: state.barPhase)
-        .animation(TF.hudWidthFlow, value: capsuleWidth)
-        .animation(TF.hudMorph, value: capsuleHeight)
+        .animation(TF.hudWidthFlow, value: recordingMotionTargetWidth)
     }
 
     private var capsuleShadowColor: Color {
+        if hudStyle == .ink { return .clear }
         if #available(macOS 26.0, *), nativeGlassVariant == .clearCore || nativeGlassVariant == .minimalRegular {
             return Color.black.opacity(0.08)
         }
@@ -146,6 +175,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var capsuleShadowRadius: CGFloat {
+        if hudStyle == .ink { return 0 }
         if #available(macOS 26.0, *), nativeGlassVariant == .clearCore || nativeGlassVariant == .minimalRegular {
             return 10
         }
@@ -153,27 +183,41 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var capsuleShadowYOffset: CGFloat {
+        if hudStyle == .ink { return 0 }
         if #available(macOS 26.0, *), nativeGlassVariant == .clearCore || nativeGlassVariant == .minimalRegular {
             return 5
         }
         return 4
     }
 
-    private var legacyCapsuleCore: some View {
+    private func inkCapsuleCore(recordingLayout: HUDRecordingLayout) -> some View {
+        ZStack {
+            InkHUDSurface(cornerRadius: capsuleCornerRadius)
+            styledBarContent(recordingLayout: recordingLayout)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
+    }
+
+    private func styledBarContent(recordingLayout: HUDRecordingLayout) -> some View {
+        barContent(recordingLayout: recordingLayout).environment(\.hudStyle, hudStyle)
+    }
+
+    private func legacyCapsuleCore(recordingLayout: HUDRecordingLayout) -> some View {
         ZStack {
             capsuleSurface
             capsuleOverlay
 
-            barContent
+            styledBarContent(recordingLayout: recordingLayout)
                 .animation(TF.hudMorph, value: state.barPhase)
-                .frame(width: capsuleWidth, height: capsuleHeight)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay { capsuleBorder }
                 .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
         }
     }
 
     @available(macOS 26.0, *)
-    private var liquidCapsuleCore: some View {
+    private func liquidCapsuleCore(recordingLayout: HUDRecordingLayout) -> some View {
         return Group {
             if nativeGlassVariant == .minimalRegular {
                 CleanGlassCapsule(
@@ -181,7 +225,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     style: UserDefaults.standard.bool(forKey: "museGlassClearStyle") ? .clear : .regular,
                     tintColor: nil,
                     content: AnyView(
-                        barContent
+                        styledBarContent(recordingLayout: recordingLayout)
                             .animation(TF.hudMorph, value: state.barPhase)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     )
@@ -220,7 +264,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     tintColor: nativeGlassTintColor,
                     phase: state.barPhase,
                     content: AnyView(
-                        barContent
+                        styledBarContent(recordingLayout: recordingLayout)
                             .animation(TF.hudMorph, value: state.barPhase)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .clipShape(RoundedRectangle(cornerRadius: capsuleCornerRadius, style: .continuous))
@@ -234,7 +278,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     // MARK: - Content by Phase
 
     @ViewBuilder
-    private var barContent: some View {
+    private func barContent(recordingLayout: HUDRecordingLayout) -> some View {
         switch state.barPhase {
         case .preparing:
             preparingContent
@@ -243,7 +287,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     removal: .opacity
                 ))
         case .recording:
-            recordingContent
+            recordingContent(layout: recordingLayout)
                 .transition(.asymmetric(
                     insertion: .offset(x: 6).combined(with: .opacity),
                     removal: .offset(x: -4).combined(with: .opacity)
@@ -279,47 +323,21 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     private var preparingContent: some View {
         HStack(spacing: 0) {
-            PreparingDot()
+            PreparingDot(color: TF.recording)
         }
         .frame(maxWidth: .infinity)
     }
 
-    private var recordingContent: some View {
-        Group {
-            if isRecordingInitialCircleState {
-                AnimatedRecordingIndicatorCluster(
-                    audioLevel: state.audioLevel,
-                    recordingStartDate: state.recordingStartDate
-                ) {
-                    activity, time, flow in
-                    recordingInitialCircleContent(activity: activity, time: time, flow: flow)
-                }
-            } else {
-                recordingExpandedContent
-            }
-        }
-    }
-
-    private func recordingInitialCircleContent(activity: CGFloat, time: TimeInterval, flow: CGFloat) -> some View {
-        ZStack {
-            RecordingGlassInnerGlow(activity: activity, time: time)
-                .frame(width: 44, height: 34)
-
-            RecordingDot(time: time, activity: activity, flow: flow)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var recordingExpandedContent: some View {
+    private func recordingContent(layout: HUDRecordingLayout) -> some View {
+        // 外壳、文字视窗与渐隐直接消费同一动画帧，不再通过几何回调另取尺寸。
         ZStack(alignment: .leading) {
-            HStack(spacing: 0) {
-                recordingAnimatedWaveZone
-
-                recordingTextZone
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.trailing, recordingTrailingInset)
+            recordingAnimatedWaveZone
+            recordingTextZone(layout: layout)
+                .frame(width: layout.textViewportWidth, height: TF.barHeight, alignment: .leading)
+                .offset(x: recordingTextLeadingInset)
         }
+        .frame(width: layout.capsuleWidth, height: TF.barHeight, alignment: .leading)
+        .clipped()
     }
 
     private var recordingAnimatedWaveZone: some View {
@@ -328,74 +346,146 @@ struct FloatingBarView<S: FloatingBarState>: View {
             recordingStartDate: state.recordingStartDate
         ) { activity, time, flow in
             ZStack(alignment: .leading) {
-                RecordingGlassInnerGlow(activity: activity, time: time)
-                    .frame(width: 76, height: 34)
+                if hudStyle == .appleNative {
+                    RecordingGlassInnerGlow(activity: activity, time: time)
+                        .frame(width: 76, height: 34)
+                }
 
-                RecordingDot(time: time, activity: activity, flow: flow)
+                RecordingDot(time: time, activity: activity, flow: flow, style: hudStyle)
                     .frame(width: TF.barHeight, height: TF.barHeight, alignment: .center)
             }
-            .frame(width: recordingIconWidth + recordingLeadingInset, height: TF.barHeight, alignment: .leading)
+            .frame(width: recordingIconWidth, height: TF.barHeight, alignment: .leading)
         }
     }
 
     @ViewBuilder
-    private var recordingTextZone: some View {
+    private func recordingTextZone(layout: HUDRecordingLayout) -> some View {
         if isRecordingLabelOnlyState {
             Text(L("录音中", "Recording"))
                 .font(TF.hudFontTitle)
                 .floatingBarReadableText(color: barTextColor)
-                .padding(.leading, recordingIconTextGap)
-                .contentTransition(.opacity)
-                .animation(TF.hudTextFlow, value: state.transcriptionText)
-        } else if !state.segments.isEmpty {
-            if shouldTrimRecordingText {
-                Color.clear
-                    .overlay(alignment: .trailing) {
-                        Text(state.transcriptionText)
-                            .font(TF.hudFontTitle)
-                            .floatingBarReadableText(color: barTextColor)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .contentTransition(.opacity)
-                    }
-                    .mask {
-                        HStack(spacing: 0) {
-                            LinearGradient(
-                                colors: [.clear, .white],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                            .frame(width: recordingTrimFadeWidth)
-                            Rectangle()
-                        }
-                    }
-                    .padding(.leading, recordingIconTextGap)
-                    .padding(.trailing, recordingTextTailPadding)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-                    .animation(TF.hudTextFlow, value: state.transcriptionText)
-            } else {
-                Text(state.transcriptionText)
-                    .font(TF.hudFontTitle)
-                    .floatingBarReadableText(color: barTextColor)
-                    .lineLimit(1)
-                    .padding(.leading, recordingIconTextGap)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-                    .contentTransition(.opacity)
-                    .animation(TF.hudTextFlow, value: state.transcriptionText)
-            }
+        } else {
+            StreamingHUDText(
+                text: state.transcriptionText,
+                color: barTextColor,
+                leadingFadeWidth: recordingTrimFadeWidth,
+                trailingFadeWidth: recordingTextTailPadding,
+                recordingLayout: layout
+            )
         }
     }
 
     private var processingContent: some View {
-        ZStack {
-            Text(state.currentMode.processingLabel)
+        TimelineView(.periodic(from: .now, by: 0.5)) { timeline in
+            let elapsed = max(
+                0,
+                timeline.date.timeIntervalSince(processingStartDate ?? timeline.date)
+            )
+            let showsLiveElapsed = state.currentMode.kind != .voicePolish
+            if state.isVoicePolishUnavailable {
+                voicePolishUnavailableContent
+            } else {
+                HStack(spacing: 5) {
+                HStack(spacing: 5) {
+                    Text(processingLabel)
+                    if showsLiveElapsed {
+                        Text("· \(String(format: "%.1fs", elapsed))")
+                            .monospacedDigit()
+                            .opacity(0.72)
+                    }
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(
+                    showsLiveElapsed
+                        ? L(
+                            "\(processingLabel)，已等待 \(String(format: "%.1f", elapsed)) 秒",
+                            "\(processingLabel), \(String(format: "%.1f", elapsed)) seconds"
+                        )
+                        : processingLabel
+                )
+
+                if state.isRequestingVoicePolishCanonicalText {
+                    Text(state.voicePolishCanonicalExitMessage ?? L("正在切换…", "Switching…"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .opacity(0.82)
+                        .accessibilityLabel(L(
+                            "正在切换到已纠正识别文本",
+                            "Switching to the corrected transcript"
+                        ))
+                } else if state.canUseVoicePolishCanonicalText {
+                    Button {
+                        state.useVoicePolishCanonicalText()
+                    } label: {
+                        Text(canonicalExitButtonTitle)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.96))
+                            .padding(.horizontal, 8)
+                            .frame(height: 24)
+                            .background {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.14))
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .help(L(
+                        "按 Esc 或点击此处，跳过继续润色并立即使用术语纠正后的识别文本",
+                        "Press Esc or click to skip polishing and use the corrected transcript"
+                    ))
+                    .accessibilityLabel(canonicalExitAccessibilityLabel)
+                    .accessibilityHint(L(
+                        "跳过继续润色并立即使用术语纠正后的识别文本，也可以按 Esc",
+                        "Skip further polishing and use the terminology-corrected transcript now. You can also press Escape."
+                    ))
+                } else if let message = state.voicePolishCanonicalExitMessage {
+                    Text(message)
+                        .font(.system(size: 11, weight: .semibold))
+                        .opacity(0.82)
+                }
+                }
                 .font(TF.hudFontTitle)
                 .floatingBarReadableText(color: barTextColor)
+            }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var voicePolishUnavailableContent: some View {
+        HStack(spacing: 7) {
+            Text(state.voicePolishUnavailableMessage ?? L(
+                "这次没有完成润色，原转写已保留",
+                "Polishing did not finish. The transcript was preserved."
+            ))
+            .font(.system(size: 11, weight: .semibold))
+            .lineLimit(1)
+
+            Button {
+                state.retryVoicePolish()
+            } label: {
+                Text(state.isRetryingVoicePolish ? L("正在重试…", "Retrying…") : L("重试润色", "Retry"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background { Capsule().fill(Color.white.opacity(0.14)) }
+            }
+            .buttonStyle(.plain)
+            .disabled(state.isRetryingVoicePolish)
+
+            Button {
+                state.useVoicePolishCanonicalText()
+            } label: {
+                Text(L("使用原转写", "Use transcript"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background { Capsule().fill(Color.white.opacity(0.14)) }
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(L(
+                "使用已完成术语纠正的原转写并继续输入",
+                "Use the terminology-corrected transcript and continue"
+            ))
+        }
+        .floatingBarReadableText(color: barTextColor)
     }
 
     private var doneContent: some View {
@@ -643,7 +733,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private var barTextColor: Color {
-        Color.white.opacity(0.98)
+        hudStyle == .ink ? InkHUDPalette.text : Color.white.opacity(0.98)
     }
 
     // MARK: - Phase Transitions
@@ -675,10 +765,47 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     private func processingWidth() -> CGFloat {
-        let labelWidth = measureText(state.currentMode.processingLabel) + 84.0
+        // 普通模式给持续更新的“· 0.0s”留固定宽度；Voice Polish 使用稳定的
+        // “正在润色”文案，不把累计时间误呈现成多个阶段耗时。
+        if state.isVoicePolishUnavailable {
+            return min(
+                TF.barFallbackWidth,
+                max(520, measureText(state.voicePolishUnavailableMessage ?? "") + 250)
+            )
+        }
+        let showsCanonicalExitStatus = state.canUseVoicePolishCanonicalText
+            || state.isRequestingVoicePolishCanonicalText
+            || state.voicePolishCanonicalExitMessage != nil
+        let actionReserve: CGFloat = showsCanonicalExitStatus ? 172 : 0
+        let labelWidth = measureText(processingLabel) + 126.0 + actionReserve
         guard state.preserveProcessingWidthForCopyFallback else { return labelWidth }
         let preservedInputWidth = max(TF.barFallbackMinWidth, min(TF.barFallbackWidth, recordingPeakWidth))
         return max(labelWidth, preservedInputWidth)
+    }
+
+    private var processingLabel: String {
+        let label = state.currentMode.processingLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard label.isEmpty else { return label }
+        return state.currentMode.kind == .voicePolish
+            ? L("正在润色", "Polishing")
+            : L("处理中", "Processing")
+    }
+
+    private var canonicalExitButtonTitle: String {
+        if state.voicePolishCanonicalExitMessage != nil {
+            return L("切换失败 · 重试", "Switch failed · Retry")
+        }
+        return L("Esc 用纠正文本", "Esc: corrected transcript")
+    }
+
+    private var canonicalExitAccessibilityLabel: String {
+        if state.voicePolishCanonicalExitMessage != nil {
+            return L(
+                "切换失败，重试使用已纠正识别文本",
+                "Switch failed. Retry using the corrected transcript"
+            )
+        }
+        return L("使用已纠正识别文本", "Use corrected transcript")
     }
 
     private func copyFallbackWidth() -> CGFloat {

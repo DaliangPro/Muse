@@ -17,6 +17,7 @@ struct VocabularyStorageContext: @unchecked Sendable {
         fileManager: .default,
         hotwordsDidChange: {
             SenseVoiceServerManager.syncHotwordsAndRestart()
+            AliyunVocabularySyncCoordinator.schedule()
         },
         revealFile: { url in
             #if canImport(AppKit)

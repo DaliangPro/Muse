@@ -407,6 +407,10 @@ private actor SenseVoiceEventRecorder {
             return "completed"
         case .processingResult(let text):
             return "processing:\(text)"
+        case .voicePolishStage(let stage):
+            return "voicePolishStage:\(stage.rawValue)"
+        case .voicePolishUnavailable(let reason):
+            return "voicePolishUnavailable:\(reason?.rawValue ?? "unknown")"
         case .finalized(let text, _):
             return "finalized:\(text)"
         case .streamingInterrupted:

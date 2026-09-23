@@ -5,6 +5,7 @@ import SwiftUI
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 struct LLMSettingsCard: View, SettingsCardHelpers {
+    let role: PolishModelRole
     let onClose: (() -> Void)?
     /// 底排按钮组量到的实际宽度；输入框与它取齐（左右对齐）
     @State private var footerActionsWidth: CGFloat?
@@ -27,7 +28,8 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     @State private var serverStarting = false
     @State private var serverRunning = false
 
-    init(onClose: (() -> Void)? = nil) {
+    init(role: PolishModelRole = .standard, onClose: (() -> Void)? = nil) {
+        self.role = role
         self.onClose = onClose
     }
 
@@ -85,7 +87,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
 
     var body: some View {
         settingsGroupCard(
-            L("文本处理", "Text Processing"),
+            role.title,
             trailing: AnyView(cardTrailing),
             cornerRadius: ModelSettingsStyle.outerCardCornerRadius,
             headerBottomSpacing: ModelSettingsStyle.headerBottomSpacing,
@@ -125,6 +127,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             .zIndex(10)
 
             LLMSettingsFooter(
+                role: role,
                 showsCancel: onClose == nil,
                 selectedProvider: selectedLLMProvider,
                 hasCredentials: hasLLMCredentials,
@@ -165,10 +168,17 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             loadLLMCredentials()
             await checkServerStatus()
         }
+        .onDisappear {
+            testTask?.cancel()
+            modelFetchTask?.cancel()
+        }
         .onChange(of: selectedLLMProvider) { oldProvider, newProvider in
             handleLLMProviderChange(from: oldProvider, to: newProvider)
             fetchedModels = []
             modelFetchStatus = .idle
+        }
+        .onChange(of: effectiveLLMValues) { oldValues, newValues in
+            handleEffectiveValuesChange(from: oldValues, to: newValues)
         }
     }
 
@@ -311,7 +321,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
 
     private func stopLocalServer() {
         Task {
-            let result = await LocalLLMServerControl.unloadAndStopIfUnneeded()
+            let result = await LocalLLMServerControl.unloadAndStopIfUnneeded(excluding: role)
             if result == .stoppedServer {
                 serverRunning = false
             }
@@ -326,15 +336,14 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
         isEditingLLM = true
         loadLLMCredentialsForProvider(newProvider)
 
-        if newProvider == .localQwen || hasLLMCredentials {
-            KeychainService.selectedLLMProvider = newProvider
-            if newProvider == .localQwen {
-                Task { await preloadLocalLLM() }
-            } else if oldProvider == .localQwen {
-                stopLocalServer()
-                Task { await LocalLLMServerControl.stopQwen3IfASRDoesNotNeedIt() }
-            }
-        }
+    }
+
+    private func handleEffectiveValuesChange(
+        from oldValues: [String: String],
+        to newValues: [String: String]
+    ) {
+        guard oldValues != newValues else { return }
+        invalidateConnectionTest()
     }
 
     // MARK: - Data
@@ -354,14 +363,14 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     }
 
     private func loadLLMCredentials() {
-        selectedLLMProvider = KeychainService.selectedLLMProvider
+        selectedLLMProvider = KeychainService.selectedPolishProvider(for: role)
         loadLLMCredentialsForProvider(selectedLLMProvider)
     }
 
     private func loadLLMCredentialsForProvider(_ provider: LLMProvider) {
         testTask?.cancel()
         editedFields = []
-        if let values = KeychainService.loadLLMCredentials(for: provider) {
+        if let values = KeychainService.loadPolishCredentials(for: provider, role: role) {
             savedLLMValues = values
             hasStoredLLM = true
             llmCredentialValues = Self.displayValues(from: values, fields: currentLLMFields)
@@ -377,12 +386,17 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
         }
     }
 
+    private func invalidateConnectionTest() {
+        testTask?.cancel()
+        llmTestStatus = .idle
+    }
+
     private func saveLLMCredentials() {
         let values = effectiveLLMValues
-        let previousProvider = KeychainService.selectedLLMProvider
+        let previousProvider = KeychainService.selectedPolishProvider(for: role)
         do {
-            try KeychainService.saveLLMCredentials(for: selectedLLMProvider, values: values)
-            KeychainService.selectedLLMProvider = selectedLLMProvider
+            try KeychainService.savePolishCredentials(for: selectedLLMProvider, role: role, values: values)
+            KeychainService.setSelectedPolishProvider(selectedLLMProvider, for: role)
             // REPAIR_PLAN H1 改进①：改选本地模型立即预热引擎
             AppStartupCoordinator.startLocalServerIfNeeded()
             llmCredentialValues = Self.displayValues(from: values, fields: currentLLMFields)
@@ -395,14 +409,15 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             llmTestStatus = .idle
             Task { @MainActor in llmTestStatus = .saved }
             // 仅当「换了服务商且弹窗里没测过新商」才作废主页色点；原商仅保存不动连通状态
-            if previousProvider != selectedLLMProvider,
-               ModelConnectivityCache.llm?.provider != selectedLLMProvider {
-                ModelConnectivityCache.llm = (selectedLLMProvider, .idle)
+            if previousProvider != selectedLLMProvider {
+                ModelConnectivityCache.polish[role] = nil
             }
 
             // Preload local LLM model on save
             if selectedLLMProvider == .localQwen {
                 Task { await preloadLocalLLM() }
+            } else if previousProvider == .localQwen {
+                Task { _ = await LocalLLMServerControl.unloadAndStopIfUnneeded() }
             }
         } catch {
             llmTestStatus = .failed(L("保存失败", "Save failed"))
@@ -412,46 +427,45 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     private func testLLMConnection() {
         testTask?.cancel()
         llmTestStatus = .testing
-        let testValues = effectiveLLMValues
+        let values = effectiveLLMValues
         let provider = selectedLLMProvider
         testTask = Task {
+            let config: LLMConfig?
+            if provider == .localQwen {
+                config = KeychainService.loadPolishConfig(for: role, provider: provider)
+            } else {
+                config = LLMProviderRegistry.configType(for: provider)?.init(credentials: values)?.toLLMConfig().withThinkingMode(.disabled)
+            }
+            guard let config else {
+                recordTestOutcome(.failed(L("配置无效或本地引擎未启动", "Invalid config or local engine stopped")), provider: provider, config: nil)
+                return
+            }
             do {
-                let llmConfig: LLMConfig
-                if provider == .localQwen {
-                    // LLM runs on Qwen3-ASR server (shares Metal GPU lock)
-                    let port = SenseVoiceServerManager.currentQwen3Port ?? SenseVoiceServerManager.currentPort
-                    guard let port else {
-                        guard !Task.isCancelled else { return }
-                        recordTestOutcome(.failed(L("Qwen3 服务未运行，请先启动", "Qwen3 server not running, start it first")), provider: provider)
-                        return
-                    }
-                    llmConfig = LLMConfig(apiKey: "", model: "qwen3.5-9b", baseURL: "http://127.0.0.1:\(port)/v1")
-                } else {
-                    guard let configType = LLMProviderRegistry.configType(for: provider),
-                          let config = configType.init(credentials: testValues)
-                    else {
-                        guard !Task.isCancelled else { return }
-                        recordTestOutcome(.failed(L("配置无效", "Invalid config")), provider: provider)
-                        return
-                    }
-                    llmConfig = config.toLLMConfig()
-                }
-                let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-                let reply = try await client.process(text: "hi", prompt: "{text}", config: llmConfig)
+                try await PolishModelConnectionTester.test(role: role, config: config, client: LLMProviderRegistry.makeClient(for: provider))
                 guard !Task.isCancelled else { return }
-                recordTestOutcome(.success, provider: provider)
-                AppLogger.log("[Settings] LLM test OK (\(provider.rawValue)) replyLen=\(reply.count)")
+                recordTestOutcome(.success, provider: provider, config: config)
+                DebugFileLogger.log("[Settings] polish test OK role=\(role.rawValue) provider=\(provider.rawValue) model=\(config.model)")
             } catch {
                 guard !Task.isCancelled else { return }
-                AppLogger.log("[Settings] LLM test failed (\(provider.rawValue)): \(String(describing: error))")
-                recordTestOutcome(.failed(error.localizedDescription), provider: provider)
+                recordTestOutcome(.failed(error.localizedDescription), provider: provider, config: config)
             }
         }
     }
 
     /// 测试结果同时记入回传通道，主页色点关弹窗时采纳
-    private func recordTestOutcome(_ status: SettingsTestStatus, provider: LLMProvider) {
+    private func recordTestOutcome(
+        _ status: SettingsTestStatus,
+        provider: LLMProvider,
+        config: LLMConfig?
+    ) {
         llmTestStatus = status
-        ModelConnectivityCache.llm = (provider, status)
+        if let config {
+            ModelConnectivityCache.polish[role] = LLMConnectivityCacheEntry(
+                signature: LLMConnectivitySignature(provider: provider, config: config),
+                status: status
+            )
+        } else {
+            ModelConnectivityCache.polish[role] = nil
+        }
     }
 }

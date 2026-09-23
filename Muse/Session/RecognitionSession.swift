@@ -3,10 +3,47 @@ import os
 
 private struct ASRTeardownResult: Sendable {
     let providerIsStreaming: Bool
-    let clean: Bool
+    let endAudioSucceeded: Bool
+    let eventStreamDrained: Bool
+
+    var clean: Bool {
+        endAudioSucceeded && eventStreamDrained
+    }
 }
 
 private struct BatchFallbackTimeoutError: Error {}
+
+private enum VoicePolishUserChoice: Sendable {
+    case retry
+    case useCanonical
+    case cancel
+}
+
+private enum TranscriptRecoveryResult: Sendable, Equatable {
+    case notNeeded
+    case succeeded
+    case failed
+}
+
+private enum ASRRecoveryError: Error, LocalizedError {
+    case partialTextPreserved(provider: String)
+    case noTranscript(provider: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .partialTextPreserved(let provider):
+            return L(
+                "\(provider) 全文重识别失败，已保留现有文字，内容可能不完整",
+                "\(provider) full re-recognition failed. Existing text was preserved and may be incomplete."
+            )
+        case .noTranscript(let provider):
+            return L(
+                "\(provider) 未返回识别结果，请重试或暂时切换到豆包",
+                "\(provider) returned no transcript. Try again or temporarily switch to Doubao."
+            )
+        }
+    }
+}
 
 struct RecognitionSessionID: Hashable, Sendable {
     let rawValue: UInt64
@@ -24,6 +61,9 @@ private struct LLMPostProcessingResult: Sendable {
     var finalText: String
     var processedText: String?
     var llmFailed: Bool
+    var voicePolishHistoryStatus: String?
+    var voicePolishPerformance: VoicePolishPerformanceMeasurement?
+    var voicePolishVocabularyContext: VocabularyStorageContext?
 }
 
 actor RecognitionSession {
@@ -63,10 +103,16 @@ actor RecognitionSession {
     private let asrConfigLoader: (@Sendable (ASRProvider) async -> (any ASRProviderConfig)?)?
     private let microphonePermission: (@Sendable () async -> Bool)?
     private let promptContextCapture: @Sendable () async -> PromptContext
+    private let writingContextCapture: @Sendable (WritingContextLevel) async -> WritingContext
+    private let frontmostApplicationBundleIdentifier: @Sendable () async -> String?
     private let requestOptionsProvider: (@Sendable (ProcessingMode) -> (
         options: ASRRequestOptions,
         hotwordCount: Int
     ))?
+    private let llmClientFactory: (@Sendable () -> any LLMClient)?
+    private let llmConfigLoader: (@Sendable () async -> LLMConfig?)?
+    private let voicePolishRecentInputStore: VoicePolishRecentInputContextStore
+    private let aliyunReplaySleep: @Sendable (Duration) async throws -> Void
     private var asrClient: (any SpeechRecognizer)?
     private var asrClientSessionID: RecognitionSessionID?
 
@@ -85,10 +131,24 @@ actor RecognitionSession {
         promptContextCapture: @escaping @Sendable () async -> PromptContext = {
             PromptContext.capture()
         },
+        writingContextCapture: @escaping @Sendable (WritingContextLevel) async -> WritingContext = {
+            await WritingContextCapture.capture(level: $0)
+        },
+        frontmostApplicationBundleIdentifier: @escaping @Sendable () async -> String? = {
+            await MainActor.run {
+                NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            }
+        },
         requestOptionsProvider: (@Sendable (ProcessingMode) -> (
             options: ASRRequestOptions,
             hotwordCount: Int
-        ))? = nil
+        ))? = nil,
+        llmClientFactory: (@Sendable () -> any LLMClient)? = nil,
+        llmConfigLoader: (@Sendable () async -> LLMConfig?)? = nil,
+        voicePolishRecentInputStore: VoicePolishRecentInputContextStore = .shared,
+        aliyunReplaySleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
     ) {
         self.audioEngine = audioEngine
         self.injectionEngine = injectionEngine
@@ -98,7 +158,13 @@ actor RecognitionSession {
         self.asrConfigLoader = asrConfigLoader
         self.microphonePermission = microphonePermission
         self.promptContextCapture = promptContextCapture
+        self.writingContextCapture = writingContextCapture
+        self.frontmostApplicationBundleIdentifier = frontmostApplicationBundleIdentifier
         self.requestOptionsProvider = requestOptionsProvider
+        self.llmClientFactory = llmClientFactory
+        self.llmConfigLoader = llmConfigLoader
+        self.voicePolishRecentInputStore = voicePolishRecentInputStore
+        self.aliyunReplaySleep = aliyunReplaySleep
     }
 
     private let logger = Logger(
@@ -117,7 +183,10 @@ actor RecognitionSession {
 
     /// Return the appropriate LLM client for the currently selected provider.
     private func currentLLMClient() -> any LLMClient {
-        LLMProviderRegistry.makeClient(for: KeychainService.selectedLLMProvider)
+        if let llmClientFactory { return llmClientFactory() }
+        return LLMProviderRegistry.makeClient(for: KeychainService.selectedPolishProvider(
+            for: .resolve(currentMode.voicePolishQualityMode)
+        ))
     }
 
     private func loadASRConfigOffActor(for provider: ASRProvider) async -> (any ASRProviderConfig)? {
@@ -134,10 +203,14 @@ actor RecognitionSession {
     }
 
     private func loadLLMConfigOffActor() async -> LLMConfig? {
-        let provider = KeychainService.selectedLLMProvider
+        if let llmConfigLoader {
+            return await llmConfigLoader()
+        }
+        let role = PolishModelRole.resolve(currentMode.voicePolishQualityMode)
+        let provider = KeychainService.selectedPolishProvider(for: role)
         DebugFileLogger.log("LLM config load start provider=\(provider.rawValue)")
         let result: TimedValue<LLMConfig> = await AsyncTimeout.value(.milliseconds(900)) {
-            KeychainService.loadLLMConfig()
+            KeychainService.loadPolishConfig(for: role)
         }
         if result.timedOut {
             DebugFileLogger.log("LLM config load timeout provider=\(provider.rawValue)")
@@ -230,8 +303,26 @@ actor RecognitionSession {
 
     private var promptContext: PromptContext = PromptContext(selectedText: "", clipboardText: "")
 
+    // MARK: - Voice Polish writing context（录音启动时并行，400ms 超时）
+
+    private var writingContextTask: Task<WritingContext, Never>?
+    private var writingContextTaskSessionID: RecognitionSessionID?
+    /// 录音开始时冻结目标应用，避免停止或 HUD 切换焦点后把应用级术语套到错误应用。
+    private var targetApplicationBundleIdentifier: String?
+    private var targetApplicationBundleIdentifierSessionID: RecognitionSessionID?
+
+    // MARK: - Active Voice Polish task
+
+    private var voicePolishTask: Task<VoicePolishResult, Never>?
+    private var voicePolishTaskSessionID: RecognitionSessionID?
+    private var voicePolishCanonicalOptionSessionID: RecognitionSessionID?
+    private var canonicalVoicePolishRequestSessionID: RecognitionSessionID?
+    private var voicePolishChoiceSessionID: RecognitionSessionID?
+    private var voicePolishChoiceContinuation: CheckedContinuation<VoicePolishUserChoice, Never>?
+
     // MARK: - Speculative LLM (fire during recording pauses)
 
+    private let polishPrefetch = PolishPrefetch()
     private var speculativeLLMTask: Task<String?, Never>?
     private var speculativeLLMSessionID: RecognitionSessionID?
     private var speculativeLLMText: String = ""
@@ -254,6 +345,46 @@ actor RecognitionSession {
         }
     }
 
+    /// 用户不想继续等待模型时，取消当前 Voice Polish 请求并使用已完成术语纠正的
+    /// canonical 文本继续注入。该出口是主动选择，不计为 LLM 失败或 fallback。
+    @discardableResult
+    func useCanonicalVoicePolishResult() -> Bool {
+        guard currentMode.kind == .voicePolish,
+              state == .postProcessing,
+              let sessionID = currentSessionID,
+              voicePolishCanonicalOptionSessionID == sessionID else { return false }
+        canonicalVoicePolishRequestSessionID = sessionID
+        if voicePolishChoiceSessionID == sessionID {
+            resolveVoicePolishChoice(.useCanonical, sessionID: sessionID)
+            DebugFileLogger.log(
+                "voice polish unavailable canonical accepted session=\(sessionID.rawValue)"
+            )
+            return true
+        }
+        if voicePolishTaskSessionID == sessionID {
+            voicePolishTask?.cancel()
+        }
+        DebugFileLogger.log(
+            "voice polish canonical requested session=\(sessionID.rawValue)"
+        )
+        return true
+    }
+
+    /// 只接受当前明确停在 unavailable 状态的会话。每次重试仍沿用同一份
+    /// canonical 输入、上下文与有界 Pipeline，不会把 rejected draft 当事实来源。
+    @discardableResult
+    func retryVoicePolishResult() -> Bool {
+        guard currentMode.kind == .voicePolish,
+              state == .postProcessing,
+              let sessionID = currentSessionID,
+              voicePolishChoiceSessionID == sessionID else { return false }
+        resolveVoicePolishChoice(.retry, sessionID: sessionID)
+        DebugFileLogger.log(
+            "voice polish unavailable retry accepted session=\(sessionID.rawValue)"
+        )
+        return true
+    }
+
     // MARK: - Start
 
     func startRecording(mode: ProcessingMode = .direct) async {
@@ -265,18 +396,38 @@ actor RecognitionSession {
 
         let provider = selectedASRProvider()
         let sessionID = makeSessionID()
+        let effectiveMode = ASRProviderRegistry.resolvedMode(for: mode, provider: provider)
         currentSessionID = sessionID
         activeProvider = provider
-        let effectiveMode = ASRProviderRegistry.resolvedMode(for: mode, provider: provider)
-        DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
-
-        self.currentMode = effectiveMode
-        self.recordingStartTime = nil
+        currentMode = effectiveMode
+        recordingStartTime = nil
         recordingStartSessionID = nil
         hasEmittedReadyForCurrentSession = false
         pendingLLMError = nil
         streamingDegraded = false
+        // 第一次 await 前必须进入 starting。否则快速松键/ESC 会把仍在捕获前台
+        // App 的会话误认为 idle，待 await 返回后形成僵尸录音。
         state = .starting
+
+        let capturedApplicationBundleIdentifier = await frontmostApplicationBundleIdentifier()
+        guard isCurrent(sessionID), state == .starting else { return }
+        targetApplicationBundleIdentifier = capturedApplicationBundleIdentifier
+        targetApplicationBundleIdentifierSessionID = sessionID
+        DebugFileLogger.log("startRecording begin mode=\(effectiveMode.name) provider=\(provider.rawValue) session=\(sessionID.rawValue)")
+
+        if effectiveMode.kind == .voicePolish {
+            let level = VoicePolishSettings.contextLevel()
+            let capture = writingContextCapture
+            writingContextTask = Task { await capture(level) }
+            writingContextTaskSessionID = sessionID
+            DebugFileLogger.log(
+                "voice polish context capture scheduled level=\(level.rawValue) session=\(sessionID.rawValue)"
+            )
+        } else {
+            writingContextTask?.cancel()
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
+        }
 
         // Load credentials for selected provider
         guard let config = await resolveASRConfig(provider: provider, sessionID: sessionID) else {
@@ -304,10 +455,12 @@ actor RecognitionSession {
         } else {
             let effectiveHotwords = HotwordStorage.loadEffectiveForASR()
             let biasSettings = ASRBiasSettingsStorage.load()
-            let needsLLM = !effectiveMode.prompt.isEmpty
+            let needsLLM = effectiveMode.requiresLLM
             requestSetup = (
                 ASRRequestOptions(
-                    enablePunc: !needsLLM,
+                    // Voice Polish V2 使用 Provider 可用的带标点终稿；其余模式
+                    // 沿用旧行为：直出开标点，通用 LLM 模式关闭 ASR 标点。
+                    enablePunc: effectiveMode.kind == .voicePolish || !needsLLM,
                     hotwords: effectiveHotwords.words,
                     userHotwordCount: effectiveHotwords.userCount,
                     correctionWords: SnippetStorage.userCorrectionWords(),
@@ -318,15 +471,20 @@ actor RecognitionSession {
             )
         }
 
-        // Capture prompt context while the user's selection is still active.
-        DebugFileLogger.log("prompt context capture start")
-        let capturedPromptContext = await promptContextCapture()
-        DebugFileLogger.log("prompt context capture done")
-        guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
-            DebugFileLogger.log("startRecording: zombie detected after capture, bailing")
-            return
+        // Voice Polish 使用独立、受授权级别约束的 WritingContext，不读取旧的
+        // selected/clipboard PromptContext，也不让上下文采集阻塞麦克风启动。
+        if effectiveMode.kind == .voicePolish {
+            promptContext = PromptContext(selectedText: "", clipboardText: "")
+        } else {
+            DebugFileLogger.log("prompt context capture start")
+            let capturedPromptContext = await promptContextCapture()
+            DebugFileLogger.log("prompt context capture done")
+            guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
+                DebugFileLogger.log("startRecording: zombie detected after capture, bailing")
+                return
+            }
+            promptContext = capturedPromptContext
         }
-        promptContext = capturedPromptContext
 
         // Reset text state and clean up previous pipeline
         currentTranscript = .empty
@@ -436,8 +594,18 @@ actor RecognitionSession {
             currentConfig = nil
             currentConfigSessionID = nil
         }
+        polishPrefetch.reset(session: sessionID)
         if speculativeLLMSessionID == sessionID || speculativeDebounceSessionID == sessionID {
             resetSpeculativeLLM(sessionID: sessionID)
+        }
+        if writingContextTaskSessionID == sessionID {
+            writingContextTask?.cancel()
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
+        }
+        if targetApplicationBundleIdentifierSessionID == sessionID {
+            targetApplicationBundleIdentifier = nil
+            targetApplicationBundleIdentifierSessionID = nil
         }
 
         SoundFeedback.playError()
@@ -716,7 +884,7 @@ actor RecognitionSession {
 
     /// Pre-warm LLM connection for modes with post-processing
     private func prewarmLLMIfNeeded(sessionID: RecognitionSessionID) async {
-        guard !currentMode.prompt.isEmpty else { return }
+        guard currentMode.requiresLLM else { return }
         let llmConfig = await loadLLMConfigOffActor()
         guard isCurrent(sessionID), state == .recording else {
             DebugFileLogger.log("startRecording: cancelled during LLM prewarm config load, bailing")
@@ -730,7 +898,10 @@ actor RecognitionSession {
 
     /// Switch the processing mode before stopping. Used for cross-mode hotkey stops.
     func switchMode(to mode: ProcessingMode) {
-        currentMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
+        guard state == .starting || state == .recording else { return }
+        let resolvedMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
+        if resolvedMode != currentMode { polishPrefetch.invalidate() }
+        currentMode = resolvedMode
     }
 
     // MARK: - Stop
@@ -758,6 +929,7 @@ actor RecognitionSession {
         if state == .starting {
             DebugFileLogger.log("stopRecording during starting: cancelling pending session")
             forceReset()
+            onASREvent?(.completed)
             return
         }
         guard state == .recording, let sessionID = currentSessionID else {
@@ -779,7 +951,13 @@ actor RecognitionSession {
         state = .finishing
 
         let stopT0 = ContinuousClock.now
-        SoundFeedback.playStop()
+
+        // 用户主动松开热键时保留 300ms 收声窗口，避免最后一两个字仍在麦克风/HAL
+        // 缓冲区中就被截断。服务端自动停录带 expectedSessionID，不额外延迟。
+        if expectedSessionID == nil, audioCaptureSessionID == sessionID {
+            await audioEngine.captureReleaseTail()
+            guard ensureCurrent("release tail capture") else { return }
+        }
 
         // Stop capture first so flushRemaining() can emit the tail audio chunk.
         if audioCaptureSessionID == sessionID {
@@ -787,7 +965,14 @@ actor RecognitionSession {
             audioEngine.stop()
             audioEngine.clearAudioHandlers()
         }
+        // 停止提示音必须在麦克风真正关闭后播放，否则尾音保护会把提示音录进去。
+        SoundFeedback.playStop()
         let uploadFailed = await finishAudioChunkPipeline(sessionID: sessionID)
+        let recordedAudio = audioEngine.getRecordedAudio()
+        let audioSummary = PCMAudioActivitySummary.analyze(recordedAudio)
+        DebugFileLogger.log(
+            "stop: audio summary bytes=\(audioSummary.validByteCount) frames=\(audioSummary.analyzedFrameCount) voiced=\(audioSummary.voicedFrameCount) peak=\(audioSummary.peakAmplitude) meaningful=\(audioSummary.hasMeaningfulSpeech)"
+        )
         DebugFileLogger.log("stop: audio stopped +\(ContinuousClock.now - stopT0)")
         guard ensureCurrent("audio pipeline") else {
             DebugFileLogger.log("stopRecording: zombie after audio pipeline, bailing")
@@ -797,7 +982,7 @@ actor RecognitionSession {
         // Keep speculative LLM task alive — we'll compare its input text
         // against the final ASR transcript after full teardown.
         cancelSpeculativeLLM(sessionID: sessionID)
-        let needsLLM = !currentMode.prompt.isEmpty
+        let needsLLM = currentMode.requiresLLM
         let provider = activeProvider
 
         let asrTeardown = await teardownASRClient(
@@ -819,27 +1004,50 @@ actor RecognitionSession {
             return
         }
 
-        // Batch fallback: if streaming broke mid-session, always retry with
-        // the full local recording to get complete text, even if we have partial.
+        // Batch fallback: retry only when the audio/transcript itself may be incomplete.
+        // A provider that accepted endAudio but did not close its event stream in time
+        // is a lifecycle anomaly, not automatically a content failure. For Volcano,
+        // preserve already-valid text instead of creating a second real-time replay.
         // REPAIR_PLAN K2：转写严重滞后时服务端可能只 final 了开头段就正常关流
         //（实测说 8s 首包 7.4s 才到、注入仅 3 字），clean 关闭不代表文本完整——
         // 长录音字数低到不合理时同样强制批量复核。
         let recordedDuration = recordingStartSessionID == sessionID
             ? recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
             : 0
+        let transcriptTextCount = Self.effectiveTranscriptText(for: currentTranscript).count
         let implausiblyShort = Self.isTranscriptImplausiblyShort(
-            textCount: Self.effectiveTranscriptText(for: currentTranscript).count,
-            durationSeconds: recordedDuration
+            textCount: transcriptTextCount,
+            audioSummary: audioSummary
         )
+        let voicedButEmpty = provider == .aliyun
+            && transcriptTextCount == 0
+            && audioSummary.hasMeaningfulSpeech
         if implausiblyShort {
             DebugFileLogger.log(
-                "stop: transcript implausibly short for \(String(format: "%.1f", recordedDuration))s recording, forcing batch fallback"
+                "stop: transcript implausibly short for voiced=\(String(format: "%.1f", audioSummary.voicedDurationSeconds))s wall=\(String(format: "%.1f", recordedDuration))s, forcing batch fallback"
             )
         }
-        let streamingFailed = uploadFailed || !asrTeardown.clean
-            || streamingDegraded || implausiblyShort
-        await recoverTranscriptAfterStreamingFailureIfNeeded(
+        if voicedButEmpty {
+            DebugFileLogger.log(
+                "stop: Aliyun returned zero text for voiced audio, forcing paced full replay"
+            )
+        }
+        let volcanoCloseTimeoutWithValidText = provider == .volcano
+            && asrTeardown.endAudioSucceeded
+            && !asrTeardown.eventStreamDrained
+            && transcriptTextCount > 0
+        if volcanoCloseTimeoutWithValidText {
+            DebugFileLogger.log(
+                "stop: volcano event stream close timed out with valid text (\(transcriptTextCount) chars); skipping full replay"
+            )
+        }
+        let teardownRequiresRecovery = !asrTeardown.clean
+            && !volcanoCloseTimeoutWithValidText
+        let streamingFailed = uploadFailed || teardownRequiresRecovery
+            || streamingDegraded || implausiblyShort || voicedButEmpty
+        let recoveryResult = await recoverTranscriptAfterStreamingFailureIfNeeded(
             streamingFailed: streamingFailed,
+            audio: recordedAudio,
             sessionID: sessionID
         )
         guard ensureCurrent("batch fallback") else { return }
@@ -852,24 +1060,62 @@ actor RecognitionSession {
         }
 
         if !effectiveText.isEmpty {
+            // 原始 ASR 终稿只作为历史审计证据保存；后续纠错与润色使用独立的
+            // canonical 文本，避免为了提升正确率而覆盖 raw transcript。
             let rawText = effectiveText
             guard let llmResult = await postProcessRecognizedText(
                 rawText: rawText,
                 needsLLM: needsLLM,
                 earlyLLMTask: earlyLLMTask,
+                transcript: currentTranscript,
+                provider: provider,
+                durationMs: Int((recordedDuration * 1_000).rounded()),
                 sessionID: sessionID,
-                stopStartedAt: stopT0
+                stopStartedAt: stopT0,
+                allowsVoicePolishUserChoice: true
             ) else { return }
             guard ensureCurrent("pre-injection") else { return }
 
+            let historyID = UUID().uuidString
             let injectionOutcome = injectFinalText(
                 llmResult.finalText,
                 stopStartedAt: stopT0
             )
+            if let voicePolishPerformance = llmResult.voicePolishPerformance {
+                let elapsed = ContinuousClock.now - stopT0
+                let milliseconds = elapsed.components.seconds * 1_000
+                    + Int64(elapsed.components.attoseconds / 1_000_000_000_000_000)
+                VoicePolishPerformanceStore.record(
+                    measurement: voicePolishPerformance.completing(
+                        stopElapsedMilliseconds: Int(clamping: milliseconds)
+                    ),
+                    latencyMilliseconds: Int(clamping: milliseconds),
+                    qualityMode: currentMode.voicePolishQualityMode,
+                    defaults: llmResult.voicePolishVocabularyContext?.userDefaults ?? .standard
+                )
+            }
             guard ensureCurrent("post-injection") else { return }
             onASREvent?(.finalized(text: llmResult.finalText, injection: injectionOutcome))
+            let editLearningTarget: PostInjectionEditLearningTarget?
+            if currentMode.kind == .voicePolish,
+               case .inserted = injectionOutcome,
+               VoicePolishSettings.personalizationEnabled()
+                    || VoicePolishSettings.terminologyLearningEnabled() {
+                editLearningTarget = PostInjectionEditLearningMonitor.capture(
+                    injectedText: llmResult.finalText,
+                    historyID: historyID
+                )
+            } else {
+                editLearningTarget = nil
+            }
+            if recoveryResult == .failed {
+                onASREvent?(.error(ASRRecoveryError.partialTextPreserved(
+                    provider: provider.displayName
+                )))
+            }
 
             await saveSuccessfulHistory(
+                historyID: historyID,
                 rawText: rawText,
                 llmResult: llmResult,
                 streamingFailed: streamingFailed,
@@ -877,6 +1123,12 @@ actor RecognitionSession {
                 durationSeconds: recordedDuration,
                 sessionID: sessionID
             )
+            if let editLearningTarget {
+                await PostInjectionEditLearningMonitor.shared.start(
+                    editLearningTarget,
+                    historyStore: historyStore
+                )
+            }
             guard ensureCurrent("history save") else { return }
 
         } else {
@@ -886,8 +1138,14 @@ actor RecognitionSession {
                 sessionID: sessionID
             )
             guard ensureCurrent("empty completion") else { return }
-            onASREvent?(.processingResult(text: ""))
-            onASREvent?(.completed)
+            if recoveryResult == .failed, audioSummary.hasMeaningfulSpeech {
+                onASREvent?(.error(ASRRecoveryError.noTranscript(
+                    provider: provider.displayName
+                )))
+            } else {
+                onASREvent?(.processingResult(text: ""))
+                onASREvent?(.completed)
+            }
         }
 
         // Only reset to idle if this is still the active session.
@@ -898,6 +1156,29 @@ actor RecognitionSession {
             currentTranscript = .empty
             recordingStartTime = nil
             recordingStartSessionID = nil
+        }
+        if writingContextTaskSessionID == sessionID {
+            writingContextTask?.cancel()
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
+        }
+        if targetApplicationBundleIdentifierSessionID == sessionID {
+            targetApplicationBundleIdentifier = nil
+            targetApplicationBundleIdentifierSessionID = nil
+        }
+        if voicePolishTaskSessionID == sessionID {
+            voicePolishTask?.cancel()
+            voicePolishTask = nil
+            voicePolishTaskSessionID = nil
+        }
+        if voicePolishCanonicalOptionSessionID == sessionID {
+            voicePolishCanonicalOptionSessionID = nil
+        }
+        if canonicalVoicePolishRequestSessionID == sessionID {
+            canonicalVoicePolishRequestSessionID = nil
+        }
+        if voicePolishChoiceSessionID == sessionID {
+            resolveVoicePolishChoice(.cancel, sessionID: sessionID)
         }
         resetSpeculativeLLM(sessionID: sessionID)
         logger.info("Session complete, injected \(effectiveText.count) chars")
@@ -911,11 +1192,14 @@ actor RecognitionSession {
         sessionID: RecognitionSessionID,
         stopStartedAt stopT0: ContinuousClock.Instant
     ) async -> Task<String?, Never>? {
-        guard needsLLM && canEarlyLLM else { return nil }
+        guard needsLLM && canEarlyLLM && currentMode.kind != .voicePolish else { return nil }
 
-        var finalASRText = currentTranscript.composedText
+        let rawASRText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        finalASRText = SnippetStorage.applyEffective(to: finalASRText)
+        let finalASRText = canonicalText(
+            for: rawASRText,
+            sessionID: sessionID
+        )
         DebugFileLogger.log("stop: needsLLM=true mode=\(currentMode.name) text=\(finalASRText.count)chars specMatch=\(finalASRText == speculativeLLMText)")
         guard !finalASRText.isEmpty else { return nil }
 
@@ -953,7 +1237,10 @@ actor RecognitionSession {
         let task: Task<String?, Never> = Task {
             do {
                 let result = try await client.process(
-                    text: finalASRText, prompt: prompt, config: llmConfig
+                    text: finalASRText,
+                    prompt: prompt,
+                    context: .processingMode,
+                    config: llmConfig
                 )
                 let cleanedResult = mode.applyingLLMResultCleanup(to: result)
                 DebugFileLogger.log("stop: fresh LLM done \(cleanedResult.count) chars +\(ContinuousClock.now - stopT0)")
@@ -974,17 +1261,283 @@ actor RecognitionSession {
         rawText: String,
         needsLLM: Bool,
         earlyLLMTask: Task<String?, Never>?,
+        transcript: RecognitionTranscript,
+        provider: ASRProvider,
+        durationMs: Int,
         sessionID: RecognitionSessionID,
-        stopStartedAt stopT0: ContinuousClock.Instant
+        stopStartedAt stopT0: ContinuousClock.Instant,
+        vocabularyContext: VocabularyStorageContext = .production,
+        allowsVoicePolishUserChoice: Bool = false
     ) async -> LLMPostProcessingResult? {
-        var finalText = SnippetStorage.applyEffective(to: rawText)
+        let asrReadyAt = ContinuousClock.now
+        // rawText 必须原样留给历史审计。语音润色分支会在构造 envelope 时
+        // 一次性完成术语规范化；其他模式仍在这里生成 canonical。
+        var finalText = rawText
+        if currentMode.kind != .voicePolish {
+            finalText = canonicalText(
+                for: rawText,
+                sessionID: sessionID,
+                vocabularyContext: vocabularyContext
+            )
+        }
         var processedText: String?
         var llmFailed = false
+        var voicePolishHistoryStatus: String?
+        var voicePolishPerformance: VoicePolishPerformanceMeasurement?
+        let frozenQualityMode = currentMode.voicePolishQualityMode
+        var performance = VoicePolishSessionPerformance(stoppedAt: stopT0, asrReadyAt: asrReadyAt)
+        performance.prefetchScheduledCount = polishPrefetch.scheduledCount(session: sessionID)
+        var returnedPolishResult = false
+        func finalized(_ value: LLMPostProcessingResult) -> LLMPostProcessingResult {
+            var value = value
+            if let measurement = value.voicePolishPerformance {
+                value.voicePolishPerformance = performance.measurement(outcome: measurement.outcome)
+                returnedPolishResult = true
+            }
+            return value
+        }
+        defer {
+            if frozenQualityMode != nil, !returnedPolishResult {
+                // 取消也留下一条不含正文的统计；先前自动失败不能随会话退出消失。
+                let measurement = performance.measurement(outcome: .cancelled)
+                VoicePolishPerformanceStore.record(
+                    measurement: measurement,
+                    latencyMilliseconds: measurement.stopLatencyMilliseconds ?? 0,
+                    qualityMode: frozenQualityMode,
+                    defaults: vocabularyContext.userDefaults
+                )
+            }
+        }
 
         // LLM post-processing: prefer early result (fired at stop time),
         // fall back to synchronous call for very short recordings where
         // no streaming text was available yet.
-        if let earlyTask = earlyLLMTask {
+        if currentMode.kind == .voicePolish {
+            state = .postProcessing
+            voicePolishCanonicalOptionSessionID = sessionID
+            let mode = currentMode
+            guard let writingContext = await polishWritingContext(
+                sessionID: sessionID, vocabularyContext: vocabularyContext
+            ) else { return nil }
+            writingContextTask = nil
+            writingContextTaskSessionID = nil
+            DebugFileLogger.log(
+                "voice polish context scene=\(writingContext.scene.rawValue) level=\(writingContext.level.rawValue) safety=\(writingContext.safety.rawValue) selected=\(writingContext.selectedText?.count ?? 0) before=\(writingContext.textBeforeCursor?.count ?? 0) after=\(writingContext.textAfterCursor?.count ?? 0) recent=\(writingContext.recentMuseInputs.count)"
+            )
+            VoicePolishContextDiagnostics.record(writingContext)
+
+            var prepared = preparePolishRequest(
+                rawText: rawText, transcript: transcript, mode: mode,
+                writingContext: writingContext, durationMs: durationMs,
+                provider: provider, sessionID: sessionID, vocabularyContext: vocabularyContext
+            )
+            finalText = prepared.canonicalText
+            var envelope: VoiceInputEnvelope?
+            repeat {
+                envelope = prepared.request?.input
+                guard envelope == nil, allowsVoicePolishUserChoice else { break }
+                performance.recordSetupFailure()
+                let waitingAt = ContinuousClock.now
+                let choice = await waitForVoicePolishChoice(reason: .setupFailed, sessionID: sessionID)
+                performance.decisionWait += ContinuousClock.now - waitingAt
+                switch choice {
+                case .retry:
+                    performance.userRetryCount += 1
+                    prepared = preparePolishRequest(
+                        rawText: rawText, transcript: transcript, mode: mode,
+                        writingContext: writingContext, durationMs: durationMs,
+                        provider: provider, sessionID: sessionID, vocabularyContext: vocabularyContext
+                    )
+                    finalText = prepared.canonicalText
+                    continue
+                case .useCanonical:
+                    _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
+                    return finalized(canonicalVoicePolishResult(
+                        finalText,
+                        vocabularyContext: vocabularyContext
+                    ))
+                case .cancel:
+                    return nil
+                }
+            } while envelope == nil
+
+            guard let envelope else {
+                performance.recordSetupFailure()
+                voicePolishCanonicalOptionSessionID = nil
+                llmFailed = true
+                voicePolishHistoryStatus = "voice_polish_fallback"
+                onASREvent?(.processingResult(text: finalText))
+                return finalized(LLMPostProcessingResult(
+                    finalText: finalText,
+                    processedText: nil,
+                    llmFailed: true,
+                    voicePolishHistoryStatus: voicePolishHistoryStatus,
+                    voicePolishPerformance: VoicePolishPerformanceMeasurement(
+                        outcome: .setupFailure
+                    ),
+                    voicePolishVocabularyContext: vocabularyContext
+                ))
+            }
+
+            if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
+                return finalized(canonicalVoicePolishResult(
+                    envelope,
+                    vocabularyContext: vocabularyContext
+                ))
+            }
+
+            var loadedLLMConfig = await loadLLMConfigOffActor()
+            if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
+                return finalized(canonicalVoicePolishResult(
+                    envelope,
+                    vocabularyContext: vocabularyContext
+                ))
+            }
+            while loadedLLMConfig == nil, allowsVoicePolishUserChoice {
+                performance.recordSetupFailure()
+                let waitingAt = ContinuousClock.now
+                let choice = await waitForVoicePolishChoice(reason: .setupFailed, sessionID: sessionID)
+                performance.decisionWait += ContinuousClock.now - waitingAt
+                switch choice {
+                case .retry:
+                    performance.userRetryCount += 1
+                    loadedLLMConfig = await loadLLMConfigOffActor()
+                case .useCanonical:
+                    _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
+                    return finalized(canonicalVoicePolishResult(
+                        envelope,
+                        vocabularyContext: vocabularyContext
+                    ))
+                case .cancel:
+                    return nil
+                }
+            }
+            if let llmConfig = loadedLLMConfig {
+                guard isCurrent(sessionID) else {
+                    DebugFileLogger.log("stopRecording: superseded during voice polish config, bailing")
+                    return nil
+                }
+                guard let request = prepared.request else { return nil }
+                let voicePolishConfig = llmConfig
+                let pipeline = VoicePolishPipeline(
+                    client: currentLLMClient(),
+                    config: voicePolishConfig,
+                    onStage: { [weak self] stage in
+                        Task { [weak self] in
+                            await self?.emitVoicePolishStage(stage, sessionID: sessionID)
+                        }
+                    }
+                )
+                var prefetched = polishPrefetch.take(session: sessionID, key: .init(
+                    text: request.fallbackText, requirements: request.preferences.additionalRequirements,
+                    provider: KeychainService.selectedPolishProvider(for: .standard),
+                    config: voicePolishConfig))
+                if prefetched != nil {
+                    performance.reusedPrefetch = true
+                    DebugFileLogger.log("polish prefetch: reused completed candidate")
+                }
+                var totalAttempts = 0
+                var pipelineStartedAt = stopT0
+                let result: VoicePolishResult
+                while true {
+                    let readyCandidate = prefetched
+                    prefetched = nil
+                    let task = Task {
+                        if let readyCandidate {
+                            // 预生成已另计调度与复用；停止后没有发起正式请求。
+                            return Self.voicePolishResult(readyCandidate, replacingAttemptCount: 0)
+                        }
+                        return await pipeline.process(request, startedAt: pipelineStartedAt)
+                    }
+                    voicePolishTask = task
+                    voicePolishTaskSessionID = sessionID
+                    let currentResult = await task.value
+                    performance.record(
+                        currentResult,
+                        completedAutomatically: isCurrent(sessionID)
+                            && canonicalVoicePolishRequestSessionID != sessionID
+                    )
+                    if voicePolishTaskSessionID == sessionID {
+                        voicePolishTask = nil
+                        voicePolishTaskSessionID = nil
+                    }
+                    totalAttempts += currentResult.llmAttemptCount
+                    let accumulatedResult = Self.voicePolishResult(
+                        currentResult,
+                        replacingAttemptCount: totalAttempts
+                    )
+                    guard isCurrent(sessionID) else {
+                        DebugFileLogger.log("stopRecording: superseded during voice polish, bailing")
+                        return nil
+                    }
+                    if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
+                        return finalized(canonicalVoicePolishResult(
+                            envelope,
+                            pipelineResult: accumulatedResult,
+                            vocabularyContext: vocabularyContext
+                        ))
+                    }
+                    guard currentResult.usedFallback,
+                          allowsVoicePolishUserChoice else {
+                        result = accumulatedResult
+                        break
+                    }
+                    let waitingAt = ContinuousClock.now
+                    let choice = await waitForVoicePolishChoice(
+                        reason: currentResult.failureReason, sessionID: sessionID
+                    )
+                    performance.decisionWait += ContinuousClock.now - waitingAt
+                    switch choice {
+                    case .retry:
+                        performance.userRetryCount += 1
+                        // 用户明确重试是一轮新的有界请求，不能继续消耗从录音停止
+                        // 时开始计算的旧 deadline。
+                        pipelineStartedAt = .now
+                        continue
+                    case .useCanonical:
+                        _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
+                        return finalized(canonicalVoicePolishResult(
+                            envelope,
+                            pipelineResult: accumulatedResult,
+                            vocabularyContext: vocabularyContext
+                        ))
+                    case .cancel:
+                        return nil
+                    }
+                }
+                voicePolishPerformance = VoicePolishPerformanceMeasurement(result: result)
+                voicePolishCanonicalOptionSessionID = nil
+                finalText = result.text
+                if !result.usedFallback {
+                    processedText = result.text
+                }
+                llmFailed = result.usedFallback
+                voicePolishHistoryStatus = Self.voicePolishHistoryStatus(for: result)
+                // 一旦选择了 pipeline 结果，先通知 HUD 关闭 canonical 出口，再做非关键的
+                // 近期输入记忆；否则该 await 窗口内 UI 仍会展示一个后台已拒绝的动作。
+                onASREvent?(.processingResult(text: result.text))
+                if VoicePolishSettings.recentInputContextEnabled(defaults: vocabularyContext.userDefaults), !result.usedFallback {
+                    await voicePolishRecentInputStore.remember(
+                        result.text,
+                        applicationBundleID: writingContext.applicationBundleID
+                    )
+                    guard isCurrent(sessionID) else {
+                        DebugFileLogger.log("stopRecording: stale recent voice polish output ignored")
+                        return nil
+                    }
+                }
+            } else {
+                performance.recordSetupFailure()
+                DebugFileLogger.log("stop: no LLM credentials for voice polish, falling back")
+                llmFailed = true
+                voicePolishHistoryStatus = "voice_polish_fallback"
+                onASREvent?(.processingResult(text: envelope.fallbackText))
+                finalText = envelope.fallbackText
+                voicePolishPerformance = VoicePolishPerformanceMeasurement(
+                    outcome: .setupFailure
+                )
+            }
+        } else if let earlyTask = earlyLLMTask {
             state = .postProcessing
             DebugFileLogger.log("stop: awaiting early LLM result +\(ContinuousClock.now - stopT0)")
             // REPAIR_PLAN J12：stop 链路上 LLM 是唯一无会话级硬超时的阻塞点——底层
@@ -1008,10 +1561,10 @@ actor RecognitionSession {
                 onASREvent?(.processingResult(text: result))
             } else {
                 let err = pendingLLMError ?? LLMError.emptyResponse(nil)
-                DebugFileLogger.log("stop: early LLM failed, falling back to raw text: \(err)")
+                DebugFileLogger.log("stop: early LLM failed, falling back to canonical text: \(err)")
                 pendingLLMError = nil
                 llmFailed = true
-                onASREvent?(.processingResult(text: rawText))
+                onASREvent?(.processingResult(text: finalText))
             }
         } else if needsLLM {
             state = .postProcessing
@@ -1036,6 +1589,7 @@ actor RecognitionSession {
                             return .success(try await client.process(
                                 text: textForLLM,
                                 prompt: prompt,
+                                context: .processingMode,
                                 config: llmConfig
                             ))
                         } catch {
@@ -1052,9 +1606,9 @@ actor RecognitionSession {
                         return nil
                     }
                     if cleanedResult.isEmpty {
-                        DebugFileLogger.log("stop: sync LLM empty result, falling back to raw text")
+                        DebugFileLogger.log("stop: sync LLM empty result, falling back to canonical text")
                         llmFailed = true
-                        onASREvent?(.processingResult(text: rawText))
+                        onASREvent?(.processingResult(text: finalText))
                     } else {
                         processedText = cleanedResult
                         finalText = cleanedResult
@@ -1066,14 +1620,14 @@ actor RecognitionSession {
                         return nil
                     }
                     logger.error("LLM failed: \(error)")
-                    DebugFileLogger.log("stop: sync LLM FAILED, falling back to raw text: \(error)")
+                    DebugFileLogger.log("stop: sync LLM FAILED, falling back to canonical text: \(error)")
                     llmFailed = true
-                    onASREvent?(.processingResult(text: rawText))
+                    onASREvent?(.processingResult(text: finalText))
                 }
             } else {
-                DebugFileLogger.log("stop: no LLM credentials, falling back to raw text")
+                DebugFileLogger.log("stop: no LLM credentials, falling back to canonical text")
                 llmFailed = true
-                onASREvent?(.processingResult(text: rawText))
+                onASREvent?(.processingResult(text: finalText))
             }
         }
 
@@ -1092,11 +1646,167 @@ actor RecognitionSession {
             }
         }
 
-        return LLMPostProcessingResult(
+        if voicePolishCanonicalOptionSessionID == sessionID {
+            voicePolishCanonicalOptionSessionID = nil
+        }
+
+        return finalized(LLMPostProcessingResult(
             finalText: finalText,
             processedText: processedText,
-            llmFailed: llmFailed
+            llmFailed: llmFailed,
+            voicePolishHistoryStatus: voicePolishHistoryStatus,
+            voicePolishPerformance: voicePolishPerformance,
+            voicePolishVocabularyContext: voicePolishPerformance == nil
+                ? nil
+                : vocabularyContext
+        ))
+    }
+
+    private func emitVoicePolishStage(
+        _ stage: VoicePolishStage,
+        sessionID: RecognitionSessionID
+    ) {
+        guard isCurrent(sessionID),
+              state == .postProcessing,
+              voicePolishCanonicalOptionSessionID == sessionID,
+              voicePolishChoiceSessionID == nil else { return }
+        onASREvent?(.voicePolishStage(stage))
+    }
+
+    private func waitForVoicePolishChoice(
+        reason: VoicePolishFailureReason?,
+        sessionID: RecognitionSessionID
+    ) async -> VoicePolishUserChoice {
+        guard isCurrent(sessionID), state == .postProcessing else { return .cancel }
+        if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
+            return .useCanonical
+        }
+        // 同一会话同时只能存在一个选择点。若旧 continuation 尚未清理，先让
+        // 它退出，避免悬挂或一次点击唤醒错误的等待者。
+        if let pending = voicePolishChoiceContinuation {
+            pending.resume(returning: .cancel)
+            voicePolishChoiceContinuation = nil
+            voicePolishChoiceSessionID = nil
+        }
+        return await withCheckedContinuation { continuation in
+            voicePolishChoiceSessionID = sessionID
+            voicePolishChoiceContinuation = continuation
+            onASREvent?(.voicePolishUnavailable(reason: reason))
+        }
+    }
+
+    private func resolveVoicePolishChoice(
+        _ choice: VoicePolishUserChoice,
+        sessionID: RecognitionSessionID
+    ) {
+        guard voicePolishChoiceSessionID == sessionID,
+              let continuation = voicePolishChoiceContinuation else { return }
+        voicePolishChoiceSessionID = nil
+        voicePolishChoiceContinuation = nil
+        continuation.resume(returning: choice)
+    }
+
+    private func applicationBundleIdentifier(for sessionID: RecognitionSessionID) -> String? {
+        guard targetApplicationBundleIdentifierSessionID == sessionID else { return nil }
+        return targetApplicationBundleIdentifier
+    }
+
+    private func terminologyApplicationBundleIdentifier(
+        for sessionID: RecognitionSessionID,
+        fallbackBundleIdentifier: String?
+    ) -> String? {
+        if targetApplicationBundleIdentifierSessionID == sessionID {
+            return targetApplicationBundleIdentifier
+        }
+        return fallbackBundleIdentifier
+    }
+
+    private func canonicalText(
+        for rawText: String,
+        sessionID: RecognitionSessionID,
+        vocabularyContext: VocabularyStorageContext = .production
+    ) -> String {
+        VoicePolishTerminologyRuntime.prepare(
+            rawText: rawText,
+            applicationBundleIdentifier: applicationBundleIdentifier(for: sessionID),
+            context: vocabularyContext
+        ).canonicalText
+    }
+
+    private func consumeCanonicalVoicePolishRequest(
+        sessionID: RecognitionSessionID
+    ) -> Bool {
+        guard canonicalVoicePolishRequestSessionID == sessionID else { return false }
+        canonicalVoicePolishRequestSessionID = nil
+        voicePolishCanonicalOptionSessionID = nil
+        return true
+    }
+
+    private func canonicalVoicePolishResult(
+        _ envelope: VoiceInputEnvelope,
+        pipelineResult: VoicePolishResult? = nil,
+        vocabularyContext: VocabularyStorageContext
+    ) -> LLMPostProcessingResult {
+        let canonicalText = envelope.fallbackText
+        onASREvent?(.processingResult(text: canonicalText))
+        return LLMPostProcessingResult(
+            finalText: canonicalText,
+            processedText: nil,
+            llmFailed: false,
+            voicePolishHistoryStatus: "voice_polish_canonical",
+            voicePolishPerformance: VoicePolishPerformanceMeasurement(
+                outcome: .canonicalExit,
+                route: pipelineResult?.executedRoute,
+                llmAttemptCount: pipelineResult?.llmAttemptCount ?? 0
+            ),
+            voicePolishVocabularyContext: vocabularyContext
         )
+    }
+
+    private func canonicalVoicePolishResult(
+        _ canonicalText: String,
+        vocabularyContext: VocabularyStorageContext
+    ) -> LLMPostProcessingResult {
+        onASREvent?(.processingResult(text: canonicalText))
+        return LLMPostProcessingResult(
+            finalText: canonicalText,
+            processedText: nil,
+            llmFailed: false,
+            voicePolishHistoryStatus: "voice_polish_canonical",
+            voicePolishPerformance: VoicePolishPerformanceMeasurement(
+                outcome: .canonicalExit
+            ),
+            voicePolishVocabularyContext: vocabularyContext
+        )
+    }
+
+    private static func voicePolishResult(
+        _ result: VoicePolishResult,
+        replacingAttemptCount attemptCount: Int
+    ) -> VoicePolishResult {
+        VoicePolishResult(
+            text: result.text,
+            detectedRoute: result.detectedRoute,
+            executedRoute: result.executedRoute,
+            llmAttemptCount: attemptCount,
+            validationCodes: result.validationCodes,
+            usedFallback: result.usedFallback,
+            failureReason: result.failureReason,
+            rejectedDraft: result.rejectedDraft,
+            repairAttemptCount: result.repairAttemptCount
+        )
+    }
+
+    private static func voicePolishHistoryStatus(for result: VoicePolishResult) -> String {
+        guard result.usedFallback else { return "voice_polish_success" }
+        switch result.failureReason {
+        case .timeout:
+            return "voice_polish_timeout"
+        case .validationFailed:
+            return "voice_polish_validation_failed"
+        case .requestFailed, .setupFailed, .none:
+            return "voice_polish_fallback"
+        }
     }
 
     // REPAIR_PLAN K1：防泄漏清洗只作用于真 LLM 输出。直出与 LLM 失败回退的文本是
@@ -1128,6 +1838,7 @@ actor RecognitionSession {
     }
 
     private func saveSuccessfulHistory(
+        historyID: String,
         rawText: String,
         llmResult: LLMPostProcessingResult,
         streamingFailed: Bool,
@@ -1137,9 +1848,24 @@ actor RecognitionSession {
     ) async {
         // J15：状态口径反映注入结局——仅复制到剪贴板 / 没找到输入位置时不再记 completed
         let status: String
-        if llmResult.llmFailed { status = "llm_error" }
-        else if streamingFailed { status = "stream_recovered" }
-        else {
+        if llmResult.voicePolishHistoryStatus == "voice_polish_canonical",
+           case .inserted = injection {
+            // 用户主动选用 canonical 是正常出口；即使本次 ASR 曾恢复，也不能记成
+            // LLM 失败或普通 fallback，否则会污染 Voice Polish 失败率。
+            status = "voice_polish_canonical"
+        } else if llmResult.llmFailed {
+            if let voicePolishStatus = llmResult.voicePolishHistoryStatus,
+               case .inserted = injection {
+                status = voicePolishStatus
+            } else {
+                status = "llm_error"
+            }
+        } else if streamingFailed {
+            status = "stream_recovered"
+        } else if let voicePolishStatus = llmResult.voicePolishHistoryStatus,
+                  case .inserted = injection {
+            status = voicePolishStatus
+        } else {
             switch injection {
             case .inserted:
                 status = "completed"
@@ -1152,11 +1878,11 @@ actor RecognitionSession {
 
         let finalText = llmResult.finalText
         await historyStore.insert(HistoryRecord(
-            id: UUID().uuidString,
+            id: historyID,
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: rawText,
-            processingMode: currentMode.id == ProcessingMode.directId ? nil : currentMode.name,
+            processingMode: historyProcessingModeName,
             processedText: llmResult.processedText,
             finalText: finalText,
             status: status,
@@ -1188,7 +1914,7 @@ actor RecognitionSession {
             createdAt: Date(),
             durationSeconds: durationSeconds,
             rawText: "",
-            processingMode: currentMode.id == ProcessingMode.directId ? nil : currentMode.name,
+            processingMode: historyProcessingModeName,
             processedText: nil,
             finalText: "",
             status: status,
@@ -1197,6 +1923,18 @@ actor RecognitionSession {
         ))
         guard isCurrent(sessionID) else { return }
         DebugFileLogger.log("stop: no text recognized, saved to history as \(status)")
+    }
+
+    /// 新记录使用真实执行的基础模式名称。
+    private var historyProcessingModeName: String {
+        switch currentMode.id {
+        case ProcessingMode.directId:
+            return L("直出", "Direct")
+        case ProcessingMode.lightPolishId, ProcessingMode.formalWriting.id:
+            return L("润色", "Polish")
+        default:
+            return currentMode.name
+        }
     }
 
     private func teardownASRClient(
@@ -1208,12 +1946,16 @@ actor RecognitionSession {
         // ASR teardown: send endAudio and drain event stream with hard deadlines.
         // Uses detached tasks + continuation so a stuck client can't block stopRecording.
         let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider).isStreaming
-        var clean = true
+        var eventStreamDrained = true
 
         guard let client,
               isCurrent(sessionID),
               ownsASRClient(client, sessionID: sessionID) else {
-            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: clean)
+            return ASRTeardownResult(
+                providerIsStreaming: providerIsStreaming,
+                endAudioSucceeded: true,
+                eventStreamDrained: true
+            )
         }
         let ownedEventTask: Task<Void, Never>?
         let ownedEventToken: UUID?
@@ -1231,34 +1973,50 @@ actor RecognitionSession {
         }
         guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
             DebugFileLogger.log("stop: ASR endAudio returned for stale session=\(sessionID.rawValue)")
-            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+            return ASRTeardownResult(
+                providerIsStreaming: providerIsStreaming,
+                endAudioSucceeded: false,
+                eventStreamDrained: false
+            )
         }
         if !endAudioOK {
             DebugFileLogger.log("endAudio timeout or failed")
-            clean = false
         }
 
         // Always try to drain events — even if endAudio failed, the server
         // may have already queued transcript events before the connection broke.
         if let evtTask = ownedEventTask {
-            let drainTimeout: Duration = providerIsStreaming ? .seconds(2) : .seconds(5)
+            let drainTimeout: Duration
+            if provider == .volcano {
+                drainTimeout = .milliseconds(1_200)
+            } else {
+                drainTimeout = providerIsStreaming ? .seconds(2) : .seconds(5)
+            }
             let drained = await AsyncTimeout.run(drainTimeout) {
                 await evtTask.value
             }
             guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
                 DebugFileLogger.log("stop: event drain returned for stale session=\(sessionID.rawValue)")
-                return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+                return ASRTeardownResult(
+                    providerIsStreaming: providerIsStreaming,
+                    endAudioSucceeded: false,
+                    eventStreamDrained: false
+                )
             }
             if !drained {
                 DebugFileLogger.log("event stream drain timeout")
-                clean = false
+                eventStreamDrained = false
             }
         }
 
         await client.disconnect()
         guard isCurrent(sessionID), ownsASRClient(client, sessionID: sessionID) else {
             DebugFileLogger.log("stop: disconnect returned for stale session=\(sessionID.rawValue)")
-            return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: false)
+            return ASRTeardownResult(
+                providerIsStreaming: providerIsStreaming,
+                endAudioSucceeded: false,
+                eventStreamDrained: false
+            )
         }
 
         ownedEventTask?.cancel()
@@ -1270,23 +2028,33 @@ actor RecognitionSession {
         }
         clearASRClientIfOwned(client, sessionID: sessionID)
         hasEmittedReadyForCurrentSession = false
-        DebugFileLogger.log("stop: ASR teardown complete (clean=\(clean)) +\(ContinuousClock.now - stopT0)")
-        return ASRTeardownResult(providerIsStreaming: providerIsStreaming, clean: clean)
+        let result = ASRTeardownResult(
+            providerIsStreaming: providerIsStreaming,
+            endAudioSucceeded: endAudioOK,
+            eventStreamDrained: eventStreamDrained
+        )
+        DebugFileLogger.log(
+            "stop: ASR teardown complete (clean=\(result.clean) endAudio=\(result.endAudioSucceeded) drained=\(result.eventStreamDrained)) +\(ContinuousClock.now - stopT0)"
+        )
+        return result
     }
 
     private func recoverTranscriptAfterStreamingFailureIfNeeded(
         streamingFailed: Bool,
+        audio fullAudio: Data,
         sessionID: RecognitionSessionID
-    ) async {
-        guard streamingFailed, isCurrent(sessionID) else { return }
+    ) async -> TranscriptRecoveryResult {
+        guard streamingFailed, isCurrent(sessionID) else { return .notNeeded }
 
         let partialText = currentTranscript.composedText
         DebugFileLogger.log("stop: streaming failed (partial=\(partialText.count) chars), attempting batch fallback")
 
-        let fullAudio = audioEngine.getRecordedAudio()
         guard !fullAudio.isEmpty,
               currentConfigSessionID == sessionID,
-              let config = currentConfig else { return }
+              let config = currentConfig else {
+            DebugFileLogger.log("stop: batch fallback unavailable (audio/config missing)")
+            return .failed
+        }
         let provider = activeProvider
 
         onASREvent?(.processingResult(text: partialText.isEmpty ? "重新识别中..." : partialText))
@@ -1296,11 +2064,11 @@ actor RecognitionSession {
             provider: provider
         ) else {
             DebugFileLogger.log("stop: batch fallback failed, using partial text")
-            return
+            return .failed
         }
         guard isCurrent(sessionID) else {
             DebugFileLogger.log("stop: batch fallback result ignored for stale session")
-            return
+            return .failed
         }
 
         // REPAIR_PLAN K2：兜底不劣化——批量结果比流式已有文本更短时保留流式，
@@ -1310,7 +2078,7 @@ actor RecognitionSession {
             DebugFileLogger.log(
                 "stop: batch fallback shorter than streaming (\(batchText.count) < \(streamingText.count)), keeping streaming text"
             )
-            return
+            return .succeeded
         }
 
         currentTranscript = RecognitionTranscript(
@@ -1320,6 +2088,7 @@ actor RecognitionSession {
             isFinal: true
         )
         DebugFileLogger.log("stop: batch fallback succeeded, \(batchText.count) chars")
+        return .succeeded
     }
 
     // REPAIR_PLAN K2：注入取值守卫。HUD 字幕与 LLM 路径显示/消费 composedText
@@ -1340,9 +2109,20 @@ actor RecognitionSession {
         return auth
     }
 
-    // REPAIR_PLAN K2：长录音字数低到不合理（有字但不足每秒 0.5 字）视为疑似
-    // 流层丢失，强制批量复核。0 字不触发——那是「没说话」，走 empty 路径；
-    // 短录音不触发——短句+快松手是正常形态。
+    // REPAIR_PLAN K10：按真实有声时长而非墙钟录音时长判断，长停顿不再把正常
+    // 文本误报为丢字；活动摘要只计通过声音阈值的 20ms 帧。
+    static func isTranscriptImplausiblyShort(
+        textCount: Int,
+        audioSummary: PCMAudioActivitySummary
+    ) -> Bool {
+        isTranscriptImplausiblyShort(
+            textCount: textCount,
+            durationSeconds: audioSummary.voicedDurationSeconds
+        )
+    }
+
+    // REPAIR_PLAN K2：有声时长较长且不足每秒 0.5 字时视为疑似流层丢失。
+    // 0 字交由 K7 的 PCM 活动摘要另行判断；不足 10 秒的短句不触发。
     static func isTranscriptImplausiblyShort(
         textCount: Int,
         durationSeconds: Double
@@ -1388,22 +2168,39 @@ actor RecognitionSession {
             break
         }
 
-        // Notify UI layer for all non-ready events
-        onASREvent?(event)
-
         switch event {
         case .ready, .completed:
             break  // handled above
 
         case .transcript(let transcript):
+            if transcript.composedText != currentTranscript.composedText {
+                polishPrefetch.invalidate()
+            }
             currentTranscript = transcript
+            onASREvent?(event)
             logger.info("Transcript updated chars=\(transcript.displayText.count, privacy: .public) segments=\(transcript.confirmedSegments.count, privacy: .public) final=\(transcript.isFinal, privacy: .public)")
-            if state == .recording && !currentMode.prompt.isEmpty {
+            if state == .recording, currentMode.requiresLLM {
                 scheduleSpeculativeLLM(sessionID: sessionID)
             }
 
         case .error(let error):
             logger.error("ASR error: \(error, privacy: .private)")
+            let supportsFullPCMReplay = activeProvider == .aliyun
+                || activeProvider == .volcano
+            if supportsFullPCMReplay,
+               state == .recording || state == .finishing {
+                // 云端任务失败不再立即 forceReset 丢掉本地整段音频。录音中只给
+                // 非致命断流提示，停止阶段静默标记降级，随后统一做完整重放。
+                streamingDegraded = true
+                DebugFileLogger.log(
+                    "ASR terminal error preserved local audio state=\(state); batch fallback required"
+                )
+                if state == .recording {
+                    onASREvent?(.streamingInterrupted)
+                }
+                return
+            }
+            onASREvent?(event)
             if state == .recording || state == .starting {
                 Task { await self.failActiveSessionAfterASRError(sessionID: sessionID) }
             }
@@ -1412,9 +2209,11 @@ actor RecognitionSession {
             // REPAIR_PLAN B7b：客户端静默重连成功也会发此事件——重连期间的
             // 语音服务端没听到，标记降级让停止流程批量复核全文
             streamingDegraded = true
+            onASREvent?(event)
             logger.warning("streaming degraded (interrupted/reconnected); batch fallback will verify at stop")
 
-        case .processingResult, .finalized:
+        case .processingResult, .voicePolishStage, .voicePolishUnavailable, .finalized:
+            onASREvent?(event)
             break
         }
     }
@@ -1513,7 +2312,7 @@ actor RecognitionSession {
         guard isCurrent(sessionID) else { return }
         // Skip speculative LLM for local models — they're fast enough (~0.5s)
         // and would compete for Metal GPU with local ASR.
-        guard KeychainService.selectedLLMProvider != .localQwen else { return }
+        guard KeychainService.selectedPolishProvider(for: .resolve(currentMode.voicePolishQualityMode)) != .localQwen else { return }
 
         speculativeDebounceTask?.cancel()
         let debounceToken = UUID()
@@ -1535,9 +2334,14 @@ actor RecognitionSession {
 
     private func fireSpeculativeLLM(sessionID: RecognitionSessionID) async {
         guard isCurrent(sessionID), state == .recording else { return }
-        var text = currentTranscript.composedText
+        if currentMode.kind == .voicePolish {
+            await firePolishPrefetch(sessionID: sessionID)
+            return
+        }
+        guard currentMode.kind != .voicePolish else { return }
+        let rawText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        text = SnippetStorage.applyEffective(to: text)
+        let text = canonicalText(for: rawText, sessionID: sessionID)
         guard !text.isEmpty, text != speculativeLLMText else { return }
         guard let llmConfig = await loadLLMConfigOffActor() else { return }
         guard isCurrent(sessionID), state == .recording else { return }
@@ -1557,7 +2361,10 @@ actor RecognitionSession {
         let task: Task<String?, Never> = Task {
             do {
                 let result = try await client.process(
-                    text: text, prompt: prompt, config: llmConfig
+                    text: text,
+                    prompt: prompt,
+                    context: .processingMode,
+                    config: llmConfig
                 )
                 let cleanedResult = mode.applyingLLMResultCleanup(to: result)
                 DebugFileLogger.log("speculative LLM: done \(cleanedResult.count) chars")
@@ -1570,6 +2377,95 @@ actor RecognitionSession {
         }
         speculativeLLMTask = task
         speculativeLLMSessionID = sessionID
+    }
+
+    private func firePolishPrefetch(
+        sessionID: RecognitionSessionID,
+        vocabularyContext: VocabularyStorageContext = .production
+    ) async {
+        let transcript = currentTranscript
+        let raw = transcript.composedText
+        let mode = currentMode
+        let provider = KeychainService.selectedPolishProvider(for: .standard)
+        // 仅云端预生成；与正式路径共享上下文纠错及完整正文构造。
+        guard mode.kind == .voicePolish, !provider.isLocal,
+              let writingContext = await polishWritingContext(
+                sessionID: sessionID, vocabularyContext: vocabularyContext
+              ),
+              let config = await loadLLMConfigOffActor(),
+              isCurrent(sessionID), state == .recording,
+              currentMode == mode, currentTranscript == transcript,
+              KeychainService.selectedPolishProvider(for: .standard) == provider else { return }
+        let prepared = preparePolishRequest(
+            rawText: raw, transcript: transcript, mode: mode, writingContext: writingContext,
+            durationMs: 0, provider: activeProvider, sessionID: sessionID,
+            vocabularyContext: vocabularyContext
+        )
+        guard let request = prepared.request else { return }
+        let pipeline = VoicePolishEditingPipeline(client: currentLLMClient(), config: config)
+        polishPrefetch.start(session: sessionID, key: .init(
+            text: request.fallbackText, requirements: request.preferences.additionalRequirements,
+            provider: provider, config: config
+        )) {
+            await pipeline.process(request)
+        }
+    }
+
+    /// 预生成保留录音开始时捕获的上下文，正式交付再次读取当前近期输入并精确比对正文。
+    private func polishWritingContext(
+        sessionID: RecognitionSessionID, vocabularyContext: VocabularyStorageContext
+    ) async -> WritingContext? {
+        var context: WritingContext
+        if writingContextTaskSessionID == sessionID, let task = writingContextTask {
+            context = await task.value
+        } else {
+            context = WritingContext(
+                level: VoicePolishSettings.contextLevel(defaults: vocabularyContext.userDefaults),
+                safety: .unknown
+            )
+        }
+        guard isCurrent(sessionID) else { return nil }
+        if VoicePolishSettings.recentInputContextEnabled(defaults: vocabularyContext.userDefaults) {
+            let recent = await voicePolishRecentInputStore.recentInputs(
+                applicationBundleID: context.applicationBundleID
+            )
+            guard isCurrent(sessionID) else { return nil }
+            context = context.includingRecentMuseInputs(recent)
+        }
+        return context
+    }
+
+    /// 一处构造最终送给模型的正文，确保词库、分段与授权上下文在预生成和交付间一致。
+    private func preparePolishRequest(
+        rawText: String, transcript: RecognitionTranscript, mode: ProcessingMode,
+        writingContext: WritingContext, durationMs: Int, provider: ASRProvider,
+        sessionID: RecognitionSessionID, vocabularyContext: VocabularyStorageContext
+    ) -> (request: VoicePolishRequest?, canonicalText: String) {
+        let terminology = VoicePolishTerminologyRuntime.prepare(
+            rawText: rawText,
+            applicationBundleIdentifier: terminologyApplicationBundleIdentifier(
+                for: sessionID, fallbackBundleIdentifier: writingContext.applicationBundleID
+            ), context: vocabularyContext
+        )
+        let segments = transcript.confirmedSegments.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.map { VoicePolishTerminologyRuntime.canonicalText(for: $0, reusing: terminology) }
+        guard let envelope = VoiceInputEnvelope.fromFinalTranscript(
+            transcript, rawFinalText: rawText, canonicalText: terminology.canonicalText,
+            preferredCanonicalSegmentTexts: segments,
+            deterministicCorrections: terminology.projection.corrections,
+            durationMs: durationMs, provider: provider
+        ) else { return (nil, terminology.canonicalText) }
+        let entities = EntityResolver.resolve(
+            segments: envelope.segments, lexicon: terminology.projection.personalLexicon,
+            snippets: terminology.fixedSnippets, hotwords: [], context: writingContext
+        )
+        let request = VoicePolishRequest(
+            input: envelope, context: writingContext,
+            preferences: UserPolishPreferences(additionalRequirements: mode.prompt),
+            qualityMode: .standard, resolvedEntities: entities
+        )
+        return (request, terminology.canonicalText)
     }
 
     private func cancelSpeculativeLLM(sessionID: RecognitionSessionID) {
@@ -1588,6 +2484,7 @@ actor RecognitionSession {
     }
 
     private func resetSpeculativeLLM(sessionID: RecognitionSessionID? = nil) {
+        polishPrefetch.reset(session: sessionID)
         if sessionID == nil || speculativeDebounceSessionID == sessionID {
             speculativeDebounceTask?.cancel()
             speculativeDebounceTask = nil
@@ -1610,40 +2507,79 @@ actor RecognitionSession {
         config: any ASRProviderConfig,
         provider: ASRProvider
     ) async -> String? {
+        let timeout = Self.batchFallbackTimeout(
+            provider: provider,
+            audioByteCount: audio.count
+        )
+        let clientFactory = asrClientFactory
+        let replaySleep = aliyunReplaySleep
         do {
             return try await AsyncTimeout.throwingValue(
-                .seconds(30),
+                timeout,
                 timeoutError: BatchFallbackTimeoutError()
             ) {
-                guard let client = ASRProviderRegistry.createClient(for: provider) else { return nil }
+                guard let client = clientFactory(provider) else { return nil }
                 do {
                     let options = ASRRequestOptions(enablePunc: true, contextHistoryLength: 0)
                     try await client.connect(config: config, options: options)
-                    // Send all audio at once, then signal end
-                    try await client.sendAudio(audio)
+                    if provider == .aliyun {
+                        try await AliyunAudioReplay.send(
+                            audio: audio,
+                            to: client,
+                            sleep: replaySleep
+                        )
+                    } else if provider == .volcano {
+                        try await VolcanoAudioReplay.send(
+                            audio: audio,
+                            to: client
+                        )
+                    } else {
+                        try await client.sendAudio(audio)
+                    }
                     try await client.endAudio()
 
                     // Wait for final transcript
                     let events = await client.events
+                    var latestNonEmptyText: String?
                     for await event in events {
                         switch event {
-                        case .transcript(let transcript) where transcript.isFinal:
-                            await client.disconnect()
-                            // REPAIR_PLAN K2：批量 final 同样可能 auth 短于 composed，取长
+                        case .transcript(let transcript):
+                            // REPAIR_PLAN K2：批量结果同样可能 auth 短于 composed，取长。
                             let text = RecognitionSession.effectiveTranscriptText(for: transcript)
-                            return text.isEmpty ? nil : text
-                        case .error:
+                            if !text.isEmpty {
+                                latestNonEmptyText = text
+                            }
+                            guard transcript.isFinal else { continue }
+                            let result = latestNonEmptyText
+                            await client.disconnect()
+                            return result
+                        case .error(let error):
+                            DebugFileLogger.log(
+                                "batch fallback provider=\(provider.rawValue) server error: \(error)"
+                            )
                             await client.disconnect()
                             return nil
                         case .completed:
+                            let result = latestNonEmptyText
+                            if let result {
+                                DebugFileLogger.log(
+                                    "batch fallback provider=\(provider.rawValue) completed without final; using latest \(result.count) chars"
+                                )
+                            }
                             await client.disconnect()
-                            return nil
+                            return result
                         default:
                             continue
                         }
                     }
+                    let result = latestNonEmptyText
+                    if let result {
+                        DebugFileLogger.log(
+                            "batch fallback provider=\(provider.rawValue) event stream ended without final; using latest \(result.count) chars"
+                        )
+                    }
                     await client.disconnect()
-                    return nil
+                    return result
                 } catch {
                     DebugFileLogger.log("batch fallback error: \(error)")
                     await client.disconnect()
@@ -1651,12 +2587,25 @@ actor RecognitionSession {
                 }
             }
         } catch is BatchFallbackTimeoutError {
-            DebugFileLogger.log("batch fallback timeout after 30s")
+            DebugFileLogger.log("batch fallback timeout after \(timeout)")
             return nil
         } catch {
             DebugFileLogger.log("batch fallback cancelled: \(error)")
             return nil
         }
+    }
+
+    /// 阿里云与火山重放都按实时节奏发送，超时必须覆盖音频本身时长；其他厂商
+    /// 保持原 30 秒上限。极长会话最多等待 5 分钟，避免停止流程无限占用。
+    static func batchFallbackTimeout(
+        provider: ASRProvider,
+        audioByteCount: Int
+    ) -> Duration {
+        guard provider == .aliyun || provider == .volcano else { return .seconds(30) }
+        let bytesPerSecond = Int(AudioCaptureEngine.sampleRate)
+            * MemoryLayout<Int16>.size
+        let audioSeconds = Double(max(0, audioByteCount)) / Double(bytesPerSecond)
+        return .seconds(min(300, max(30, audioSeconds.rounded(.up) + 15)))
     }
 
     // MARK: - Force Reset
@@ -1671,6 +2620,10 @@ actor RecognitionSession {
         // 会话 ID 是本函数的第一项状态修改。此后所有旧回调都会被身份守卫拒绝；
         // 剩余清理均同步摘除共享引用，唯一可能挂起的 disconnect 完全使用局部对象。
         let resetSessionID = currentSessionID
+        polishPrefetch.reset()
+        if let resetSessionID, voicePolishChoiceSessionID == resetSessionID {
+            resolveVoicePolishChoice(.cancel, sessionID: resetSessionID)
+        }
         currentSessionID = nil
 
         let client = asrClient
@@ -1678,6 +2631,7 @@ actor RecognitionSession {
         let pipeline = audioChunkPipeline
         let debounceTask = speculativeDebounceTask
         let llmTask = speculativeLLMTask
+        let activeVoicePolishTask = voicePolishTask
         let shouldStopAudio = resetSessionID != nil && audioCaptureSessionID == resetSessionID
 
         asrClient = nil
@@ -1694,6 +2648,17 @@ actor RecognitionSession {
         speculativeLLMTask = nil
         speculativeLLMSessionID = nil
         speculativeLLMText = ""
+        writingContextTask?.cancel()
+        writingContextTask = nil
+        writingContextTaskSessionID = nil
+        targetApplicationBundleIdentifier = nil
+        targetApplicationBundleIdentifierSessionID = nil
+        voicePolishTask = nil
+        voicePolishTaskSessionID = nil
+        voicePolishCanonicalOptionSessionID = nil
+        canonicalVoicePolishRequestSessionID = nil
+        voicePolishChoiceSessionID = nil
+        voicePolishChoiceContinuation = nil
         currentConfig = nil
         currentConfigSessionID = nil
         recordingStartTime = nil
@@ -1708,6 +2673,7 @@ actor RecognitionSession {
         pipeline?.cancel()
         debounceTask?.cancel()
         llmTask?.cancel()
+        activeVoicePolishTask?.cancel()
         if shouldStopAudio {
             audioEngine.clearAudioHandlers()
             audioEngine.stop()
@@ -1765,6 +2731,112 @@ extension RecognitionSession {
 
     var hasEmittedReadyForTesting: Bool {
         hasEmittedReadyForCurrentSession
+    }
+
+    func postProcessVoicePolishForTesting(
+        rawText: String,
+        transcript: RecognitionTranscript,
+        provider: ASRProvider = .volcano,
+        durationMs: Int = 1_000,
+        writingContext: WritingContext? = nil,
+        vocabularyContext: VocabularyStorageContext = .production,
+        allowsUserChoice: Bool = false
+    ) async -> (
+        finalText: String,
+        processedText: String?,
+        llmFailed: Bool,
+        historyStatus: String?,
+        performance: VoicePolishPerformanceMeasurement?
+    )? {
+        await postProcessForTesting(
+            rawText: rawText,
+            transcript: transcript,
+            mode: .formalWriting,
+            provider: provider,
+            durationMs: durationMs,
+            writingContext: writingContext,
+            vocabularyContext: vocabularyContext,
+            allowsVoicePolishUserChoice: allowsUserChoice
+        )
+    }
+
+    /// 使用真实预生成入口，仅绕过麦克风采集和停顿计时。
+    func prefetchPolishForTesting(
+        text: String, vocabularyContext: VocabularyStorageContext,
+        writingContext: WritingContext? = nil
+    ) async {
+        if currentSessionID == nil { currentSessionID = makeSessionID() }
+        guard let sessionID = currentSessionID else { return }
+        state = .recording
+        currentMode = .formalWriting
+        if let writingContext {
+            writingContextTask = Task { writingContext }
+            writingContextTaskSessionID = sessionID
+        }
+        currentTranscript = RecognitionTranscript(confirmedSegments: [text], partialText: "",
+                                                  authoritativeText: text, isFinal: false)
+        await firePolishPrefetch(sessionID: sessionID, vocabularyContext: vocabularyContext)
+    }
+
+    func postProcessForTesting(
+        rawText: String,
+        transcript: RecognitionTranscript,
+        mode: ProcessingMode,
+        needsLLM: Bool? = nil,
+        provider: ASRProvider = .volcano,
+        durationMs: Int = 1_000,
+        writingContext: WritingContext? = nil,
+        applicationBundleIdentifier: String? = nil,
+        applicationBundleIdentifierWasCaptured: Bool = false,
+        vocabularyContext: VocabularyStorageContext = .production,
+        allowsVoicePolishUserChoice: Bool = false
+    ) async -> (
+        finalText: String,
+        processedText: String?,
+        llmFailed: Bool,
+        historyStatus: String?,
+        performance: VoicePolishPerformanceMeasurement?
+    )? {
+        let sessionID: RecognitionSessionID
+        if let currentSessionID {
+            sessionID = currentSessionID
+        } else {
+            sessionID = makeSessionID()
+            currentSessionID = sessionID
+        }
+        currentMode = mode
+        if applicationBundleIdentifierWasCaptured || applicationBundleIdentifier != nil {
+            targetApplicationBundleIdentifier = applicationBundleIdentifier
+            targetApplicationBundleIdentifierSessionID = sessionID
+        } else {
+            targetApplicationBundleIdentifier = nil
+            targetApplicationBundleIdentifierSessionID = nil
+        }
+        if let writingContext {
+            writingContextTask = Task { writingContext }
+            writingContextTaskSessionID = sessionID
+        }
+        let result = await postProcessRecognizedText(
+            rawText: rawText,
+            needsLLM: needsLLM ?? mode.requiresLLM,
+            earlyLLMTask: nil,
+            transcript: transcript,
+            provider: provider,
+            durationMs: durationMs,
+            sessionID: sessionID,
+            stopStartedAt: .now,
+            vocabularyContext: vocabularyContext,
+            allowsVoicePolishUserChoice: allowsVoicePolishUserChoice
+        )
+        return result.map {
+            (
+                finalText: $0.finalText,
+                processedText: $0.processedText,
+                llmFailed: $0.llmFailed,
+                historyStatus: $0.voicePolishHistoryStatus,
+                performance: $0.voicePolishPerformance
+            )
+        }
     }
 }
 #endif

@@ -4,7 +4,7 @@ extension Notification.Name {
     static let modelConnectivityProbed = Notification.Name("Muse.modelConnectivityProbed")
 }
 
-/// 启动时静默探测三个模型角色的连通性（2026-06-12 用户拍板）：
+/// 启动时静默探测语音识别与文本处理的连通性（2026-06-12 用户拍板）：
 /// 结果写入 ModelConnectivityCache，打开模型设置页即见灯，无需逐个手动测试。
 /// 每次应用生命周期只探一次；页面内手动测试仍可随时刷新。
 @MainActor
@@ -23,8 +23,9 @@ enum ModelConnectivityProber {
 
     static func probeAll() async {
         async let asr: Void = probeASR()
-        async let llm: Void = probeLLMAndAsset()
-        _ = await (asr, llm)
+        async let light: Void = probePolish(.light)
+        async let standard: Void = probePolish(.standard)
+        _ = await (asr, light, standard)
         AppLogger.log("[ConnectivityProber] 启动连通性探测完成")
         // 通知模型设置页刷新色点（页面可能在探测完成前就已打开）
         NotificationCenter.default.post(name: .modelConnectivityProbed, object: nil)
@@ -52,36 +53,16 @@ enum ModelConnectivityProber {
         }
     }
 
-    private static func probeLLMAndAsset() async {
-        let llmProvider = KeychainService.selectedLLMProvider
-        let llmStatus = await probeLLM(provider: llmProvider, config: KeychainService.loadLLMConfig())
-        ModelConnectivityCache.llm = (llmProvider, llmStatus)
-
-        // 沉淀与文本处理同服务商（凭证共享）时复用结果，省一次真实调用
-        let assetProvider = KeychainService.selectedAssetExtractionLLMProvider
-        if assetProvider == llmProvider {
-            ModelConnectivityCache.asset = (assetProvider, llmStatus)
-        } else {
-            let status = await probeLLM(
-                provider: assetProvider,
-                config: KeychainService.loadAssetExtractionLLMConfig()
-            )
-            ModelConnectivityCache.asset = (assetProvider, status)
-        }
-    }
-
-    private static func probeLLM(provider: LLMProvider, config: LLMConfig?) async -> SettingsTestStatus {
-        guard let config else {
-            return .failed(provider == .localQwen
-                ? L("本地引擎未启动", "Local engine not running")
-                : L("待配置", "Needs setup"))
-        }
-        let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
+    private static func probePolish(_ role: PolishModelRole) async {
+        let provider = KeychainService.selectedPolishProvider(for: role)
+        guard let config = KeychainService.loadPolishConfig(for: role) else { return }
+        let status: SettingsTestStatus
         do {
-            _ = try await client.process(text: "hi", prompt: "{text}", config: config)
-            return .success
-        } catch {
-            return .failed(error.localizedDescription)
-        }
+            try await PolishModelConnectionTester.test(role: role, config: config, client: LLMProviderRegistry.makeClient(for: provider))
+            status = .success
+        } catch { status = .failed(error.localizedDescription) }
+        ModelConnectivityCache.polish[role] = LLMConnectivityCacheEntry(
+            signature: LLMConnectivitySignature(provider: provider, config: config), status: status
+        )
     }
 }

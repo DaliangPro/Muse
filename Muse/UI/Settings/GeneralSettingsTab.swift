@@ -3,6 +3,13 @@ import SwiftUI
 import AVFoundation
 import ApplicationServices
 
+private struct VoicePolishCorrectionDraft: Identifiable {
+    let record: HistoryRecord
+    let existingCorrection: VoicePolishCorrectionRecord?
+
+    var id: String { record.id }
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // MARK: - General Settings Tab
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -17,23 +24,21 @@ struct GeneralSettingsTab: View {
     // 切回时 body 立即显示上次值、再后台刷新，消除闪烁（2026-06-25）
     @State private var statistics: HistoryStore.Statistics? = GeneralSettingsTab.cachedStatistics
     @State private var recentRecords: [HistoryRecord] = GeneralSettingsTab.cachedRecords
-    @State private var languageAssetCount = GeneralSettingsTab.cachedAssetCount
     @State private var historyDatabaseErrorMessage: String?
-    @State private var assetDatabaseErrorMessage: String?
     @State private var copiedRecentRecordId: String?
+    @State private var correctionDraft: VoicePolishCorrectionDraft?
+    @State private var correctionsByHistoryID: [String: VoicePolishCorrectionRecord] = [:]
     @State private var selectedDayKey = GeneralRecentHistorySection.dayKey(for: Date())
 
     private static var cachedStatistics: HistoryStore.Statistics?
     private static var cachedRecords: [HistoryRecord] = []
-    private static var cachedAssetCount = 0
 
     private var databaseErrorMessage: String? {
-        let messages = [historyDatabaseErrorMessage, assetDatabaseErrorMessage].compactMap { $0 }
+        let messages = [historyDatabaseErrorMessage].compactMap { $0 }
         return messages.isEmpty ? nil : messages.joined(separator: "\n")
     }
 
     private let historyStore = HistoryStore()
-    private let assetStore = LanguageAssetStore()
     private var currentStatistics: HistoryStore.Statistics {
         statistics ?? HistoryStore.Statistics(totalDuration: 0, totalCharacters: 0, recordCount: 0, timeSavedSeconds: 0)
     }
@@ -50,15 +55,22 @@ struct GeneralSettingsTab: View {
             GeneralOverviewSection(
                 stats: currentStatistics,
                 hasMicrophonePermission: hasMic,
-                hasAccessibilityPermission: hasAccessibility,
-                languageAssetCount: languageAssetCount
+                hasAccessibilityPermission: hasAccessibility
             )
 
             GeneralRecentHistorySection(
                 records: recentRecords,
                 copiedRecordId: copiedRecentRecordId,
+                correctedRecordIds: Set(correctionsByHistoryID.keys),
                 selectedDayKey: $selectedDayKey,
                 onCopy: copyRecentRecord,
+                onLearn: { record in
+                    correctionDraft = VoicePolishCorrectionDraft(
+                        record: record,
+                        existingCorrection: correctionsByHistoryID[record.id]
+                    )
+                },
+                onUndoCorrection: undoVoicePolishCorrection,
                 onDelete: deleteRecentRecord
             )
                 .padding(.top, GeneralSettingsStyle.overviewHistoryTopSpacing)
@@ -75,8 +87,39 @@ struct GeneralSettingsTab: View {
         .onChange(of: selectedDayKey) { _, _ in
             Task { await reloadHistoryData() }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .languageAssetStoreDidChange)) { _ in
-            Task { await reloadAssetCount() }
+        .sheet(item: $correctionDraft) { draft in
+            VoicePolishCorrectionSheet(
+                record: draft.record,
+                existingCorrection: draft.existingCorrection,
+                onConfirm: { correctedText, scene, learnTerminology, learnStyle in
+                    let candidates = learnTerminology
+                        ? TerminologyCorrectionExtractor.candidates(
+                            generatedText: draft.record.finalText,
+                            correctedText: correctedText
+                        )
+                        : []
+
+                    _ = try await TerminologyHistoryTransactionCoordinator.shared.confirmCorrection(
+                        historyStore: historyStore,
+                        historyID: draft.record.id,
+                        candidates: candidates,
+                        correctedText: correctedText,
+                        scene: scene,
+                        // 编辑旧记录时保留它此前的独立风格授权；全局关闭只阻止新授权。
+                        personalizationEnabled: VoicePolishSettings.personalizationEnabled()
+                            || (draft.existingCorrection?.learnStyle == true && learnStyle),
+                        retentionLimit: VoicePolishSettings.correctionLimit(),
+                        learnStyle: learnStyle,
+                        learnTerminology: learnTerminology
+                    )
+                    await reloadHistoryData()
+                    return VoicePolishCorrectionConfirmationResult(
+                        rememberedTerms: candidates,
+                        learnedStyle: learnStyle
+                    )
+                },
+                onCancel: { correctionDraft = nil }
+            )
         }
     }
 
@@ -88,10 +131,15 @@ struct GeneralSettingsTab: View {
                 ?? Calendar.current.startOfDay(for: Date())
             let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day
             let records = try await historyStore.fetchBetweenOrThrow(start: day, end: nextDay)
+            let corrections = try await historyStore.fetchVoicePolishCorrections()
             let sortedRecords = records.sorted { $0.createdAt > $1.createdAt }
             await MainActor.run {
                 statistics = stats
                 recentRecords = sortedRecords
+                correctionsByHistoryID = Dictionary(
+                    corrections.map { ($0.historyID, $0) },
+                    uniquingKeysWith: { newer, _ in newer }
+                )
                 historyDatabaseErrorMessage = nil
                 Self.cachedStatistics = stats
                 Self.cachedRecords = sortedRecords
@@ -100,22 +148,6 @@ struct GeneralSettingsTab: View {
             await MainActor.run {
                 // 保留上次成功数据；错误不能伪装成 0 条。
                 historyDatabaseErrorMessage = error.localizedDescription
-            }
-        }
-        await reloadAssetCount()
-    }
-
-    private func reloadAssetCount() async {
-        do {
-            let assetCount = try await assetStore.countOrThrow()
-            await MainActor.run {
-                languageAssetCount = assetCount
-                assetDatabaseErrorMessage = nil
-                Self.cachedAssetCount = assetCount
-            }
-        } catch {
-            await MainActor.run {
-                assetDatabaseErrorMessage = error.localizedDescription
             }
         }
     }
@@ -150,8 +182,33 @@ struct GeneralSettingsTab: View {
 
     private func deleteRecentRecord(_ record: HistoryRecord) {
         Task {
-            await historyStore.delete(id: record.id)
-            await reloadHistoryData()
+            do {
+                try await TerminologyHistoryTransactionCoordinator.shared.deleteHistory(
+                    historyStore: historyStore,
+                    historyID: record.id
+                )
+                await reloadHistoryData()
+            } catch {
+                await MainActor.run {
+                    historyDatabaseErrorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func undoVoicePolishCorrection(_ record: HistoryRecord) {
+        Task {
+            do {
+                try await TerminologyHistoryTransactionCoordinator.shared.undoCorrection(
+                    historyStore: historyStore,
+                    historyID: record.id
+                )
+                await reloadHistoryData()
+            } catch {
+                await MainActor.run {
+                    historyDatabaseErrorMessage = error.localizedDescription
+                }
+            }
         }
     }
 

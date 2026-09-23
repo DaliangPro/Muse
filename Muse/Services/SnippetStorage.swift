@@ -34,6 +34,13 @@ enum SnippetStorage {
     /// Triggers are matched case-insensitively and space-insensitively via `buildFlexPattern`.
     ///
     /// Verified against: Volcengine Seed ASR 2.0, Qwen3-ASR 0.6B/1.7B, SenseVoice-Small.
+    static let commonCorrectionsV2: [(trigger: String, value: String)] = [
+        ("Type less", "Typeless"),
+        ("食奇家", "食其家"),
+        ("时其家", "食其家"),
+        ("食齐家", "食其家"),
+    ]
+
     static let defaultSnippets: [(trigger: String, value: String)] = [
 
         // ── vibe coding (ASR 几乎必错) ──
@@ -193,12 +200,12 @@ enum SnippetStorage {
         ("cloud flair",     "Cloudflare"),
         ("N video",         "NVIDIA"),
         ("onyx",            "ONNX"),
-    ]
+    ] + commonCorrectionsV2
 
     // MARK: - Initialization
 
     private static let schemaVersionKey = "tf_snippets_schema_version"
-    private static let currentSchemaVersion = 1
+    private static let currentSchemaVersion = 2
     private static let legacyMigratedKey = "tf_snippets_migrated_to_file_v2"
     private static let oldUDKey = "tf_snippets"
 
@@ -248,11 +255,35 @@ enum SnippetStorage {
             switch nextVersion {
             case 1:
                 try migrateLegacyUserDefaults(context: context)
+            case 2:
+                try appendCommonCorrectionsV2(context: context)
             default:
                 throw MigrationError.unsupportedSchemaVersion(nextVersion)
             }
             context.userDefaults.set(nextVersion, forKey: schemaVersionKey)
             version = nextVersion
+        }
+    }
+
+    /// 只追加本版本新增的高置信纠正规则，保留既有内置与用户自定义内容。
+    private static func appendCommonCorrectionsV2(context: VocabularyStorageContext) throws {
+        switch loadBuiltinResult(context: context) {
+        case .value(let existing):
+            var merged = existing
+            var keys = Set(existing.map(pairKey))
+            for correction in commonCorrectionsV2 {
+                let key = pairKey(correction)
+                guard keys.insert(key).inserted else { continue }
+                merged.append(correction)
+            }
+            guard merged.map(pairKey) != existing.map(pairKey) else { return }
+            try writeFile(merged, to: builtinFileURL(in: context))
+            invalidateCache()
+        case .missing:
+            try writeFile(defaultSnippets, to: builtinFileURL(in: context))
+            invalidateCache()
+        case .corrupt(let backupURL, let error):
+            throw MigrationError.corruptFile(backupURL, error)
         }
     }
 

@@ -52,7 +52,7 @@ final class ModeStorageLanguageMigrationTests: XCTestCase {
         XCTAssertEqual(optimize?.prompt, ProcessingMode.promptOptimizePromptTemplateEN)
 
         let direct = loaded.first { $0.id == ProcessingMode.direct.id }
-        XCTAssertEqual(direct?.name, "Direct Output")
+        XCTAssertEqual(direct?.name, "Direct")
     }
 
     func testCustomizedNameAndPromptArePreserved() throws {

@@ -11,27 +11,41 @@ struct SettingsWindowTrafficLightAligner {
             let zoomButton = window.standardWindowButton(.zoomButton)
         else { return }
 
-        let closeFrame = closeButton.frame
-        let minimizeFrame = minimizeButton.frame
-        let zoomFrame = zoomButton.frame
-        let minimizeOffset = minimizeFrame.minX - closeFrame.minX
-        let zoomOffset = zoomFrame.minX - closeFrame.minX
-        let targetY: CGFloat
-        if let buttonContainer = closeButton.superview {
-            targetY = buttonContainer.bounds.height - topInset - closeFrame.height
-        } else {
-            targetY = closeFrame.minY
+        // 全尺寸内容视图可能被 SwiftUI 排在标题栏之上，保持原生按钮所在容器位于内容上方。
+        if let frameView = window.contentView?.superview {
+            var titlebar: NSView = closeButton
+            while let parent = titlebar.superview, parent !== frameView { titlebar = parent }
+            if titlebar.superview === frameView, frameView.subviews.last !== titlebar {
+                frameView.addSubview(titlebar, positioned: .above, relativeTo: nil)
+            }
         }
 
-        closeButton.setFrameOrigin(NSPoint(x: leadingInset, y: targetY))
-        minimizeButton.setFrameOrigin(NSPoint(x: leadingInset + minimizeOffset, y: targetY))
-        zoomButton.setFrameOrigin(NSPoint(x: leadingInset + zoomOffset, y: targetY))
-        alignToWindowEdges(
-            in: window,
-            closeButton: closeButton,
-            minimizeButton: minimizeButton,
-            zoomButton: zoomButton
-        )
+        // 为原有顶距补足容器高度，不能通过抬高按钮来规避标题栏裁切。
+        let requiredHeight = topInset + max(closeButton.frame.height, minimizeButton.frame.height, zoomButton.frame.height)
+        if let frameView = window.contentView?.superview {
+            var containers: [NSView] = []
+            var ancestor = closeButton.superview
+            while let view = ancestor, view !== frameView {
+                containers.append(view)
+                ancestor = view.superview
+            }
+            if ancestor === frameView {
+                for container in containers.reversed() where container.frame.height < requiredHeight {
+                    guard let parent = container.superview else { continue }
+                    var frame = container.frame
+                    frame.origin.y = parent.bounds.maxY - requiredHeight
+                    frame.size.height = requiredHeight
+                    container.frame = frame
+                }
+            }
+        }
+
+        let closeScreenRect = window.convertToScreen(closeButton.convert(closeButton.bounds, to: nil))
+        let xDelta = window.frame.minX + leadingInset - closeScreenRect.minX
+        let yDelta = window.frame.maxY - topInset - closeScreenRect.maxY
+        for button in [closeButton, minimizeButton, zoomButton] {
+            button.setFrameOrigin(NSPoint(x: button.frame.minX + xDelta, y: button.frame.minY + yDelta))
+        }
     }
 
     func alignAfterSystemLayout(in window: NSWindow) {
@@ -50,24 +64,6 @@ struct SettingsWindowTrafficLightAligner {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak window] in
             guard let window else { return }
             align(in: window)
-        }
-    }
-
-    private func alignToWindowEdges(
-        in window: NSWindow,
-        closeButton: NSButton,
-        minimizeButton: NSButton,
-        zoomButton: NSButton
-    ) {
-        let closeScreenRect = window.convertToScreen(closeButton.convert(closeButton.bounds, to: nil))
-        let desiredButtonLeft = window.frame.minX + leadingInset
-        let desiredButtonTop = window.frame.maxY - topInset
-        let xDelta = desiredButtonLeft - closeScreenRect.minX
-        let yDelta = desiredButtonTop - closeScreenRect.maxY
-        guard abs(xDelta) >= 0.5 || abs(yDelta) >= 0.5 else { return }
-
-        [closeButton, minimizeButton, zoomButton].forEach { button in
-            button.setFrameOrigin(NSPoint(x: button.frame.minX + xDelta, y: button.frame.minY + yDelta))
         }
     }
 }

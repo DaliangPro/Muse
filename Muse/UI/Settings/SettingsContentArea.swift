@@ -47,12 +47,10 @@ private extension SettingsContentArea {
         switch selectedTab {
         case .general:
             GeneralSettingsTab()
-        case .assetLibrary:
-            AssetLibraryTab()
         case .models:
             ModelSettingsTab()
         case .vocabulary:
-            VocabularyTab()
+            TerminologySettingsTab()
         case .modes:
             ModesSettingsTab()
         case .about:
@@ -64,9 +62,9 @@ private extension SettingsContentArea {
 private extension SettingsTab {
     var pageStyle: SettingsTabPageStyle {
         switch self {
-        case .general, .assetLibrary:
+        case .general, .modes, .vocabulary:
             .fixed
-        case .models, .vocabulary, .modes, .about:
+        case .models, .about:
             .scroll(showsIndicators: false)
         }
     }

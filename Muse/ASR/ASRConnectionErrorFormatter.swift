@@ -2,6 +2,12 @@ import Foundation
 
 enum ASRConnectionErrorFormatter {
     static func describe(_ error: Error) -> String {
+        if let aliyun = error as? AliyunASRError,
+           case .taskFailed(_, let message) = aliyun,
+           let message,
+           !looksLikeRawProtocolText(message) {
+            return message
+        }
         if let volc = error as? VolcASRError, case .serverRejected(_, let message) = volc {
             // 技术裸文不糊用户脸（2026-07）：websocket/upgrade/裸 JSON 一律转人话，原文已在日志
             if let message, !looksLikeRawProtocolText(message) {

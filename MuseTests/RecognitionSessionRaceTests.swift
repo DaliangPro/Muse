@@ -3,6 +3,39 @@ import XCTest
 @testable import Muse
 
 final class RecognitionSessionRaceTests: XCTestCase {
+    func testUserStopCapturesReleaseTailBeforeStoppingAudio() async {
+        let client = RaceTestRecognizer(connectMode: .immediate)
+        let audio = AudioCaptureSpy()
+        let session = makeSession(
+            factory: RaceRecognizerFactory(preloaded: [client]),
+            audio: audio
+        )
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(audio.releaseTailCallCount, 1)
+        XCTAssertTrue(audio.wasRunningDuringReleaseTail)
+        XCTAssertFalse(audio.isRunning)
+    }
+
+    func testServerInitiatedStopSkipsReleaseTail() async throws {
+        let client = RaceTestRecognizer(connectMode: .immediate)
+        let audio = AudioCaptureSpy()
+        let session = makeSession(
+            factory: RaceRecognizerFactory(preloaded: [client]),
+            audio: audio
+        )
+
+        await session.startRecording()
+        let sessionIDCandidate = await session.currentSessionIDForTesting
+        let sessionID = try XCTUnwrap(sessionIDCandidate)
+        await session.stopRecording(expectedSessionID: sessionID)
+
+        XCTAssertEqual(audio.releaseTailCallCount, 0)
+        XCTAssertFalse(audio.isRunning)
+    }
+
     func testOldConnectFailureCannotStopNewSessionAudio() async {
         let first = RaceTestRecognizer(connectMode: .suspended)
         let second = RaceTestRecognizer(connectMode: .immediate)
@@ -179,34 +212,321 @@ final class RecognitionSessionRaceTests: XCTestCase {
         XCTAssertEqual(state, .idle)
     }
 
+    func testAliyunVoicedEmptyTranscriptUsesPacedFullReplay() async {
+        let liveClient = RaceTestRecognizer(connectMode: .immediate)
+        let replayClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "完整恢复文本"
+        )
+        let factory = RaceRecognizerFactory(preloaded: [liveClient, replayClient])
+        let audio = AudioCaptureSpy(recordedAudio: Self.voicedPCM())
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: audio,
+            injection: injection,
+            provider: .aliyun,
+            config: AliyunASRConfig(credentials: ["apiKey": "sk-test"])!,
+            aliyunReplaySleep: { _ in }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(injection.injectionCount, 1)
+        XCTAssertTrue(recorder.values.contains {
+            $0.hasPrefix("finalized:完整恢复文本:")
+        })
+        let replayPackets = await replayClient.sentAudioPackets
+        let replayPacketSizes = replayPackets.map(\.count)
+        XCTAssertFalse(replayPacketSizes.isEmpty)
+        XCTAssertTrue(replayPacketSizes.allSatisfy { $0 <= AliyunAudioReplay.chunkByteSize })
+    }
+
+    func testAliyunReplayFailurePreservesPartialAndShowsExplicitError() async {
+        let liveClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "已有部分文字"
+        )
+        let replayClient = RaceTestRecognizer(connectMode: .immediate)
+        let factory = RaceRecognizerFactory(preloaded: [liveClient, replayClient])
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(recordedAudio: Self.voicedPCM()),
+            injection: injection,
+            provider: .aliyun,
+            config: AliyunASRConfig(credentials: ["apiKey": "sk-test"])!,
+            aliyunReplaySleep: { _ in }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.handleASREventForTesting(.streamingInterrupted)
+        await session.stopRecording()
+
+        XCTAssertEqual(injection.injectionCount, 1)
+        XCTAssertTrue(recorder.values.contains {
+            $0.hasPrefix("finalized:已有部分文字:")
+        })
+        XCTAssertTrue(recorder.values.contains {
+            $0.contains(L("全文重识别失败", "full re-recognition failed")) && $0.contains(L("已保留现有文字", "Existing text was preserved"))
+        })
+    }
+
+    func testAliyunVoicedEmptyReplayFailureShowsExplicitError() async {
+        let liveClient = RaceTestRecognizer(connectMode: .immediate)
+        let replayClient = RaceTestRecognizer(connectMode: .immediate)
+        let factory = RaceRecognizerFactory(preloaded: [liveClient, replayClient])
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(recordedAudio: Self.voicedPCM()),
+            injection: injection,
+            provider: .aliyun,
+            config: AliyunASRConfig(credentials: ["apiKey": "sk-test"])!,
+            aliyunReplaySleep: { _ in }
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(injection.injectionCount, 0)
+        XCTAssertTrue(recorder.values.contains {
+            $0.contains(L("未返回识别结果", "returned no transcript")) && $0.contains(L("豆包", "Doubao"))
+        })
+    }
+
+    func testAliyunDigitalSilenceStaysEmptyWithoutReplay() async {
+        let liveClient = RaceTestRecognizer(connectMode: .immediate)
+        let unusedReplayClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "不应使用"
+        )
+        let factory = RaceRecognizerFactory(
+            preloaded: [liveClient, unusedReplayClient]
+        )
+        let injection = TextInjectionSpy()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(
+                recordedAudio: Data(repeating: 0, count: 32_000)
+            ),
+            injection: injection,
+            provider: .aliyun,
+            config: AliyunASRConfig(credentials: ["apiKey": "sk-test"])!,
+            aliyunReplaySleep: { _ in }
+        )
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(injection.injectionCount, 0)
+        XCTAssertEqual(factory.createdClientCount, 1)
+    }
+
+    func testVolcanoReplayUsesLatestNonFinalTranscriptOnNormalCompletion() async {
+        let liveClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "已有部分文字"
+        )
+        let replayClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "全文重放恢复完整文字",
+            finalTranscriptIsFinal: false
+        )
+        let factory = RaceRecognizerFactory(preloaded: [liveClient, replayClient])
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(recordedAudio: Self.voicedPCM()),
+            injection: injection,
+            provider: .volcano,
+            config: VolcanoASRConfig(credentials: [
+                "appKey": "test-app",
+                "accessKey": "test-access",
+                "resourceId": VolcanoASRConfig.resourceIdBigASR,
+            ])!
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.handleASREventForTesting(.streamingInterrupted)
+        await session.stopRecording()
+
+        XCTAssertEqual(injection.injectionCount, 1)
+        XCTAssertTrue(recorder.values.contains {
+            $0.hasPrefix("finalized:全文重放恢复完整文字:")
+        })
+        XCTAssertFalse(recorder.values.contains {
+            $0.contains(L("全文重识别失败", "full re-recognition failed"))
+        })
+    }
+
+    func testVolcanoEventDrainTimeoutWithValidTextSkipsFullReplay() async {
+        let liveClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "已有有效文字",
+            finalTranscriptIsFinal: false,
+            completesEventsOnEndAudio: false
+        )
+        let unusedReplayClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "不应创建全文重放"
+        )
+        let factory = RaceRecognizerFactory(
+            preloaded: [liveClient, unusedReplayClient]
+        )
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(recordedAudio: Self.voicedPCM()),
+            injection: injection,
+            provider: .volcano,
+            config: VolcanoASRConfig(credentials: [
+                "appKey": "test-app",
+                "accessKey": "test-access",
+                "resourceId": VolcanoASRConfig.resourceIdBigASR,
+            ])!
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(factory.createdClientCount, 1)
+        XCTAssertEqual(injection.injectionCount, 1)
+        XCTAssertTrue(recorder.values.contains {
+            $0.hasPrefix("finalized:已有有效文字:")
+        })
+        XCTAssertFalse(recorder.values.contains {
+            $0.contains(L("全文重识别失败", "full re-recognition failed"))
+        })
+    }
+
+    func testVolcanoEndAudioFailureStillUsesFullReplay() async {
+        let liveClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "已有部分文字",
+            finalTranscriptIsFinal: false,
+            endAudioFails: true
+        )
+        let replayClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "结束包失败后的完整文字",
+            finalTranscriptIsFinal: false
+        )
+        let factory = RaceRecognizerFactory(preloaded: [liveClient, replayClient])
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(recordedAudio: Self.voicedPCM()),
+            injection: injection,
+            provider: .volcano,
+            config: VolcanoASRConfig(credentials: [
+                "appKey": "test-app",
+                "accessKey": "test-access",
+                "resourceId": VolcanoASRConfig.resourceIdBigASR,
+            ])!
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(factory.createdClientCount, 2)
+        XCTAssertEqual(injection.injectionCount, 1)
+        XCTAssertTrue(recorder.values.contains {
+            $0.hasPrefix("finalized:结束包失败后的完整文字:")
+        })
+    }
+
+    func testVolcanoEventDrainTimeoutWithoutTextStillUsesFullReplay() async {
+        let liveClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            completesEventsOnEndAudio: false
+        )
+        let replayClient = RaceTestRecognizer(
+            connectMode: .immediate,
+            finalTranscript: "零文本超时后的恢复文字",
+            finalTranscriptIsFinal: false
+        )
+        let factory = RaceRecognizerFactory(preloaded: [liveClient, replayClient])
+        let injection = TextInjectionSpy()
+        let recorder = RaceRecognitionEventRecorder()
+        let session = makeSession(
+            factory: factory,
+            audio: AudioCaptureSpy(recordedAudio: Self.voicedPCM()),
+            injection: injection,
+            provider: .volcano,
+            config: VolcanoASRConfig(credentials: [
+                "appKey": "test-app",
+                "accessKey": "test-access",
+                "resourceId": VolcanoASRConfig.resourceIdBigASR,
+            ])!
+        )
+        await session.setOnASREvent { recorder.record($0) }
+
+        await session.startRecording()
+        await session.stopRecording()
+
+        XCTAssertEqual(factory.createdClientCount, 2)
+        XCTAssertEqual(injection.injectionCount, 1)
+        XCTAssertTrue(recorder.values.contains {
+            $0.hasPrefix("finalized:零文本超时后的恢复文字:")
+        })
+    }
+
     private func makeSession(
         factory: RaceRecognizerFactory,
         audio: AudioCaptureSpy = AudioCaptureSpy(),
         injection: TextInjectionSpy = TextInjectionSpy(),
-        historyStore: HistoryStore = HistoryStore(path: ":memory:")
+        historyStore: HistoryStore = HistoryStore(path: ":memory:"),
+        provider: ASRProvider = .apple,
+        config: any ASRProviderConfig = AppleASRConfig(credentials: [:])!,
+        aliyunReplaySleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
     ) -> RecognitionSession {
         RecognitionSession(
             audioEngine: audio,
             injectionEngine: injection,
             historyStore: historyStore,
             asrClientFactory: { factory.makeClient(for: $0) },
-            selectedASRProvider: { .apple },
-            asrConfigLoader: { _ in AppleASRConfig(credentials: [:]) },
+            selectedASRProvider: { provider },
+            asrConfigLoader: { _ in config },
             microphonePermission: { true },
             promptContextCapture: {
                 PromptContext(selectedText: "", clipboardText: "")
             },
-            requestOptionsProvider: { _ in (ASRRequestOptions(), 0) }
+            requestOptionsProvider: { _ in (ASRRequestOptions(), 0) },
+            aliyunReplaySleep: aliyunReplaySleep
         )
     }
 
-    fileprivate static func transcript(_ text: String) -> RecognitionTranscript {
+    fileprivate static func transcript(
+        _ text: String,
+        isFinal: Bool = true
+    ) -> RecognitionTranscript {
         RecognitionTranscript(
             confirmedSegments: [text],
             partialText: "",
             authoritativeText: text,
-            isFinal: true
+            isFinal: isFinal
         )
+    }
+
+    private static func voicedPCM() -> Data {
+        var samples = [Int16](repeating: 2_000, count: 3_200)
+        return samples.withUnsafeMutableBytes { Data($0) }
     }
 
     private func waitUntil(
@@ -225,6 +545,7 @@ final class RecognitionSessionRaceTests: XCTestCase {
 
 private enum TestRaceError: Error {
     case connectFailed
+    case endAudioFailed
 }
 
 private actor RaceTestRecognizer: SpeechRecognizer {
@@ -237,10 +558,14 @@ private actor RaceTestRecognizer: SpeechRecognizer {
     private let eventContinuation: AsyncStream<RecognitionEvent>.Continuation
     private let connectMode: ConnectMode
     private let finalTranscript: String?
+    private let finalTranscriptIsFinal: Bool
+    private let completesEventsOnEndAudio: Bool
+    private let endAudioFails: Bool
     private let blocksDisconnect: Bool
     private var connectContinuation: CheckedContinuation<Void, Error>?
     private var disconnectContinuations: [CheckedContinuation<Void, Never>] = []
     private var disconnectReleased = false
+    private(set) var sentAudioPackets: [Data] = []
     private(set) var isConnecting = false
     private(set) var isDisconnecting = false
     private(set) var isDisconnected = false
@@ -248,6 +573,9 @@ private actor RaceTestRecognizer: SpeechRecognizer {
     init(
         connectMode: ConnectMode,
         finalTranscript: String? = nil,
+        finalTranscriptIsFinal: Bool = true,
+        completesEventsOnEndAudio: Bool = true,
+        endAudioFails: Bool = false,
         blocksDisconnect: Bool = false
     ) {
         let pair = AsyncStream<RecognitionEvent>.makeStream()
@@ -255,6 +583,9 @@ private actor RaceTestRecognizer: SpeechRecognizer {
         self.eventContinuation = pair.continuation
         self.connectMode = connectMode
         self.finalTranscript = finalTranscript
+        self.finalTranscriptIsFinal = finalTranscriptIsFinal
+        self.completesEventsOnEndAudio = completesEventsOnEndAudio
+        self.endAudioFails = endAudioFails
         self.blocksDisconnect = blocksDisconnect
     }
 
@@ -279,7 +610,7 @@ private actor RaceTestRecognizer: SpeechRecognizer {
     }
 
     func sendAudio(_ data: Data) async throws {
-        _ = data
+        sentAudioPackets.append(data)
     }
 
     nonisolated func sendAudioBuffer(_ buffer: AVAudioPCMBuffer) async throws {
@@ -288,10 +619,18 @@ private actor RaceTestRecognizer: SpeechRecognizer {
 
     func endAudio() async throws {
         if let finalTranscript {
-            eventContinuation.yield(.transcript(RecognitionSessionRaceTests.transcript(finalTranscript)))
+            eventContinuation.yield(.transcript(RecognitionSessionRaceTests.transcript(
+                finalTranscript,
+                isFinal: finalTranscriptIsFinal
+            )))
         }
-        eventContinuation.yield(.completed)
-        eventContinuation.finish()
+        if completesEventsOnEndAudio {
+            eventContinuation.yield(.completed)
+            eventContinuation.finish()
+        }
+        if endAudioFails {
+            throw TestRaceError.endAudioFailed
+        }
     }
 
     func disconnect() async {
@@ -344,16 +683,35 @@ private final class RaceRecognizerFactory: @unchecked Sendable {
             return count
         }
     }
+
+    var createdClientCount: Int {
+        lock.withLock { created.count }
+    }
 }
 
 private final class AudioCaptureSpy: AudioCaptureControlling, @unchecked Sendable {
     private let lock = NSLock()
+    private let recordedAudio: Data
     private var running = false
     private var onChunk: ((Data) -> Void)?
     private var onLevel: ((Float) -> Void)?
+    private var storedReleaseTailCallCount = 0
+    private var storedWasRunningDuringReleaseTail = false
 
     var isRunning: Bool {
         lock.withLock { running }
+    }
+
+    var releaseTailCallCount: Int {
+        lock.withLock { storedReleaseTailCallCount }
+    }
+
+    var wasRunningDuringReleaseTail: Bool {
+        lock.withLock { storedWasRunningDuringReleaseTail }
+    }
+
+    init(recordedAudio: Data = Data()) {
+        self.recordedAudio = recordedAudio
     }
 
     func warmUp() {}
@@ -386,8 +744,15 @@ private final class AudioCaptureSpy: AudioCaptureControlling, @unchecked Sendabl
         clearAudioHandlers()
     }
 
+    func captureReleaseTail() async {
+        lock.withLock {
+            storedReleaseTailCallCount += 1
+            storedWasRunningDuringReleaseTail = running
+        }
+    }
+
     func getRecordedAudio() -> Data {
-        Data()
+        recordedAudio
     }
 }
 
@@ -437,6 +802,10 @@ private final class RaceRecognitionEventRecorder: @unchecked Sendable {
                 storage.append("completed")
             case .processingResult(let text):
                 storage.append("processing:\(text)")
+            case .voicePolishStage(let stage):
+                storage.append("voicePolishStage:\(stage.rawValue)")
+            case .voicePolishUnavailable(let reason):
+                storage.append("voicePolishUnavailable:\(reason?.rawValue ?? "unknown")")
             case .finalized(let text, let injection):
                 storage.append("finalized:\(text):\(injection)")
             case .streamingInterrupted:

@@ -19,6 +19,8 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
     @State private var captureTap = ModeHotkeyCaptureTap()
     @State private var pendingModifierCode: Int?
     @State private var pendingModifierModifiers: UInt64 = 0
+    @State private var contextRaw = VoicePolishSettings.contextLevel().rawValue
+    @State private var recentInput = VoicePolishSettings.recentInputContextEnabled()
 
     init(
         mode: ProcessingMode,
@@ -41,9 +43,29 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            fieldsSection
+            if mode.isUserDeletable {
+                fieldsSection
+            } else {
+                Text(mode.name)
+                    .font(TF.settingsFontBodyStrong)
+                    .foregroundStyle(TF.settingsText)
+                if mode.kind == .voicePolish {
+                    compactFieldRow(
+                        title: L("润色文案", "Status"),
+                        text: $processingLabel,
+                        prompt: L("正在润色", "Polishing")
+                    )
+                }
+            }
             shortcutSection
             triggerSection
+            if (mode.kind == .direct) || mode.kind == .voicePolish {
+                DisclosureGroup(L("上下文与隐私", "Context & privacy")) {
+                    OutputContextSettings(context: $contextRaw, recentInput: $recentInput)
+                        .padding(.top, 8)
+                }
+                .font(TF.settingsFontCaption)
+            }
 
             if let conflict {
                 conflictWarning(conflict)
@@ -168,11 +190,19 @@ private extension ModeSettingsSheet {
             SettingsTextButton(L("保存", "Save"), variant: .primary, width: 64) {
                 stopListening()
                 var updated = mode
-                updated.name = sanitizedModeName
-                updated.processingLabel = sanitizedProcessingLabel
+                if mode.isUserDeletable {
+                    updated.name = sanitizedModeName
+                }
+                if mode.isUserDeletable || mode.kind == .voicePolish {
+                    updated.processingLabel = sanitizedProcessingLabel
+                }
                 updated.hotkeyCode = hotkeyCode
                 updated.hotkeyModifiers = hotkeyModifiers
                 updated.hotkeyStyle = hotkeyStyle
+                if (mode.kind == .direct) || mode.kind == .voicePolish {
+                    VoicePolishSettings.setContextLevel(WritingContextLevel(rawValue: contextRaw) ?? .nearbyText)
+                    VoicePolishSettings.setRecentInputContextEnabled(recentInput)
+                }
                 onSave(updated)
             }
         }
@@ -192,6 +222,7 @@ private extension ModeSettingsSheet {
                 width: ModeSettingsSheetLayout.fieldWidth,
                 height: ModeSettingsSheetLayout.fieldHeight
             )
+            .accessibilityLabel(title)
         }
         .frame(height: ModeSettingsSheetLayout.fieldHeight)
     }

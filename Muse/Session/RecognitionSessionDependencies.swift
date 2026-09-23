@@ -10,6 +10,7 @@ protocol AudioCaptureControlling: AnyObject, Sendable {
     func setAudioChunkHandler(_ handler: ((Data) -> Void)?)
     func clearAudioHandlers()
     func start(timeout: Duration) async throws
+    func captureReleaseTail() async
     func stop()
     func getRecordedAudio() -> Data
 }
@@ -18,6 +19,9 @@ extension AudioCaptureControlling {
     func start() async throws {
         try await start(timeout: AudioCaptureEngine.startTimeout)
     }
+
+    /// 测试替身与不需要尾音保护的采集实现可沿用无操作默认值。
+    func captureReleaseTail() async {}
 }
 
 extension AudioCaptureEngine: AudioCaptureControlling {}

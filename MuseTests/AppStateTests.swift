@@ -154,6 +154,146 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.feedbackMessage, "找不到麦克风")
     }
 
+    func testVoicePolishStageEnablesCanonicalExitAndInvokesItOnce() async {
+        let appState = AppState(
+            initialModes: ProcessingMode.defaults,
+            voicePolishCanonicalExitDelay: .zero
+        )
+        appState.currentMode = .formalWriting
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.stopRecording()
+        var invocationCount = 0
+        appState.onUseVoicePolishCanonicalText = {
+            invocationCount += 1
+            return true
+        }
+
+        appState.showVoicePolishStage(.analyzing)
+
+        XCTAssertEqual(appState.voicePolishStage, .analyzing)
+        XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
+
+        let result = await appState.useVoicePolishCanonicalTextIfAvailable(
+            restoreOnFailure: true
+        )
+        let duplicateResult = await appState.useVoicePolishCanonicalTextIfAvailable(
+            restoreOnFailure: true
+        )
+
+        XCTAssertEqual(result, .accepted)
+        XCTAssertEqual(duplicateResult, .stale)
+        XCTAssertFalse(duplicateResult.shouldAbortSessionAfterEscape)
+        XCTAssertEqual(invocationCount, 1)
+        XCTAssertFalse(appState.canUseVoicePolishCanonicalText)
+        XCTAssertFalse(appState.isRequestingVoicePolishCanonicalText)
+        XCTAssertNotNil(appState.voicePolishCanonicalExitMessage)
+
+        appState.showProcessingResult("已选择的纠正原文")
+        let afterCommitResult = await appState.useVoicePolishCanonicalTextIfAvailable(
+            restoreOnFailure: false
+        )
+        XCTAssertEqual(afterCommitResult, .stale)
+        XCTAssertFalse(afterCommitResult.shouldAbortSessionAfterEscape)
+    }
+
+    func testCompletedPolishDoesNotShowDelayedCanonicalExit() async throws {
+        let appState = AppState(
+            initialModes: ProcessingMode.defaults,
+            voicePolishCanonicalExitDelay: .milliseconds(20)
+        )
+        appState.currentMode = .formalWriting
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.stopRecording()
+        appState.showVoicePolishStage(.polishing)
+        XCTAssertFalse(appState.canUseVoicePolishCanonicalText)
+
+        appState.showProcessingResult("已经完成的润色结果")
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(appState.canUseVoicePolishCanonicalText,
+                       "润色先完成时，迟到的延时任务不能再次显示 Esc 提示")
+        XCTAssertNil(appState.voicePolishStage)
+        XCTAssertNil(appState.voicePolishCanonicalExitMessage)
+    }
+
+    func testCanonicalExitRejectionRestoresMouseActionAndShowsRetryState() async {
+        let appState = makeCanonicalReadyAppState()
+        appState.onUseVoicePolishCanonicalText = { false }
+
+        let result = await appState.useVoicePolishCanonicalTextIfAvailable(
+            restoreOnFailure: true
+        )
+
+        XCTAssertEqual(result, .rejected)
+        XCTAssertTrue(result.shouldAbortSessionAfterEscape)
+        XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
+        XCTAssertFalse(appState.isRequestingVoicePolishCanonicalText)
+        XCTAssertNotNil(appState.voicePolishCanonicalExitMessage)
+    }
+
+    func testCommittedProcessingResultInvalidatesPendingCanonicalAckWithoutRestoringButton() async {
+        let appState = makeCanonicalReadyAppState()
+        let gate = VoicePolishCanonicalAckGate()
+        appState.onUseVoicePolishCanonicalText = {
+            await gate.waitForResolution()
+        }
+
+        let requestTask = Task { @MainActor in
+            await appState.useVoicePolishCanonicalTextIfAvailable(
+                restoreOnFailure: true
+            )
+        }
+        while !(await gate.hasStarted) {
+            await Task.yield()
+        }
+        XCTAssertTrue(appState.isRequestingVoicePolishCanonicalText)
+
+        // 模拟 pipeline 已提交 polished 结果，但迟到的 session ack 随后才返回 false。
+        appState.showProcessingResult("已经提交的润色结果")
+        await gate.resolve(false)
+        let result = await requestTask.value
+
+        XCTAssertEqual(result, .stale)
+        XCTAssertFalse(result.shouldAbortSessionAfterEscape)
+        XCTAssertNil(appState.voicePolishStage)
+        XCTAssertFalse(appState.canUseVoicePolishCanonicalText)
+        XCTAssertFalse(appState.isRequestingVoicePolishCanonicalText)
+        XCTAssertNil(appState.voicePolishCanonicalExitMessage)
+    }
+
+    func testVoicePolishUnavailableRequiresExplicitRetryOrCanonicalChoice() async {
+        let appState = AppState(
+            initialModes: ProcessingMode.defaults,
+            voicePolishCanonicalExitDelay: .zero
+        )
+        appState.currentMode = .formalWriting
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.stopRecording()
+
+        appState.showVoicePolishUnavailable(.validationFailed)
+
+        XCTAssertEqual(appState.barPhase, .processing)
+        XCTAssertTrue(appState.isVoicePolishUnavailable)
+        XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
+        XCTAssertTrue(appState.voicePolishUnavailableMessage?.contains(L("原转写已保留", "The transcript was preserved.")) == true)
+
+        var retryCount = 0
+        appState.onRetryVoicePolish = {
+            retryCount += 1
+            return true
+        }
+        appState.retryVoicePolish()
+        for _ in 0..<20 where retryCount == 0 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(retryCount, 1)
+        XCTAssertFalse(appState.isVoicePolishUnavailable)
+        XCTAssertEqual(appState.voicePolishStage, .analyzing)
+    }
+
     func testReconcileCurrentModeKeepsSupportedCustomModeForQuickOnlyProvider() {
         let appState = AppState(initialModes: ProcessingMode.defaults)
         let customMode = ProcessingMode(
@@ -182,11 +322,41 @@ final class AppStateTests: XCTestCase {
         } ?? []
     }
 
+    private func makeCanonicalReadyAppState() -> AppState {
+        let appState = AppState(
+            initialModes: ProcessingMode.defaults,
+            voicePolishCanonicalExitDelay: .zero
+        )
+        appState.currentMode = .formalWriting
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.stopRecording()
+        appState.showVoicePolishStage(.polishing)
+        return appState
+    }
+
     private func restorePasteboardItems(_ items: [NSPasteboardItem]) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         if !items.isEmpty {
             pasteboard.writeObjects(items)
         }
+    }
+}
+
+private actor VoicePolishCanonicalAckGate {
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private(set) var hasStarted = false
+
+    func waitForResolution() async -> Bool {
+        await withCheckedContinuation { continuation in
+            hasStarted = true
+            self.continuation = continuation
+        }
+    }
+
+    func resolve(_ accepted: Bool) {
+        continuation?.resume(returning: accepted)
+        continuation = nil
     }
 }

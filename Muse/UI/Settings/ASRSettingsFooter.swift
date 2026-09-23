@@ -50,8 +50,14 @@ private extension ASRSettingsFooter {
         }
         if selectedProvider == .apple {
             return L(
-                "Apple 仅使用端侧识别，音频不上传；若当前语言不支持，请切换语言或改用火山引擎。",
-                "Apple uses on-device recognition only; audio is not uploaded. Switch language or use Volcano Speech if unsupported."
+                "Apple 仅使用端侧识别，音频不上传；若当前语言不支持，请切换语言或改用云端引擎。",
+                "Apple uses on-device recognition only; audio is not uploaded. Switch language or use a cloud engine if unsupported."
+            )
+        }
+        if selectedProvider == .aliyun {
+            return L(
+                "Muse 自动同步本地热词到百炼，默认最高权重 5；已有 ID 时更新，否则自动创建。",
+                "Muse syncs local hotwords to Model Studio at maximum weight 5, updating an existing ID or creating one automatically."
             )
         }
         if isZeroCredentialProvider {

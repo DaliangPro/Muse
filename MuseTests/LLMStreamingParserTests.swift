@@ -2,6 +2,54 @@ import XCTest
 @testable import Muse
 
 final class LLMStreamingParserTests: XCTestCase {
+    func testThinkingProbeAcceptsTokenLimitOnlyWithReasoningAndTerminalEvent() throws {
+        for content in ["", "尚未完成的答案"] {
+            var parser = LLMStreamingParser()
+            let chunk: [String: Any] = ["choices": [["delta": ["reasoning_content": "推理测试", "content": content], "finish_reason": "length"]]]
+            let data = try JSONSerialization.data(withJSONObject: chunk)
+            try parser.consume(line: "data: " + String(decoding: data, as: UTF8.self))
+            try parser.consume(line: "")
+            XCTAssertEqual(try parser.finish(allowIncompleteProbeAnswer: true), content)
+            XCTAssertTrue(parser.reasoningObserved)
+            XCTAssertTrue(parser.isComplete)
+            XCTAssertTrue(parser.hitOutputTokenLimit)
+            // 同一响应绝不能通过正常正文交付校验。
+            XCTAssertThrowsError(try parser.finish())
+        }
+    }
+
+    func testThinkingProbeStillRejectsInterruptedReasoningStream() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{"reasoning_content":"推理测试"},"finish_reason":null}]}"#)
+        try parser.consume(line: "")
+        XCTAssertTrue(parser.reasoningObserved)
+        XCTAssertThrowsError(try parser.finish(allowIncompleteProbeAnswer: true))
+    }
+
+    func testThinkingProbeAcceptsLimitedAnswerWithoutInventingReasoningEvidence() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{"content":"不完整正文"},"finish_reason":"length"}]}"#)
+        try parser.consume(line: "")
+        XCTAssertEqual(try parser.finish(allowIncompleteProbeAnswer: true), "不完整正文")
+        XCTAssertFalse(parser.reasoningObserved)
+        XCTAssertThrowsError(try parser.finish())
+    }
+
+    func testThinkingProbeRejectsEmptyTokenLimitResponse() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+        try parser.consume(line: "")
+        XCTAssertThrowsError(try parser.finish(allowIncompleteProbeAnswer: true))
+    }
+
+    func testThinkingProbeAllowsCompleteReasoningWithoutFinalAnswer() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(line: #"data: {"choices":[{"delta":{"reasoning_content":"推理测试"},"finish_reason":"stop"}]}"#)
+        try parser.consume(line: "")
+        XCTAssertEqual(try parser.finish(allowIncompleteProbeAnswer: true), "")
+        XCTAssertThrowsError(try parser.finish())
+    }
+
     func testDataWithoutSpaceAndDoneAreParsed() throws {
         var parser = LLMStreamingParser()
         try parser.consume(line: #"data:{"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}"#)
@@ -40,6 +88,21 @@ final class LLMStreamingParserTests: XCTestCase {
 
         XCTAssertEqual(try parser.finish(), "finished")
         XCTAssertTrue(parser.isComplete)
+    }
+
+    func testLengthFinishReasonIsReportedAsTruncated() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertThrowsError(try parser.finish()) { error in
+            guard case LLMError.truncatedResponse(let count) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(count, 7)
+        }
     }
 
     func testFinishReasonWithoutDeltaStillCompletes() throws {
@@ -144,5 +207,75 @@ final class LLMStreamingParserTests: XCTestCase {
         try parser.consume(line: "")
 
         XCTAssertEqual(try parser.finish(), "ok")
+    }
+
+    func testReasoningContentIsObservedButNotIncludedInFinalText() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"reasoning_content":"内部推理"},"finish_reason":null}]}"#
+        )
+        try parser.consume(line: "")
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"703"},"finish_reason":"stop"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertEqual(try parser.finish(), "703")
+        XCTAssertTrue(parser.reasoningObserved)
+    }
+
+    func testThinkingFieldIsObservedButNotIncludedInFinalText() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"thinking":"内部推理"},"finish_reason":null}]}"#
+        )
+        try parser.consume(line: "")
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"703"},"finish_reason":"stop"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertEqual(try parser.finish(), "703")
+        XCTAssertTrue(parser.reasoningObserved)
+    }
+
+    func testReasoningTokenUsageIsObserved() throws {
+        var parser = LLMStreamingParser()
+        try parser.consume(
+            line: #"data: {"choices":[],"usage":{"completion_tokens_details":{"reasoning_tokens":12}}}"#
+        )
+        try parser.consume(line: "")
+        try parser.consume(
+            line: #"data: {"choices":[{"delta":{"content":"703"},"finish_reason":"stop"}]}"#
+        )
+        try parser.consume(line: "")
+
+        XCTAssertEqual(try parser.finish(), "703")
+        XCTAssertTrue(parser.reasoningObserved)
+    }
+
+    func testNonStreamingReasoningDetailsRequireAtLeastOneEntry() throws {
+        let emptyData = Data(
+            #"{"choices":[{"message":{"content":"703","reasoning_details":[]}}]}"#.utf8
+        )
+        let populatedData = Data(
+            #"{"choices":[{"message":{"content":"703","reasoning_details":[{"type":"text"}]}}]}"#.utf8
+        )
+
+        let empty = try JSONDecoder().decode(ChatCompletionResponse.self, from: emptyData)
+        let populated = try JSONDecoder().decode(ChatCompletionResponse.self, from: populatedData)
+
+        XCTAssertNil(empty.thinkingEvidence.reasoningObserved)
+        XCTAssertEqual(populated.thinkingEvidence.reasoningObserved, true)
+    }
+
+    func testNonStreamingLengthFinishReasonIsMarkedAsTruncated() throws {
+        let data = Data(
+            #"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#.utf8
+        )
+
+        let response = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
+
+        XCTAssertTrue(response.hitOutputTokenLimit)
     }
 }

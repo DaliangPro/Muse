@@ -52,6 +52,8 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     static let channels: AVAudioChannelCount = 1
     static let chunkDurationMs: Int = 200
     static let startTimeout: Duration = .seconds(15)
+    /// 用户松开热键后继续收音一小段，覆盖发音结束与按键释放几乎同时发生的尾字。
+    static let releaseTailDuration: Duration = .milliseconds(300)
     static let samplesPerChunk: Int = Int(sampleRate * Double(chunkDurationMs) / 1000)
     static let chunkByteSize: Int = samplesPerChunk * MemoryLayout<Int16>.size
     static let targetFormat: AVAudioFormat = AVAudioFormat(
@@ -367,6 +369,11 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         }
         AppLogger.log("[Audio] Capture session started (AVCapture), device: \(device.localizedName)")
         return .success
+    }
+
+    /// 保持采集管线短暂开启；调用方随后 stop() 时会统一排空回调队列与剩余 PCM。
+    func captureReleaseTail() async {
+        try? await Task.sleep(for: Self.releaseTailDuration)
     }
 
     func stop() {

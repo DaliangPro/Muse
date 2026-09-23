@@ -3,21 +3,21 @@ import Foundation
 // MARK: - Provider Enum
 
 enum ASRProvider: String, CaseIterable, Codable, Sendable {
-    // 2026-06-11 产品决策（REPAIR_PLAN G1）：云端只保留火山引擎，
-    // 其余 13 家（openai/azure/google/aws/deepgram/assemblyai/soniox/
-    // aliyun/bailian/tencent/baidu/iflytek/custom）整体移除，
-    // 历史用户的选择由 migrateRemovedProvider 兜底到 volcano
+    // 2026-07-21 产品决策：在 G1 精简后的火山引擎基础上新增阿里云百炼，
+    // 其余已移除云厂商仍由 selectedASRProvider 的解析兜底到 volcano。
     // Local
     case sherpa
     case apple
     // Cloud
     case volcano
+    case aliyun
 
     var displayName: String {
         switch self {
         case .sherpa:   return L("本地识别", "Local ASR")
         case .apple:    return "Apple Speech"
         case .volcano:  return L("火山引擎 (Doubao)", "Volcano (Doubao)")
+        case .aliyun:   return L("阿里云百炼", "Alibaba Cloud Model Studio")
         }
     }
 

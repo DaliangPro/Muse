@@ -3,6 +3,67 @@ import XCTest
 @testable import Muse
 
 final class VolcASRReconnectTests: XCTestCase {
+    func testFullReplayUsesTwoHundredMillisecondChunksAndPacing() async throws {
+        let client = VolcReplayRecognizer()
+        let sleepRecorder = VolcReplaySleepRecorder()
+        let audio = Data(
+            repeating: 0x2A,
+            count: AudioCaptureEngine.chunkByteSize * 2 + 17
+        )
+
+        try await VolcanoAudioReplay.send(
+            audio: audio,
+            to: client,
+            sleep: { duration in
+                await sleepRecorder.record(duration)
+            }
+        )
+
+        let packetSizes = await client.packetSizes
+        let sleepDurations = await sleepRecorder.durations
+        XCTAssertEqual(
+            packetSizes,
+            [AudioCaptureEngine.chunkByteSize, AudioCaptureEngine.chunkByteSize, 17]
+        )
+        XCTAssertEqual(
+            sleepDurations,
+            [VolcanoAudioReplay.chunkInterval, VolcanoAudioReplay.chunkInterval]
+        )
+    }
+
+    func testOfficialServerErrorAfterEndAudioIsNotReportedAsCompleted() async throws {
+        let socket = ScriptedVolcWebSocketTask()
+        let factory = VolcDialFactorySpy(tasks: [socket])
+        let client = makeClient(factory: factory)
+        let recorder = VolcEventRecorder()
+
+        try await client.connect(config: try makeConfig())
+        let stream = await client.events
+        let consumer = Task { await recorder.consume(stream) }
+        let receiveStarted = await awaitValue { socket.pendingReceiveCount == 1 }
+        XCTAssertTrue(receiveStarted)
+
+        try await client.sendAudio(Data([0x01]))
+        try await client.endAudio()
+        socket.yieldReceive(.data(makeOfficialServerErrorMessage(
+            code: 55_000_031,
+            message: "server busy"
+        )))
+
+        let streamFinished = await awaitValue { await recorder.isFinished }
+        if streamFinished {
+            await consumer.value
+        } else {
+            consumer.cancel()
+        }
+
+        let values = await recorder.values
+        XCTAssertTrue(values.contains { value in
+            value.contains("55000031") && value.contains("server busy")
+        })
+        XCTAssertFalse(values.contains("completed"))
+    }
+
     func testReconnectAfterFirstReceiveLoopEndsStillDeliversTranscript() async throws {
         let first = ScriptedVolcWebSocketTask(sendFailureCalls: [3])
         let second = ScriptedVolcWebSocketTask()
@@ -207,6 +268,26 @@ final class VolcASRReconnectTests: XCTestCase {
         )
     }
 
+    private func makeOfficialServerErrorMessage(
+        code: UInt32,
+        message: String
+    ) -> Data {
+        let header = VolcHeader(
+            messageType: .serverError,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+        let messageData = Data(message.utf8)
+        var codeBigEndian = code.bigEndian
+        var sizeBigEndian = UInt32(messageData.count).bigEndian
+        var data = header.encode()
+        data.append(Data(bytes: &codeBigEndian, count: MemoryLayout<UInt32>.size))
+        data.append(Data(bytes: &sizeBigEndian, count: MemoryLayout<UInt32>.size))
+        data.append(messageData)
+        return data
+    }
+
     private func awaitValue(
         timeout: Duration = .seconds(2),
         condition: @escaping @Sendable () async -> Bool
@@ -220,6 +301,38 @@ final class VolcASRReconnectTests: XCTestCase {
         return false
     }
 
+}
+
+private actor VolcReplayRecognizer: SpeechRecognizer {
+    private var packets: [Data] = []
+
+    var packetSizes: [Int] {
+        packets.map(\.count)
+    }
+
+    var events: AsyncStream<RecognitionEvent> {
+        AsyncStream { continuation in continuation.finish() }
+    }
+
+    func connect(config: any ASRProviderConfig, options: ASRRequestOptions) async throws {
+        _ = config
+        _ = options
+    }
+
+    func sendAudio(_ data: Data) async throws {
+        packets.append(data)
+    }
+
+    func endAudio() async throws {}
+    func disconnect() async {}
+}
+
+private actor VolcReplaySleepRecorder {
+    private(set) var durations: [Duration] = []
+
+    func record(_ duration: Duration) {
+        durations.append(duration)
+    }
 }
 
 private enum TestVolcLifecycleError: Error {
@@ -366,6 +479,10 @@ private actor VolcEventRecorder {
             return "completed"
         case .processingResult(let text):
             return "processing:\(text)"
+        case .voicePolishStage(let stage):
+            return "voicePolishStage:\(stage.rawValue)"
+        case .voicePolishUnavailable(let reason):
+            return "voicePolishUnavailable:\(reason?.rawValue ?? "unknown")"
         case .finalized(let text, _):
             return "finalized:\(text)"
         case .streamingInterrupted:

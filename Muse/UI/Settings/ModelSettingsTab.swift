@@ -4,48 +4,34 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
     @State private var activeEditor: ModelSettingsEditor?
     @State private var refreshID = UUID()
     @State private var asrTestStatus: SettingsTestStatus = .idle
-    @State private var llmTestStatus: SettingsTestStatus = .idle
-    @State private var assetTestStatus: SettingsTestStatus = .idle
     @State private var testTask: Task<Void, Never>?
 
     var body: some View {
-        // 2026-07-08 大梁老师拍板：四块矩形之间用弹性 Spacer 均分页面剩余高度，
-        // 页尾留白恒等于页边距、与其他页一致；间距随窗口高度自动均分，不再写死。
-        // （页宽恒定 600，三卡横排永远放不下，原 ViewThatFits 恒走纵排，故直接纵排）
-        VStack(alignment: .leading, spacing: 0) {
-            asrCard
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: ModelSettingsStyle.cardSpacing)
-            llmCard
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: ModelSettingsStyle.cardSpacing)
-            assetCard
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: ModelSettingsStyle.cardSpacing)
-            LocalModelResourceStrip()
-                .fixedSize(horizontal: false, vertical: true)
+        let _ = refreshID
+        ScrollView {
+            VStack(alignment: .leading, spacing: ModelSettingsStyle.cardSpacing) {
+                asrCard
+                PolishModelSummaryCard(role: .standard, onEdit: { activeEditor = .standardPolish })
+                LocalModelResourceStrip()
+            }
+            .frame(maxWidth: .infinity)
         }
-        .id(refreshID)
         .onReceive(NotificationCenter.default.publisher(for: .modelConnectivityProbed)) { _ in
-            // 自动探测只点亮色点（body 直读缓存），不触碰按钮状态
             refreshID = UUID()
         }
         .sheet(item: $activeEditor, onDismiss: {
             refreshID = UUID()
+            NotificationCenter.default.post(name: .modelConnectivityProbed, object: nil)
         }) { editor in
             ModelSettingsEditorSheet(editor: editor)
         }
-        .onDisappear {
-            testTask?.cancel()
-        }
+        .onDisappear { testTask?.cancel() }
     }
 
-    // 色点 = 手动测试优先，否则探测缓存；按钮状态只跟手动点击走，
-    // 启动自动探测不会让「测试连接」按钮出现被点击的状态（2026-06-12 用户拍板）
     private var asrCard: some View {
         let asrSummary = ModelSettingsSummary.asr()
         return ModelCapabilityCard(
-            title: L("语音识别", "Speech Recognition"),
+            title: L("语音识别模型", "Speech Recognition Model"),
             provider: asrSummary.provider,
             model: asrSummary.model,
             statusTitle: liveStatus(asrTestStatus, cached: cachedASRStatus, summary: asrSummary).title,
@@ -56,36 +42,6 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
         )
     }
 
-    private var llmCard: some View {
-        let llmSummary = ModelSettingsSummary.llm()
-        return ModelCapabilityCard(
-            title: L("文本处理", "Text Processing"),
-            provider: llmSummary.provider,
-            model: llmSummary.model,
-            statusTitle: liveStatus(llmTestStatus, cached: cachedLLMStatus, summary: llmSummary).title,
-            statusTone: liveStatus(llmTestStatus, cached: cachedLLMStatus, summary: llmSummary).tone,
-            testStatus: llmTestStatus,
-            onTest: { testLLMConnection(forAssetExtraction: false) },
-            onEdit: { activeEditor = .llm }
-        )
-    }
-
-    private var assetCard: some View {
-        let assetSummary = ModelSettingsSummary.asset()
-        return ModelCapabilityCard(
-            title: L("语料沉淀", "Corpus Extraction"),
-            provider: assetSummary.provider,
-            model: assetSummary.model,
-            statusTitle: liveStatus(assetTestStatus, cached: cachedAssetStatus, summary: assetSummary).title,
-            statusTone: liveStatus(assetTestStatus, cached: cachedAssetStatus, summary: assetSummary).tone,
-            testStatus: assetTestStatus,
-            onTest: { testLLMConnection(forAssetExtraction: true) },
-            onEdit: { activeEditor = .asset }
-        )
-    }
-
-    /// 色点显示用户真正关心的「连通状态」：手动测过→实时反馈；
-    /// 否则用启动探测/弹窗回传的缓存；都没有→按配置情况给待配置/未测试
     private func liveStatus(
         _ test: SettingsTestStatus,
         cached: SettingsTestStatus?,
@@ -118,21 +74,6 @@ struct ModelSettingsTab: View, SettingsCardHelpers {
         return cached.status
     }
 
-    private var cachedLLMStatus: SettingsTestStatus? {
-        guard let cached = ModelConnectivityCache.llm,
-              cached.provider == KeychainService.selectedLLMProvider else { return nil }
-        return cached.status
-    }
-
-    private var cachedAssetStatus: SettingsTestStatus? {
-        guard let cached = ModelConnectivityCache.asset,
-              cached.provider == KeychainService.selectedAssetExtractionLLMProvider else { return nil }
-        return cached.status
-    }
-
-}
-
-private extension ModelSettingsTab {
     func testASRConnection() {
         testTask?.cancel()
         asrTestStatus = .testing
@@ -171,53 +112,75 @@ private extension ModelSettingsTab {
         ModelConnectivityCache.asr = (provider, status)
     }
 
-    func recordLLMStatus(_ status: SettingsTestStatus, provider: LLMProvider, forAssetExtraction: Bool) {
-        if forAssetExtraction {
-            assetTestStatus = status
-            ModelConnectivityCache.asset = (provider, status)
-        } else {
-            llmTestStatus = status
-            ModelConnectivityCache.llm = (provider, status)
+}
+
+private struct PolishModelSummaryCard: View {
+    let role: PolishModelRole
+    let onEdit: () -> Void
+    @State private var status: SettingsTestStatus = .idle
+    @State private var task: Task<Void, Never>?
+    @State private var refreshID = UUID()
+
+    var body: some View {
+        let _ = refreshID
+        let summary = ModelSettingsSummary.llm(role: role)
+        let provider = KeychainService.selectedPolishProvider(for: role)
+        let config = KeychainService.loadPolishConfig(for: role)
+        let cached = ModelConnectivityCache.polish[role]
+        let signature = config.map { LLMConnectivitySignature(provider: provider, config: $0) }
+        let current = cached?.isCurrent == true && cached?.signature == signature ? cached?.status : nil
+        let effective = status == .testing ? status : current ?? status
+        let tone: SettingsStatusTone = effective == .success ? .success : {
+            if case .failed = effective { return .danger }
+            return config == nil ? .warning : .neutral
+        }()
+        ModelCapabilityCard(
+            title: role.title, provider: summary.provider, model: summary.model,
+            statusTitle: statusTitle(effective, configured: config != nil),
+            statusTone: tone, testStatus: status,
+            onTest: { test(provider: provider, config: config) }, onEdit: onEdit
+        )
+        .onReceive(NotificationCenter.default.publisher(for: .modelConnectivityProbed)) { _ in
+            refreshID = UUID()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .llmThinkingValidationInvalidated)) { _ in
+            status = .idle
+            refreshID = UUID()
+        }
+        .onChange(of: signature) { _, _ in
+            task?.cancel()
+            status = .idle
+        }
+        .onDisappear { task?.cancel() }
+    }
+
+    private func statusTitle(_ status: SettingsTestStatus, configured: Bool) -> String {
+        switch status {
+        case .testing: return L("测试中…", "Testing…")
+        case .success: return L("连接正常", "Connected")
+        case .failed: return L("连接异常", "Connection failed")
+        default: return configured ? L("未测试", "Not tested") : L("待配置", "Needs setup")
         }
     }
 
-    func testLLMConnection(forAssetExtraction: Bool) {
-        testTask?.cancel()
-        if forAssetExtraction {
-            assetTestStatus = .testing
-        } else {
-            llmTestStatus = .testing
-        }
-
-        let provider = forAssetExtraction
-            ? KeychainService.selectedAssetExtractionLLMProvider
-            : KeychainService.selectedLLMProvider
-        let config = forAssetExtraction
-            ? KeychainService.loadAssetExtractionLLMConfig()
-            : KeychainService.loadLLMConfig()
-
-        testTask = Task {
-            do {
-                guard let config else {
-                    guard !Task.isCancelled else { return }
-                    // localQwen 的 config 为 nil 通常是本地引擎没在跑，而非没配置
-                    let message = provider == .localQwen
-                        ? L("本地引擎未启动", "Local engine not running")
-                        : L("待配置", "Needs setup")
-                    recordLLMStatus(.failed(message), provider: provider, forAssetExtraction: forAssetExtraction)
-                    return
-                }
-
-                let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-                let reply = try await client.process(text: "hi", prompt: "{text}", config: config)
-                guard !Task.isCancelled else { return }
-                recordLLMStatus(.success, provider: provider, forAssetExtraction: forAssetExtraction)
-                AppLogger.log("[Settings] Model summary LLM test OK (\(provider.rawValue)) replyLen=\(reply.count)")
-            } catch {
-                guard !Task.isCancelled else { return }
-                recordLLMStatus(.failed(error.localizedDescription), provider: provider, forAssetExtraction: forAssetExtraction)
-                AppLogger.log("[Settings] Model summary LLM test failed (\(provider.rawValue)): \(String(describing: error))")
+    private func test(provider: LLMProvider, config: LLMConfig?) {
+        task?.cancel()
+        status = .testing
+        task = Task {
+            guard let config else {
+                status = .failed(L("待配置或本地引擎未启动", "Needs setup or local engine stopped"))
+                return
             }
+            let result: SettingsTestStatus
+            do {
+                try await PolishModelConnectionTester.test(role: role, config: config, client: LLMProviderRegistry.makeClient(for: provider))
+                result = .success
+            } catch { result = .failed(error.localizedDescription) }
+            guard !Task.isCancelled else { return }
+            status = result
+            ModelConnectivityCache.polish[role] = LLMConnectivityCacheEntry(
+                signature: LLMConnectivitySignature(provider: provider, config: config), status: result
+            )
         }
     }
 }

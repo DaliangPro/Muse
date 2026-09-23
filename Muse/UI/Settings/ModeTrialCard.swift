@@ -15,7 +15,9 @@ struct ModeTrialCard: View {
     @State private var trialInput = ""
     @State private var trialOutput = ""
     @State private var trialError = ""
+    @State private var trialDiagnostics = ""
     @State private var isRunningTrial = false
+    @State private var activeTrialID: UUID?
     @State private var didSaveSampleFlash = false
 
     /// 标准测试文案（2026-06-12 用户拍板定稿）：真实语音输入的口语原文
@@ -33,8 +35,8 @@ struct ModeTrialCard: View {
 
     /// 翻译模式：一段书面中文，译文质量一目了然
     static var translateSampleText: String { L(
-        "这款产品的核心价值在于，把你每天的语音输入自动沉淀为可复用的创作素材，让灵感不再流失。",
-        "把你每天的语音输入自动沉淀为可复用的创作素材，让灵感不再流失——这就是这款产品的核心价值。"
+        "这款输入法可以把口述内容变成文字，日常输入更快，需要时还能整理内容结构。",
+        "这款输入法可以把口述内容变成文字，日常输入更快，需要时还能整理内容结构。"
     ) }
 
     /// 分模式默认样例（2026-06-12 用户拍板）
@@ -89,6 +91,8 @@ struct ModeTrialCard: View {
             trialInput = Self.effectiveSample(for: mode)
         }
         .onChange(of: mode.id) { _, _ in
+            activeTrialID = nil
+            isRunningTrial = false
             trialInput = Self.effectiveSample(for: mode)
             clearResult()
         }
@@ -119,6 +123,7 @@ private extension ModeTrialCard {
                     isEditable: true
                 )
                 .id(mode.id)
+                .accessibilityLabel(L("试跑输入", "Trial input"))
 
                 if trialInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     Text(L("输入一段测试文本...", "Enter sample text..."))
@@ -182,7 +187,7 @@ private extension ModeTrialCard {
 
                 Spacer(minLength: 8)
 
-                if isRunningTrial || !trialError.isEmpty {
+                if isRunningTrial || !trialError.isEmpty || !trialDiagnostics.isEmpty {
                     trialStatusLine
                 }
             }
@@ -195,6 +200,7 @@ private extension ModeTrialCard {
                     text: .constant(trialOutput),
                     isEditable: false
                 )
+                .accessibilityLabel(L("试跑输出", "Trial output"))
 
                 if trialOutput.isEmpty {
                     Text(L("测试输出会显示在这里...", "Output will appear here..."))
@@ -222,6 +228,7 @@ private extension ModeTrialCard {
                 }
                 .disabled(!canRunTrial || isRunningTrial)
                 .opacity((canRunTrial && !isRunningTrial) ? 1 : 0.62)
+                .accessibilityHint(trialButtonAccessibilityHint)
 
                 SettingsIconButton(
                     systemName: "xmark",
@@ -231,7 +238,7 @@ private extension ModeTrialCard {
                 ) {
                     clearResult()
                 }
-                .disabled(trialOutput.isEmpty && trialError.isEmpty)
+                .disabled(trialOutput.isEmpty && trialError.isEmpty && trialDiagnostics.isEmpty)
                 .help(L("清空输出", "Clear the output"))
 
                 Spacer(minLength: 0)
@@ -251,16 +258,34 @@ private extension ModeTrialCard {
                     .controlSize(.small)
                     .scaleEffect(0.7)
             }
-            Text(trialError.isEmpty ? L("调用中...", "Calling...") : trialError)
+            Text(trialStatusText)
                 .font(TF.settingsFontMetadata)
                 .foregroundStyle(trialError.isEmpty ? TF.settingsTextTertiary : TF.settingsAccentAmber)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(trialStatusText)
     }
 
     var canRunTrial: Bool {
         !trialInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var trialStatusText: String {
+        if isRunningTrial { return L("调用中...", "Calling...") }
+        if !trialError.isEmpty { return trialError }
+        return trialDiagnostics
+    }
+
+    var trialButtonAccessibilityHint: String {
+        if mode.kind == .voicePolish {
+            return L(
+                "只测试文字润色链路，不包含麦克风和语音识别。真实语音请使用语音润色快捷键。",
+                "Tests the text-polishing path only, without microphone or speech recognition. Use the Voice Polish shortcut for a real voice test."
+            )
+        }
+        return L("使用当前设置处理左侧文字。", "Process the input with the current settings.")
     }
 
     var fieldFill: Color {
@@ -286,14 +311,105 @@ private extension ModeTrialCard {
         guard !input.isEmpty, !isRunningTrial else { return }
 
         isRunningTrial = true
+        let trialID = UUID()
+        activeTrialID = trialID
         clearResult()
-        defer { isRunningTrial = false }
+        defer {
+            if activeTrialID == trialID {
+                isRunningTrial = false
+                activeTrialID = nil
+            }
+        }
 
         var draftMode = mode
         draftMode.name = name
         draftMode.processingLabel = processingLabel
         draftMode.prompt = prompt
         draftMode.hotkeyStyle = hotkeyStyle
+
+        if draftMode.kind == .direct {
+            trialOutput = VoicePolishTerminologyRuntime.prepare(rawText: input, applicationBundleIdentifier: nil).canonicalText
+            return
+        }
+
+        let role = PolishModelRole.resolve(draftMode.voicePolishQualityMode)
+        guard let llmConfig = KeychainService.loadPolishConfig(for: role) else {
+            trialError = L("当前 LLM 没有可用配置", "Current LLM is not configured")
+            return
+        }
+
+        let provider = KeychainService.selectedPolishProvider(for: role)
+        let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
+
+        if draftMode.kind == .voicePolish {
+            let trialStartedAt = ContinuousClock.now
+            let voicePolishConfig = llmConfig
+            let asrProvider = KeychainService.selectedASRProvider
+            let prepared = VoicePolishTerminologyRuntime.prepare(
+                rawText: input,
+                applicationBundleIdentifier: nil
+            )
+            let rawSegment = RecognitionSegment(
+                id: "s1",
+                text: input,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+            let canonicalSegment = RecognitionSegment(
+                id: "s1",
+                text: prepared.canonicalText,
+                startTimeMs: nil,
+                endTimeMs: nil,
+                confidence: nil,
+                isFinal: true
+            )
+            let envelope = VoiceInputEnvelope(
+                providerFinalText: input,
+                rawSegments: [rawSegment],
+                canonicalText: prepared.canonicalText,
+                segments: [canonicalSegment],
+                durationMs: 0,
+                provider: asrProvider
+            )
+            let trialContext = WritingContext(
+                scene: .unknown,
+                level: .metadataOnly,
+                safety: .unknown
+            )
+            let resolvedEntities = EntityResolver.resolve(
+                segments: envelope.segments,
+                lexicon: prepared.projection.personalLexicon,
+                snippets: prepared.fixedSnippets,
+                hotwords: [],
+                context: trialContext
+            )
+            let voicePolishRequest = VoicePolishRequest(
+                input: envelope,
+                context: trialContext,
+                preferences: UserPolishPreferences(
+                    additionalRequirements: draftMode.prompt
+                ),
+                qualityMode: draftMode.voicePolishQualityMode ?? .standard,
+                resolvedEntities: resolvedEntities
+            )
+            guard activeTrialID == trialID else { return }
+            let result = await VoicePolishPipeline(
+                client: client,
+                config: voicePolishConfig
+            ).process(voicePolishRequest)
+            guard activeTrialID == trialID else { return }
+            let elapsedMilliseconds = milliseconds(
+                ContinuousClock.now - trialStartedAt
+            )
+            trialOutput = result.text
+            trialDiagnostics = voicePolishDiagnostics(
+                result,
+                elapsedMilliseconds: elapsedMilliseconds
+            )
+            return
+        }
 
         guard !draftMode.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             trialOutput = input
@@ -305,23 +421,18 @@ private extension ModeTrialCard {
             to: context.expandContextVariables(draftMode.prompt)
         )
 
-        guard let llmConfig = KeychainService.loadLLMConfig() else {
-            trialError = L("当前 LLM 没有可用配置", "Current LLM is not configured")
-            return
-        }
-
-        let provider = KeychainService.selectedLLMProvider
-        let client: any LLMClient = LLMProviderRegistry.makeClient(for: provider)
-
         do {
             let result = try await client.process(
                 text: input,
                 prompt: expandedPrompt,
+                context: .processingMode,
                 config: llmConfig
             )
+            guard activeTrialID == trialID else { return }
             let cleaned = draftMode.applyingLLMResultCleanup(to: result)
             trialOutput = cleaned.isEmpty ? L("模型返回为空", "The model returned an empty response") : cleaned
         } catch {
+            guard activeTrialID == trialID else { return }
             trialError = error.localizedDescription
         }
     }
@@ -329,5 +440,29 @@ private extension ModeTrialCard {
     func clearResult() {
         trialOutput = ""
         trialError = ""
+        trialDiagnostics = ""
+    }
+
+    func voicePolishDiagnostics(
+        _ result: VoicePolishResult,
+        elapsedMilliseconds: Int64
+    ) -> String {
+        let calls = L("\(result.llmAttemptCount) 次", "\(result.llmAttemptCount) call(s)")
+        // 传输检查不能证明内容或版式合格，输入推断的预期也不是实际成稿版式。
+        let status = result.usedFallback ? L("未完成", "Incomplete") : L("已生成", "Generated")
+        let fallback = result.usedFallback ? L(" · 原文回退", " · Fallback") : ""
+        return "\(calls) · \(durationText(elapsedMilliseconds)) · \(status)\(fallback)"
+    }
+
+    func milliseconds(_ duration: Duration) -> Int64 {
+        duration.components.seconds * 1_000
+            + Int64(duration.components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    func durationText(_ milliseconds: Int64) -> String {
+        if milliseconds < 1_000 {
+            return "\(milliseconds) ms"
+        }
+        return String(format: "%.1f s", Double(milliseconds) / 1_000)
     }
 }

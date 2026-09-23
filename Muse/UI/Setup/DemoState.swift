@@ -18,12 +18,15 @@ final class DemoState {
     var recordingStartDate: Date?
     var copyFallbackWasCopied = false
     var preserveProcessingWidthForCopyFallback = false
+    var voicePolishStage: VoicePolishStage?
+    var canUseVoicePolishCanonicalText = false
 
     var transcriptionText: String {
         segments.map(\.text).joined()
     }
 
     func copyFallbackToClipboard() {}
+    func useVoicePolishCanonicalText() {}
 
     func dismissCopyFallback() {
         stop()
@@ -44,6 +47,17 @@ final class DemoState {
                 guard let self else { return }
                 await self.runOneCycle()
             }
+        }
+    }
+
+    /// 样式面板按需播放一轮，结束后停在录音预览，避免持续后台循环。
+    func playQuickModeDemoOnce() {
+        stop()
+        demoTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runOneCycle()
+            guard !Task.isCancelled else { return }
+            self.showFrozenRecordingPreview(text: L("把此刻的想法，清晰留下来", "Keep this thought, clearly"))
         }
     }
 

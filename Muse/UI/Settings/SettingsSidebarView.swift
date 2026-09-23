@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// 墨色一体侧栏（2026-06-11 用户拍板方案一）：与内容区同底色，纯文字导航，
-/// 选中态为贴左缘的琥珀短竖线；关于与设置沉底。
+/// 墨色一体侧栏：纯文字导航以暖灰层级和墨色字重表达选中态；
+/// 关于与设置沉底。
 struct SettingsSidebarView: View {
     let width: CGFloat
     @Binding var selectedTab: SettingsTab
@@ -18,6 +18,7 @@ struct SettingsSidebarView: View {
     @State private var isSettingsControlHovered = false
     @State private var hoveredTab: SettingsTab?
     @State private var settingsPanelFrame = CGRect.zero
+    @State private var showsHUDStylePicker = false
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -27,15 +28,17 @@ struct SettingsSidebarView: View {
                         navItem(tab)
                     }
                 }
-                .padding(.leading, SettingsSidebarLayout.leadingInset)
-                .padding(.top, SettingsSidebarLayout.navTopInset)
-                .onHover { isHovering in
-                    if !isHovering {
-                        withAnimation(.easeOut(duration: 0.10)) {
-                            hoveredTab = nil
-                        }
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let location):
+                        updateHoveredTab(SettingsSidebarLayout.navigationTab(at: location))
+                    case .ended:
+                        updateHoveredTab(nil)
                     }
                 }
+                .padding(.leading, SettingsSidebarLayout.leadingInset)
+                .padding(.top, SettingsSidebarLayout.navTopInset)
                 .zIndex(0)
 
                 Spacer()
@@ -51,6 +54,7 @@ struct SettingsSidebarView: View {
         // 侧栏配色对齐使用引导（2026-07-06 大梁老师）：改用 settingsSidebarTint 实色，
         // 与引导侧栏完全一致，取代原毛玻璃方案。
         .background(TF.settingsSidebarTint)
+        .sheet(isPresented: $showsHUDStylePicker) { HUDStylePicker() }
         .settingsDismissOnOutsideClick(
             isActive: isSettingsPanelOpen,
             allowedFrames: [settingsPanelFrame]
@@ -70,8 +74,7 @@ private extension SettingsSidebarView {
             textLeadingInset: SettingsSidebarLayout.navTextLeadingInset,
             verticalPadding: SettingsSidebarLayout.navItemVerticalPadding,
             cornerRadius: SettingsSidebarLayout.navItemCornerRadius,
-            controlWidth: SettingsSidebarLayout.controlWidth,
-            accentLineLeadingOffset: -SettingsSidebarLayout.leadingInset
+            controlWidth: SettingsSidebarLayout.controlWidth
         ) {
             closeSettingsPanel(animated: false)
             selectedTab = tab
@@ -79,8 +82,6 @@ private extension SettingsSidebarView {
             if tab == .about {
                 onSelectAbout()
             }
-        } onHoverActive: {
-            updateHoveredTab(tab)
         }
     }
 
@@ -96,7 +97,11 @@ private extension SettingsSidebarView {
                     showDockIcon: $showDockIcon,
                     launchAtLogin: $launchAtLogin,
                     preserveClipboard: $preserveClipboard,
-                    onLaunchAtLoginChanged: onLaunchAtLoginChanged
+                    onLaunchAtLoginChanged: onLaunchAtLoginChanged,
+                    onShowHUDStylePicker: {
+                        closeSettingsPanel(animated: false)
+                        showsHUDStylePicker = true
+                    }
                 )
                     .padding(.horizontal, SettingsSidebarLayout.settingsPanelHorizontalInset)
                     .padding(.top, SettingsSidebarLayout.settingsPanelTopInset)
@@ -113,7 +118,7 @@ private extension SettingsSidebarView {
             // 仅未展开、悬停「设置」时给一道微亮行
             Group {
                 if isSettingsControlHovered && !isSettingsPanelOpen {
-                    Rectangle().fill(TF.settingsSidebarGlassHoverFill)
+                    Rectangle().fill(TF.settingsSidebarHoverFill)
                         .clipShape(shape)
                 }
             }
@@ -166,11 +171,10 @@ private extension SettingsSidebarView {
         }
     }
 
-    func updateHoveredTab(_ tab: SettingsTab) {
+    func updateHoveredTab(_ tab: SettingsTab?) {
         guard hoveredTab != tab else { return }
-        withAnimation(.easeOut(duration: 0.10)) {
-            hoveredTab = tab
-        }
+        // 单一位置来源直接更新高亮，避免多个进入/离开动画互相打断。
+        hoveredTab = tab
     }
 
     func updateSettingsControlHover(_ isHovering: Bool) {

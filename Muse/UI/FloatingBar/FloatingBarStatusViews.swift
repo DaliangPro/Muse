@@ -19,28 +19,34 @@ struct ErrorDot: View {
 }
 
 struct DoneCheckmarkGlyph: View {
+    @Environment(\.hudStyle) private var style
 
     var body: some View {
         Image(systemName: "checkmark")
             .font(TF.hudFontLargeTitle)
             .foregroundStyle(TF.success)
-            .shadow(color: TF.success.opacity(0.28), radius: 6, x: 0, y: 0)
-            .shadow(color: Color.white.opacity(0.08), radius: 2, x: 0, y: 0)
+            .shadow(color: style == .ink ? .clear : TF.success.opacity(0.28), radius: 6, x: 0, y: 0)
+            .shadow(color: style == .ink ? .clear : Color.white.opacity(0.08), radius: 2, x: 0, y: 0)
             .accessibilityLabel(L("已完成", "Done"))
     }
 }
 
 private struct FloatingBarReadableTextModifier: ViewModifier {
     let color: Color
+    @Environment(\.hudStyle) private var style
 
     func body(content: Content) -> some View {
-        content
-            .foregroundStyle(color)
-            .shadow(color: Color.black.opacity(0.26), radius: 0, x: 0.42, y: 0)
-            .shadow(color: Color.black.opacity(0.26), radius: 0, x: -0.42, y: 0)
-            .shadow(color: Color.black.opacity(0.22), radius: 0, x: 0, y: 0.42)
-            .shadow(color: Color.black.opacity(0.22), radius: 0, x: 0, y: -0.42)
-            .shadow(color: Color.black.opacity(0.72), radius: 0.5, x: 0, y: 0.45)
+        if style == .ink {
+            content.foregroundStyle(color)
+        } else {
+            content
+                .foregroundStyle(color)
+                .shadow(color: Color.black.opacity(0.26), radius: 0, x: 0.42, y: 0)
+                .shadow(color: Color.black.opacity(0.26), radius: 0, x: -0.42, y: 0)
+                .shadow(color: Color.black.opacity(0.22), radius: 0, x: 0, y: 0.42)
+                .shadow(color: Color.black.opacity(0.22), radius: 0, x: 0, y: -0.42)
+                .shadow(color: Color.black.opacity(0.72), radius: 0.5, x: 0, y: 0.45)
+        }
     }
 }
 

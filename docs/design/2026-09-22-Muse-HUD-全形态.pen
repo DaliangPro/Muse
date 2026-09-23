@@ -1,0 +1,4421 @@
+{
+  "version": "2.18",
+  "children": [
+    {
+      "type": "frame",
+      "id": "bi8Au",
+      "x": 0,
+      "y": 0,
+      "name": "00 · 共用组件与尺寸",
+      "clip": true,
+      "width": 1440,
+      "height": 224,
+      "fill": "#F3F2EF",
+      "layout": "none",
+      "children": [
+        {
+          "type": "text",
+          "id": "M7QnOQ",
+          "x": 40,
+          "y": 25,
+          "name": "组件标题",
+          "fill": "$ink",
+          "content": "MUSE / HUD",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 26,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "JSlRf",
+          "x": 40,
+          "y": 70,
+          "name": "组件说明",
+          "fill": "$muted",
+          "content": "两种材质 · 共用蓝绿波形 · 启动圈同色 · 单行 40 pt · 最大宽度 528 pt",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 14,
+          "fontWeight": "500"
+        },
+        {
+          "type": "frame",
+          "id": "Xluiw",
+          "x": 44,
+          "y": 119,
+          "name": "苹果原生波形组件区",
+          "width": 220,
+          "height": 64,
+          "fill": "$stage",
+          "cornerRadius": 12,
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "oxx8w",
+              "x": 12,
+              "y": 12,
+              "name": "波形 / 苹果原生",
+              "reusable": true,
+              "width": 40,
+              "height": 40,
+              "layout": "none",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "B3r0h",
+                  "x": 7,
+                  "y": 12,
+                  "name": "柔和蓝绿光晕",
+                  "fill": "#20E6D43A",
+                  "width": 26,
+                  "height": 16,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 6
+                  }
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "J7nkG",
+                  "x": 12.2,
+                  "y": 16.75,
+                  "name": "波形条 1",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#38FFB8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 6.5
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "l5OdiE",
+                  "x": 15.579999999999998,
+                  "y": 14.9,
+                  "name": "波形条 2",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#38FFB8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 10.2
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "SrAE6",
+                  "x": 18.96,
+                  "y": 15.75,
+                  "name": "波形条 3",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#38FFB8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 8.5
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "uCPmf",
+                  "x": 22.34,
+                  "y": 14.4,
+                  "name": "波形条 4",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#6BFFA8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 11.2
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "RtjmJ",
+                  "x": 25.72,
+                  "y": 16.25,
+                  "name": "波形条 5",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#6BFFA8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 7.5
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "Rrxp7",
+              "x": 68,
+              "y": 22,
+              "name": "组件标签",
+              "fill": "#FFFFFF",
+              "content": "苹果原生",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "500"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "LJVzA",
+          "x": 314,
+          "y": 119,
+          "name": "墨色波形组件区",
+          "width": 220,
+          "height": 64,
+          "fill": "$stage",
+          "cornerRadius": 12,
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "GkWmo",
+              "x": 12,
+              "y": 12,
+              "name": "波形 / 墨色",
+              "reusable": true,
+              "width": 40,
+              "height": 40,
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "e0NLzs",
+                  "x": 12.2,
+                  "y": 16.75,
+                  "name": "波形条 1",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#38FFB8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 6.5
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "Wcf80",
+                  "x": 15.579999999999998,
+                  "y": 14.9,
+                  "name": "波形条 2",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#38FFB8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 10.2
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "TB5Xu",
+                  "x": 18.96,
+                  "y": 15.75,
+                  "name": "波形条 3",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#38FFB8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 8.5
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "fd1Bx",
+                  "x": 22.34,
+                  "y": 14.4,
+                  "name": "波形条 4",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#6BFFA8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 11.2
+                },
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 1.09,
+                  "id": "NhKqs",
+                  "x": 25.72,
+                  "y": 16.25,
+                  "name": "波形条 5",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 180,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#1FB8FF",
+                        "position": 0
+                      },
+                      {
+                        "color": "#14E6F0",
+                        "position": 0.5
+                      },
+                      {
+                        "color": "#6BFFA8",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 2.18,
+                  "height": 7.5
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "id": "ox0s9",
+              "x": 68,
+              "y": 22,
+              "name": "组件标签",
+              "fill": "#FFFFFF",
+              "content": "墨色",
+              "fontFamily": "Noto Sans SC",
+              "fontSize": 14,
+              "fontWeight": "500"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "L1ZKP",
+          "x": 632,
+          "y": 130,
+          "name": "字形规格",
+          "fill": "$ink",
+          "content": "文字 14 pt / Semibold",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "u2VOfg",
+          "x": 632,
+          "y": 164,
+          "name": "圆角规格",
+          "fill": "$muted",
+          "content": "圆形 40 × 40 · 胶囊圆角 20",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 13,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "z1Ezx",
+          "x": 1010,
+          "y": 130,
+          "name": "复制恢复规格",
+          "fill": "$ink",
+          "content": "复制恢复卡片高度 132 pt",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "q43UAZ",
+          "x": 1010,
+          "y": 164,
+          "name": "尺寸单位",
+          "fill": "$muted",
+          "content": "下方 HUD 按 1:1 尺寸排列",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 13,
+          "fontWeight": "500"
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "oBGlD",
+      "x": 0,
+      "y": 284,
+      "name": "01 · 录音与结果 / 双样式全形态",
+      "width": 1440,
+      "height": 1220,
+      "fill": "#F3F2EF",
+      "layout": "none",
+      "children": [
+        {
+          "type": "text",
+          "id": "RfNxf",
+          "x": 40,
+          "y": 28,
+          "name": "画板标题",
+          "fill": "$ink",
+          "content": "01 / 录音与结果",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 28,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "UG9Lh",
+          "x": 40,
+          "y": 78,
+          "name": "画板说明",
+          "fill": "$muted",
+          "content": "从启动圆形到满宽胶囊，再到完成与错误反馈。每行对应同一状态，尺寸为 1:1。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 14,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "BEMAl",
+          "x": 264,
+          "y": 127,
+          "name": "苹果原生标题",
+          "fill": "$ink",
+          "content": "苹果原生",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 20,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "gAjou",
+          "x": 382,
+          "y": 133,
+          "name": "苹果原生材质",
+          "fill": "$muted",
+          "content": "半透明玻璃 · 静态示意",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "t7jIBq",
+          "x": 848,
+          "y": 127,
+          "name": "墨色标题",
+          "fill": "$ink",
+          "content": "墨色",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 20,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "Gpxia",
+          "x": 914,
+          "y": 133,
+          "name": "墨色材质",
+          "fill": "$muted",
+          "content": "完全不透明 · 无玻璃",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "frame",
+          "id": "G9G4u",
+          "x": 244,
+          "y": 180,
+          "name": "苹果原生 / 相同桌面底色",
+          "width": 556,
+          "height": 936,
+          "fill": "$stage",
+          "cornerRadius": 18,
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "Q17lS",
+              "x": 258,
+              "y": 32,
+              "name": "苹果原生 / 启动准备",
+              "width": 40,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "yuq9b",
+                  "x": 12,
+                  "y": 12,
+                  "name": "等待环轨道",
+                  "innerRadius": 0.76,
+                  "fill": "#DE615330",
+                  "width": 16,
+                  "height": 16
+                },
+                {
+                  "type": "ellipse",
+                  "id": "AL2cf",
+                  "x": 12,
+                  "y": 12,
+                  "name": "旋转进度弧",
+                  "innerRadius": 0.76,
+                  "startAngle": 10,
+                  "sweepAngle": 245,
+                  "fill": "#DE6153",
+                  "width": 16,
+                  "height": 16
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "VrDVg",
+              "x": 24,
+              "y": 104,
+              "name": "行分隔 1",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "av8mN",
+              "x": 258,
+              "y": 136,
+              "name": "苹果原生 / 等待说话",
+              "width": 40,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "id": "q8P0VE",
+                  "type": "ref",
+                  "ref": "oxx8w",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "I7aoy",
+              "x": 24,
+              "y": 208,
+              "name": "行分隔 2",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "OzNdV",
+              "x": 230.5,
+              "y": 240,
+              "name": "苹果原生 / 无实时转写",
+              "clip": true,
+              "width": 95,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "id": "wkTYZ",
+                  "type": "ref",
+                  "ref": "oxx8w",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "DqUBk",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 54,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "UvO7I",
+                      "x": 0,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "#FFFFFF",
+                      "content": "录音中",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "PQ6pT",
+              "x": 24,
+              "y": 312,
+              "name": "行分隔 3",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "ME6Jp",
+              "x": 237.5,
+              "y": 344,
+              "name": "苹果原生 / 刚刚出字",
+              "clip": true,
+              "width": 81,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "id": "psQXg",
+                  "type": "ref",
+                  "ref": "oxx8w",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "FRIww",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 40,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "wzfkW",
+                      "x": 0,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "#FFFFFF",
+                      "content": "今天",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "FY0rB",
+                      "x": 28,
+                      "y": 0,
+                      "name": "新文字尾部渐隐 / 12 pt / 尾字进入后的静帧",
+                      "opacity": 0,
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#959FAB00",
+                            "position": 0
+                          },
+                          {
+                            "color": "#959FAB",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 12,
+                      "height": 40
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "S7XyI",
+              "x": 24,
+              "y": 416,
+              "name": "行分隔 4",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "MBunL",
+              "x": 175,
+              "y": 448,
+              "name": "苹果原生 / 逐步展开",
+              "clip": true,
+              "width": 206,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "id": "w27SLK",
+                  "type": "ref",
+                  "ref": "oxx8w",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "nZY0I",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 165,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "UJJWR",
+                      "x": 0,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "#FFFFFF",
+                      "content": "今天下午三点讨论新版本",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "IAHx6",
+                      "x": 153,
+                      "y": 0,
+                      "name": "新文字尾部渐隐 / 12 pt / 尾字进入后的静帧",
+                      "opacity": 0,
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#959FAB00",
+                            "position": 0
+                          },
+                          {
+                            "color": "#959FAB",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 12,
+                      "height": 40
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "K43Py",
+              "x": 24,
+              "y": 520,
+              "name": "行分隔 5",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "KbzCC",
+              "x": 14,
+              "y": 552,
+              "name": "苹果原生 / 达到最大宽度",
+              "clip": true,
+              "width": 528,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "id": "x426J6",
+                  "type": "ref",
+                  "ref": "oxx8w",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "YEZhp",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 487,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "pPLYY",
+                      "x": -113,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "#FFFFFF",
+                      "content": "先把前面已经确认的内容整理清楚，再把今天讨论的几个重点写下来，接着确认下一步的安排。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "VzcTO",
+                      "x": 475,
+                      "y": 0,
+                      "name": "新文字尾部渐隐 / 12 pt / 尾字进入后的静帧",
+                      "opacity": 0,
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#959FAB00",
+                            "position": 0
+                          },
+                          {
+                            "color": "#959FAB",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 12,
+                      "height": 40
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "Iekky",
+                      "x": 0,
+                      "y": 0,
+                      "name": "旧文字左侧淡出 / 4 pt",
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#959FAB",
+                            "position": 0
+                          },
+                          {
+                            "color": "#959FAB00",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 4,
+                      "height": 40
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "DgtkG",
+              "x": 24,
+              "y": 624,
+              "name": "行分隔 6",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "KYIE4",
+              "x": 215,
+              "y": 656,
+              "name": "苹果原生 / 输出完成",
+              "width": 126,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "Tmgtg",
+                  "x": 21,
+                  "y": 10,
+                  "name": "完成对勾",
+                  "width": 20,
+                  "height": 20,
+                  "icon": "check",
+                  "library": "lucide",
+                  "fill": "#6BB36B"
+                },
+                {
+                  "type": "text",
+                  "id": "rTCdg",
+                  "x": 49,
+                  "y": 9,
+                  "name": "完成提示",
+                  "fill": "#FFFFFF",
+                  "content": "已完成",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "VnTZK",
+              "x": 24,
+              "y": 728,
+              "name": "行分隔 7",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "Nm0wl",
+              "x": 187,
+              "y": 760,
+              "name": "苹果原生 / 文本反馈",
+              "width": 182,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "FwXmy",
+                  "x": 42,
+                  "y": 9,
+                  "name": "剪贴板提示",
+                  "fill": "#FFFFFF",
+                  "content": "已复制到剪贴板",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "bNRvy",
+              "x": 24,
+              "y": 832,
+              "name": "行分隔 8",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "PJNLw",
+              "x": 180,
+              "y": 864,
+              "name": "苹果原生 / 发生错误",
+              "width": 196,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "Uv70Q",
+                  "x": 16,
+                  "y": 12.5,
+                  "name": "错误图标底",
+                  "fill": "#DE615330",
+                  "width": 15,
+                  "height": 15
+                },
+                {
+                  "type": "text",
+                  "id": "smhId",
+                  "x": 21,
+                  "y": 11,
+                  "name": "错误叹号",
+                  "fill": "#DE6153",
+                  "content": "!",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 11,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "PGCYZ",
+                  "x": 44,
+                  "y": 9,
+                  "name": "错误文案",
+                  "fill": "#FFFFFF",
+                  "content": "连接中断，请重试",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "vr97p",
+          "x": 828,
+          "y": 180,
+          "name": "墨色 / 相同桌面底色",
+          "width": 556,
+          "height": 936,
+          "fill": "$stage",
+          "cornerRadius": 18,
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "GAe2T",
+              "x": 258,
+              "y": 32,
+              "name": "墨色 / 启动准备",
+              "width": 40,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "ae3hd",
+                  "x": 12,
+                  "y": 12,
+                  "name": "等待环轨道",
+                  "innerRadius": 0.76,
+                  "fill": "#DE615330",
+                  "width": 16,
+                  "height": 16
+                },
+                {
+                  "type": "ellipse",
+                  "id": "E9MWv",
+                  "x": 12,
+                  "y": 12,
+                  "name": "旋转进度弧",
+                  "innerRadius": 0.76,
+                  "startAngle": 10,
+                  "sweepAngle": 245,
+                  "fill": "#DE6153",
+                  "width": 16,
+                  "height": 16
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "N2G7R",
+              "x": 24,
+              "y": 104,
+              "name": "行分隔 1",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "qMNBr",
+              "x": 258,
+              "y": 136,
+              "name": "墨色 / 等待说话",
+              "width": 40,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "id": "RtMY1",
+                  "type": "ref",
+                  "ref": "GkWmo",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "HJnDo",
+              "x": 24,
+              "y": 208,
+              "name": "行分隔 2",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "jYlBU",
+              "x": 230.5,
+              "y": 240,
+              "name": "墨色 / 无实时转写",
+              "clip": true,
+              "width": 95,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "id": "KAXL9",
+                  "type": "ref",
+                  "ref": "GkWmo",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "Aa7pB",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 54,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "kNXto",
+                      "x": 0,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "$hud-text",
+                      "content": "录音中",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "QJ5ft",
+              "x": 24,
+              "y": 312,
+              "name": "行分隔 3",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "DZKH7",
+              "x": 237.5,
+              "y": 344,
+              "name": "墨色 / 刚刚出字",
+              "clip": true,
+              "width": 81,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "id": "SmZis",
+                  "type": "ref",
+                  "ref": "GkWmo",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "GjAkm",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 40,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Jc4zi",
+                      "x": 0,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "$hud-text",
+                      "content": "今天",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "xIOlv",
+                      "x": 28,
+                      "y": 0,
+                      "name": "新文字尾部渐隐 / 12 pt / 尾字进入后的静帧",
+                      "opacity": 0,
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#1C1D2000",
+                            "position": 0
+                          },
+                          {
+                            "color": "#1C1D20",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 12,
+                      "height": 40
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "PZZvd",
+              "x": 24,
+              "y": 416,
+              "name": "行分隔 4",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "yJIDW",
+              "x": 175,
+              "y": 448,
+              "name": "墨色 / 逐步展开",
+              "clip": true,
+              "width": 206,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "id": "KYD4c",
+                  "type": "ref",
+                  "ref": "GkWmo",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "scvmJ",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 165,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Ry7vN",
+                      "x": 0,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "$hud-text",
+                      "content": "今天下午三点讨论新版本",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "odnJt",
+                      "x": 153,
+                      "y": 0,
+                      "name": "新文字尾部渐隐 / 12 pt / 尾字进入后的静帧",
+                      "opacity": 0,
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#1C1D2000",
+                            "position": 0
+                          },
+                          {
+                            "color": "#1C1D20",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 12,
+                      "height": 40
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "LttnH",
+              "x": 24,
+              "y": 520,
+              "name": "行分隔 5",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "nQcZI",
+              "x": 14,
+              "y": 552,
+              "name": "墨色 / 达到最大宽度",
+              "clip": true,
+              "width": 528,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "id": "p2676",
+                  "type": "ref",
+                  "ref": "GkWmo",
+                  "name": "蓝绿音频波形",
+                  "x": 0,
+                  "y": 0
+                },
+                {
+                  "type": "frame",
+                  "id": "UMYDP",
+                  "x": 37,
+                  "y": 0,
+                  "name": "文字视口 / 超长裁切",
+                  "clip": true,
+                  "width": 487,
+                  "height": 40,
+                  "layout": "none",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "s1zPWM",
+                      "x": -113,
+                      "y": 9,
+                      "name": "实时转写文字",
+                      "fill": "$hud-text",
+                      "content": "先把前面已经确认的内容整理清楚，再把今天讨论的几个重点写下来，接着确认下一步的安排。",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "sDIk9",
+                      "x": 475,
+                      "y": 0,
+                      "name": "新文字尾部渐隐 / 12 pt / 尾字进入后的静帧",
+                      "opacity": 0,
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#1C1D2000",
+                            "position": 0
+                          },
+                          {
+                            "color": "#1C1D20",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 12,
+                      "height": 40
+                    },
+                    {
+                      "type": "rectangle",
+                      "id": "G4p8o",
+                      "x": 0,
+                      "y": 0,
+                      "name": "旧文字左侧淡出 / 4 pt",
+                      "fill": {
+                        "type": "gradient",
+                        "gradientType": "linear",
+                        "enabled": true,
+                        "rotation": 90,
+                        "size": {
+                          "height": 1
+                        },
+                        "colors": [
+                          {
+                            "color": "#1C1D20",
+                            "position": 0
+                          },
+                          {
+                            "color": "#1C1D2000",
+                            "position": 1
+                          }
+                        ]
+                      },
+                      "width": 4,
+                      "height": 40
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "L42zle",
+              "x": 24,
+              "y": 624,
+              "name": "行分隔 6",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "v0EFjC",
+              "x": 215,
+              "y": 656,
+              "name": "墨色 / 输出完成",
+              "width": 126,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "icon",
+                  "id": "PANpZ",
+                  "x": 21,
+                  "y": 10,
+                  "name": "完成对勾",
+                  "width": 20,
+                  "height": 20,
+                  "icon": "check",
+                  "library": "lucide",
+                  "fill": "#6BB36B"
+                },
+                {
+                  "type": "text",
+                  "id": "GRKr3",
+                  "x": 49,
+                  "y": 9,
+                  "name": "完成提示",
+                  "fill": "$hud-text",
+                  "content": "已完成",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "dI0ko",
+              "x": 24,
+              "y": 728,
+              "name": "行分隔 7",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "I8tECE",
+              "x": 187,
+              "y": 760,
+              "name": "墨色 / 文本反馈",
+              "width": 182,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "sajTM",
+                  "x": 42,
+                  "y": 9,
+                  "name": "剪贴板提示",
+                  "fill": "$hud-text",
+                  "content": "已复制到剪贴板",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "DuvHu",
+              "x": 24,
+              "y": 832,
+              "name": "行分隔 8",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "E7YXgO",
+              "x": 180,
+              "y": 864,
+              "name": "墨色 / 发生错误",
+              "width": 196,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "ellipse",
+                  "id": "QYmwa",
+                  "x": 16,
+                  "y": 12.5,
+                  "name": "错误图标底",
+                  "fill": "#DE615330",
+                  "width": 15,
+                  "height": 15
+                },
+                {
+                  "type": "text",
+                  "id": "O0PO6F",
+                  "x": 21,
+                  "y": 11,
+                  "name": "错误叹号",
+                  "fill": "#DE6153",
+                  "content": "!",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 11,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "text",
+                  "id": "r4Fdb",
+                  "x": 44,
+                  "y": 9,
+                  "name": "错误文案",
+                  "fill": "$hud-text",
+                  "content": "连接中断，请重试",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "h00PJS",
+          "x": 40,
+          "y": 207,
+          "name": "状态 1",
+          "fill": "$ink",
+          "content": "01  启动准备",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "IhS4P",
+          "x": 40,
+          "y": 236,
+          "name": "状态说明 1",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "40 × 40 · 等待音频就绪",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "C6P33",
+          "x": 40,
+          "y": 311,
+          "name": "状态 2",
+          "fill": "$ink",
+          "content": "02  等待说话",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "J3aw8r",
+          "x": 40,
+          "y": 340,
+          "name": "状态说明 2",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "40 × 40 · 录音已开始",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "UFFc0",
+          "x": 40,
+          "y": 415,
+          "name": "状态 3",
+          "fill": "$ink",
+          "content": "03  无实时转写",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "kjMvj",
+          "x": 40,
+          "y": 444,
+          "name": "状态说明 3",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "95 × 40 · 固定录音提示",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "m1GN8y",
+          "x": 40,
+          "y": 519,
+          "name": "状态 4",
+          "fill": "$ink",
+          "content": "04  刚刚出字",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "A6Wjh",
+          "x": 40,
+          "y": 548,
+          "name": "状态说明 4",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "81 × 40 · 尾部渐隐",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "lpQZR",
+          "x": 40,
+          "y": 623,
+          "name": "状态 5",
+          "fill": "$ink",
+          "content": "05  逐步展开",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "aDuTi",
+          "x": 40,
+          "y": 652,
+          "name": "状态说明 5",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "206 × 40 · 宽度随文字增加",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "TOqki",
+          "x": 40,
+          "y": 727,
+          "name": "状态 6",
+          "fill": "$ink",
+          "content": "06  达到最大宽度",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "RZ8zN",
+          "x": 40,
+          "y": 756,
+          "name": "状态说明 6",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "528 × 40 · 长句向左滚动",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "QHr3g",
+          "x": 40,
+          "y": 831,
+          "name": "状态 7",
+          "fill": "$ink",
+          "content": "07  输出完成",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "ZdZOf",
+          "x": 40,
+          "y": 860,
+          "name": "状态说明 7",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "126 × 40 · 成功反馈",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "trrN9",
+          "x": 40,
+          "y": 935,
+          "name": "状态 8",
+          "fill": "$ink",
+          "content": "08  文本反馈",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "AuesV",
+          "x": 40,
+          "y": 964,
+          "name": "状态说明 8",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "182 × 40 · 剪贴板提示",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "T4nb3",
+          "x": 40,
+          "y": 1039,
+          "name": "状态 9",
+          "fill": "$ink",
+          "content": "09  发生错误",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "VmVCE",
+          "x": 40,
+          "y": 1068,
+          "name": "状态说明 9",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "196 × 40 · 简短错误提示",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "P8MjT7",
+          "x": 40,
+          "y": 1151,
+          "name": "隐藏状态说明",
+          "fill": "$muted",
+          "content": "隐藏状态：录音未启动，或反馈结束后，桌面上不显示 HUD。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 13,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "bV2Ea",
+          "x": 40,
+          "y": 1180,
+          "name": "玻璃呈现说明",
+          "fill": "$muted",
+          "content": "苹果原生的玻璃会随实际桌面背景变化；此处保留可编辑的静态材质示意。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "RvhHK",
+      "x": 1520,
+      "y": 284,
+      "name": "02 · 处理与恢复 / 双样式全形态",
+      "width": 1440,
+      "height": 1340,
+      "fill": "#F3F2EF",
+      "layout": "none",
+      "children": [
+        {
+          "type": "text",
+          "id": "PGEEy",
+          "x": 40,
+          "y": 28,
+          "name": "画板标题",
+          "fill": "$ink",
+          "content": "02 / 处理与恢复",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 28,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "P63PV",
+          "x": 40,
+          "y": 78,
+          "name": "画板说明",
+          "fill": "$muted",
+          "content": "润色文案可自定义。这里使用默认文案，展开所有跳过、重试和手动复制形态。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 14,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "TK6K0",
+          "x": 264,
+          "y": 127,
+          "name": "苹果原生标题",
+          "fill": "$ink",
+          "content": "苹果原生",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 20,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "ObjII",
+          "x": 382,
+          "y": 133,
+          "name": "苹果原生材质",
+          "fill": "$muted",
+          "content": "半透明玻璃 · 静态示意",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "H3eub",
+          "x": 848,
+          "y": 127,
+          "name": "墨色标题",
+          "fill": "$ink",
+          "content": "墨色",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 20,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "GQZGm",
+          "x": 914,
+          "y": 133,
+          "name": "墨色材质",
+          "fill": "$muted",
+          "content": "完全不透明 · 无玻璃",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "frame",
+          "id": "crs8x",
+          "x": 244,
+          "y": 180,
+          "name": "苹果原生 / 相同桌面底色",
+          "width": 556,
+          "height": 1080,
+          "fill": "$stage",
+          "cornerRadius": 18,
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "JbXNr",
+              "x": 187,
+              "y": 32,
+              "name": "苹果原生 / 正在润色",
+              "width": 182,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "CPf4R",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 142,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "zMKsX",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 182,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "B2QMH",
+                      "name": "润色阶段文案",
+                      "fill": "#FFFFFF",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "r3wkZ",
+              "x": 24,
+              "y": 104,
+              "name": "行分隔 1",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "X7epyV",
+              "x": 194,
+              "y": 136,
+              "name": "苹果原生 / 其他模式处理",
+              "width": 168,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "Vmgb8",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 131,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "B9XjV",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 168,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "E7g6K",
+                      "name": "处理阶段文案",
+                      "fill": "#FFFFFF",
+                      "content": "处理中",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "text",
+                      "id": "j80Ej",
+                      "name": "实时等待秒数",
+                      "fill": "#FFFFFFB8",
+                      "content": "· 0.5s",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "BBj4Y",
+              "x": 24,
+              "y": 208,
+              "name": "行分隔 2",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "q4QJkZ",
+              "x": 101,
+              "y": 240,
+              "name": "苹果原生 / 可使用纠正文本",
+              "width": 354,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "N7M5N",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 276,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "CQUWm",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 354,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "jMiCz",
+                      "name": "润色阶段文案",
+                      "fill": "#FFFFFF",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "K8nu4",
+                      "name": "使用纠正文本按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "KhkLM",
+                          "name": "使用纠正文本按钮文字",
+                          "fill": "#FFFFFF",
+                          "content": "Esc 用纠正文本",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "UALCm",
+              "x": 24,
+              "y": 312,
+              "name": "行分隔 3",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "bQG2x",
+              "x": 101,
+              "y": 344,
+              "name": "苹果原生 / 正在切换",
+              "width": 354,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "F5vCO",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 276,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "j2sCb",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 354,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "wb0yD",
+                      "name": "润色阶段文案",
+                      "fill": "#FFFFFF",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "text",
+                      "id": "M2y2Fi",
+                      "name": "切换中的提示",
+                      "fill": "#FFFFFFD1",
+                      "content": "正在切换…",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "drIzg",
+              "x": 24,
+              "y": 416,
+              "name": "行分隔 4",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "my0nE",
+              "x": 101,
+              "y": 448,
+              "name": "苹果原生 / 切换失败",
+              "width": 354,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "gE6CD",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 276,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "d7DCzE",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 354,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "Vl6Hh",
+                      "name": "润色阶段文案",
+                      "fill": "#FFFFFF",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "BLqJ8",
+                      "name": "切换失败重试按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "xxHVd",
+                          "name": "切换失败重试按钮文字",
+                          "fill": "#FFFFFF",
+                          "content": "切换失败 · 重试",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "RMyi5",
+              "x": 24,
+              "y": 520,
+              "name": "行分隔 5",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "np3TZ",
+              "x": 62,
+              "y": 552,
+              "name": "苹果原生 / 润色未完成",
+              "width": 432,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "zLEc6",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 337,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "xZkZ9",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 432,
+                  "height": 40,
+                  "gap": 7,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "lhfkR",
+                      "name": "保留转写提示",
+                      "fill": "#FFFFFF",
+                      "content": "这次没有完成润色，原转写已保留",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "YsQ2Y",
+                      "name": "重试润色按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "uXtXQ",
+                          "name": "重试润色按钮文字",
+                          "fill": "#FFFFFF",
+                          "content": "重试润色",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "PTntI",
+                      "name": "使用原转写按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "L9zT8",
+                          "name": "使用原转写按钮文字",
+                          "fill": "#FFFFFF",
+                          "content": "使用原转写",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "h1r1V",
+              "x": 24,
+              "y": 624,
+              "name": "行分隔 6",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "r2q9iD",
+              "x": 62,
+              "y": 656,
+              "name": "苹果原生 / 重试润色中",
+              "width": 432,
+              "height": 40,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "rectangle",
+                  "cornerRadius": 4,
+                  "id": "s3qAac",
+                  "x": 12,
+                  "y": 17,
+                  "name": "处理进度柔光 / 动画静帧",
+                  "fill": {
+                    "type": "gradient",
+                    "gradientType": "linear",
+                    "enabled": true,
+                    "rotation": 90,
+                    "size": {
+                      "height": 1
+                    },
+                    "colors": [
+                      {
+                        "color": "#CBD5FF16",
+                        "position": 0
+                      },
+                      {
+                        "color": "#6699FF16",
+                        "position": 0.8
+                      },
+                      {
+                        "color": "#6699FF00",
+                        "position": 1
+                      }
+                    ]
+                  },
+                  "width": 337,
+                  "height": 7,
+                  "effect": {
+                    "type": "blur",
+                    "radius": 5
+                  }
+                },
+                {
+                  "type": "frame",
+                  "id": "kL6ne",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 432,
+                  "height": 40,
+                  "gap": 7,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "LGOB2",
+                      "name": "保留转写提示",
+                      "fill": "#FFFFFF",
+                      "content": "这次没有完成润色，原转写已保留",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "ICaF8",
+                      "name": "重试润色按钮",
+                      "opacity": 0.48,
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "hs14A",
+                          "name": "重试润色按钮文字",
+                          "fill": "#FFFFFF",
+                          "content": "正在重试…",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "KEh7K",
+                      "name": "使用原转写按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "S29szD",
+                          "name": "使用原转写按钮文字",
+                          "fill": "#FFFFFF",
+                          "content": "使用原转写",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "eDXKg",
+              "x": 24,
+              "y": 728,
+              "name": "行分隔 7",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "ohBWY",
+              "x": 62,
+              "y": 750,
+              "name": "苹果原生 / 手动复制恢复",
+              "width": 432,
+              "height": 132,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "NTPuW",
+                  "x": 36,
+                  "y": 14,
+                  "name": "恢复文本 / 四行以内",
+                  "fill": "#FFFFFF",
+                  "textGrowth": "fixed-width",
+                  "width": 360,
+                  "content": "今天下午三点讨论新版本。\n先把已经确认的内容整理清楚，\n再确认下一步的安排。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "frame",
+                  "id": "eXmd3",
+                  "x": 186,
+                  "y": 90,
+                  "name": "复制按钮",
+                  "width": 60,
+                  "height": 28,
+                  "fill": "#66696EE0",
+                  "cornerRadius": 10,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "l27aZy",
+                      "name": "复制按钮文字",
+                      "fill": "#FFFFFF",
+                      "content": "复制",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "oLzXO",
+              "x": 24,
+              "y": 904,
+              "name": "行分隔 8",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "nrcMo",
+              "x": 62,
+              "y": 926,
+              "name": "苹果原生 / 复制完成",
+              "width": 432,
+              "height": 132,
+              "fill": {
+                "type": "gradient",
+                "gradientType": "linear",
+                "enabled": true,
+                "rotation": 180,
+                "size": {
+                  "height": 1
+                },
+                "colors": [
+                  {
+                    "color": "#A6AEBBAB",
+                    "position": 0
+                  },
+                  {
+                    "color": "#8994A2C7",
+                    "position": 1
+                  }
+                ]
+              },
+              "cornerRadius": 20,
+              "stroke": "#DCE5F66B",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "effect": {
+                "type": "background_blur",
+                "radius": 18
+              },
+              "layout": "none",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "P3U28i",
+                  "x": 36,
+                  "y": 14,
+                  "name": "恢复文本 / 四行以内",
+                  "fill": "#FFFFFF",
+                  "textGrowth": "fixed-width",
+                  "width": 360,
+                  "content": "今天下午三点讨论新版本。\n先把已经确认的内容整理清楚，\n再确认下一步的安排。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "frame",
+                  "id": "uhYxI",
+                  "x": 186,
+                  "y": 90,
+                  "name": "已复制按钮",
+                  "width": 60,
+                  "height": 28,
+                  "fill": "#75787DE0",
+                  "cornerRadius": 10,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "jcPlz",
+                      "name": "复制按钮文字",
+                      "fill": "#FFFFFF",
+                      "content": "已复制",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "IQVSm",
+          "x": 828,
+          "y": 180,
+          "name": "墨色 / 相同桌面底色",
+          "width": 556,
+          "height": 1080,
+          "fill": "$stage",
+          "cornerRadius": 18,
+          "layout": "none",
+          "children": [
+            {
+              "type": "frame",
+              "id": "PRN8v",
+              "x": 187,
+              "y": 32,
+              "name": "墨色 / 正在润色",
+              "width": 182,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "Uq4NR",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 182,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "R90VqV",
+                      "name": "润色阶段文案",
+                      "fill": "$hud-text",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "m9Qwzp",
+              "x": 24,
+              "y": 104,
+              "name": "行分隔 1",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "lTWEb",
+              "x": 194,
+              "y": 136,
+              "name": "墨色 / 其他模式处理",
+              "width": 168,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "QFwp3",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 168,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "t6xN1",
+                      "name": "处理阶段文案",
+                      "fill": "$hud-text",
+                      "content": "处理中",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "text",
+                      "id": "EBFsO",
+                      "name": "实时等待秒数",
+                      "fill": "#F5F2EBB8",
+                      "content": "· 0.5s",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "saKFq",
+              "x": 24,
+              "y": 208,
+              "name": "行分隔 2",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "H61Cn",
+              "x": 101,
+              "y": 240,
+              "name": "墨色 / 可使用纠正文本",
+              "width": 354,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "fAoEX",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 354,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "XwYxn",
+                      "name": "润色阶段文案",
+                      "fill": "$hud-text",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "p62MC9",
+                      "name": "使用纠正文本按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "nFS1L",
+                          "name": "使用纠正文本按钮文字",
+                          "fill": "$hud-text",
+                          "content": "Esc 用纠正文本",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "q1avyR",
+              "x": 24,
+              "y": 312,
+              "name": "行分隔 3",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "UlzCh",
+              "x": 101,
+              "y": 344,
+              "name": "墨色 / 正在切换",
+              "width": 354,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "dQbef",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 354,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "NoR4l",
+                      "name": "润色阶段文案",
+                      "fill": "$hud-text",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "text",
+                      "id": "eRXoE",
+                      "name": "切换中的提示",
+                      "fill": "#F5F2EBD1",
+                      "content": "正在切换…",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "g1q7X",
+              "x": 24,
+              "y": 416,
+              "name": "行分隔 4",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "eIPnE",
+              "x": 101,
+              "y": 448,
+              "name": "墨色 / 切换失败",
+              "width": 354,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "WA3L5",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 354,
+                  "height": 40,
+                  "gap": 5,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "P0TCc",
+                      "name": "润色阶段文案",
+                      "fill": "$hud-text",
+                      "content": "正在润色",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 14,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "FkI62",
+                      "name": "切换失败重试按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "otL5B",
+                          "name": "切换失败重试按钮文字",
+                          "fill": "$hud-text",
+                          "content": "切换失败 · 重试",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "DBoeD",
+              "x": 24,
+              "y": 520,
+              "name": "行分隔 5",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "mxixN",
+              "x": 62,
+              "y": 552,
+              "name": "墨色 / 润色未完成",
+              "width": 432,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "OSnvb",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 432,
+                  "height": 40,
+                  "gap": 7,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "DRgre",
+                      "name": "保留转写提示",
+                      "fill": "$hud-text",
+                      "content": "这次没有完成润色，原转写已保留",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "bht1o",
+                      "name": "重试润色按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "I42fj",
+                          "name": "重试润色按钮文字",
+                          "fill": "$hud-text",
+                          "content": "重试润色",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "m9cRYL",
+                      "name": "使用原转写按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "J1m9o",
+                          "name": "使用原转写按钮文字",
+                          "fill": "$hud-text",
+                          "content": "使用原转写",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "Z8I73l",
+              "x": 24,
+              "y": 624,
+              "name": "行分隔 6",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "m7Cl5",
+              "x": 62,
+              "y": 656,
+              "name": "墨色 / 重试润色中",
+              "width": 432,
+              "height": 40,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "BAqya",
+                  "x": 0,
+                  "y": 0,
+                  "name": "居中内容",
+                  "width": 432,
+                  "height": 40,
+                  "gap": 7,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "x2P59M",
+                      "name": "保留转写提示",
+                      "fill": "$hud-text",
+                      "content": "这次没有完成润色，原转写已保留",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 11,
+                      "fontWeight": "600"
+                    },
+                    {
+                      "type": "frame",
+                      "id": "whfbt",
+                      "name": "重试润色按钮",
+                      "opacity": 0.48,
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "jYpU2",
+                          "name": "重试润色按钮文字",
+                          "fill": "$hud-text",
+                          "content": "正在重试…",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "zikNW",
+                      "name": "使用原转写按钮",
+                      "height": 24,
+                      "fill": "#FFFFFF24",
+                      "cornerRadius": 12,
+                      "padding": [
+                        0,
+                        8
+                      ],
+                      "justifyContent": "center",
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "text",
+                          "id": "aMbAh",
+                          "name": "使用原转写按钮文字",
+                          "fill": "$hud-text",
+                          "content": "使用原转写",
+                          "fontFamily": "Noto Sans SC",
+                          "fontSize": 11,
+                          "fontWeight": "600"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "Bdgh1",
+              "x": 24,
+              "y": 728,
+              "name": "行分隔 7",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "rbQ4H",
+              "x": 62,
+              "y": 750,
+              "name": "墨色 / 手动复制恢复",
+              "width": 432,
+              "height": 132,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "R2qJR",
+                  "x": 36,
+                  "y": 14,
+                  "name": "恢复文本 / 四行以内",
+                  "fill": "$hud-text",
+                  "textGrowth": "fixed-width",
+                  "width": 360,
+                  "content": "今天下午三点讨论新版本。\n先把已经确认的内容整理清楚，\n再确认下一步的安排。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "frame",
+                  "id": "Zcryy",
+                  "x": 186,
+                  "y": 90,
+                  "name": "复制按钮",
+                  "width": 60,
+                  "height": 28,
+                  "fill": "#66696EE0",
+                  "cornerRadius": 10,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "tiqjg",
+                      "name": "复制按钮文字",
+                      "fill": "$hud-text",
+                      "content": "复制",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "rectangle",
+              "id": "KtnbI",
+              "x": 24,
+              "y": 904,
+              "name": "行分隔 8",
+              "fill": "#FFFFFF0B",
+              "width": 508,
+              "height": 1
+            },
+            {
+              "type": "frame",
+              "id": "RuwJj",
+              "x": 62,
+              "y": 926,
+              "name": "墨色 / 复制完成",
+              "width": 432,
+              "height": 132,
+              "fill": "$hud-ink",
+              "cornerRadius": 20,
+              "stroke": "$hud-line",
+              "strokeWidth": 1,
+              "strokeAlignment": "inner",
+              "layout": "none",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "W4hIFc",
+                  "x": 36,
+                  "y": 14,
+                  "name": "恢复文本 / 四行以内",
+                  "fill": "$hud-text",
+                  "textGrowth": "fixed-width",
+                  "width": 360,
+                  "content": "今天下午三点讨论新版本。\n先把已经确认的内容整理清楚，\n再确认下一步的安排。",
+                  "fontFamily": "Noto Sans SC",
+                  "fontSize": 14,
+                  "fontWeight": "600"
+                },
+                {
+                  "type": "frame",
+                  "id": "Dkt9p",
+                  "x": 186,
+                  "y": 90,
+                  "name": "已复制按钮",
+                  "width": 60,
+                  "height": 28,
+                  "fill": "#75787DE0",
+                  "cornerRadius": 10,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "text",
+                      "id": "L0YV3z",
+                      "name": "复制按钮文字",
+                      "fill": "$hud-text",
+                      "content": "已复制",
+                      "fontFamily": "Noto Sans SC",
+                      "fontSize": 12,
+                      "fontWeight": "600"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "NpspL",
+          "x": 40,
+          "y": 207,
+          "name": "状态 10",
+          "fill": "$ink",
+          "content": "10  正在润色",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "c15XV",
+          "x": 40,
+          "y": 236,
+          "name": "状态说明 10",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "182 × 40 · 可自定义阶段文案",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "B6NNZ",
+          "x": 40,
+          "y": 311,
+          "name": "状态 11",
+          "fill": "$ink",
+          "content": "11  其他模式处理",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "CmNcS",
+          "x": 40,
+          "y": 340,
+          "name": "状态说明 11",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "168 × 40 · 显示等待秒数",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "t3PjCT",
+          "x": 40,
+          "y": 415,
+          "name": "状态 12",
+          "fill": "$ink",
+          "content": "12  可使用纠正文本",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "r7V0Vi",
+          "x": 40,
+          "y": 444,
+          "name": "状态说明 12",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "354 × 40 · Esc 或点击",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "BojmP",
+          "x": 40,
+          "y": 519,
+          "name": "状态 13",
+          "fill": "$ink",
+          "content": "13  正在切换",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "UyDwN",
+          "x": 40,
+          "y": 548,
+          "name": "状态说明 13",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "354 × 40 · 请求中的提示",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "nRF0a",
+          "x": 40,
+          "y": 623,
+          "name": "状态 14",
+          "fill": "$ink",
+          "content": "14  切换失败",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "IFzzB",
+          "x": 40,
+          "y": 652,
+          "name": "状态说明 14",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "354 × 40 · 点击重试",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "n18P7",
+          "x": 40,
+          "y": 727,
+          "name": "状态 15",
+          "fill": "$ink",
+          "content": "15  润色未完成",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "GCGEu",
+          "x": 40,
+          "y": 756,
+          "name": "状态说明 15",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "432 × 40 · 保留原转写",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "gMxB5",
+          "x": 40,
+          "y": 831,
+          "name": "状态 16",
+          "fill": "$ink",
+          "content": "16  重试润色中",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "hnyLH",
+          "x": 40,
+          "y": 860,
+          "name": "状态说明 16",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "432 × 40 · 重试按钮禁用",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "EEWVe",
+          "x": 40,
+          "y": 935,
+          "name": "状态 17",
+          "fill": "$ink",
+          "content": "17  手动复制恢复",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "qWYRv",
+          "x": 40,
+          "y": 964,
+          "name": "状态说明 17",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "432 × 132 · 最多显示四行",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "OueiN",
+          "x": 40,
+          "y": 1111,
+          "name": "状态 18",
+          "fill": "$ink",
+          "content": "18  复制完成",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 15,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "HRDr8",
+          "x": 40,
+          "y": 1140,
+          "name": "状态说明 18",
+          "fill": "$muted",
+          "textGrowth": "fixed-width",
+          "width": 190,
+          "content": "432 × 132 · 已复制反馈",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "uxVkE",
+          "x": 40,
+          "y": 1288,
+          "name": "文案说明",
+          "fill": "$muted",
+          "content": "阶段文案、提示文本、按钮、背景和波形均为可编辑图层。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 13,
+          "fontWeight": "500"
+        },
+        {
+          "type": "text",
+          "id": "yTOfb",
+          "x": 40,
+          "y": 1315,
+          "name": "静态说明",
+          "fill": "$muted",
+          "content": "画布展示各状态的静帧，展开、波形及渐隐的时间变化以应用中的动效为准。",
+          "fontFamily": "Noto Sans SC",
+          "fontSize": 12,
+          "fontWeight": "500"
+        }
+      ]
+    }
+  ],
+  "variables": {
+    "hud-ink": {
+      "type": "color",
+      "value": "#1C1D20"
+    },
+    "hud-line": {
+      "type": "color",
+      "value": "#47494D"
+    },
+    "hud-text": {
+      "type": "color",
+      "value": "#F5F2EB"
+    },
+    "stage": {
+      "type": "color",
+      "value": "#3E4B58"
+    },
+    "ink": {
+      "type": "color",
+      "value": "#252827"
+    },
+    "muted": {
+      "type": "color",
+      "value": "#6B726E"
+    }
+  },
+  "fileToken": "dafadb74-c7a8-47b6-bf1d-fa66047850af"
+}

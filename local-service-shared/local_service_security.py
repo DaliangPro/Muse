@@ -194,6 +194,9 @@ def decode_and_validate_llm_body(
         ):
             raise RequestValidationError(400, "max_tokens 必须在 1 到 8192 之间")
 
+    if "think" in payload and not isinstance(payload["think"], bool):
+        raise RequestValidationError(400, "think 必须是布尔值")
+
     return payload
 
 

@@ -13,7 +13,13 @@ struct ModeStorage {
     }
 
     func save(_ modes: [ProcessingMode]) throws {
-        try JSONFileStore.writeOrThrow(modes, to: fileURL)
+        // 退出活动列表的旧配置仍留在原文件，避免保存其他设置时丢失用户附加要求。
+        var preserved = modes
+        if case .value(let saved) = JSONFileStore.read([ProcessingMode].self, from: fileURL),
+           !preserved.contains(where: { $0.id == ProcessingMode.lightPolishId }) {
+            preserved += saved.filter { $0.id == ProcessingMode.lightPolishId }
+        }
+        try JSONFileStore.writeOrThrow(preserved, to: fileURL)
     }
 
     /// 核心读取：保留 missing / value / corrupt 三态，供设置页决定是否进入恢复流程。
@@ -36,6 +42,7 @@ struct ModeStorage {
 
         // Migrate legacy built-in flags for default modes, and drop unknown built-ins.
         var result = saved.compactMap { mode -> ProcessingMode? in
+            if mode.id == ProcessingMode.lightPolishId { return nil }
             if mode.id == ProcessingMode.directId {
                 var direct = ProcessingMode.direct
                 direct.name = mode.name
@@ -52,11 +59,21 @@ struct ModeStorage {
                 return migrateDefaultMode(mode, fallback: .translate)
             }
             if mode.id == ProcessingMode.formalWriting.id {
-                return migrateSeededDefaultPrompt(
+                var migrated = migrateSeededDefaultPrompt(
                     mode,
-                    legacyPrompts: [ProcessingMode.legacyFormalWritingPromptTemplate],
+                    legacyPrompts: [
+                        ProcessingMode.legacyFormalWritingPromptTemplate,
+                        ProcessingMode.legacyVoiceDraftEnginePromptTemplate,
+                        ProcessingMode.formalWritingPromptTemplateZH,
+                        ProcessingMode.formalWritingPromptTemplateEN,
+                    ],
                     fallbackPrompt: ProcessingMode.formalWriting.prompt
                 )
+                // Voice Polish 是拥有独立设置、术语和学习数据的稳定系统模式。
+                // 旧版本曾把它标成可删除；升级后只修正保护标记，不改用户 Prompt、
+                // 快捷键、名称或处理文案。
+                migrated.isBuiltin = true
+                return migrated
             }
             if mode.id == ProcessingMode.translate.id {
                 return migrateSeededDefaultPrompt(
@@ -77,7 +94,16 @@ struct ModeStorage {
 
         // Ensure required built-in modes always exist.
         let resultIds = Set(result.map(\.id))
-        for builtin in ProcessingMode.builtins where !resultIds.contains(builtin.id) {
+        for template in ProcessingMode.builtins where !resultIds.contains(template.id) {
+            var builtin = template
+            if let code = builtin.hotkeyCode,
+               result.contains(where: {
+                   $0.hotkeyCode == code && ($0.hotkeyModifiers ?? 0) == (builtin.hotkeyModifiers ?? 0)
+               }) {
+                // 补全系统入口时不抢占用户已有快捷键。
+                builtin.hotkeyCode = nil
+                builtin.hotkeyModifiers = nil
+            }
             if let idx = ProcessingMode.builtins.firstIndex(where: { $0.id == builtin.id }) {
                 let insertAt = min(idx, result.count)
                 result.insert(builtin, at: insertAt)
@@ -112,7 +138,10 @@ struct ModeStorage {
         legacyPrompts: Set<String>,
         fallbackPrompt: String
     ) -> ProcessingMode {
-        guard legacyPrompts.contains(mode.prompt) else { return mode }
+        let normalizedPrompt = Self.normalizedPromptFingerprint(mode.prompt)
+        guard legacyPrompts.contains(where: {
+            Self.normalizedPromptFingerprint($0) == normalizedPrompt
+        }) else { return mode }
 
         var migrated = mode
         migrated.prompt = fallbackPrompt
@@ -126,17 +155,19 @@ struct ModeStorage {
     /// 重置为当前语言默认名；用户改过的名称（不在集合内）一律保留。
     /// 「Promp优化」是历史 typo 世代的默认名，必须入册否则存量数据不迁移。
     private static let knownDefaultNames: [UUID: Set<String>] = [
-        ProcessingMode.direct.id: ["直出模式", "Direct Output"],
+        ProcessingMode.direct.id: ["直出", "Direct", "直出模式", "Direct Output", "正常输出", "Normal Output"],
         ProcessingMode.smartDirect.id: ["智能模式", "Smart Mode"],
-        ProcessingMode.formalWriting.id: ["语音润色", "Voice Polish"],
-        ProcessingMode.promptOptimize.id: ["Prompt优化", "Promp优化", "Prompt Optimizer"],
+        ProcessingMode.formalWriting.id: ["润色", "Polish", "语音润色", "Voice Polish", "标准润色", "Standard Polish", "结构化输出", "Structured Output"],
+        ProcessingMode.lightPolishId: ["轻度润色", "Light Polish"],
+        ProcessingMode.promptOptimize.id: ["Prompt优化", "Promp优化", "提示词优化", "Prompt Optimizer"],
         ProcessingMode.translate.id: ["英文翻译", "Translation"],
         ProcessingMode.commandMode.id: ["命令模式", "Command Mode"],
     ]
 
     /// 各默认模式的「已知默认处理标签」集合：同名称逻辑，自定义标签保留
     private static let knownDefaultLabels: [UUID: Set<String>] = [
-        ProcessingMode.formalWriting.id: ["润色中", "Polishing"],
+        ProcessingMode.formalWriting.id: ["正在润色", "润色中", "Polishing", "标准润色中", "Standard polishing", "整理中", "Structuring"],
+        ProcessingMode.lightPolishId: ["轻度润色中", "Light polishing"],
         ProcessingMode.promptOptimize.id: ["优化中", "Optimizing"],
         ProcessingMode.translate.id: ["翻译中", "Translating"],
         ProcessingMode.commandMode.id: ["执行中", "Executing"],
@@ -186,9 +217,33 @@ struct ModeStorage {
         if let labels = Self.knownDefaultLabels[mode.id], labels.contains(mode.processingLabel) {
             migrated.processingLabel = current.processingLabel
         }
-        if let prompts = Self.knownDefaultPrompts[mode.id], prompts.contains(mode.prompt) {
+        if mode.kind == .voicePolish, Self.isOfficialVoicePolishPrompt(mode.prompt) {
+            // V2 中官方规则迁入 VoicePolishPrompts，存储字段仅表示附加要求。
+            migrated.prompt = ""
+        } else if let prompts = Self.knownDefaultPrompts[mode.id], prompts.contains(mode.prompt) {
             migrated.prompt = current.prompt
         }
         return migrated
+    }
+
+    private static func isOfficialVoicePolishPrompt(_ prompt: String) -> Bool {
+        let normalized = normalizedPromptFingerprint(prompt)
+        let official = [
+            ProcessingMode.legacyFormalWritingPromptTemplate,
+            ProcessingMode.legacyVoiceDraftEnginePromptTemplate,
+            ProcessingMode.formalWritingPromptTemplateZH,
+            ProcessingMode.formalWritingPromptTemplateEN,
+        ]
+        return official.contains {
+            normalizedPromptFingerprint($0) == normalized
+        }
+    }
+
+    /// 官方指纹只允许换行统一与 Unicode NFC；不 trim、不折叠空格、不忽略大小写。
+    private static func normalizedPromptFingerprint(_ prompt: String) -> String {
+        prompt
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .precomposedStringWithCanonicalMapping
     }
 }

@@ -597,41 +597,44 @@ final class NativeLiquidGlassContainerView: NSView {
     }
 }
 
-/// 真·单层原生玻璃：就一个 NSGlassEffectView，content 直接进 contentView，
-/// 零容器、零 lens、零手画叠加——对照系统「专注模式」那种干净用法（2026-06-24 大梁老师）。
+/// 玻璃只承载材质，动态内容留在外层 SwiftUI 树中，避免每次文字更新重置内嵌宿主。
 @available(macOS 26.0, *)
-struct CleanGlassCapsule: NSViewRepresentable {
-
+struct CleanGlassCapsule: View {
     let cornerRadius: CGFloat
     let style: NSGlassEffectView.Style
     let tintColor: NSColor?
     let content: AnyView
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    var body: some View {
+        CleanGlassSurface(cornerRadius: cornerRadius, style: style, tintColor: tintColor)
+            .overlay { content }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+}
+
+@available(macOS 26.0, *)
+private struct CleanGlassSurface: NSViewRepresentable {
+    let cornerRadius: CGFloat
+    let style: NSGlassEffectView.Style
+    let tintColor: NSColor?
 
     func makeNSView(context: Context) -> NSGlassEffectView {
         let glass = NSGlassEffectView()
         glass.style = style
         glass.cornerRadius = cornerRadius
         glass.tintColor = tintColor
-
-        let host = NSHostingView(rootView: content)
-        host.wantsLayer = true
-        host.layer?.backgroundColor = NSColor.clear.cgColor
-        host.autoresizingMask = [.width, .height]
-        glass.contentView = host
-        context.coordinator.host = host
+        glass.contentView = NSView()
         return glass
     }
 
-    func updateNSView(_ glass: NSGlassEffectView, context: Context) {
-        glass.style = style
-        glass.cornerRadius = cornerRadius
-        glass.tintColor = tintColor
-        context.coordinator.host?.rootView = content
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSGlassEffectView, context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else { return nil }
+        return CGSize(width: width, height: height)
     }
 
-    final class Coordinator {
-        var host: NSHostingView<AnyView>?
+    func updateNSView(_ glass: NSGlassEffectView, context: Context) {
+        if glass.style != style { glass.style = style }
+        if glass.cornerRadius != cornerRadius { glass.cornerRadius = cornerRadius }
+        if glass.tintColor != tintColor { glass.tintColor = tintColor }
     }
 }

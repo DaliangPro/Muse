@@ -350,8 +350,11 @@ struct LLMStreamingParser: Sendable {
     private var events: SSEEventAccumulator
     private var result = ""
     private var resultBytes = 0
+    var hasContent: Bool { !result.isEmpty }
     private let maxResponseBytes: Int
     private(set) var isComplete = false
+    private(set) var reasoningObserved = false
+    private(set) var hitOutputTokenLimit = false
 
     init(
         maxResponseBytes: Int = defaultMaximumResponseBytes,
@@ -368,13 +371,19 @@ struct LLMStreamingParser: Sendable {
         }
     }
 
-    mutating func finish() throws -> String {
+    /// 思考探针只提取证据，不交付题目答案；正常结束但答案耗尽预算不等于连接中断。
+    /// 没有推理证据仍交给上层差分验证；正文生成及缺失结束标志的流继续严格校验。
+    mutating func finish(allowIncompleteProbeAnswer: Bool = false) throws -> String {
         if !isComplete {
             for payload in events.finish() {
                 try consume(payload: payload)
             }
         }
         guard isComplete else {
+            throw LLMError.truncatedResponse(result.count)
+        }
+        if allowIncompleteProbeAnswer, reasoningObserved || !result.isEmpty { return result }
+        guard !hitOutputTokenLimit else {
             throw LLMError.truncatedResponse(result.count)
         }
         guard !result.isEmpty else {
@@ -411,8 +420,17 @@ struct LLMStreamingParser: Sendable {
               let chunk = try? JSONDecoder().decode(ChatStreamChunk.self, from: data)
         else { return }
 
+        if (chunk.usage?.completion_tokens_details?.reasoning_tokens ?? 0) > 0 {
+            reasoningObserved = true
+        }
         for choice in chunk.choices {
+            if choice.delta?.reasoningObserved == true {
+                reasoningObserved = true
+            }
             if let content = choice.delta?.content, !content.isEmpty {
+                if content.contains("<think>") {
+                    reasoningObserved = true
+                }
                 let additionalBytes = content.utf8.count
                 guard additionalBytes <= maxResponseBytes - resultBytes else {
                     throw LLMError.responseTooLarge(maxResponseBytes)
@@ -422,8 +440,23 @@ struct LLMStreamingParser: Sendable {
             }
             if let finishReason = choice.finish_reason?.trimmingCharacters(in: .whitespacesAndNewlines),
                !finishReason.isEmpty {
+                if LLMCompletionTermination.hitOutputTokenLimit(finishReason) {
+                    hitOutputTokenLimit = true
+                }
                 isComplete = true
             }
         }
+    }
+}
+
+enum LLMCompletionTermination {
+    static func hitOutputTokenLimit(_ reason: String?) -> Bool {
+        guard let normalized = reason?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !normalized.isEmpty else { return false }
+        return normalized == "length"
+            || normalized == "max_tokens"
+            || normalized == "max_output_tokens"
     }
 }

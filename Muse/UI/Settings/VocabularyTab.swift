@@ -16,6 +16,9 @@ private enum VocabularyPanel: String, CaseIterable {
 }
 
 struct VocabularyTab: View, SettingsCardHelpers {
+    /// V3 中热词已并入统一术语库；此兼容视图可只承载整句/固定短语替换。
+    let fixedReplacementOnly: Bool
+
     @State private var hotwords: [String] = HotwordStorage.load()
     @State private var newHotword = ""
     @State private var builtinHotwordCount = HotwordStorage.builtinCount()
@@ -32,15 +35,24 @@ struct VocabularyTab: View, SettingsCardHelpers {
     @State private var draftTriggerInput = ""
     @State private var isCreatingRule = false
 
+    init(fixedReplacementOnly: Bool = false) {
+        self.fixedReplacementOnly = fixedReplacementOnly
+        _selectedPanel = State(initialValue: fixedReplacementOnly ? .snippets : .hotwords)
+    }
+
     var body: some View {
         GeometryReader { proxy in
             let contentHeight = max(
                 0,
-                proxy.size.height - SettingsControlSpec.actionHeight - VocabularySettingsStyle.pageSpacing
+                proxy.size.height - (fixedReplacementOnly
+                    ? 0
+                    : SettingsControlSpec.actionHeight + VocabularySettingsStyle.pageSpacing)
             )
 
             VStack(alignment: .leading, spacing: VocabularySettingsStyle.pageSpacing) {
-                panelSwitch
+                if !fixedReplacementOnly {
+                    panelSwitch
+                }
                 content
                     .frame(
                         maxWidth: .infinity,

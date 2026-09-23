@@ -4,18 +4,20 @@ import SwiftUI
 
 struct PreparingDot: View {
 
+    var color: Color = TF.recording
+
     @State private var rotation = 0.0
 
     var body: some View {
         ZStack {
             Circle()
-                .stroke(TF.recording.opacity(0.16), lineWidth: 1.6)
+                .stroke(color.opacity(0.16), lineWidth: 1.6)
                 .frame(width: 16, height: 16)
 
             Circle()
                 .trim(from: 0.16, to: 0.76)
                 .stroke(
-                    TF.recording,
+                    color,
                     style: StrokeStyle(lineWidth: 1.8, lineCap: .round)
                 )
                 .frame(width: 16, height: 16)
@@ -38,7 +40,10 @@ struct AnimatedRecordingIndicatorCluster<Content: View>: View {
     let content: (_ activity: CGFloat, _ time: TimeInterval, _ flow: CGFloat) -> Content
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+        TimelineView(.animation) { timeline in
+            #if HUD_PERFORMANCE_PROBE
+            let _ = HUDPerformanceProbe.recordFrame(timeline.date)
+            #endif
             let time = max(
                 0,
                 timeline.date.timeIntervalSinceReferenceDate
@@ -50,296 +55,154 @@ struct AnimatedRecordingIndicatorCluster<Content: View>: View {
 
             content(activity, time, flow)
         }
+        #if HUD_PERFORMANCE_PROBE
+        .onAppear { HUDPerformanceProbe.recordIndicatorMount() }
+        #endif
     }
 }
 
-/// Blue-green flowing waveform badge. Keeps the original "voice input" semantics
-/// while replacing the old red palette with a softer liquid gradient.
+/// 波形和光晕在画布中一次绘制，避免每帧重建多层 SwiftUI 布局与阴影视图。
 struct RecordingDot: View {
-
     let time: Double
     let activity: CGFloat
     let flow: CGFloat
+    var style: HUDStyle = .appleNative
 
     var body: some View {
-        ZStack {
-            WaveSoftGlow(activity: activity, flow: flow)
-                .frame(width: 30.0, height: 20.0)
-
-            FlowingWaveStripes(time: time, activity: activity, flow: flow)
-                .frame(width: 24.0, height: 14.2)
+        Canvas(rendersAsynchronously: true) { context, size in
+            if style == .appleNative {
+                var glow = context
+                glow.translateBy(x: (size.width - 30) / 2, y: (size.height - 20) / 2)
+                drawSoftGlow(in: glow)
+            }
+            var stripes = context
+            stripes.translateBy(x: (size.width - 24) / 2, y: (size.height - 14.2) / 2)
+            drawStripes(in: stripes)
         }
-        .frame(width: 44, height: 44)
+        .frame(width: TF.barHeight, height: TF.barHeight)
+        .allowsHitTesting(false)
+    }
+
+    private func drawSoftGlow(in context: GraphicsContext) {
+        var base = context
+        base.blendMode = .screen
+        base.addFilter(.blur(radius: 8))
+        base.fill(
+            Path(roundedRect: CGRect(x: 0.6, y: 4.6, width: 28.8, height: 10.8), cornerRadius: 5.4),
+            with: .linearGradient(Gradient(colors: [
+                Color(red: 0.16, green: 0.76, blue: 1).opacity(0.08 + Double(activity) * 0.06),
+                Color(red: 0.12, green: 0.94, blue: 0.92).opacity(0.10 + Double(activity) * 0.07),
+                Color(red: 0.30, green: 1, blue: 0.74).opacity(0.06 + Double(activity) * 0.05),
+            ]), startPoint: CGPoint(x: 0, y: 10), endPoint: CGPoint(x: 30, y: 10))
+        )
+        var soft = context
+        soft.blendMode = .screen
+        drawRecordingGlow(in: soft, center: CGPoint(x: 30 * (0.16 + flow * 0.18), y: 9.6),
+                          size: CGSize(width: 14.4, height: 18.4), radius: 10.2, blur: 5,
+                          colors: [Color(red: 0.18, green: 0.80, blue: 1).opacity(0.08 + Double(activity) * 0.06), .clear])
+        drawRecordingGlow(in: soft, center: CGPoint(x: 30 * (0.54 + flow * 0.12), y: 11.2),
+                          size: CGSize(width: 12.6, height: 16.4), radius: 9, blur: 5,
+                          colors: [Color(red: 0.22, green: 1, blue: 0.78).opacity(0.07 + Double(activity) * 0.05), .clear])
+    }
+
+    private func drawStripes(in context: GraphicsContext) {
+        let width: CGFloat = 24
+        let height: CGFloat = 14.2
+        let barWidth = width / 11
+        let gap = barWidth * 0.55
+        let startX = (width - 5 * barWidth - 4 * gap) / 2
+        var mask = Path()
+        for (index, ratio) in [0.52, 0.82, 0.68, 0.90, 0.60].enumerated() {
+            let pulse = 0.88 + sin(time * 2.2 + Double(index) * 0.55) * 0.08
+            let barHeight = height * ratio * pulse * (0.78 + activity * 0.30)
+            let rect = CGRect(x: startX + CGFloat(index) * (barWidth + gap), y: (height - barHeight) / 2,
+                              width: barWidth, height: barHeight)
+            let path = Path(roundedRect: rect, cornerRadius: barWidth / 2)
+            mask.addPath(path)
+            let drift = Double(flow) * 0.18 + Double(index) * 0.03
+            let distance = abs(CGFloat(index) - flow * 4)
+            var bar = context
+            if style == .appleNative {
+                bar.addFilter(.shadow(color: Color(red: 0.18, green: 0.96, blue: 0.84)
+                    .opacity(max(0.16, 0.31 - Double(distance) * 0.045)), radius: 3.8))
+            }
+            bar.fill(path, with: .linearGradient(Gradient(colors: [
+                Color(red: 0.12, green: 0.72, blue: 1).opacity(0.90 - drift * 0.20),
+                Color(red: 0.08, green: 0.90, blue: 0.94),
+                (index >= 3 ? Color(red: 0.42, green: 1, blue: 0.66) : Color(red: 0.22, green: 1, blue: 0.72))
+                    .opacity(0.92 + drift * 0.06),
+            ]), startPoint: CGPoint(x: rect.midX, y: rect.minY), endPoint: CGPoint(x: rect.midX, y: rect.maxY)))
+        }
+        guard style == .appleNative else { return }
+        var highlight = context
+        highlight.clip(to: mask)
+        highlight.blendMode = .screen
+        highlight.addFilter(.blur(radius: 3.2))
+        highlight.translateBy(x: width * (0.20 + flow * 0.60), y: height / 2)
+        highlight.rotate(by: .degrees(-12))
+        let rect = CGRect(x: -width * 0.12, y: -height * 0.7, width: width * 0.24, height: height * 1.4)
+        highlight.fill(Path(rect), with: .linearGradient(Gradient(colors: [
+            .clear, .white.opacity(0.32), Color(red: 0.34, green: 1, blue: 0.80).opacity(0.22), .clear,
+        ]), startPoint: CGPoint(x: 0, y: rect.minY), endPoint: CGPoint(x: 0, y: rect.maxY)))
     }
 }
 
 struct RecordingGlassInnerGlow: View {
-
     let activity: CGFloat
     let time: Double
 
     var body: some View {
-        GeometryReader { geometry in
-            let source = CGPoint(x: 22, y: geometry.size.height * 0.5)
+        Canvas(rendersAsynchronously: true) { context, size in
+            var field = context
+            field.blendMode = .screen
+            field.opacity = 0.92
+            let source = CGPoint(x: 22, y: size.height / 2)
             let phase = time * 0.74
+            let intensity = 0.55 + activity * 0.45
             let corePulse = 0.82 + 0.18 * sin(phase)
             let fieldPulse = 0.84 + 0.16 * sin(phase * 0.76 + 0.9)
-            let intensity = 0.55 + activity * 0.45
-            let innerDrift = CGPoint(
-                x: 1.4 * cos(phase * 0.38 + 0.3),
-                y: 0.9 * sin(phase * 0.34 + 0.6)
-            )
-            let fieldDrift = CGPoint(
-                x: 2.2 * cos(phase * 0.22 + 0.8),
-                y: 1.6 * sin(phase * 0.26 + 0.1)
-            )
-
-            ZStack {
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.10, green: 0.80, blue: 1.0).opacity(0.16 * Double(intensity) * corePulse),
-                                Color(red: 0.10, green: 0.96, blue: 0.92).opacity(0.09 * Double(intensity) * corePulse),
-                                .clear,
-                            ],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 18
-                        )
-                    )
-                    .frame(width: 28, height: 28)
-                    .blur(radius: 6)
-                    .position(x: source.x + innerDrift.x, y: source.y + innerDrift.y)
-
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.10, green: 0.78, blue: 1.0).opacity(0.08 * Double(intensity) * fieldPulse),
-                                Color(red: 0.10, green: 0.96, blue: 0.92).opacity(0.05 * Double(intensity) * fieldPulse),
-                                .clear,
-                            ],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 24
-                        )
-                    )
-                    .frame(width: 40, height: 40)
-                    .blur(radius: 11)
-                    .position(
-                        x: source.x + fieldDrift.x,
-                        y: source.y + fieldDrift.y
-                    )
-
-                Ellipse()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.10, green: 0.82, blue: 1.0).opacity(0.07 * Double(intensity) * fieldPulse),
-                                Color(red: 0.10, green: 0.96, blue: 0.92).opacity(0.04 * Double(intensity) * fieldPulse),
-                                .clear,
-                            ],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 28
-                        )
-                    )
-                    .frame(width: 52, height: 36)
-                    .blur(radius: 14)
-                    .rotationEffect(.degrees(-14 + sin(phase * 0.21) * 6))
-                    .position(
-                        x: source.x + 3.2 + 2.8 * cos(phase * 0.18 + 1.0),
-                        y: source.y + 0.4 + 1.8 * sin(phase * 0.24 + 0.7)
-                    )
-
-                diffuseBlob(source: source, size: 19, radiusX: 7, radiusY: 6, angle: phase * 0.44 + 2.5, blue: 0.08, aqua: 0.03, blur: 7, intensity: intensity)
-                diffuseBlob(source: source, size: 17, radiusX: 6, radiusY: 8, angle: phase * 0.38 + 4.0, blue: 0.04, aqua: 0.05, blur: 7, intensity: intensity)
-                diffuseBlob(source: source, size: 22, radiusX: 10, radiusY: 7, angle: phase * 0.30 + 5.2, blue: 0.03, aqua: 0.07, blur: 9, intensity: intensity)
-                diffuseBlob(source: source, size: 18, radiusX: 9, radiusY: 8, angle: phase * 0.34 + 0.8, blue: 0.03, aqua: 0.05, blur: 8, intensity: intensity)
-                diffuseBlob(source: source, size: 15, radiusX: 12, radiusY: 5, angle: phase * 0.26 + 0.2, blue: 0.02, aqua: 0.04, blur: 6, intensity: intensity)
+            drawRecordingGlow(in: field,
+                center: CGPoint(x: source.x + 1.4 * cos(phase * 0.38 + 0.3), y: source.y + 0.9 * sin(phase * 0.34 + 0.6)),
+                size: CGSize(width: 28, height: 28), radius: 18, blur: 6,
+                colors: [Color(red: 0.10, green: 0.80, blue: 1).opacity(0.16 * intensity * corePulse),
+                         Color(red: 0.10, green: 0.96, blue: 0.92).opacity(0.09 * intensity * corePulse), .clear])
+            drawRecordingGlow(in: field,
+                center: CGPoint(x: source.x + 2.2 * cos(phase * 0.22 + 0.8), y: source.y + 1.6 * sin(phase * 0.26 + 0.1)),
+                size: CGSize(width: 40, height: 40), radius: 24, blur: 11,
+                colors: [Color(red: 0.10, green: 0.78, blue: 1).opacity(0.08 * intensity * fieldPulse),
+                         Color(red: 0.10, green: 0.96, blue: 0.92).opacity(0.05 * intensity * fieldPulse), .clear])
+            drawRecordingGlow(in: field,
+                center: CGPoint(x: source.x + 3.2 + 2.8 * cos(phase * 0.18 + 1), y: source.y + 0.4 + 1.8 * sin(phase * 0.24 + 0.7)),
+                size: CGSize(width: 52, height: 36), radius: 28, blur: 14, rotation: -14 + sin(phase * 0.21) * 6,
+                colors: [Color(red: 0.10, green: 0.82, blue: 1).opacity(0.07 * intensity * fieldPulse),
+                         Color(red: 0.10, green: 0.96, blue: 0.92).opacity(0.04 * intensity * fieldPulse), .clear])
+            for blob in recordingGlowBlobs {
+                let angle = phase * blob.speed + blob.offset
+                drawRecordingGlow(in: field,
+                    center: CGPoint(x: source.x + blob.radiusX * cos(angle), y: source.y + blob.radiusY * sin(angle)),
+                    size: CGSize(width: blob.size, height: blob.size), radius: blob.size / 2, blur: blob.blur,
+                    colors: [Color(red: 0.12, green: 0.76, blue: 1).opacity(blob.blue * intensity),
+                             Color(red: 0.10, green: 0.94, blue: 0.92).opacity(blob.aqua * intensity), .clear])
             }
-            .blendMode(.screen)
-            .opacity(0.92)
-        }
-        .allowsHitTesting(false)
-    }
-
-    private func diffuseBlob(
-        source: CGPoint,
-        size: CGFloat,
-        radiusX: CGFloat,
-        radiusY: CGFloat,
-        angle: Double,
-        blue: Double,
-        aqua: Double,
-        blur: CGFloat,
-        intensity: CGFloat
-    ) -> some View {
-        let position = CGPoint(
-            x: source.x + radiusX * CGFloat(cos(angle)),
-            y: source.y + radiusY * CGFloat(sin(angle))
-        )
-
-        return Circle()
-            .fill(
-                RadialGradient(
-                    colors: [
-                        Color(red: 0.12, green: 0.76, blue: 1.0).opacity(blue * Double(intensity)),
-                        Color(red: 0.10, green: 0.94, blue: 0.92).opacity(aqua * Double(intensity)),
-                        .clear,
-                    ],
-                    center: .center,
-                    startRadius: 0,
-                    endRadius: size * 0.5
-                )
-            )
-            .frame(width: size, height: size)
-            .blur(radius: blur)
-            .position(position)
-    }
-}
-
-private struct WaveSoftGlow: View {
-
-    let activity: CGFloat
-    let flow: CGFloat
-
-    var body: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            let height = geometry.size.height
-            let leadOffset = width * (0.16 + flow * 0.18) - width * 0.5
-            let trailOffset = width * (0.54 + flow * 0.12) - width * 0.5
-
-            ZStack {
-                Capsule(style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.16, green: 0.76, blue: 1.0).opacity(0.08 + Double(activity) * 0.06),
-                                Color(red: 0.12, green: 0.94, blue: 0.92).opacity(0.10 + Double(activity) * 0.07),
-                                Color(red: 0.30, green: 1.0, blue: 0.74).opacity(0.06 + Double(activity) * 0.05),
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .frame(width: width * 0.96, height: height * 0.54)
-                    .blur(radius: 8)
-
-                Ellipse()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.18, green: 0.80, blue: 1.0).opacity(0.08 + Double(activity) * 0.06),
-                                .clear,
-                            ],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: width * 0.34
-                        )
-                    )
-                    .frame(width: width * 0.48, height: height * 0.92)
-                    .blur(radius: 5)
-                    .offset(x: leadOffset, y: -height * 0.02)
-
-                Ellipse()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.22, green: 1.0, blue: 0.78).opacity(0.07 + Double(activity) * 0.05),
-                                .clear,
-                            ],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: width * 0.30
-                        )
-                    )
-                    .frame(width: width * 0.42, height: height * 0.82)
-                    .blur(radius: 5)
-                    .offset(x: trailOffset, y: height * 0.06)
-            }
-            .blendMode(.screen)
-            .frame(width: width, height: height)
         }
         .allowsHitTesting(false)
     }
 }
 
-private struct FlowingWaveStripes: View {
+private let recordingGlowBlobs: [(size: CGFloat, radiusX: CGFloat, radiusY: CGFloat, speed: Double, offset: Double, blue: Double, aqua: Double, blur: CGFloat)] = [
+    (19, 7, 6, 0.44, 2.5, 0.08, 0.03, 7),
+    (17, 6, 8, 0.38, 4.0, 0.04, 0.05, 7),
+    (22, 10, 7, 0.30, 5.2, 0.03, 0.07, 9),
+    (18, 9, 8, 0.34, 0.8, 0.03, 0.05, 8),
+    (15, 12, 5, 0.26, 0.2, 0.02, 0.04, 6),
+]
 
-    let time: Double
-    let activity: CGFloat
-    let flow: CGFloat
-
-    private let baseHeights: [CGFloat] = [0.52, 0.82, 0.68, 0.90, 0.60]
-
-    var body: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            let height = geometry.size.height
-            let barWidth = width / 11.0
-            let gap = barWidth * 0.55
-            let bars = HStack(alignment: .center, spacing: gap) {
-                ForEach(Array(baseHeights.enumerated()), id: \.offset) { index, ratio in
-                    let pulse = 0.88 + CGFloat(sin(time * 2.2 + Double(index) * 0.55)) * 0.08
-                    let levelLift = 0.78 + activity * 0.30
-
-                    RoundedRectangle(cornerRadius: barWidth / 2, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: stripeColors(for: index),
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .frame(width: barWidth, height: height * ratio * pulse * levelLift)
-                        .shadow(color: stripeGlow(for: index), radius: 3.8, x: 0, y: 0)
-                }
-            }
-
-            ZStack {
-                bars
-
-                LinearGradient(
-                    colors: [
-                        .clear,
-                        Color.white.opacity(0.32),
-                        Color(red: 0.34, green: 1.0, blue: 0.80).opacity(0.22),
-                        .clear,
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(width: width * 0.24, height: height * 1.4)
-                .rotationEffect(.degrees(-12))
-                .position(x: width * (0.20 + flow * 0.60), y: height * 0.5)
-                .blendMode(.screen)
-                .blur(radius: 3.2)
-                .mask { bars }
-            }
-            .frame(width: width, height: height)
-        }
-    }
-
-    private func stripeColors(for index: Int) -> [Color] {
-        let blue = Color(red: 0.12, green: 0.72, blue: 1.0)
-        let aqua = Color(red: 0.08, green: 0.90, blue: 0.94)
-        let mint = Color(red: 0.22, green: 1.0, blue: 0.72)
-        let lime = Color(red: 0.42, green: 1.0, blue: 0.66)
-        let drift = Double(flow) * 0.18 + Double(index) * 0.03
-
-        return [
-            blue.opacity(0.90 - drift * 0.20),
-            aqua.opacity(1.0),
-            (index >= 3 ? lime : mint).opacity(0.92 + drift * 0.06),
-        ]
-    }
-
-    private func stripeGlow(for index: Int) -> Color {
-        let distance = abs(CGFloat(index) - (flow * 4.0))
-        let emphasis = max(0.16, 0.31 - Double(distance) * 0.045)
-        return Color(red: 0.18, green: 0.96, blue: 0.84).opacity(emphasis)
-    }
+private func drawRecordingGlow(in context: GraphicsContext, center: CGPoint, size: CGSize,
+                               radius: CGFloat, blur: CGFloat, rotation: Double = 0, colors: [Color]) {
+    var glow = context
+    glow.translateBy(x: center.x, y: center.y)
+    glow.rotate(by: .degrees(rotation))
+    glow.addFilter(.blur(radius: blur))
+    glow.fill(Path(ellipseIn: CGRect(x: -size.width / 2, y: -size.height / 2, width: size.width, height: size.height)),
+              with: .radialGradient(Gradient(colors: colors), center: .zero, startRadius: 0, endRadius: radius))
 }

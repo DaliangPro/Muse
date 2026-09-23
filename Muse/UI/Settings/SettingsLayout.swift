@@ -2,7 +2,7 @@ import SwiftUI
 
 enum SettingsLayout {
     /// 2026-07-08 大梁老师拍板：整体高度定 560；
-    /// 各页自适应——概览/语料/常用词缩底部撑满区，输入模式 Prompt 与测试区等比缩
+    /// 各页自适应——概览/词库缩底部撑满区，输出模式提示词 与测试区等比缩
     static let windowContentHeight: CGFloat = 560
     static let windowMinimumContentWidth: CGFloat = 240
     static let windowMinimumContentHeight: CGFloat = windowContentHeight

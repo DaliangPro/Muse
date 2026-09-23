@@ -60,6 +60,11 @@ enum ASRProviderRegistry {
                 createClient: { VolcASRClient() },
                 capabilities: .streaming()
             ),
+            .aliyun: ProviderEntry(
+                configType: AliyunASRConfig.self,
+                createClient: { AliyunASRClient() },
+                capabilities: .streaming()
+            ),
         ]
         #if HAS_SHERPA_ONNX
         if ServerExecutableResolver.live.isAvailable(name: "sensevoice-server") {
@@ -136,7 +141,7 @@ enum ASRProviderRegistry {
         provider: ASRProvider,
         capabilities: ASRProviderCapabilities
     ) -> ProcessingMode {
-        supports(mode, for: provider, capabilities: capabilities) ? mode : .direct
+        supports(mode, for: provider, capabilities: capabilities) ? VoiceInputModes.resolve(mode) : .direct
     }
 
     /// 显式固定回退优先级，避免依赖 `allCases` 的声明顺序。
@@ -149,7 +154,7 @@ enum ASRProviderRegistry {
         if capabilities(requested).isAvailable {
             return requested
         }
-        return [ASRProvider.volcano, .apple, .sherpa]
+        return [ASRProvider.volcano, .aliyun, .apple, .sherpa]
             .first { capabilities($0).isAvailable }
             ?? requested
     }

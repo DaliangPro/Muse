@@ -10,6 +10,17 @@ enum SettingsSidebarLayout {
     static let navItemVerticalPadding: CGFloat = 0
     static let navItemCornerRadius: CGFloat = 8
     static let navItemTextFont = TF.settingsFontNavigation
+    static let navItemSelectedTextFont = TF.settingsFontNavigationSelected
+
+    /// 同一个连续区域接收鼠标位置，行间隙延续上一行，跨行不经过空高亮。
+    static func navigationTab(at location: CGPoint) -> SettingsTab? {
+        let tabs = SettingsTab.allCases
+        let stride = navItemHeight + navItemSpacing
+        let height = CGFloat(tabs.count) * stride - navItemSpacing
+        guard location.x >= 0, location.x < controlWidth,
+              location.y >= 0, location.y < height else { return nil }
+        return tabs[Int(location.y / stride)]
+    }
 
     static let settingsLeadingInset: CGFloat = SettingsLayout.sidebarLeadingInset
     static let settingsBottomInset: CGFloat = 12
@@ -22,10 +33,10 @@ enum SettingsSidebarLayout {
     static let settingsPanelBottomInset: CGFloat = 8
     static let settingsPanelTextColor = TF.settingsTextSecondary
 
-    /// 重构面板（2026-07-06 大梁老师）：点选图标按钮的行高与行距（外观 / 语言 / 三开关共 5 行）
+    /// 外观、语言、HUD 样式与三个开关，共六行。
     static let settingsPanelOptionHeight: CGFloat = 26
     static let settingsPanelOptionSpacing: CGFloat = 5
-    static let settingsPanelOptionRowCount: CGFloat = 5
+    static let settingsPanelOptionRowCount: CGFloat = 6
 
     static var settingsPanelHeight: CGFloat {
         settingsPanelTopInset

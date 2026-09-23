@@ -22,9 +22,9 @@ enum ModelSettingsSummary {
         )
     }
 
-    static func llm() -> ModelSettingsSummaryData {
-        let provider = KeychainService.selectedLLMProvider
-        let config = KeychainService.loadLLMConfig()
+    static func llm(role: PolishModelRole = .standard) -> ModelSettingsSummaryData {
+        let provider = KeychainService.selectedPolishProvider(for: role)
+        let config = KeychainService.loadPolishConfig(for: role)
         let configured = provider == .localQwen ? LocalQwenLLMConfig.isModelAvailable : config != nil
         return ModelSettingsSummaryData(
             provider: provider.displayName,
@@ -34,18 +34,7 @@ enum ModelSettingsSummary {
         )
     }
 
-    static func asset() -> ModelSettingsSummaryData {
-        let provider = KeychainService.selectedAssetExtractionLLMProvider
-        let override = KeychainService.loadAssetExtractionModelOverride(for: provider)
-        let config = KeychainService.loadAssetExtractionLLMConfig()
-        let configured = provider == .localQwen ? LocalQwenLLMConfig.isModelAvailable : config != nil
-        return ModelSettingsSummaryData(
-            provider: provider.displayName,
-            model: llmModelName(provider: provider, config: config, override: override),
-            statusTitle: configured ? L("已保存", "Saved") : L("待配置", "Needs setup"),
-            statusTone: configured ? .success : .warning
-        )
-    }
+
 
     private static func asrModelName(provider: ASRProvider, credentials: [String: String]) -> String {
         switch provider {
@@ -61,6 +50,9 @@ enum ModelSettingsSummary {
                 return "Doubao 2.0"
             }
             return resourceID
+        case .aliyun:
+            return (AliyunASRConfig(credentials: credentials)?.model
+                ?? AliyunASRModel.defaultModel).displayName
         case .sherpa:
             return "SenseVoice"
         case .apple:
@@ -76,9 +68,6 @@ enum ModelSettingsSummary {
             return LocalQwenLLMConfig.availableModel?.displayName ?? "Qwen3"
         }
         if let model = config?.model, !model.isEmpty {
-            return model
-        }
-        if let model = KeychainService.loadLLMCredentials(for: provider)?["model"], !model.isEmpty {
             return model
         }
         return L("未设置", "Not set")

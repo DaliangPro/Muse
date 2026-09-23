@@ -23,6 +23,19 @@ enum HotwordStorage {
     /// Common tech terms that ASR engines frequently mis-transcribe.
     /// 默认内置热词（2026-06-13 大梁老师精简定稿）：从原 ~150 删减到 52 个高频常用词,
     /// 作为项目默认、打包分发给他人时的初始内置热词。
+    static let commonVocabularyV2: [String] = [
+        // ── 常用品牌与本地生活 ──
+        "Typeless", "食其家", "麦当劳", "肯德基", "星巴克", "瑞幸咖啡",
+        "海底捞", "喜茶", "霸王茶姬", "美团", "饿了么", "携程",
+
+        // ── 国内常用应用与平台 ──
+        "微信", "企业微信", "飞书", "钉钉", "抖音", "小红书", "淘宝",
+        "京东", "哔哩哔哩", "剪映",
+
+        // ── 常用 AI 产品 ──
+        "豆包", "通义千问", "Kimi",
+    ]
+
     static let defaultHotwords: [String] = [
         // ── AI models & companies ──
         "Claude", "Claude Code", "GPT", "Gemini", "Anthropic", "OpenAI",
@@ -49,12 +62,12 @@ enum HotwordStorage {
 
         // ── Hardware ──
         "NVIDIA", "CUDA", "GPU", "TPU",
-    ]
+    ] + commonVocabularyV2
 
     // MARK: - Initialization
 
     private static let schemaVersionKey = "tf_hotwords_schema_version"
-    private static let currentSchemaVersion = 1
+    private static let currentSchemaVersion = 2
     private static let legacyMigratedKey = "tf_hotwords_migrated_to_file_v2"
     private static let oldUDKey = "tf_hotwords"
 
@@ -103,11 +116,35 @@ enum HotwordStorage {
             switch nextVersion {
             case 1:
                 try migrateLegacyUserDefaults(context: context)
+            case 2:
+                try appendCommonVocabularyV2(context: context)
             default:
                 throw MigrationError.unsupportedSchemaVersion(nextVersion)
             }
             context.userDefaults.set(nextVersion, forKey: schemaVersionKey)
             version = nextVersion
+        }
+    }
+
+    /// 只追加本版本新增的通用词，不重置用户已调整过的内置文件。
+    private static func appendCommonVocabularyV2(context: VocabularyStorageContext) throws {
+        switch loadBuiltinResult(context: context) {
+        case .value(let existing):
+            var merged = existing
+            var keys = Set(existing.map(normalizedKey))
+            for word in commonVocabularyV2 {
+                let key = normalizedKey(word)
+                guard keys.insert(key).inserted else { continue }
+                merged.append(word)
+            }
+            guard merged != existing else { return }
+            try writeFile(merged, to: builtinFileURL(in: context))
+            context.hotwordsDidChange()
+        case .missing:
+            try writeFile(defaultHotwords, to: builtinFileURL(in: context))
+            context.hotwordsDidChange()
+        case .corrupt(let backupURL, let error):
+            throw MigrationError.corruptFile(backupURL, error)
         }
     }
 

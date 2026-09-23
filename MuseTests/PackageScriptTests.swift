@@ -12,10 +12,26 @@ final class PackageScriptTests: XCTestCase {
             "scripts/sign-app-bundle.sh",
             "scripts/test_app_bundle.sh",
             "scripts/health-check.sh",
+            "scripts/build_and_run.sh",
         ] {
             let result = try run("/bin/bash", arguments: ["-n", repositoryRoot.appendingPathComponent(relativePath).path])
             XCTAssertEqual(result.status, 0, "\(relativePath): \(result.output)")
         }
+    }
+
+    func testBuildAndRunStopsStaleInstancesAndVerifiesExactlyOneProcess() throws {
+        let source = try source(at: "scripts/build_and_run.sh")
+        let terminateCall = try XCTUnwrap(source.range(of: "  terminate_running_instances\n"))
+        let packageCall = try XCTUnwrap(source.range(of: #"  "$ROOT_DIR/scripts/package-app.sh""#))
+
+        XCTAssertLessThan(terminateCall.lowerBound, packageCall.lowerBound)
+        XCTAssertTrue(source.contains("running_app_pids()"))
+        XCTAssertTrue(source.contains(#"/bin/ps -axo pid=,command="#))
+        XCTAssertTrue(source.contains(#"/bin/kill "$pid""#))
+        XCTAssertFalse(source.contains(#"/bin/kill -9"#))
+        XCTAssertTrue(source.contains("verify_single_running_instance"))
+        XCTAssertTrue(source.contains(#"if [ "$count" -ne 1 ]"#))
+        XCTAssertFalse(source.contains(#"pgrep -af "$APP_PATH/Contents/MacOS/Muse""#))
     }
 
     func testPackagingScriptRequiresStrictFinalSealPolicy() throws {
@@ -34,6 +50,42 @@ final class PackageScriptTests: XCTestCase {
         XCTAssertTrue(signingSource.contains("--options runtime"), signingSource)
         XCTAssertTrue(signingSource.contains("--timestamp"), signingSource)
         XCTAssertTrue(signingSource.contains("MUSE_DEFER_GATEKEEPER_ASSESSMENT"), signingSource)
+        XCTAssertTrue(
+            packageSource.contains("Refusing to package a tracked dirty worktree"),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains("MUSE_SOURCE_COMMIT cannot override provenance"),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(#"git -C "$PROJECT_DIR" diff --quiet"#),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(#"git -C "$PROJECT_DIR" diff --cached --quiet"#),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(#"git -C "$PROJECT_DIR" ls-files --others --exclude-standard"#),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains("Refusing to package untracked build inputs"),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(
+                #"QUALITY_DATASET_PATH="$PROJECT_DIR/docs/2026-08-17-Muse-Voice-Polish-Quality-Test-Set.json""#
+            ),
+            packageSource
+        )
+        XCTAssertTrue(
+            packageSource.contains(
+                "MUSE_QUALITY_DATASET_PATH cannot override the frozen production dataset"
+            ),
+            packageSource
+        )
 
         let outerSign = #"/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$APP_PATH""#
         let strictVerify = #"/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP_PATH""#
@@ -105,6 +157,21 @@ final class PackageScriptTests: XCTestCase {
         XCTAssertFalse(result.output.contains("Signing outer app bundle last"), result.output)
     }
 
+    func testInteractiveBundleKeepsItsOwnNameAndURLScheme() throws {
+        let fixture = try makePackagingFixture()
+        defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
+        let packaging = try runPackage(fixture, includesLocalServices: false, extraEnvironment: [
+            "APP_NAME": "Muse 交互测试",
+            "APP_BUNDLE_ID": "pro.daliang.muse.interactive-test",
+        ])
+        XCTAssertEqual(packaging.status, 0, packaging.output)
+        let data = try Data(contentsOf: fixture.app.appendingPathComponent("Contents/Info.plist"))
+        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        XCTAssertEqual(plist["CFBundleName"] as? String, "Muse 交互测试")
+        let urlTypes = try XCTUnwrap(plist["CFBundleURLTypes"] as? [[String: Any]])
+        XCTAssertEqual(urlTypes.first?["CFBundleURLSchemes"] as? [String], ["muse-interactive-test"])
+    }
+
     func testCloudBundlePassesStrictVerification() throws {
         let fixture = try makePackagingFixture()
         defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
@@ -115,6 +182,103 @@ final class PackageScriptTests: XCTestCase {
 
         let validation = try runBundleValidation(for: fixture.app, expectsLocalServices: false)
         XCTAssertEqual(validation.status, 0, validation.output)
+    }
+
+    func testPackagingFreezesExternalQualityManifestAfterFinalSignature() throws {
+        let fixture = try makePackagingFixture()
+        defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
+        let manifest = fixture.root.appendingPathComponent("quality-build-manifest.json")
+        let dataset = fixture.root.appendingPathComponent("quality-dataset.json")
+        let datasetData = Data("quality-dataset-fixture".utf8)
+        try datasetData.write(to: dataset)
+        let commit = String(repeating: "1", count: 40)
+        let tree = String(repeating: "2", count: 40)
+
+        let packaging = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: [
+                "MUSE_QUALITY_BUILD_MANIFEST_PATH": manifest.path,
+                "MUSE_QUALITY_DATASET_PATH": dataset.path,
+                "MUSE_SOURCE_COMMIT": commit,
+                "MUSE_SOURCE_TREE": tree,
+            ]
+        )
+
+        XCTAssertEqual(packaging.status, 0, packaging.output)
+        XCTAssertTrue(packaging.output.contains("Quality build manifest ready"), packaging.output)
+        let data = try Data(contentsOf: manifest)
+        let document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(document["schema_version"] as? Int, 1)
+        XCTAssertEqual(
+            document["artifact_kind"] as? String,
+            "muse_voice_polish_quality_candidate"
+        )
+        XCTAssertEqual(document["package_mode"] as? String, "test")
+        XCTAssertEqual(document["source_commit"] as? String, commit)
+        XCTAssertEqual(document["source_tree"] as? String, tree)
+        let datasetHash = VoicePolishProviderAudit.sha256Hex(datasetData)
+        XCTAssertEqual(document["dataset_sha256"] as? String, datasetHash)
+        let executable = fixture.app.appendingPathComponent("Contents/MacOS/Muse")
+        let executableHash = try run(
+            "/usr/bin/shasum",
+            arguments: ["-a", "256", executable.path]
+        ).output.split(separator: " ").first.map(String.init)
+        XCTAssertEqual(document["executable_sha256"] as? String, executableHash)
+        let requirement = try XCTUnwrap(document["designated_requirement"] as? String)
+        XCTAssertFalse(requirement.isEmpty)
+        XCTAssertEqual(
+            document["designated_requirement_sha256"] as? String,
+            VoicePolishProviderAudit.sha256Hex(Data(requirement.utf8))
+        )
+        let manifestHash = VoicePolishProviderAudit.sha256Hex(data)
+        XCTAssertTrue(
+            packaging.output.contains("MUSE_QUALITY_EXPECTED_MANIFEST_SHA256=\(manifestHash)"),
+            packaging.output
+        )
+        XCTAssertTrue(
+            packaging.output.contains("MUSE_QUALITY_EXPECTED_DATASET_SHA256=\(datasetHash)"),
+            packaging.output
+        )
+        let attributes = try fileManager.attributesOfItem(atPath: manifest.path)
+        XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o444)
+    }
+
+    func testQualityManifestTestModeRejectsRelativeAndSymlinkDataset() throws {
+        let fixture = try makePackagingFixture()
+        defer { try? fileManager.trashItem(at: fixture.root, resultingItemURL: nil) }
+        let manifest = fixture.root.appendingPathComponent("quality-build-manifest.json")
+        let provenance = [
+            "MUSE_QUALITY_BUILD_MANIFEST_PATH": manifest.path,
+            "MUSE_SOURCE_COMMIT": String(repeating: "1", count: 40),
+            "MUSE_SOURCE_TREE": String(repeating: "2", count: 40),
+        ]
+
+        let relative = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: provenance.merging([
+                "MUSE_QUALITY_DATASET_PATH": "relative-quality-dataset.json",
+            ]) { _, new in new }
+        )
+        XCTAssertNotEqual(relative.status, 0, relative.output)
+        XCTAssertTrue(relative.output.contains("dataset path must be absolute"), relative.output)
+
+        let dataset = fixture.root.appendingPathComponent("quality-dataset.json")
+        try Data("fixture".utf8).write(to: dataset)
+        let symlink = fixture.root.appendingPathComponent("quality-dataset-link.json")
+        try fileManager.createSymbolicLink(at: symlink, withDestinationURL: dataset)
+        let linked = try runPackage(
+            fixture,
+            includesLocalServices: false,
+            extraEnvironment: provenance.merging([
+                "MUSE_QUALITY_DATASET_PATH": symlink.path,
+            ]) { _, new in new }
+        )
+        XCTAssertNotEqual(linked.status, 0, linked.output)
+        XCTAssertTrue(linked.output.contains("regular non-symlink file"), linked.output)
     }
 
     func testSigningWindowRequiresHashLockedPrebuiltBinary() throws {

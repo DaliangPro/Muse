@@ -12,6 +12,24 @@ struct HistoryRecord: Identifiable, Hashable, Sendable {
     let characterCount: Int?
     let tokenCount: Int?
 
+    /// 识别记录只展示一个模式标签。直出模式兼容历史上曾写入的“正常输出”名称；
+    /// 其他模式沿用写入时的名称，旧记录没有模式时不猜测。
+    var processingModeDisplayName: String? {
+        guard let processingMode,
+              !processingMode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let directAliases = Set([
+            ProcessingMode.direct.name,
+            "正常输出", "Normal Output", "直出", "Direct", "Direct Output", "直出模式"
+        ])
+        if directAliases.contains(processingMode) {
+            if status.hasPrefix("voice_polish_") {
+                return L("轻度润色", "Light Polish")
+            }
+            return L("直出", "Direct")
+        }
+        return processingMode
+    }
+
     init(
         id: String,
         createdAt: Date,

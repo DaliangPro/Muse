@@ -17,11 +17,66 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Muse"
 APP_BUNDLE_ID="pro.daliang.muse"
 APP_PATH="${MUSE_APP_PATH:-/Applications/Muse.app}"
+APP_EXECUTABLE="$APP_PATH/Contents/MacOS/$APP_NAME"
 PREVIEW_APP_PATH="$ROOT_DIR/dist/Muse-Preview.app"
 
 quit_app() {
   local bundle_id="$1"
   /usr/bin/osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
+}
+
+running_app_pids() {
+  /bin/ps -axo pid=,command= | /usr/bin/awk -v executable="$APP_EXECUTABLE" '
+    {
+      pid = $1
+      command = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+      if (command == executable || index(command, executable " ") == 1) {
+        print pid
+      }
+    }
+  '
+}
+
+wait_for_app_exit() {
+  local attempts="${1:-20}"
+  while [ "$attempts" -gt 0 ]; do
+    if [ -z "$(running_app_pids)" ]; then
+      return 0
+    fi
+    sleep 0.1
+    attempts=$((attempts - 1))
+  done
+  return 1
+}
+
+terminate_running_instances() {
+  quit_app "$APP_BUNDLE_ID"
+  if wait_for_app_exit 20; then
+    return 0
+  fi
+
+  local pid
+  while IFS= read -r pid; do
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      /bin/kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done < <(running_app_pids)
+
+  if ! wait_for_app_exit 20; then
+    echo "ERROR: existing $APP_NAME process did not exit: $(running_app_pids)" >&2
+    return 1
+  fi
+}
+
+verify_single_running_instance() {
+  local pids count
+  pids="$(running_app_pids)"
+  count="$(printf '%s\n' "$pids" | /usr/bin/awk 'NF { count += 1 } END { print count + 0 }')"
+  if [ "$count" -ne 1 ]; then
+    echo "ERROR: expected exactly one $APP_NAME process, found $count: $pids" >&2
+    return 1
+  fi
 }
 
 move_preview_to_trash() {
@@ -34,8 +89,7 @@ move_preview_to_trash() {
 
 build_app() {
   quit_app "pro.daliang.muse.preview"
-  quit_app "$APP_BUNDLE_ID"
-  sleep 1
+  terminate_running_instances
   move_preview_to_trash
 
   APP_PATH="$APP_PATH" \
@@ -61,7 +115,7 @@ case "$MODE" in
     build_app
     open_app
     sleep 2
-    /usr/bin/pgrep -af "$APP_PATH/Contents/MacOS/Muse" >/dev/null
+    verify_single_running_instance
     ;;
   --logs|logs)
     build_app

@@ -72,20 +72,20 @@ enum TF {
         light: (0.900, 0.910, 0.920),
         dark:  (0.188, 0.188, 0.188)
     )
-    /// 侧栏选中行底色（2026-06-11 用户三轮微调定稿）：深浅都用半透白，
-    /// 亮度恒为「比周围玻璃亮一档」，随背后背景自适应，不再出现深块压亮底
+    /// 侧栏选中行底色：浅色侧栏已是实色，使用暖灰平色建立清晰层级；
+    /// 深色继续用半透白提亮，保持原有明度关系。
     static let settingsSidebarActiveFill = adaptiveColor(
-        light: (1.000, 1.000, 1.000),
+        light: (0.918, 0.914, 0.906),
         dark:  (1.000, 1.000, 1.000),
-        lightAlpha: 0.45,
+        lightAlpha: 1.0,
         darkAlpha: 0.12
     )
-    /// 毛玻璃侧栏专用悬停底：同选中的半透白体系、再轻一档；
-    /// 常用词页等实色区仍用 settingsSidebarRowHoverFill，互不影响
-    static let settingsSidebarGlassHoverFill = adaptiveColor(
-        light: (1.000, 1.000, 1.000),
+    /// 实色侧栏悬停底：浅色使用介于侧栏底与选中底之间的暖灰平色，
+    /// 保留鼠标跟随感；深色继续用半透白提亮。
+    static let settingsSidebarHoverFill = adaptiveColor(
+        light: (0.938, 0.935, 0.928),
         dark:  (1.000, 1.000, 1.000),
-        lightAlpha: 0.22,
+        lightAlpha: 1.0,
         darkAlpha: 0.07
     )
     /// 毛玻璃调色罩（2026-06-11 用户两轮微调）：深色叠半黑压暗、浅色叠淡白提亮
@@ -355,6 +355,7 @@ enum TF {
 
     // 侧栏导航（与 BodyLarge 同值别名；13pt 档 2026-06-12 起开放给「主角信息」类正文）
     static let settingsFontNavigation = settingsFontBodyLarge
+    static let settingsFontNavigationSelected = Font.system(size: 13, weight: .medium)
 
     // 图标字体四档（Image(systemName:) 专用，文字不得使用）
     static let settingsFontIconMicro = Font.system(size: 8, weight: .medium)
@@ -417,7 +418,7 @@ enum TF {
     // MARK: Floating Bar
 
     static let barWidth: CGFloat = 528
-    static let barHeight: CGFloat = 48
+    static let barHeight: CGFloat = 40
     static let barFallbackWidth: CGFloat = 432
     static let barFallbackMinWidth: CGFloat = 320
     static let barFallbackHeight: CGFloat = 132
@@ -430,5 +431,4 @@ enum TF {
     static let hudVisibility = Animation.spring(response: 0.42, dampingFraction: 0.88, blendDuration: 0.12)
     static let hudMorph = Animation.spring(response: 0.32, dampingFraction: 0.90, blendDuration: 0.08)
     static let hudWidthFlow = Animation.spring(response: 0.26, dampingFraction: 0.94, blendDuration: 0.04)
-    static let hudTextFlow = Animation.easeOut(duration: 0.18)
 }

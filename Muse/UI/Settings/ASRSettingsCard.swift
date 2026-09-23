@@ -18,6 +18,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     @State private var testTask: Task<Void, Never>?
     /// Hint shown below ASR credentials when only bigasr works (not seed 2.0)
     @State private var volcResourceHint: String?
+    @State private var aliyunVocabularySyncNotice: AliyunVocabularySyncNotice?
 
     @AppStorage(DefaultsKeys.qwen3FinalEnabled) private var qwen3FinalEnabled = true
     @AppStorage(DefaultsKeys.sensevoiceEnabled) private var sensevoiceEnabled = true
@@ -69,6 +70,13 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
 
     private var inlineGuideLink: ASRProviderGuideLink? {
         showsInlineGuideLink ? currentASRGuideLinks.first : nil
+    }
+
+    private var showsAliyunWorkspaceHint: Bool {
+        guard selectedASRProvider == .aliyun else { return false }
+        return (effectiveASRValues["workspaceId"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
     }
 
     private var providerOptions: [(value: String, label: String)] {
@@ -182,12 +190,56 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                     .padding(.top, 6)
                     .zIndex(0)
             }
+
+            if showsAliyunWorkspaceHint {
+                Text(L(
+                    "建议填写 Workspace ID 使用专属域名，以提高连接稳定性；未填写仍可正常使用。",
+                    "Add a Workspace ID to use a dedicated endpoint for better connection stability; it remains optional."
+                ))
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
+                    .zIndex(0)
+            }
+
+            if selectedASRProvider == .aliyun,
+               let notice = aliyunVocabularySyncNotice {
+                Text(notice.message)
+                    .font(TF.settingsFontCaption)
+                    .foregroundStyle(
+                        notice.state == .failed
+                            ? TF.settingsAccentRed
+                            : TF.settingsTextTertiary
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
+                    .zIndex(0)
+            }
         }
         .task {
             loadASRCredentials()
         }
         .onChange(of: selectedASRProvider) { oldProvider, newProvider in
             handleASRProviderChange(from: oldProvider, to: newProvider)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .aliyunVocabularySyncStatusDidChange)
+        ) { notification in
+            guard selectedASRProvider == .aliyun,
+                  let notice = notification.object as? AliyunVocabularySyncNotice
+            else { return }
+            aliyunVocabularySyncNotice = notice
+            if notice.state == .success,
+               editedFields.isEmpty,
+               let values = KeychainService.loadASRCredentials(for: .aliyun) {
+                savedASRValues = values
+                asrCredentialValues = Self.displayValues(
+                    from: values,
+                    fields: AliyunASRConfig.credentialFields
+                )
+                editedFields = []
+            }
         }
     }
 
@@ -225,7 +277,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
             Task {
                 let manager = SenseVoiceServerManager.shared
                 await manager.stopSenseVoice()
-                let llmNeedsQwen3 = KeychainService.selectedLLMProvider == .localQwen
+                let llmNeedsQwen3 = KeychainService.anyPolishUsesLocalModel
                 if !llmNeedsQwen3 {
                     await manager.stopQwen3()
                 }
@@ -307,6 +359,12 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     private func saveASRCredentials() {
         let values = effectiveASRValues
         let previousProvider = KeychainService.selectedASRProvider
+        let previousAliyunModel = selectedASRProvider == .aliyun
+            ? AliyunASRConfig(credentials: savedASRValues)?.model
+            : nil
+        let nextAliyunModel = selectedASRProvider == .aliyun
+            ? AliyunASRConfig(credentials: values)?.model
+            : nil
         do {
             try KeychainService.saveASRCredentials(for: selectedASRProvider, values: values)
             KeychainService.selectedASRProvider = selectedASRProvider
@@ -317,14 +375,17 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
             savedASRValues = values
             editedFields = []
             hasStoredASR = true
+            if selectedASRProvider == .aliyun {
+                AliyunVocabularySyncCoordinator.schedule(after: .milliseconds(50))
+            }
             // 弹窗场景保存后留在编辑态：字段保持可见可改，不退回「只读+修改」模式
             isEditingASR = onClose != nil
             // 先归零再异步置 .saved：保证连续两次保存时状态确实发生变化，按钮每次都能闪绿
             asrTestStatus = .idle
             Task { @MainActor in asrTestStatus = .saved }
             // 仅当「换了服务商且弹窗里没测过新商」才作废主页色点；原商仅保存不动连通状态
-            if previousProvider != selectedASRProvider,
-               ModelConnectivityCache.asr?.provider != selectedASRProvider {
+            if previousProvider != selectedASRProvider
+                || previousAliyunModel != nextAliyunModel {
                 ModelConnectivityCache.asr = (selectedASRProvider, .idle)
             }
         } catch {

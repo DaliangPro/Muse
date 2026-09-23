@@ -3,7 +3,7 @@ import AVFoundation
 import ApplicationServices
 
 /// 使用引导（2026-07-09 大梁老师改版 · 无侧栏幻灯片式）：
-/// 全宽画布，7 页线性流——欢迎 → 语音输入 → AI 润色 → 语料资产 → 授权 → 识别引擎 → 就绪；
+/// 全宽画布，6 页线性流——欢迎 → 语音输入 → AI 润色 → 授权 → 识别引擎 → 就绪；
 /// 两侧纯线条箭头翻页，左下角保留深浅色开关。引擎只介绍不配置，触发键随模式动态。
 struct SetupWizardView: View {
 
@@ -16,9 +16,9 @@ struct SetupWizardView: View {
     @AppStorage(DefaultsKeys.language) private var language = AppLanguage.systemSelection
     @AppStorage("tf_settingsAppearance") private var appearanceSelection = SettingsAppearanceMode.system.rawValue
 
-    private let lastStep = 6
+    private let lastStep = 5
     private let permissionsContentHeight: CGFloat = 132
-    private let enginesContentHeight: CGFloat = 158
+    private let enginesContentHeight: CGFloat = 216
     private let readyDescriptionHeight: CGFloat = 58
 
     var body: some View {
@@ -46,13 +46,13 @@ struct SetupWizardView: View {
             Group {
                 switch step {
                 case 0: welcomeScreen
-                case 1, 2, 3:
-                    // 三个功能页各自独立成页（2026-07-09 大梁老师：不再是速览的子页）
+                case 1, 2:
+                    // 输入与润色各占一页。
                     SetupFeatureSlide(index: step - 1)
                         .padding(.horizontal, 64)
                         .id(step)
-                case 4: permissionsScreen
-                case 5: enginesScreen
+                case 3: permissionsScreen
+                case 4: enginesScreen
                 default: readyScreen
                 }
             }
@@ -62,7 +62,7 @@ struct SetupWizardView: View {
         .animation(.easeInOut(duration: 0.25), value: step)
         .clipped()
         // 2026-07-09 大梁老师改版：底部按钮行撤掉，改为两侧纯线条箭头翻页
-        // （功能速览的 3 个子页也由同一对箭头依次接管；就绪页无右箭头，页内「开始使用」收尾）
+        // （功能介绍页也由同一对箭头依次接管；就绪页无右箭头，页内「开始使用」收尾）
         // 箭头是浮在内容上层的「灵动按钮」（2026-07-09 大梁老师：加大、内收，与 UI 重叠无妨）
         .overlay(alignment: .leading) {
             if canGoBack {
@@ -312,7 +312,7 @@ struct SetupWizardView: View {
 
             ZStack(alignment: .top) {
                 setupTitleBlock(
-                    title: L("三种识别引擎", "Recognition engines"),
+                    title: L("四种识别引擎", "Recognition engines"),
                     subtitle: L("先开箱即用，后自由配置", "Ready out of the box, configure freely later")
                 )
                 .frame(maxWidth: .infinity)
@@ -342,6 +342,9 @@ struct SetupWizardView: View {
                       recommended: true)
             engineRow(L("火山云端", "Volcano cloud"),
                       L("高精度，需填 API 凭据", "High accuracy, needs an API key"),
+                      recommended: false)
+            engineRow(L("阿里云百炼", "Alibaba Cloud"),
+                      L("Fun-ASR / Paraformer 流式识别，需填 API Key", "Fun-ASR / Paraformer streaming, needs an API key"),
                       recommended: false)
             engineRow(L("本地离线", "Local offline"),
                       L("支持 SenseVoice + Qwen3 本地离线识别",

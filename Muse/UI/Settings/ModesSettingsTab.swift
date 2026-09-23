@@ -11,6 +11,7 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
     @State private var modePickerTriggerFrame = CGRect.zero
     @State private var modePickerPopoverFrame = CGRect.zero
     @State private var configuringModeId: UUID?
+    @State private var saveError: String?
 
     var body: some View {
         // 2026-07-08 大梁老师：工作区高度改按实际几何现场计算（隐藏标题栏窗口的
@@ -26,7 +27,7 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
         }
         .onAppear {
             if selectedModeId == nil {
-                selectedModeId = modes.first?.id
+                selectedModeId = visibleModes.first?.id
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectMode)) { note in
@@ -34,6 +35,10 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
             selectedModeId = modeId
             isModePickerOpen = false
         }
+        .alert(L("保存失败", "Save failed"), isPresented: Binding(
+            get: { saveError != nil }, set: { if !$0 { saveError = nil } }
+        )) { Button(L("知道了", "OK")) { saveError = nil } }
+        message: { Text(saveError ?? "") }
         .sheet(isPresented: isModeSettingsPresented) {
             modeSettingsSheet
         }
@@ -60,8 +65,13 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
 }
 
 private extension ModesSettingsTab {
+    var visibleModes: [ProcessingMode] {
+        modes
+    }
+
     var selectedMode: ProcessingMode? {
-        modes.first { $0.id == selectedModeId }
+        guard let mode = modes.first(where: { $0.id == selectedModeId }) else { return nil }
+        return VoiceInputModes.resolve(mode, in: modes)
     }
 
     func modeWorkspace(workbenchHeight: CGFloat) -> some View {
@@ -82,8 +92,8 @@ private extension ModesSettingsTab {
 
             if isModePickerOpen {
                 ModePickerPopover(
-                    modes: modes,
-                    selectedModeId: selectedModeId,
+                    modes: visibleModes,
+                    selectedModeId: selectedMode?.id,
                     popoverFrame: $modePickerPopoverFrame,
                     hotkeyTitle: hotkeyDisplayTitle,
                     onSelect: selectMode,
@@ -120,7 +130,9 @@ private extension ModesSettingsTab {
                 mode: mode,
                 workbenchHeight: workbenchHeight,
                 onSave: { updated in
-                    updateMode(updated)
+                    var stored = modes.first(where: { $0.id == updated.id }) ?? updated
+                    stored.prompt = updated.prompt
+                    updateMode(stored)
                 }
             )
         } else {
@@ -134,11 +146,16 @@ private extension ModesSettingsTab {
             modeWorkspaceLeft
                 .zIndex(20)
 
-            Spacer(minLength: 16)
-
             if let mode = selectedMode {
-                ModeModelStatusIndicator(status: currentModelStatus(for: mode))
+                ModeSettingsButton(modeName: mode.name) {
+                    configuringModeId = mode.id
+                }
+                if mode.isUserDeletable {
+                    ModeDeleteButton(modeName: mode.name) { deletingModeId = mode.id }
+                }
             }
+
+            Spacer(minLength: 16)
         }
         .padding(.leading, ModeSettingsLayout.modeToolbarLeadingInset)
         .padding(.trailing, ModeSettingsLayout.modeToolbarTrailingInset)
@@ -154,17 +171,7 @@ private extension ModesSettingsTab {
                 triggerFrame: $modePickerTriggerFrame
             )
 
-            if let mode = selectedMode {
-                ModeSettingsButton(modeName: mode.name) {
-                    configuringModeId = mode.id
-                }
 
-                if !mode.isBuiltin {
-                    ModeDeleteButton(modeName: mode.name) {
-                        deletingModeId = mode.id
-                    }
-                }
-            }
         }
     }
 
@@ -227,6 +234,9 @@ private extension ModesSettingsTab {
             try ModeStorage().save(modes)
         } catch {
             AppLogger.log("[ModesSettings] Failed to save modes: \(String(describing: error))")
+            saveError = L("模式保存失败，请重试。", "Could not save modes. Please try again.")
+            modes = appState.availableModes
+            return
         }
         appState.availableModes = modes
         NotificationCenter.default.post(name: .modesDidChange, object: nil)
@@ -239,7 +249,7 @@ private extension ModesSettingsTab {
     }
 
     func deleteMode(_ id: UUID) {
-        guard let mode = modes.first(where: { $0.id == id }), !mode.isBuiltin else { return }
+        guard let mode = modes.first(where: { $0.id == id }), mode.isUserDeletable else { return }
         modes.removeAll { $0.id == id }
         if selectedModeId == id {
             selectedModeId = modes.first(where: { $0.id == ProcessingMode.directId })?.id
@@ -261,7 +271,7 @@ private extension ModesSettingsTab {
             return .zero
         }
 
-        let popoverHeight = ModePickerControlMetrics.popoverHeight(optionCount: modes.count)
+        let popoverHeight = ModePickerControlMetrics.popoverHeight(optionCount: visibleModes.count)
         let width = max(
             ModeSettingsLayout.modePickerPopoverWidth,
             modePickerTriggerFrame.width

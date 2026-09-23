@@ -250,6 +250,24 @@ enum VolcProtocol: Sendable {
             offset += 4
         }
 
+        // 火山官方错误帧格式与普通响应不同：header + error code + payload size + payload。
+        // 先识别官方格式；若长度不吻合，再兼容历史的 header + size + JSON payload。
+        if header.messageType == .serverError,
+           data.count - offset >= 8 {
+            let code = Int(readBigEndianUInt32(from: data, offset: offset))
+            let payloadSize = Int(readBigEndianUInt32(from: data, offset: offset + 4))
+            let payloadOffset = offset + 8
+            if payloadSize == data.count - payloadOffset {
+                let payload = try decodePayload(
+                    from: data,
+                    offset: payloadOffset,
+                    size: payloadSize,
+                    compression: header.compression
+                )
+                throw serverError(from: payload, fallbackCode: code)
+            }
+        }
+
         guard data.count - offset >= 4 else {
             throw VolcProtocolError.invalidPayload
         }
@@ -258,48 +276,16 @@ enum VolcProtocol: Sendable {
         let payloadSize = Int(readBigEndianUInt32(from: data, offset: offset))
         offset += 4
 
-        let maximumWirePayloadBytes = header.compression == .gzip
-            ? maximumCompressedPayloadBytes
-            : maximumDecompressedPayloadBytes
-        guard payloadSize <= maximumWirePayloadBytes else {
-            throw VolcProtocolError.payloadTooLarge(
-                limit: maximumWirePayloadBytes,
-                actual: payloadSize
-            )
-        }
-
-        // 使用减法比较，避免 offset + payloadSize 的整数溢出。
-        guard payloadSize <= data.count - offset else {
-            throw VolcProtocolError.invalidPayload
-        }
-
-        let payloadStart = data.index(data.startIndex, offsetBy: offset)
-        let payloadEnd = data.index(payloadStart, offsetBy: payloadSize)
-        var payload = Data(data[payloadStart ..< payloadEnd])
-
-        if header.compression == .gzip {
-            payload = try gzipDecompress(
-                payload,
-                maximumOutputBytes: maximumDecompressedPayloadBytes
-            )
-        }
-
-        try validateDecodedPayloadSize(payload)
+        let payload = try decodePayload(
+            from: data,
+            offset: offset,
+            size: payloadSize,
+            compression: header.compression
+        )
 
         // Handle server error
         if header.messageType == .serverError {
-            if header.serialization == .json, !payload.isEmpty {
-                try validateDecodedPayloadSize(payload)
-                if let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
-                    let code = json["code"] as? Int
-                    let message = (json["message"] as? String).map(boundedServerErrorMessage)
-                    throw VolcProtocolError.serverError(code: code, message: message)
-                }
-            }
-            throw VolcProtocolError.serverError(
-                code: nil,
-                message: boundedServerErrorBody(payload)
-            )
+            throw serverError(from: payload, fallbackCode: nil)
         }
 
         // Parse JSON
@@ -355,6 +341,55 @@ enum VolcProtocol: Sendable {
         let byte2 = UInt32(data[data.index(start, offsetBy: 2)])
         let byte3 = UInt32(data[data.index(start, offsetBy: 3)])
         return (byte0 << 24) | (byte1 << 16) | (byte2 << 8) | byte3
+    }
+
+    private static func decodePayload(
+        from data: Data,
+        offset: Int,
+        size: Int,
+        compression: VolcCompression
+    ) throws -> Data {
+        let maximumWirePayloadBytes = compression == .gzip
+            ? maximumCompressedPayloadBytes
+            : maximumDecompressedPayloadBytes
+        guard size <= maximumWirePayloadBytes else {
+            throw VolcProtocolError.payloadTooLarge(
+                limit: maximumWirePayloadBytes,
+                actual: size
+            )
+        }
+        guard offset >= 0, offset <= data.count, size >= 0, size <= data.count - offset else {
+            throw VolcProtocolError.invalidPayload
+        }
+
+        let payloadStart = data.index(data.startIndex, offsetBy: offset)
+        let payloadEnd = data.index(payloadStart, offsetBy: size)
+        var payload = Data(data[payloadStart ..< payloadEnd])
+        if compression == .gzip {
+            payload = try gzipDecompress(
+                payload,
+                maximumOutputBytes: maximumDecompressedPayloadBytes
+            )
+        }
+        try validateDecodedPayloadSize(payload)
+        return payload
+    }
+
+    private static func serverError(
+        from payload: Data,
+        fallbackCode: Int?
+    ) -> VolcProtocolError {
+        if !payload.isEmpty,
+           let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
+            let code = json["code"] as? Int ?? fallbackCode
+            let message = ((json["message"] as? String) ?? (json["msg"] as? String))
+                .map(boundedServerErrorMessage)
+            return .serverError(code: code, message: message)
+        }
+        return .serverError(
+            code: fallbackCode,
+            message: boundedServerErrorBody(payload)
+        )
     }
 
     private static func validateDecodedPayloadSize(_ payload: Data) throws {

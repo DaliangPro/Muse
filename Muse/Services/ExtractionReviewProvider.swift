@@ -54,7 +54,12 @@ actor RemoteExtractionReviewProvider: ExtractionReviewProvider {
             do {
                 let messages = Self.promptMessages(results: batch, recipe: recipe)
                 let raw = try await RemoteAssetExtractionProvider.withTimeout(seconds: 120) {
-                    try await client.process(text: messages.user, prompt: messages.system ?? "", config: llmConfig)
+                    try await client.process(
+                        text: messages.user,
+                        prompt: messages.system ?? "",
+                        context: .structuredTask,
+                        config: llmConfig
+                    )
                 }
                 let verdicts = try Self.parse(rawResponse: raw, expectedCount: batch.count)
                 // 批内 index 换算回全局 index

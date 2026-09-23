@@ -9,7 +9,6 @@ enum AppLaunchDebug {
     static let hudDemoStaticBackground = ProcessInfo.processInfo.arguments.contains("--hud-debug-static")
     static let hudDemoFrozenRecording = ProcessInfo.processInfo.arguments.contains("--hud-debug-recording")
     static let hudDemoSpacingCompare = ProcessInfo.processInfo.arguments.contains("--hud-debug-spacing-compare")
-    static let hudDemoSpacingTight = ProcessInfo.processInfo.arguments.contains("--hud-debug-spacing-tight")
     static let floatingHUDDemoEnabled = ProcessInfo.processInfo.arguments.contains("--floating-hud-debug")
     static let floatingHUDProcessingPhase = ProcessInfo.processInfo.arguments.contains("--floating-hud-processing")
     static let floatingHUDDonePhase = ProcessInfo.processInfo.arguments.contains("--floating-hud-done")
@@ -26,7 +25,6 @@ enum AppLaunchDebug {
     static let hudDemoStaticBackground = false
     static let hudDemoFrozenRecording = false
     static let hudDemoSpacingCompare = false
-    static let hudDemoSpacingTight = false
     static let floatingHUDDemoEnabled = false
     static let floatingHUDProcessingPhase = false
     static let floatingHUDDonePhase = false

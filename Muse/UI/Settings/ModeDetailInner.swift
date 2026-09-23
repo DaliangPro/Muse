@@ -30,22 +30,11 @@ struct ModeDetailInner: View, SettingsCardHelpers {
 
     var body: some View {
         VStack(alignment: .leading, spacing: ModeSettingsLayout.modeWorkbenchGap) {
-            if isDirectMode {
-                // 直出模式不走文本处理，Prompt 与试跑无意义（2026-06-12 用户拍板）
-                directModeNotice
-            } else {
-                modePromptBlock
-                // 2026-06-12 用户拍板方案 A：撤掉写死的假「输出示例」，
-                // 挂上真试跑——用当前编辑中的 Prompt 实调模型看输出
-                ModeTrialCard(
-                    mode: mode,
-                    name: mode.name,
-                    processingLabel: mode.processingLabel,
-                    prompt: prompt,
-                    hotkeyStyle: mode.hotkeyStyle,
-                    blockHeight: trialBlockHeight
-                )
-            }
+            modePromptBlock
+            ModeTrialCard(
+                mode: mode, name: mode.name, processingLabel: mode.processingLabel,
+                prompt: prompt, hotkeyStyle: mode.hotkeyStyle, blockHeight: trialBlockHeight
+            )
         }
         .frame(width: ModeSettingsLayout.modeWorkspaceWidth, alignment: .topLeading)
         .frame(minHeight: workbenchHeight, alignment: .topLeading)
@@ -66,35 +55,7 @@ struct ModeDetailInner: View, SettingsCardHelpers {
         mode.id == ProcessingMode.directId
     }
 
-    private var directModeNotice: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(L("直出模式", "Direct Mode"))
-                .font(TF.settingsFontBodyLarge)
-                .foregroundStyle(TF.settingsTextTertiary)
 
-            Text(L("识别结果原样输出，不经过任何文本处理，因此无需配置 Prompt，也没有输出差异可供示例。", "Recognized text is inserted as-is with no post-processing, so there is no prompt to configure and nothing to preview."))
-                .font(TF.settingsFontBody)
-                .foregroundStyle(TF.settingsTextSecondary)
-                .lineSpacing(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(ModeSettingsLayout.modeGutter)
-        .frame(width: ModeSettingsLayout.modeWorkspaceWidth, alignment: .topLeading)
-        .background {
-            RoundedRectangle(
-                cornerRadius: ModeSettingsLayout.modeFieldCornerRadius,
-                style: .continuous
-            )
-            .fill(modeFieldFill)
-        }
-        .overlay {
-            RoundedRectangle(
-                cornerRadius: ModeSettingsLayout.modeFieldCornerRadius,
-                style: .continuous
-            )
-            .stroke(modeFieldStroke, lineWidth: 1)
-        }
-    }
 }
 
 private extension ModeDetailInner {
@@ -134,10 +95,12 @@ private extension ModeDetailInner {
         }
     }
 
-    /// 标题行：Prompt + 恢复默认（靠右）。保存按钮已撤——输入即自动保存（2026-07-08 大梁老师）
+    /// 标题行：处理要求 + 恢复默认（靠右）。保存按钮已撤——输入即自动保存（2026-07-08 大梁老师）
     var modePromptHeader: some View {
         HStack(spacing: ModeSettingsLayout.modePromptActionSpacing) {
-            Text("Prompt")
+            Text(mode.kind == .voicePolish
+                ? L("附加润色要求", "Additional polishing requirements")
+                : L("提示词", "Prompt"))
                 .font(TF.settingsFontBodyLarge)
                 .foregroundStyle(TF.settingsTextTertiary)
                 .lineLimit(1)
@@ -152,7 +115,10 @@ private extension ModeDetailInner {
             ) {
                 restoreDefaults()
             }
-            .help(L("恢复默认 Prompt", "Restore the default prompt"))
+            .help(mode.kind == .voicePolish
+                ? L("恢复默认附加要求", "Restore default requirements")
+                : L("恢复默认 Prompt", "Restore the default prompt"))
+            .disabled(isDirectMode)
         }
         .padding(.horizontal, ModeSettingsLayout.modeGutter)
         .padding(.vertical, 8)
@@ -162,7 +128,7 @@ private extension ModeDetailInner {
         ZStack(alignment: .topLeading) {
             ModeTextArea(
                 text: $prompt,
-                isEditable: true,
+                isEditable: !isDirectMode,
                 onScrollEdges: { above, below in
                     promptHasContentAbove = above
                     promptHasContentBelow = below
@@ -177,8 +143,12 @@ private extension ModeDetailInner {
                 showsBottom: promptHasContentBelow
             )
 
-            if shouldShowPromptPlaceholder {
-                Text(L("在这里编辑当前模式的 Prompt...", "Edit the current mode prompt here..."))
+            if shouldShowPromptPlaceholder || isDirectMode {
+                Text(isDirectMode
+                    ? L("直出不使用提示词，识别文字直接输出。", "Direct output does not use a prompt.")
+                    : mode.kind == .voicePolish
+                    ? L("可选：填写语气、简洁度或格式偏好...", "Optional: add tone, brevity, or format preferences...")
+                    : L("在这里编辑当前模式的 Prompt...", "Edit the current mode prompt here..."))
                     .font(TF.settingsFontReading)
                     .foregroundStyle(TF.settingsTextTertiary.opacity(0.58))
                     .lineLimit(1)
@@ -239,7 +209,7 @@ private extension ModeDetailInner {
 
     /// 输入停顿 0.6s 自动落盘；编辑归属的模式在此刻捕获，防抖期间切模式也不会存错对象
     func scheduleAutoSave(_ newPrompt: String) {
-        guard newPrompt != mode.prompt else {
+        guard !isDirectMode, newPrompt != mode.prompt else {
             // 与已保存内容一致（含 syncFields 的程序性赋值）：撤销未落盘任务
             pendingSaveTask?.cancel()
             pendingSaveTask = nil
@@ -269,6 +239,6 @@ private extension ModeDetailInner {
     }
 
     func syncFields() {
-        prompt = usesLegacyNewModePromptTemplate ? "" : mode.prompt
+        prompt = isDirectMode || usesLegacyNewModePromptTemplate ? "" : mode.prompt
     }
 }

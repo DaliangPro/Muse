@@ -5,7 +5,6 @@ struct GeneralOverviewSection: View {
     let stats: HistoryStore.Statistics
     let hasMicrophonePermission: Bool
     let hasAccessibilityPermission: Bool
-    let languageAssetCount: Int
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -76,12 +75,7 @@ private extension GeneralOverviewSection {
             ) {
                 PermissionManager.openAccessibilitySettings()
             }
-            IntroStatusChip(
-                title: L("语料资产 \(languageAssetCount) 条", "\(languageAssetCount) Assets"),
-                color: TF.settingsAccentGreen
-            ) {
-                NotificationCenter.default.post(name: .navigateToTab, object: SettingsTab.assetLibrary)
-            }
+
         }
         .fixedSize(horizontal: true, vertical: false)
     }
@@ -165,7 +159,7 @@ private extension GeneralOverviewSection {
     }
 }
 
-/// 概览页右上角可点击状态角标：麦克风/辅助功能跳系统授权页、语料资产跳应用内 tab（2026-06-22）
+/// 概览页右上角可点击状态角标：麦克风/辅助功能跳系统授权页（2026-06-22）
 private struct IntroStatusChip: View {
     let title: String
     let color: Color

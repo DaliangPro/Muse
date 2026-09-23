@@ -19,6 +19,42 @@ final class AudioCaptureEngineTests: XCTestCase {
         XCTAssertEqual(format.commonFormat, .pcmFormatInt16)
     }
 
+    // MARK: - REPAIR_PLAN K7：有声零文本检测
+
+    func testAudioActivitySummaryKeepsDigitalSilenceEmpty() {
+        let audio = pcmData(sample: 0, sampleCount: 16_000)
+
+        let summary = PCMAudioActivitySummary.analyze(audio)
+
+        XCTAssertEqual(summary.validByteCount, 32_000)
+        XCTAssertEqual(summary.voicedFrameCount, 0)
+        XCTAssertEqual(summary.peakAmplitude, 0)
+        XCTAssertFalse(summary.hasMeaningfulSpeech)
+    }
+
+    func testAudioActivitySummaryDetectsSustainedVoiceLevel() {
+        let audio = pcmData(sample: 2_000, sampleCount: 3_200)
+
+        let summary = PCMAudioActivitySummary.analyze(audio)
+
+        XCTAssertEqual(summary.analyzedFrameCount, 10)
+        XCTAssertEqual(summary.voicedFrameCount, 10)
+        XCTAssertEqual(summary.peakAmplitude, 2_000)
+        XCTAssertTrue(summary.hasMeaningfulSpeech)
+    }
+
+    func testAudioActivitySummaryDoesNotTreatSingleClickAsSpeech() {
+        var audio = pcmData(sample: 0, sampleCount: 3_200)
+        var click = Int16(20_000).littleEndian
+        withUnsafeBytes(of: &click) { bytes in
+            audio.replaceSubrange(0..<bytes.count, with: bytes)
+        }
+
+        let summary = PCMAudioActivitySummary.analyze(audio)
+
+        XCTAssertFalse(summary.hasMeaningfulSpeech)
+    }
+
     // MARK: - REPAIR_PLAN B8
 
     func testAccumulatedAudioRespectsByteLimit() {
@@ -109,4 +145,8 @@ final class AudioCaptureEngineTests: XCTestCase {
         XCTAssertFalse(state.isCurrent(first))
     }
 
+    private func pcmData(sample: Int16, sampleCount: Int) -> Data {
+        var samples = [Int16](repeating: sample.littleEndian, count: sampleCount)
+        return samples.withUnsafeMutableBytes { Data($0) }
+    }
 }
