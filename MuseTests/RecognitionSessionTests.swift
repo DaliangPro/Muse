@@ -841,14 +841,13 @@ final class RecognitionSessionTests: XCTestCase {
         }
     }
 
-    func testVoicePolishEmitsStageAndCanImmediatelyUseCanonicalText() async throws {
+    func testPolishWaitsForModelAndCancellationProducesNoText() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         try SnippetStorage.saveBuiltin([
             (trigger: "Type less", value: "Typeless"),
         ], context: fixture.context)
         let raw = "我正在使用 Type less。"
-        let canonical = "我正在使用 Typeless。"
         let client = RecognitionSessionBlockingVoicePolishLLM()
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -870,11 +869,12 @@ final class RecognitionSessionTests: XCTestCase {
             isFinal: true
         )
         let vocabularyContext = fixture.context
-        async let processingResult = session.postProcessVoicePolishForTesting(
-            rawText: raw,
-            transcript: transcript,
-            vocabularyContext: vocabularyContext
-        )
+        let pending = Task {
+            await session.postProcessVoicePolishForTesting(
+                rawText: raw, transcript: transcript,
+                vocabularyContext: vocabularyContext, allowsUserChoice: true
+            )
+        }
 
         for _ in 0..<100 {
             if await client.requestCount() > 0,
@@ -885,19 +885,20 @@ final class RecognitionSessionTests: XCTestCase {
         }
         let requestCount = await client.requestCount()
         XCTAssertEqual(requestCount, 1)
-        let accepted = await session.useCanonicalVoicePolishResult()
-        XCTAssertTrue(accepted)
-        let result = await processingResult
+        try await Task.sleep(for: .milliseconds(1_350))
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("processing:") })
+        await session.abortCurrentSession()
+        let result = await boundedCompletion(pending, session: session) ?? nil
 
-        XCTAssertEqual(result?.finalText, canonical)
-        XCTAssertNil(result?.processedText)
-        XCTAssertFalse(result?.llmFailed ?? true)
-        XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
-        XCTAssertTrue(recorder.values.contains("voicePolishStage:rendering"))
-        XCTAssertTrue(recorder.values.contains("processing:\(canonical)"))
+        XCTAssertNil(result)
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("processing:") })
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("finalized:") })
+        XCTAssertTrue(recorder.values.contains("completed"))
+        let state = await session.state
+        XCTAssertEqual(state, .idle)
     }
 
-    func testVoicePolishCanonicalRequestIsRejectedAfterPipelineResultCommitted() async throws {
+    func testVoicePolishCommitsCompletedPipelineResult() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let polished = "这是已经提交的润色结果。"
@@ -928,11 +929,9 @@ final class RecognitionSessionTests: XCTestCase {
             transcript: transcript,
             vocabularyContext: fixture.context
         )
-        let acceptedAfterCommit = await session.useCanonicalVoicePolishResult()
 
         XCTAssertEqual(result?.finalText, polished)
         XCTAssertTrue(recorder.values.contains("processing:\(polished)"))
-        XCTAssertFalse(acceptedAfterCommit)
     }
 
     func testVoicePolishFallbackUsesCanonicalTextInsteadOfRawTranscript() async throws {
@@ -966,7 +965,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.historyStatus, "voice_polish_fallback")
     }
 
-    func testVoicePolishFailureWaitsForExplicitCanonicalChoiceInsteadOfSilentInjection() async throws {
+    func testPolishFailureWaitsAndCancellationProducesNoText() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
@@ -1026,19 +1025,15 @@ final class RecognitionSessionTests: XCTestCase {
             "events=\(recorder.values) requests=\(requestCount)"
         )
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
-        let accepted = await session.useCanonicalVoicePolishResult()
-        XCTAssertTrue(accepted)
+        await session.abortCurrentSession()
         let result = await boundedCompletion(pendingTask, session: session) ?? nil
 
-        XCTAssertEqual(result?.finalText, source)
-        XCTAssertNil(result?.processedText)
-        XCTAssertFalse(result?.llmFailed ?? true)
-        XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
-        XCTAssertTrue(recorder.values.contains("processing:\(source)"))
-        XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
-        XCTAssertEqual(result?.performance?.outcome, .canonicalExit)
-        XCTAssertEqual(result?.performance?.llmAttemptCount, 1)
-        XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
+        XCTAssertNil(result)
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("processing:") })
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("finalized:") })
+        XCTAssertTrue(recorder.values.contains("completed"))
+        let state = await session.state
+        XCTAssertEqual(state, .idle)
     }
 
     func testVoicePolishExplicitRetryStartsFreshSingleRequestAndReturnsStructuredDraft() async throws {

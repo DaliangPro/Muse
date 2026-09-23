@@ -208,7 +208,7 @@ Pro 的一次成稿率为 92%，`direct_send + minor_edit` 为 96%；Flash 分�
 2. 每个 Writer fragment 必须绑定交付 unit，确定性门禁检查来源事实、收件人、任务层、上下文映射、条件 cue、技术映射、文本完整度和仍未清理的高置信口述残片；
 3. 单次运行共享 120 秒总预算，自动调用最多 6 次，Repair 只改 Reviewer 指向的 fragment；
 4. Ledger 不读取原始安全上下文，只接收由本地 `EntityResolver` 证明的 canonical mapping；excluded/style/editor 内容不会反向强制写回正文；
-5. 失败不再静默注入原文。Session 保留 canonical，并显示“重新润色 / 使用原转写”；只有用户明确选择后才走原转写出口；
+5. 失败不再静默注入原文。Session 保留当前转写供用户重新润色；Esc取消当前输入，重试成功后才交付结果；
 6. Prompt v25 已把条件方向固化为本地 `operator_kind`（区分 `only_if` 与 `if_then`）。技术断词与口述符号不再信任 Planner 自报 mapping，而由本地从对应来源 span 机械推导；`Swift 6`、`Node 20` 等版本名不会被并写，路径与命令 canonical 也不能跨 span 扇出。普通数字允许中文与阿拉伯数字互换，但不得补原文没有的量词、单位或币种；
 7. 质量 Runner 已把“预算调用尝试”与“成功 Provider 调用”分开记录：超时或本地失败仍计入尝试次数，但只有完成 HTTP 200 解析并落盘审计回执的请求才计入成功调用，避免把正常超时误报为审计链路丢失；
 8. 约 1K 多约束文本的 Planner 与唯一一次 Planner Repair 使用 8,192 token 受控输出预算；初次瞬时网络失败与 schema repair 共用一个恢复槽，任何路径总尝试仍不超过 6 次，不切换用户选择的模型；

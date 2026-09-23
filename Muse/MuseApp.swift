@@ -193,10 +193,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.onCopyFallbackVisibilityChange = { [weak self] isVisible in
             self?.hotkeyManager.isCopyFallbackVisible = isVisible
         }
-        appState.onUseVoicePolishCanonicalText = { [weak self] in
-            guard let self else { return false }
-            return await self.session.useCanonicalVoicePolishResult()
-        }
         appState.onRetryVoicePolish = { [weak self] in
             guard let self else { return false }
             return await self.session.retryVoicePolishResult()
@@ -684,31 +680,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // ESC abort: interrupt immediately. Do not register any alternate abort shortcut.
+        // Esc统一中断本次输入，不再从处理中切换到其他输出。
         hotkeyManager.onESCAbort = { [weak self] in
             guard let self else { return }
             Task { @MainActor in
                 let phase = self.appState.barPhase
-                let canonicalResult = await self.appState.useVoicePolishCanonicalTextIfAvailable(
-                    restoreOnFailure: false
-                )
-                if canonicalResult == .accepted {
-                    AppLogger.log("[Muse] >>> HOTKEY: ESC use Voice Polish canonical text")
-                    DebugFileLogger.log("hotkey ESC use voice polish canonical text")
-                    return
-                }
-                guard canonicalResult.shouldAbortSessionAfterEscape else {
-                    DebugFileLogger.log("hotkey ESC ignored stale voice polish canonical ack")
-                    return
-                }
-                DebugFileLogger.log("hotkey ESC canonical unavailable or rejected; continuing with abort")
                 AppLogger.log("[Muse] >>> HOTKEY: ESC abort session (phase=\(String(describing: phase)))")
                 DebugFileLogger.log("hotkey ESC abort session phase=\(phase)")
                 self.hotkeyManager.isSessionActive = false
                 self.appState.showCancelled()
-                Task {
-                    await self.session.abortCurrentSession()
-                }
+                await self.session.abortCurrentSession()
             }
         }
 

@@ -257,6 +257,36 @@ final class FloatingBarLayoutTests: XCTestCase {
     }
 
     @MainActor
+    func testPolishHUDKeepsItsWidthWhileWaitingForTheResult() async throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("原生玻璃需要 macOS 26") }
+        _ = NSApplication.shared
+        let state = AppState(initialModes: ProcessingMode.defaults)
+        state.currentMode = .formalWriting
+        state.startRecording()
+        state.markRecordingReady()
+        state.stopRecording()
+        state.showVoicePolishStage(.polishing)
+        let host = NSHostingView(rootView: FloatingBarView(state: state, styleOverride: .appleNative)
+            .transaction { $0.disablesAnimations = true })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 180),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        host.frame = NSRect(x: 0, y: 0, width: 700, height: 180)
+        try await settleLayout(host)
+        let width = try XCTUnwrap(findGlass(in: host)).bounds.width
+
+        try await Task.sleep(for: .milliseconds(1_400))
+        try await settleLayout(host)
+
+        XCTAssertEqual(state.barPhase, .processing)
+        XCTAssertEqual(state.voicePolishStage, .polishing)
+        XCTAssertEqual(try XCTUnwrap(findGlass(in: host)).bounds.width, width, accuracy: 0.5,
+                       "持续等待模型时不能突然扩宽HUD并增加额外选项")
+    }
+
+    @MainActor
     private func settleLayout(_ host: NSView) async throws {
         for _ in 0..<3 {
             host.layoutSubtreeIfNeeded()

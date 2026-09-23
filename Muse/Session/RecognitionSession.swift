@@ -15,7 +15,6 @@ private struct BatchFallbackTimeoutError: Error {}
 
 private enum VoicePolishUserChoice: Sendable {
     case retry
-    case useCanonical
     case cancel
 }
 
@@ -315,8 +314,7 @@ actor RecognitionSession {
 
     private var voicePolishTask: Task<VoicePolishResult, Never>?
     private var voicePolishTaskSessionID: RecognitionSessionID?
-    private var voicePolishCanonicalOptionSessionID: RecognitionSessionID?
-    private var canonicalVoicePolishRequestSessionID: RecognitionSessionID?
+    private var voicePolishProcessingSessionID: RecognitionSessionID?
     private var voicePolishChoiceSessionID: RecognitionSessionID?
     private var voicePolishChoiceContinuation: CheckedContinuation<VoicePolishUserChoice, Never>?
 
@@ -343,31 +341,6 @@ actor RecognitionSession {
         default:
             logger.warning("toggleRecording ignored in state: \(String(describing: self.state))")
         }
-    }
-
-    /// 用户不想继续等待模型时，取消当前 Voice Polish 请求并使用已完成术语纠正的
-    /// canonical 文本继续注入。该出口是主动选择，不计为 LLM 失败或 fallback。
-    @discardableResult
-    func useCanonicalVoicePolishResult() -> Bool {
-        guard currentMode.kind == .voicePolish,
-              state == .postProcessing,
-              let sessionID = currentSessionID,
-              voicePolishCanonicalOptionSessionID == sessionID else { return false }
-        canonicalVoicePolishRequestSessionID = sessionID
-        if voicePolishChoiceSessionID == sessionID {
-            resolveVoicePolishChoice(.useCanonical, sessionID: sessionID)
-            DebugFileLogger.log(
-                "voice polish unavailable canonical accepted session=\(sessionID.rawValue)"
-            )
-            return true
-        }
-        if voicePolishTaskSessionID == sessionID {
-            voicePolishTask?.cancel()
-        }
-        DebugFileLogger.log(
-            "voice polish canonical requested session=\(sessionID.rawValue)"
-        )
-        return true
     }
 
     /// 只接受当前明确停在 unavailable 状态的会话。每次重试仍沿用同一份
@@ -1171,11 +1144,8 @@ actor RecognitionSession {
             voicePolishTask = nil
             voicePolishTaskSessionID = nil
         }
-        if voicePolishCanonicalOptionSessionID == sessionID {
-            voicePolishCanonicalOptionSessionID = nil
-        }
-        if canonicalVoicePolishRequestSessionID == sessionID {
-            canonicalVoicePolishRequestSessionID = nil
+        if voicePolishProcessingSessionID == sessionID {
+            voicePolishProcessingSessionID = nil
         }
         if voicePolishChoiceSessionID == sessionID {
             resolveVoicePolishChoice(.cancel, sessionID: sessionID)
@@ -1314,7 +1284,7 @@ actor RecognitionSession {
         // no streaming text was available yet.
         if currentMode.kind == .voicePolish {
             state = .postProcessing
-            voicePolishCanonicalOptionSessionID = sessionID
+            voicePolishProcessingSessionID = sessionID
             let mode = currentMode
             guard let writingContext = await polishWritingContext(
                 sessionID: sessionID, vocabularyContext: vocabularyContext
@@ -1350,12 +1320,6 @@ actor RecognitionSession {
                     )
                     finalText = prepared.canonicalText
                     continue
-                case .useCanonical:
-                    _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
-                    return finalized(canonicalVoicePolishResult(
-                        finalText,
-                        vocabularyContext: vocabularyContext
-                    ))
                 case .cancel:
                     return nil
                 }
@@ -1363,7 +1327,7 @@ actor RecognitionSession {
 
             guard let envelope else {
                 performance.recordSetupFailure()
-                voicePolishCanonicalOptionSessionID = nil
+                voicePolishProcessingSessionID = nil
                 llmFailed = true
                 voicePolishHistoryStatus = "voice_polish_fallback"
                 onASREvent?(.processingResult(text: finalText))
@@ -1379,20 +1343,7 @@ actor RecognitionSession {
                 ))
             }
 
-            if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                return finalized(canonicalVoicePolishResult(
-                    envelope,
-                    vocabularyContext: vocabularyContext
-                ))
-            }
-
             var loadedLLMConfig = await loadLLMConfigOffActor()
-            if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                return finalized(canonicalVoicePolishResult(
-                    envelope,
-                    vocabularyContext: vocabularyContext
-                ))
-            }
             while loadedLLMConfig == nil, allowsVoicePolishUserChoice {
                 performance.recordSetupFailure()
                 let waitingAt = ContinuousClock.now
@@ -1402,12 +1353,6 @@ actor RecognitionSession {
                 case .retry:
                     performance.userRetryCount += 1
                     loadedLLMConfig = await loadLLMConfigOffActor()
-                case .useCanonical:
-                    _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
-                    return finalized(canonicalVoicePolishResult(
-                        envelope,
-                        vocabularyContext: vocabularyContext
-                    ))
                 case .cancel:
                     return nil
                 }
@@ -1455,7 +1400,6 @@ actor RecognitionSession {
                     performance.record(
                         currentResult,
                         completedAutomatically: isCurrent(sessionID)
-                            && canonicalVoicePolishRequestSessionID != sessionID
                     )
                     if voicePolishTaskSessionID == sessionID {
                         voicePolishTask = nil
@@ -1469,13 +1413,6 @@ actor RecognitionSession {
                     guard isCurrent(sessionID) else {
                         DebugFileLogger.log("stopRecording: superseded during voice polish, bailing")
                         return nil
-                    }
-                    if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-                        return finalized(canonicalVoicePolishResult(
-                            envelope,
-                            pipelineResult: accumulatedResult,
-                            vocabularyContext: vocabularyContext
-                        ))
                     }
                     guard currentResult.usedFallback,
                           allowsVoicePolishUserChoice else {
@@ -1494,27 +1431,19 @@ actor RecognitionSession {
                         // 时开始计算的旧 deadline。
                         pipelineStartedAt = .now
                         continue
-                    case .useCanonical:
-                        _ = consumeCanonicalVoicePolishRequest(sessionID: sessionID)
-                        return finalized(canonicalVoicePolishResult(
-                            envelope,
-                            pipelineResult: accumulatedResult,
-                            vocabularyContext: vocabularyContext
-                        ))
                     case .cancel:
                         return nil
                     }
                 }
                 voicePolishPerformance = VoicePolishPerformanceMeasurement(result: result)
-                voicePolishCanonicalOptionSessionID = nil
+                voicePolishProcessingSessionID = nil
                 finalText = result.text
                 if !result.usedFallback {
                     processedText = result.text
                 }
                 llmFailed = result.usedFallback
                 voicePolishHistoryStatus = Self.voicePolishHistoryStatus(for: result)
-                // 一旦选择了 pipeline 结果，先通知 HUD 关闭 canonical 出口，再做非关键的
-                // 近期输入记忆；否则该 await 窗口内 UI 仍会展示一个后台已拒绝的动作。
+                // 先把已完成结果同步给HUD，再执行非关键的近期输入记忆。
                 onASREvent?(.processingResult(text: result.text))
                 if VoicePolishSettings.recentInputContextEnabled(defaults: vocabularyContext.userDefaults), !result.usedFallback {
                     await voicePolishRecentInputStore.remember(
@@ -1646,8 +1575,8 @@ actor RecognitionSession {
             }
         }
 
-        if voicePolishCanonicalOptionSessionID == sessionID {
-            voicePolishCanonicalOptionSessionID = nil
+        if voicePolishProcessingSessionID == sessionID {
+            voicePolishProcessingSessionID = nil
         }
 
         return finalized(LLMPostProcessingResult(
@@ -1668,7 +1597,7 @@ actor RecognitionSession {
     ) {
         guard isCurrent(sessionID),
               state == .postProcessing,
-              voicePolishCanonicalOptionSessionID == sessionID,
+              voicePolishProcessingSessionID == sessionID,
               voicePolishChoiceSessionID == nil else { return }
         onASREvent?(.voicePolishStage(stage))
     }
@@ -1678,9 +1607,6 @@ actor RecognitionSession {
         sessionID: RecognitionSessionID
     ) async -> VoicePolishUserChoice {
         guard isCurrent(sessionID), state == .postProcessing else { return .cancel }
-        if consumeCanonicalVoicePolishRequest(sessionID: sessionID) {
-            return .useCanonical
-        }
         // 同一会话同时只能存在一个选择点。若旧 continuation 尚未清理，先让
         // 它退出，避免悬挂或一次点击唤醒错误的等待者。
         if let pending = voicePolishChoiceContinuation {
@@ -1731,53 +1657,6 @@ actor RecognitionSession {
             applicationBundleIdentifier: applicationBundleIdentifier(for: sessionID),
             context: vocabularyContext
         ).canonicalText
-    }
-
-    private func consumeCanonicalVoicePolishRequest(
-        sessionID: RecognitionSessionID
-    ) -> Bool {
-        guard canonicalVoicePolishRequestSessionID == sessionID else { return false }
-        canonicalVoicePolishRequestSessionID = nil
-        voicePolishCanonicalOptionSessionID = nil
-        return true
-    }
-
-    private func canonicalVoicePolishResult(
-        _ envelope: VoiceInputEnvelope,
-        pipelineResult: VoicePolishResult? = nil,
-        vocabularyContext: VocabularyStorageContext
-    ) -> LLMPostProcessingResult {
-        let canonicalText = envelope.fallbackText
-        onASREvent?(.processingResult(text: canonicalText))
-        return LLMPostProcessingResult(
-            finalText: canonicalText,
-            processedText: nil,
-            llmFailed: false,
-            voicePolishHistoryStatus: "voice_polish_canonical",
-            voicePolishPerformance: VoicePolishPerformanceMeasurement(
-                outcome: .canonicalExit,
-                route: pipelineResult?.executedRoute,
-                llmAttemptCount: pipelineResult?.llmAttemptCount ?? 0
-            ),
-            voicePolishVocabularyContext: vocabularyContext
-        )
-    }
-
-    private func canonicalVoicePolishResult(
-        _ canonicalText: String,
-        vocabularyContext: VocabularyStorageContext
-    ) -> LLMPostProcessingResult {
-        onASREvent?(.processingResult(text: canonicalText))
-        return LLMPostProcessingResult(
-            finalText: canonicalText,
-            processedText: nil,
-            llmFailed: false,
-            voicePolishHistoryStatus: "voice_polish_canonical",
-            voicePolishPerformance: VoicePolishPerformanceMeasurement(
-                outcome: .canonicalExit
-            ),
-            voicePolishVocabularyContext: vocabularyContext
-        )
     }
 
     private static func voicePolishResult(
@@ -1848,12 +1727,7 @@ actor RecognitionSession {
     ) async {
         // J15：状态口径反映注入结局——仅复制到剪贴板 / 没找到输入位置时不再记 completed
         let status: String
-        if llmResult.voicePolishHistoryStatus == "voice_polish_canonical",
-           case .inserted = injection {
-            // 用户主动选用 canonical 是正常出口；即使本次 ASR 曾恢复，也不能记成
-            // LLM 失败或普通 fallback，否则会污染 Voice Polish 失败率。
-            status = "voice_polish_canonical"
-        } else if llmResult.llmFailed {
+        if llmResult.llmFailed {
             if let voicePolishStatus = llmResult.voicePolishHistoryStatus,
                case .inserted = injection {
                 status = voicePolishStatus
@@ -2655,8 +2529,7 @@ actor RecognitionSession {
         targetApplicationBundleIdentifierSessionID = nil
         voicePolishTask = nil
         voicePolishTaskSessionID = nil
-        voicePolishCanonicalOptionSessionID = nil
-        canonicalVoicePolishRequestSessionID = nil
+        voicePolishProcessingSessionID = nil
         voicePolishChoiceSessionID = nil
         voicePolishChoiceContinuation = nil
         currentConfig = nil
