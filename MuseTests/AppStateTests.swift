@@ -277,7 +277,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.barPhase, .processing)
         XCTAssertTrue(appState.isVoicePolishUnavailable)
         XCTAssertTrue(appState.canUseVoicePolishCanonicalText)
-        XCTAssertTrue(appState.voicePolishUnavailableMessage?.contains("原转写已保留") == true)
+        XCTAssertTrue(appState.voicePolishUnavailableMessage?.contains(L("原转写已保留", "The transcript was preserved.")) == true)
 
         var retryCount = 0
         appState.onRetryVoicePolish = {

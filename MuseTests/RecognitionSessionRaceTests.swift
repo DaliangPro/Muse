@@ -273,7 +273,7 @@ final class RecognitionSessionRaceTests: XCTestCase {
             $0.hasPrefix("finalized:已有部分文字:")
         })
         XCTAssertTrue(recorder.values.contains {
-            $0.contains("全文重识别失败") && $0.contains("已保留现有文字")
+            $0.contains(L("全文重识别失败", "full re-recognition failed")) && $0.contains(L("已保留现有文字", "Existing text was preserved"))
         })
     }
 
@@ -298,7 +298,7 @@ final class RecognitionSessionRaceTests: XCTestCase {
 
         XCTAssertEqual(injection.injectionCount, 0)
         XCTAssertTrue(recorder.values.contains {
-            $0.contains("未返回识别结果") && $0.contains("豆包")
+            $0.contains(L("未返回识别结果", "returned no transcript")) && $0.contains(L("豆包", "Doubao"))
         })
     }
 
@@ -365,7 +365,7 @@ final class RecognitionSessionRaceTests: XCTestCase {
             $0.hasPrefix("finalized:全文重放恢复完整文字:")
         })
         XCTAssertFalse(recorder.values.contains {
-            $0.contains("全文重识别失败")
+            $0.contains(L("全文重识别失败", "full re-recognition failed"))
         })
     }
 
@@ -407,7 +407,7 @@ final class RecognitionSessionRaceTests: XCTestCase {
             $0.hasPrefix("finalized:已有有效文字:")
         })
         XCTAssertFalse(recorder.values.contains {
-            $0.contains("全文重识别失败")
+            $0.contains(L("全文重识别失败", "full re-recognition failed"))
         })
     }
 

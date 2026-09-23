@@ -95,7 +95,7 @@ final class LLMThinkingModeValidatorTests: XCTestCase {
         guard case .failed(let message) = result else {
             return XCTFail("只有 HTTP 成功、没有状态证据时不得通过")
         }
-        XCTAssertTrue(message.contains("没有返回足够证据"))
+        XCTAssertTrue(message.contains(L("没有返回足够证据", "did not provide enough evidence")))
         let recordedModes = await probe.recordedModes()
         XCTAssertEqual(recordedModes, [.enabled, .disabled])
     }
@@ -161,7 +161,7 @@ final class LLMThinkingModeValidatorTests: XCTestCase {
             return XCTFail("预期自动纠正，实际为 \(result)")
         }
         XCTAssertEqual(mode, .enabled)
-        XCTAssertTrue(message.contains("自动调整为开启"))
+        XCTAssertTrue(message.contains(L("自动调整为开启", "changed to On")))
         let recordedModes = await probe.recordedModes()
         XCTAssertEqual(recordedModes, [.disabled, .enabled])
     }
@@ -203,7 +203,7 @@ final class LLMThinkingModeValidatorTests: XCTestCase {
         guard case .failed(let message) = result else {
             return XCTFail("没有关闭状态证据时不得自动纠正")
         }
-        XCTAssertTrue(message.contains("没有返回足够证据"))
+        XCTAssertTrue(message.contains(L("没有返回足够证据", "did not provide enough evidence")))
         let recordedModes = await probe.recordedModes()
         XCTAssertEqual(recordedModes, [.enabled, .disabled])
     }
@@ -222,7 +222,7 @@ final class LLMThinkingModeValidatorTests: XCTestCase {
         guard case .failed(let message) = result else {
             return XCTFail("两种状态都无法观察时不得假通过")
         }
-        XCTAssertTrue(message.contains("没有返回足够证据"))
+        XCTAssertTrue(message.contains(L("没有返回足够证据", "did not provide enough evidence")))
         let recordedModes = await probe.recordedModes()
         XCTAssertEqual(recordedModes, [.enabled, .disabled])
     }
@@ -246,7 +246,7 @@ final class LLMThinkingModeValidatorTests: XCTestCase {
             return XCTFail("仅关闭状态可验证时应自动纠正")
         }
         XCTAssertEqual(mode, .disabled)
-        XCTAssertTrue(message.contains("关闭"))
+        XCTAssertTrue(message.contains(L("关闭", "Off")))
         let recordedModes = await probe.recordedModes()
         XCTAssertEqual(recordedModes, [.enabled, .disabled])
     }

@@ -275,7 +275,11 @@ final class RecognitionSessionTests: XCTestCase {
             authoritativeText: "",
             isFinal: false
         )))
-        try await Task.sleep(for: .milliseconds(900))
+        // 等待预生成实际开始；固定延迟在繁忙的CI机器上不能保证任务已获得调度。
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await client.requestCount() == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let speculativeCount = await client.requestCount()
         XCTAssertEqual(speculativeCount, 1)
 
