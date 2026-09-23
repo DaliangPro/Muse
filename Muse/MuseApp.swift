@@ -97,9 +97,11 @@ struct MuseApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .appSettings) {
-                SettingsMenuCommand(
-                    register: appDelegate.registerSettingsWindowAction,
-                    open: appDelegate.openSettingsWindow
+                AppWindowMenuCommands(
+                    registerSettings: appDelegate.registerSettingsWindowAction,
+                    openSettings: appDelegate.openSettingsWindow,
+                    registerSetup: appDelegate.registerSetupWindowAction,
+                    openSetup: appDelegate.openSetupWindow
                 )
             }
         }
@@ -161,7 +163,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hudDebugPresenter = HUDDebugPresenter()
     private let hotkeyManager = HotkeyManager()
     private let session = RecognitionSession()
-    private let settingsWindowPresenter = SettingsWindowPresenter()
+    private let settingsWindowPresenter = AppWindowPresenter(windowID: "settings")
+    private let setupWindowPresenter = AppWindowPresenter(windowID: "setup")
     private let menuBarVisibilityMonitor = MenuBarVisibilityMonitor()
     private var statusItem: NSStatusItem?
     private var interactiveTestControlPanel: NSPanel?
@@ -355,7 +358,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.startHotkeyWithRetry()
         }
 
-        AppStartupCoordinator.showSetupWizardIfNeeded(appState: appState)
+        AppStartupCoordinator.showSetupWizardIfNeeded(
+            hasCompletedSetup: appState.hasCompletedSetup,
+            openSetupWindow: openSetupWindow
+        )
         AppStartupCoordinator.startLocalServerIfNeeded()
         // 启动静默探测三模型连通性，模型设置页的灯开箱即亮（2026-06-12）
         ModelConnectivityProber.probeOnLaunchIfNeeded()
@@ -576,12 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSetupFromStatusMenu() {
-        if let openSetupAction = Self.openSetupAction {
-            openSetupAction()
-            NSApp.activate(ignoringOtherApps: true)
-        } else {
-            _ = NSApp.sendAction(Selector(("showSetupWindow:")), to: nil, from: nil)
-        }
+        openSetupWindow()
     }
 
     @objc private func openAboutFromStatusMenu() {
@@ -795,12 +796,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Stored by MenuBarContent so AppDelegate can open the settings window.
-    static var openSettingsAction: (() -> Void)?
-
-    /// Stored by MenuBarContent so AppStartupCoordinator can open the setup wizard window.
-    static var openSetupAction: (() -> Void)?
-
     func applicationWillTerminate(_ notification: Notification) {
         guard !InteractiveTestRuntime.isEnabled else { return }
         // Synchronous kill: don't rely on async Task, app exits immediately after this returns
@@ -831,6 +826,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func openSettingsWindow() {
         guard !InteractiveTestRuntime.isEnabled else { return }
         settingsWindowPresenter.open()
+    }
+
+    func registerSetupWindowAction(_ action: @escaping () -> Void) {
+        setupWindowPresenter.register(openAction: action)
+    }
+
+    func openSetupWindow() {
+        guard !InteractiveTestRuntime.isEnabled else { return }
+        setupWindowPresenter.open()
     }
 
     /// Only reset hotkey state when no new recording is in progress.

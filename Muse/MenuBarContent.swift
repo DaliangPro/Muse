@@ -44,15 +44,6 @@ struct MenuBarContent: View {
         // 语言变化时强制重渲染
         let _ = language
 
-        // 注册 Dock 图标点击打开设置
-        let _ = {
-            AppDelegate.openSettingsAction = { [openWindow] in
-                openWindow(id: "settings")
-            }
-            AppDelegate.openSetupAction = { [openWindow] in
-                openWindow(id: "setup")
-            }
-        }()
     }
 
 }

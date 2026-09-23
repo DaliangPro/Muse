@@ -114,27 +114,13 @@ enum AppStartupCoordinator {
         }
     }
 
-    static func showSetupWizardIfNeeded(appState: AppState) {
-        guard !AppLaunchDebug.hudDemoEnabled, !appState.hasCompletedSetup else { return }
-        attemptOpenSetupWizard(retriesLeft: 20)
-    }
-
-    /// openSetupAction 由菜单栏视图渲染时注册，可能晚于本次调用；为 nil 时按 0.3s 间隔重试，
-    /// 直到注册就绪再开窗——消除「首次启动偶发不弹引导」的时序竞态。用与菜单栏「使用引导」
-    /// 相同的 openWindow 机制；耗尽重试才退回失效的 sendAction 兜底。
-    private static func attemptOpenSetupWizard(retriesLeft: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            MainActor.assumeIsolated {
-                if let openSetup = AppDelegate.openSetupAction {
-                    openSetup()
-                    NSApp.activate(ignoringOtherApps: true)
-                } else if retriesLeft > 0 {
-                    attemptOpenSetupWizard(retriesLeft: retriesLeft - 1)
-                } else {
-                    _ = NSApp.sendAction(Selector(("showSetupWindow:")), to: nil, from: nil)
-                }
-            }
-        }
+    static func showSetupWizardIfNeeded(
+        hasCompletedSetup: Bool,
+        openSetupWindow: () -> Void
+    ) {
+        guard !AppLaunchDebug.hudDemoEnabled, !hasCompletedSetup else { return }
+        // 与菜单共用入口；命令场景尚未注册时由展示器保留请求。
+        openSetupWindow()
     }
 
     static func startLocalServerIfNeeded() {
