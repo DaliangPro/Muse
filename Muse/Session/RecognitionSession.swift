@@ -1321,6 +1321,10 @@ actor RecognitionSession {
                     finalText = prepared.canonicalText
                     continue
                 case .cancel:
+                    await saveCancelledVoicePolishHistory(
+                        rawText: rawText, canonicalText: finalText,
+                        mode: mode, durationMs: durationMs
+                    )
                     return nil
                 }
             } while envelope == nil
@@ -1354,6 +1358,10 @@ actor RecognitionSession {
                     performance.userRetryCount += 1
                     loadedLLMConfig = await loadLLMConfigOffActor()
                 case .cancel:
+                    await saveCancelledVoicePolishHistory(
+                        rawText: rawText, canonicalText: finalText,
+                        mode: mode, durationMs: durationMs
+                    )
                     return nil
                 }
             }
@@ -1432,6 +1440,10 @@ actor RecognitionSession {
                         pipelineStartedAt = .now
                         continue
                     case .cancel:
+                        await saveCancelledVoicePolishHistory(
+                            rawText: rawText, canonicalText: finalText,
+                            mode: mode, durationMs: durationMs
+                        )
                         return nil
                     }
                 }
@@ -1801,14 +1813,42 @@ actor RecognitionSession {
 
     /// 新记录使用真实执行的基础模式名称。
     private var historyProcessingModeName: String {
-        switch currentMode.id {
+        Self.historyProcessingModeName(for: currentMode)
+    }
+
+    private static func historyProcessingModeName(for mode: ProcessingMode) -> String {
+        switch mode.id {
         case ProcessingMode.directId:
             return L("直出", "Direct")
         case ProcessingMode.lightPolishId, ProcessingMode.formalWriting.id:
             return L("润色", "Polish")
         default:
-            return currentMode.name
+            return mode.name
         }
+    }
+
+    /// 润色失败等待中被取消（Esc 或新会话顶替）时不注入、不交付，但原转写
+    /// 必须留在历史里，否则 HUD 所称「原转写已保留」会落空、整段内容丢失。
+    /// 字数与 token 记 0：本次没有产生输出，不计入统计。
+    private func saveCancelledVoicePolishHistory(
+        rawText: String,
+        canonicalText: String,
+        mode: ProcessingMode,
+        durationMs: Int
+    ) async {
+        await historyStore.insert(HistoryRecord(
+            id: UUID().uuidString,
+            createdAt: Date(),
+            durationSeconds: Double(durationMs) / 1_000,
+            rawText: rawText,
+            processingMode: Self.historyProcessingModeName(for: mode),
+            processedText: nil,
+            finalText: canonicalText,
+            status: "voice_polish_cancelled",
+            characterCount: 0,
+            tokenCount: 0
+        ))
+        DebugFileLogger.log("voice polish cancelled while awaiting choice; transcript saved to history len=\(canonicalText.count)")
     }
 
     private func teardownASRClient(

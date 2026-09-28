@@ -973,8 +973,9 @@ final class RecognitionSessionTests: XCTestCase {
         // 结构阶段返回空白正文，必须等待用户选择，不能静默交付原稿。
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [" \n"])
         let recorder = RecognitionEventRecorder()
+        let historyStore = HistoryStore(path: ":memory:")
         let session = RecognitionSession(
-            historyStore: HistoryStore(path: ":memory:"),
+            historyStore: historyStore,
             llmClientFactory: { client },
             llmConfigLoader: {
                 LLMConfig(
@@ -1034,6 +1035,14 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertTrue(recorder.values.contains("completed"))
         let state = await session.state
         XCTAssertEqual(state, .idle)
+        // 取消不交付，但原转写必须留在历史里，不能整段丢失。
+        let history = await historyStore.fetchAll()
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history.first?.status, "voice_polish_cancelled")
+        XCTAssertEqual(history.first?.rawText, source)
+        XCTAssertFalse(history.first?.finalText.isEmpty ?? true)
+        XCTAssertEqual(history.first?.characterCount, 0)
+        XCTAssertEqual(history.first?.processingMode, L("润色", "Polish"))
     }
 
     func testVoicePolishExplicitRetryStartsFreshSingleRequestAndReturnsStructuredDraft() async throws {
@@ -1046,8 +1055,9 @@ final class RecognitionSessionTests: XCTestCase {
             " \n", polished,
         ])
         let recorder = RecognitionEventRecorder()
+        let historyStore = HistoryStore(path: ":memory:")
         let session = RecognitionSession(
-            historyStore: HistoryStore(path: ":memory:"),
+            historyStore: historyStore,
             llmClientFactory: { client },
             llmConfigLoader: {
                 LLMConfig(apiKey: "test", model: "mock-model", baseURL: "https://example.com/v1")
@@ -1119,6 +1129,8 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.userRetryCount, 1)
         XCTAssertEqual(result?.performance?.llmAttemptCount, 2)
         XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
+        let cancelledHistory = await historyStore.fetchAll().filter { $0.status == "voice_polish_cancelled" }
+        XCTAssertTrue(cancelledHistory.isEmpty)
     }
 
     func testPolishPrefetchReusesActualPipelineWithoutSecondRequest() async throws {
