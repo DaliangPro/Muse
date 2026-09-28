@@ -292,24 +292,31 @@ final class HotkeyManager: NSObject {
         case .hold:
             handleBindingEvent(binding: binding, pressed: true)
         case .toggle:
-            let id = binding.modeId
-            if let activeId = activeToggleModeId, activeId != id {
-                toggleState[activeId] = false
+            handleTogglePress(binding)
+        }
+    }
+
+    /// 切换式快捷键按下：录音中按另一模式的键为跨模式停止，否则开关本模式。
+    /// Carbon、事件 tap 与修饰键三条输入路径共用此逻辑。
+    private func handleTogglePress(_ binding: ModeBinding) {
+        let id = binding.modeId
+        if let activeId = activeToggleModeId, activeId != id {
+            // Cross-mode stop: different mode's key pressed while recording
+            toggleState[activeId] = false
+            activeToggleModeId = nil
+            updateCarbonESCAbortHotkeyRegistration()
+            onCrossModeStop?(id)
+        } else {
+            let isOn = toggleState[id] ?? false
+            toggleState[id] = !isOn
+            if !isOn {
+                activeToggleModeId = id
+                updateCarbonESCAbortHotkeyRegistration()
+                binding.onStart()
+            } else {
                 activeToggleModeId = nil
                 updateCarbonESCAbortHotkeyRegistration()
-                onCrossModeStop?(id)
-            } else {
-                let isOn = toggleState[id] ?? false
-                toggleState[id] = !isOn
-                if !isOn {
-                    activeToggleModeId = id
-                    updateCarbonESCAbortHotkeyRegistration()
-                    binding.onStart()
-                } else {
-                    activeToggleModeId = nil
-                    updateCarbonESCAbortHotkeyRegistration()
-                    binding.onStop()
-                }
+                binding.onStop()
             }
         }
     }
@@ -541,26 +548,7 @@ final class HotkeyManager: NSObject {
                     if type == .keyDown {
                         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat)
                         if isRepeat != 0 { return nil }
-                        let id = binding.modeId
-                        if let activeId = activeToggleModeId, activeId != id {
-                            // Cross-mode stop: different mode's key pressed while recording
-                            toggleState[activeId] = false
-                            activeToggleModeId = nil
-                            updateCarbonESCAbortHotkeyRegistration()
-                            onCrossModeStop?(id)
-                        } else {
-                            let isOn = toggleState[id] ?? false
-                            toggleState[id] = !isOn
-                            if !isOn {
-                                activeToggleModeId = id
-                                updateCarbonESCAbortHotkeyRegistration()
-                                binding.onStart()
-                            } else {
-                                activeToggleModeId = nil
-                                updateCarbonESCAbortHotkeyRegistration()
-                                binding.onStop()
-                            }
-                        }
+                        handleTogglePress(binding)
                         return nil
                     }
                 }
@@ -602,25 +590,7 @@ final class HotkeyManager: NSObject {
             let wasDown = wasModifierDown[id] ?? false
             if pressed && !wasDown {
                 wasModifierDown[id] = true
-                if let activeId = activeToggleModeId, activeId != id {
-                    // Cross-mode stop via modifier key
-                    toggleState[activeId] = false
-                    activeToggleModeId = nil
-                    updateCarbonESCAbortHotkeyRegistration()
-                    onCrossModeStop?(id)
-                } else {
-                    let isOn = toggleState[id] ?? false
-                    toggleState[id] = !isOn
-                    if !isOn {
-                        activeToggleModeId = id
-                        updateCarbonESCAbortHotkeyRegistration()
-                        binding.onStart()
-                    } else {
-                        activeToggleModeId = nil
-                        updateCarbonESCAbortHotkeyRegistration()
-                        binding.onStop()
-                    }
-                }
+                handleTogglePress(binding)
             } else if !pressed {
                 wasModifierDown[id] = false
             }
