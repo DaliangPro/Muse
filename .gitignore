@@ -54,6 +54,7 @@ tmp/
 findings.md
 progress.md
 task_plan.md
+docs/archive/CODEX_REPAIR_PLAN.md
 
 # 签名私钥（绝不入库）
 *.p12
