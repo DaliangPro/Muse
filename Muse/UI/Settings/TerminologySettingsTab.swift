@@ -128,7 +128,7 @@ struct TerminologySettingsTab: View, SettingsCardHelpers {
         VStack(alignment: .leading, spacing: 12) {
             panelSwitch
             HStack(spacing: 10) {
-                AssetLibrarySearchField(
+                SettingsSearchField(
                     text: $searchText,
                     prompt: L("搜索原文字或替换内容", "Search words or replacements"),
                     fill: TF.settingsCard

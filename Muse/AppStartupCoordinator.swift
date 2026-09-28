@@ -114,36 +114,19 @@ enum AppStartupCoordinator {
         }
     }
 
-    static func showSetupWizardIfNeeded(appState: AppState) {
-        guard !AppLaunchDebug.hudDemoEnabled, !appState.hasCompletedSetup else { return }
-        attemptOpenSetupWizard(retriesLeft: 20)
-    }
-
-    /// openSetupAction 由菜单栏视图渲染时注册，可能晚于本次调用；为 nil 时按 0.3s 间隔重试，
-    /// 直到注册就绪再开窗——消除「首次启动偶发不弹引导」的时序竞态。用与菜单栏「使用引导」
-    /// 相同的 openWindow 机制；耗尽重试才退回失效的 sendAction 兜底。
-    private static func attemptOpenSetupWizard(retriesLeft: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            MainActor.assumeIsolated {
-                if let openSetup = AppDelegate.openSetupAction {
-                    openSetup()
-                    NSApp.activate(ignoringOtherApps: true)
-                } else if retriesLeft > 0 {
-                    attemptOpenSetupWizard(retriesLeft: retriesLeft - 1)
-                } else {
-                    _ = NSApp.sendAction(Selector(("showSetupWindow:")), to: nil, from: nil)
-                }
-            }
-        }
+    static func showSetupWizardIfNeeded(
+        hasCompletedSetup: Bool,
+        openSetupWindow: () -> Void
+    ) {
+        guard !AppLaunchDebug.hudDemoEnabled, !hasCompletedSetup else { return }
+        // 与菜单共用入口；命令场景尚未注册时由展示器保留请求。
+        openSetupWindow()
     }
 
     static func startLocalServerIfNeeded() {
-        // 三类模型角色任一选了本地引擎都需要拉起本地服务：
-        // 识别（sherpa）、润色（localQwen）、语料提炼（localQwen）——
-        // 此前漏了第三个，导致只有提炼用本地模型时服务不启动、提炼必失败
+        // 识别（sherpa）或润色（localQwen）任一选了本地引擎都需要拉起本地服务
         let needsLocalServer = KeychainService.selectedASRProvider == .sherpa
             || KeychainService.anyPolishUsesLocalModel
-            || KeychainService.selectedAssetExtractionLLMProvider == .localQwen
         guard needsLocalServer else { return }
 
         if ModelManager.isLocalASRModelAvailable || LocalQwenLLMConfig.isModelAvailable {
@@ -158,15 +141,10 @@ enum AppStartupCoordinator {
             AppLogger.log("[App] Local ASR model is not available; server was not started")
         }
 
-        // 润色/提炼选了本地千问但模型未下载时，服务即使为 ASR 拉起也无法服务 LLM，
-        // 此前会静默失败。这里独立告警，避免运行时润色/提炼无声出错。
-        if !LocalQwenLLMConfig.isModelAvailable {
-            if KeychainService.anyPolishUsesLocalModel {
-                AppLogger.log("[App] Local Qwen LLM model not downloaded; polish will fail until the model is downloaded")
-            }
-            if KeychainService.selectedAssetExtractionLLMProvider == .localQwen {
-                AppLogger.log("[App] Local Qwen LLM model not downloaded; asset extraction will fail until the model is downloaded")
-            }
+        // 润色选了本地千问但模型未下载时，服务即使为 ASR 拉起也无法服务 LLM，
+        // 此前会静默失败。这里独立告警，避免运行时润色无声出错。
+        if !LocalQwenLLMConfig.isModelAvailable, KeychainService.anyPolishUsesLocalModel {
+            AppLogger.log("[App] Local Qwen LLM model not downloaded; polish will fail until the model is downloaded")
         }
     }
 }

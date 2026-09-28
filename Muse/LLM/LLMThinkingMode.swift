@@ -26,11 +26,9 @@ enum LLMThinkingMode: String, CaseIterable, Codable, Hashable, Sendable {
     }
 }
 
-/// 同一服务商可以同时承担文本处理与语料沉淀，两者可能选用不同模型，
-/// 因此深度思考偏好必须按使用场景分开保存。
+/// 深度思考偏好按使用场景分开保存；存储键包含场景名，新增场景不会与既有偏好串用。
 enum LLMConfigurationRole: String, Codable, Sendable {
     case textProcessing
-    case assetExtraction
 }
 
 /// 连通性缓存必须绑定完整模型执行配置；只按服务商缓存会在模型或思考状态改变后

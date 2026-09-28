@@ -77,7 +77,7 @@ enum RecognitionEvent: Sendable {
     /// Voice Polish 正在执行的可见阶段；不携带任何用户正文。
     case voicePolishStage(VoicePolishStage)
     /// 润色未能安全完成。Session 此时不会自动注入原转写，而是等待用户
-    /// 明确选择“重试润色”或“使用原转写”。
+    /// 明确重试润色或取消当前输入。
     case voicePolishUnavailable(reason: VoicePolishFailureReason?)
     case finalized(text: String, injection: InjectionOutcome)
     /// 流式上传中断（REPAIR_PLAN B7a）：录音仍在继续，最终文本由停止后的

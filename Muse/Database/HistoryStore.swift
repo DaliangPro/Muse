@@ -71,25 +71,23 @@ actor HistoryStore {
             """
             sqlite3_exec(db, correctionsSQL, nil, nil, nil)
 
-            // Migration: add character_count column if it doesn't exist (for existing databases)
-            sqlite3_exec(db, "ALTER TABLE recognition_history ADD COLUMN character_count INTEGER;", nil, nil, nil)
-            sqlite3_exec(db, "ALTER TABLE recognition_history ADD COLUMN token_count INTEGER;", nil, nil, nil)
+            // 旧库补列：只在列缺失时执行，失败留下日志而不是被静默吞掉。
+            Self.addColumnIfMissing(db, table: "recognition_history", column: "character_count", definition: "INTEGER")
+            Self.addColumnIfMissing(db, table: "recognition_history", column: "token_count", definition: "INTEGER")
             // 旧纠正记录历史上同时用于风格和术语，迁移默认 true；新记录按用户
             // 本次确认的两个独立开关写入，关闭风格学习不再影响术语记忆。
-            sqlite3_exec(
-                db,
-                "ALTER TABLE voice_polish_corrections ADD COLUMN learn_style INTEGER NOT NULL DEFAULT 1;",
-                nil, nil, nil
+            Self.addColumnIfMissing(
+                db, table: "voice_polish_corrections", column: "learn_style",
+                definition: "INTEGER NOT NULL DEFAULT 1"
             )
-            sqlite3_exec(
-                db,
-                "ALTER TABLE voice_polish_corrections ADD COLUMN learn_terminology INTEGER NOT NULL DEFAULT 1;",
-                nil, nil, nil
+            Self.addColumnIfMissing(
+                db, table: "voice_polish_corrections", column: "learn_terminology",
+                definition: "INTEGER NOT NULL DEFAULT 1"
             )
 
             // REPAIR_PLAN B5：WAL 降低写阻塞；created_at 建索引，
             // 列表按时间倒序查询不再随数据量增长全表排序。
-            // busy_timeout：与 LanguageAssetStore 连接并发写同库，撞锁等待而非立刻失败
+            // busy_timeout：同库并发连接撞锁时等待而非立刻失败
             sqlite3_busy_timeout(db, 3000)
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
             sqlite3_exec(
@@ -113,8 +111,33 @@ actor HistoryStore {
         }
     }
 
-    // 关闭连接，防止每次 new HistoryStore() 泄漏 sqlite 连接（2026-06-24 修：GeneralSettingsTab/
-    // AssetLibraryTab 每次重建都 new，泄漏连接的读锁会钉住 WAL 不 checkpoint → 越用越卡，对齐 LanguageAssetStore）
+    private static func addColumnIfMissing(
+        _ db: OpaquePointer?, table: String, column: String, definition: String
+    ) {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else {
+            DebugFileLogger.log("HistoryStore migration: table_info(\(table)) failed: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+        var exists = false
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let name = sqlite3_column_text(stmt, 1), String(cString: name) == column {
+                exists = true
+                break
+            }
+        }
+        sqlite3_finalize(stmt)
+        guard !exists else { return }
+        let sql = "ALTER TABLE \(table) ADD COLUMN \(column) \(definition);"
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            let message = String(cString: sqlite3_errmsg(db))
+            AppLogger.log("[HistoryStore] 补列失败 \(table).\(column): \(message)")
+            DebugFileLogger.log("HistoryStore migration FAILED \(table).\(column): \(message)")
+        }
+    }
+
+    // 关闭连接，防止每次 new HistoryStore() 泄漏 sqlite 连接（2026-06-24 修：设置页每次重建都 new，
+    // 泄漏连接的读锁会钉住 WAL 不 checkpoint → 越用越卡）
     deinit {
         sqlite3_close(db)
     }
@@ -726,38 +749,6 @@ actor HistoryStore {
     }
 
     /// 获取全部记录的统计信息（使用数据库聚合查询，高效）
-    /// 可提炼语料计数：与提炼管线输入口径一致(status=completed 且有正文)——
-    /// 语料池卡片显示这个数才「准确」，全表 COUNT 会把失败/中断记录也算进去（2026-07）
-    func extractableRecordCount(since: Date? = nil) -> Int {
-        do {
-            return try extractableRecordCountOrThrow(since: since)
-        } catch {
-            AppLogger.log("[HistoryStore] 可提炼语料计数失败: \(error.localizedDescription)")
-            return 0
-        }
-    }
-
-    func extractableRecordCountOrThrow(since: Date? = nil) throws -> Int {
-        let db = try requireDB()
-        var sql = "SELECT COUNT(*) FROM recognition_history WHERE status = 'completed' AND TRIM(final_text) != ''"
-        if since != nil {
-            sql += " AND created_at >= ?"
-        }
-        sql += ";"
-
-        var stmt: OpaquePointer?
-        try prepare(sql, in: db, statement: &stmt)
-        defer { sqlite3_finalize(stmt) }
-
-        if let since {
-            SQL.bind(stmt, 1, ISO8601DateFormatter().string(from: since))
-        }
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
-        }
-        return Int(sqlite3_column_int(stmt, 0))
-    }
-
     func getStatistics() async -> Statistics {
         do {
             return try getStatisticsOrThrow()

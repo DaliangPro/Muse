@@ -23,23 +23,6 @@ final class DatabaseFailurePropagationTests: XCTestCase {
         }
     }
 
-    func testLanguageAssetStorePrepareFailurePropagates() async throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? fileManager.trashItem(at: directory, resultingItemURL: nil) }
-        let path = directory.appendingPathComponent("assets.sqlite").path
-        let store = LanguageAssetStore(path: path)
-        try dropTable("language_asset", at: path)
-
-        do {
-            _ = try await store.fetchAllOrThrow()
-            XCTFail("prepare 失败不得伪装成空资产库")
-        } catch LanguageAssetStoreError.databaseUnavailable {
-            XCTFail("连接仍可用，此处应是 SQL 查询失败")
-        } catch LanguageAssetStoreError.sqlite {
-            // 预期：prepare 错误向上传播。
-        }
-    }
-
     private func makeTemporaryDirectory() throws -> URL {
         let directory = fileManager.temporaryDirectory
             .appendingPathComponent("muse-database-failure-\(UUID().uuidString)", isDirectory: true)

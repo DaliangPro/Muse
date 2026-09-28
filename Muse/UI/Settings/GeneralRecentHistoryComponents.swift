@@ -9,6 +9,7 @@ struct VoicePolishHistoryPresentation: Equatable {
         case timeoutFallback
         case fallback
         case canonical
+        case cancelled
         case unknown
     }
 
@@ -73,6 +74,15 @@ struct VoicePolishHistoryPresentation: Equatable {
                 labelEN: "Used original",
                 detailZH: "你主动停止等待，已使用术语纠正后的原文。",
                 detailEN: "You stopped waiting and used the terminology-corrected transcript."
+            )
+        case "voice_polish_cancelled":
+            self.init(
+                kind: .cancelled,
+                tone: .caution,
+                labelZH: "已取消",
+                labelEN: "Cancelled",
+                detailZH: "润色未完成且你取消了本次输出，文字没有写入目标位置；这里保存了术语纠正后的原转写，可复制使用。",
+                detailEN: "Voice Polish did not complete and you cancelled the output, so nothing was inserted. The terminology-corrected transcript is kept here for copying."
             )
         default:
             self.init(
@@ -202,7 +212,7 @@ struct RecentHistoryRowView: View {
 
 }
 
-// 供其他行式列表复用（提炼页最近提炼行的删除键与本页同款,2026-07）
+// 最近记录行的图标按钮，可供其他行式列表复用
 struct RecentHistoryActionIconButton: View {
     let systemName: String
     let accessibilityLabel: String

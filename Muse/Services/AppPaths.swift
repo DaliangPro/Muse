@@ -29,6 +29,6 @@ enum AppPaths {
         return dir
     }
 
-    /// 识别历史数据库路径（HistoryStore 与 LanguageAssetStore 共用同一文件）。
+    /// 识别历史数据库路径。该文件内另有已下线资产提炼功能的表，数据原样保留。
     static var historyDBPath: String { support("history.db").path }
 }

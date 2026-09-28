@@ -116,10 +116,6 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
-    var isFormalWritingMode: Bool {
-        kind == .voicePolish
-    }
-
     /// 产品档位由录音时冻结的模式决定，不读取全局旧质量设置。
     var voicePolishQualityMode: VoicePolishQualityMode? {
         guard kind == .voicePolish else { return nil }

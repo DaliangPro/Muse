@@ -150,24 +150,4 @@ struct VoicePolishEditingPipeline: Sendable {
         if output.utf8.count > VoicePolishOutputNormalizer.maximumResponseBytes { return .abnormalLength }
         return nil
     }
-
-    /// 旧规则的离线回归入口；轻度和标准的实际执行均不调用它。
-    static func outputCodes(
-        _ output: String, request: VoicePolishRequest, contentForValidation: String? = nil
-    ) -> [VoicePolishValidationCode] {
-        var codes: [VoicePolishValidationCode] = []
-        // 正文视图只能由已验证布局逐字拼装，不能从模型输出用正则猜掉数字。
-        let content = contentForValidation ?? output
-        if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { codes.append(.emptyOutput) }
-        if VoicePolishCharacterSafety.containsUnsafeCharacters(output) { codes.append(.unsafeCharacters) }
-        if output.utf8.count > VoicePolishOutputNormalizer.maximumResponseBytes
-            || content.count > max(request.fallbackText.count * 2, request.fallbackText.count + 40) {
-            codes.append(.abnormalLength)
-        }
-        codes += VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: request.fallbackText, outputText: content, scene: request.context.scene,
-            allowsPartialTimeReview: request.qualityMode == .standard
-        )
-        return codes
-    }
 }

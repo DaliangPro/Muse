@@ -97,9 +97,11 @@ struct MuseApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .appSettings) {
-                SettingsMenuCommand(
-                    register: appDelegate.registerSettingsWindowAction,
-                    open: appDelegate.openSettingsWindow
+                AppWindowMenuCommands(
+                    registerSettings: appDelegate.registerSettingsWindowAction,
+                    openSettings: appDelegate.openSettingsWindow,
+                    registerSetup: appDelegate.registerSetupWindowAction,
+                    openSetup: appDelegate.openSetupWindow
                 )
             }
         }
@@ -161,7 +163,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hudDebugPresenter = HUDDebugPresenter()
     private let hotkeyManager = HotkeyManager()
     private let session = RecognitionSession()
-    private let settingsWindowPresenter = SettingsWindowPresenter()
+    private let settingsWindowPresenter = AppWindowPresenter(windowID: "settings")
+    private let setupWindowPresenter = AppWindowPresenter(windowID: "setup")
     private let menuBarVisibilityMonitor = MenuBarVisibilityMonitor()
     private var statusItem: NSStatusItem?
     private var interactiveTestControlPanel: NSPanel?
@@ -189,10 +192,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingBarController = FloatingBarController(state: appState)
         appState.onCopyFallbackVisibilityChange = { [weak self] isVisible in
             self?.hotkeyManager.isCopyFallbackVisible = isVisible
-        }
-        appState.onUseVoicePolishCanonicalText = { [weak self] in
-            guard let self else { return false }
-            return await self.session.useCanonicalVoicePolishResult()
         }
         appState.onRetryVoicePolish = { [weak self] in
             guard let self else { return false }
@@ -355,7 +354,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.startHotkeyWithRetry()
         }
 
-        AppStartupCoordinator.showSetupWizardIfNeeded(appState: appState)
+        AppStartupCoordinator.showSetupWizardIfNeeded(
+            hasCompletedSetup: appState.hasCompletedSetup,
+            openSetupWindow: openSetupWindow
+        )
         AppStartupCoordinator.startLocalServerIfNeeded()
         // 启动静默探测三模型连通性，模型设置页的灯开箱即亮（2026-06-12）
         ModelConnectivityProber.probeOnLaunchIfNeeded()
@@ -576,12 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSetupFromStatusMenu() {
-        if let openSetupAction = Self.openSetupAction {
-            openSetupAction()
-            NSApp.activate(ignoringOtherApps: true)
-        } else {
-            _ = NSApp.sendAction(Selector(("showSetupWindow:")), to: nil, from: nil)
-        }
+        openSetupWindow()
     }
 
     @objc private func openAboutFromStatusMenu() {
@@ -683,31 +680,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // ESC abort: interrupt immediately. Do not register any alternate abort shortcut.
+        // Esc统一中断本次输入，不再从处理中切换到其他输出。
         hotkeyManager.onESCAbort = { [weak self] in
             guard let self else { return }
             Task { @MainActor in
                 let phase = self.appState.barPhase
-                let canonicalResult = await self.appState.useVoicePolishCanonicalTextIfAvailable(
-                    restoreOnFailure: false
-                )
-                if canonicalResult == .accepted {
-                    AppLogger.log("[Muse] >>> HOTKEY: ESC use Voice Polish canonical text")
-                    DebugFileLogger.log("hotkey ESC use voice polish canonical text")
-                    return
-                }
-                guard canonicalResult.shouldAbortSessionAfterEscape else {
-                    DebugFileLogger.log("hotkey ESC ignored stale voice polish canonical ack")
-                    return
-                }
-                DebugFileLogger.log("hotkey ESC canonical unavailable or rejected; continuing with abort")
                 AppLogger.log("[Muse] >>> HOTKEY: ESC abort session (phase=\(String(describing: phase)))")
                 DebugFileLogger.log("hotkey ESC abort session phase=\(phase)")
                 self.hotkeyManager.isSessionActive = false
                 self.appState.showCancelled()
-                Task {
-                    await self.session.abortCurrentSession()
-                }
+                await self.session.abortCurrentSession()
             }
         }
 
@@ -795,12 +777,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Stored by MenuBarContent so AppDelegate can open the settings window.
-    static var openSettingsAction: (() -> Void)?
-
-    /// Stored by MenuBarContent so AppStartupCoordinator can open the setup wizard window.
-    static var openSetupAction: (() -> Void)?
-
     func applicationWillTerminate(_ notification: Notification) {
         guard !InteractiveTestRuntime.isEnabled else { return }
         // Synchronous kill: don't rely on async Task, app exits immediately after this returns
@@ -831,6 +807,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func openSettingsWindow() {
         guard !InteractiveTestRuntime.isEnabled else { return }
         settingsWindowPresenter.open()
+    }
+
+    func registerSetupWindowAction(_ action: @escaping () -> Void) {
+        setupWindowPresenter.register(openAction: action)
+    }
+
+    func openSetupWindow() {
+        guard !InteractiveTestRuntime.isEnabled else { return }
+        setupWindowPresenter.open()
     }
 
     /// Only reset hotkey state when no new recording is in progress.

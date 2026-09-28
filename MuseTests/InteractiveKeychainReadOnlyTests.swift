@@ -75,23 +75,6 @@ final class InteractiveKeychainReadOnlyTests: XCTestCase {
         }
     }
 
-    func testInteractiveDoesNotReadOrChangeLegacyFileValues() throws {
-        let original = KeychainService.loadAssetExtractionModelOverride(for: .deepseek)
-        defer { try? KeychainService.saveAssetExtractionModelOverride(original, for: .deepseek) }
-        try KeychainService.saveAssetExtractionModelOverride("existing-model", for: .deepseek)
-
-        KeychainService.withInteractiveCredentialReadOnlyForTesting {
-            XCTAssertNil(KeychainService.loadAssetExtractionModelOverride(for: .deepseek))
-            assertReadOnlyFailure {
-                try KeychainService.saveAssetExtractionModelOverride("replacement", for: .deepseek)
-            }
-            assertReadOnlyFailure {
-                try KeychainService.saveAssetExtractionModelOverride(nil, for: .deepseek)
-            }
-        }
-        XCTAssertEqual(KeychainService.loadAssetExtractionModelOverride(for: .deepseek), "existing-model")
-    }
-
     func testInteractiveAuthorizationIsScopedToAllowedCredentials() throws {
         try preservingCredentials {
             try KeychainService.saveASRCredentials(for: .volcano, values: ["appKey": "test-volcano"])

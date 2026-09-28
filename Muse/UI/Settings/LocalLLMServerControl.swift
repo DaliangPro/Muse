@@ -53,7 +53,7 @@ enum LocalLLMServerControl {
         let otherPolishNeedsServer = PolishModelRole.allCases.contains {
             $0 != role && KeychainService.selectedPolishProvider(for: $0) == .localQwen
         }
-        guard !otherPolishNeedsServer, KeychainService.selectedAssetExtractionLLMProvider != .localQwen else {
+        guard !otherPolishNeedsServer else {
             return .keptServerRunning
         }
         if let port = SenseVoiceServerManager.currentQwen3Port {
@@ -79,8 +79,7 @@ enum LocalLLMServerControl {
     static func stopQwen3IfASRDoesNotNeedIt() async {
         let asrNeedsQwen3 = KeychainService.selectedASRProvider == .sherpa
             && (UserDefaults.standard.object(forKey: DefaultsKeys.qwen3FinalEnabled) as? Bool ?? true)
-        guard !asrNeedsQwen3, !KeychainService.anyPolishUsesLocalModel,
-              KeychainService.selectedAssetExtractionLLMProvider != .localQwen else { return }
+        guard !asrNeedsQwen3, !KeychainService.anyPolishUsesLocalModel else { return }
 
         await SenseVoiceServerManager.shared.stopQwen3()
     }

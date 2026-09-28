@@ -17,21 +17,6 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         }
     }
 
-    // 旧布局工具仍保留独立反例；标准运行链不再解码或执行这些布局协议。
-    func testLegacyLayoutDecoderRejectsMissingDuplicatedAndInventedReasonSegments() throws {
-        let source = "小赵负责名单。小李下午有别的事。"
-        let segments = try VoicePolishStructurePlan.segments(in: source)
-        for layout in [
-            #"[{"style":"paragraph","segment_ids":["c1"]}]"#,
-            #"[{"style":"paragraph","segment_ids":["c1","c1"]}]"#,
-            #"[{"style":"paragraph","segment_ids":["c1","made-up"]}]"#,
-            #"[{"style":"paragraph","segment_ids":["c1","c2"],"text":"小赵负责名单。"}]"#
-        ] {
-            let object = try JSONSerialization.jsonObject(with: Data(layout.utf8))
-            XCTAssertThrowsError(try VoicePolishStructurePlan.decodeLayout(from: object, segments: segments))
-        }
-    }
-
     func testStandardPassesCompleteSourceToStructureInsteadOfApplyingPatches() async throws {
         let source = "名单交给小赵。小李下午有别的事，所以调整分工。"
         let prepared = "名单交给小赵，小李下午有别的事，所以调整分工。"
@@ -42,17 +27,6 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
-    func testReturnedNumberingIsPreservedWithoutProgramRenumbering() async {
-        let source = "请执行 `swift test`。等审核完成。请执行 `swift build`。"
-        let structured = "1. 请执行 `swift test`。\n\n等审核完成。\n\n2. 请执行 `swift build`。"
-        let (result, _) = await run(source, [structured], scene: .code)
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, structured)
-        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: source, outputText: "等审核3天完成。", scene: .code
-        ).isEmpty)
-    }
-
     func testManyReturnedBulletMarkersAreNotMistakenForContentExpansion() async {
         let source = String(repeating: "甲。", count: 20)
         let structured = Array(repeating: "- 甲。", count: 20).joined(separator: "\n\n")
@@ -60,30 +34,6 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, structured)
         XCTAssertGreaterThan(result.text.count, source.count * 2)
-    }
-
-    func testLegacyLayoutRejectsSegmentsFromBeforeSentenceBoundaryChange() throws {
-        let original = try VoicePolishStructurePlan.segments(in: "先检查，再发送。")
-        let corrected = try VoicePolishStructurePlan.segments(in: "先检查。再发送。")
-        XCTAssertEqual(original.count, 1)
-        XCTAssertEqual(corrected.count, 2)
-        for ids in [["c1"], ["c1", "c2"]] {
-            let blocks: [[String: Any]] = [["style": "paragraph", "segment_ids": ids]]
-            if ids.count == 1 {
-                XCTAssertThrowsError(try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: corrected))
-            } else {
-                let layout = try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: corrected)
-                XCTAssertEqual(try VoicePolishStructurePlan.render(layout, segments: corrected), "先检查。再发送。")
-            }
-        }
-    }
-
-    func testLegacyReviewCannotApplyPendingContentRepairAndOldLayoutTogether() throws {
-        let source = "请按装软件。"
-        let review = #"{"delivery":"other_or_uncertain","editor_spans":[],"edits":[{"before":"按装","after":"安装","kind":"word"}],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertThrowsError(try VoicePolishEditingReview.decode(
-            review, source: source, structureSegments: VoicePolishStructurePlan.segments(in: source)
-        ))
     }
 
     func testLightDoesNotRequestOrRenderStandardLayout() async throws {
@@ -117,20 +67,6 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         }
     }
 
-    func testLegacyLayoutCannotAddProgramListMarkersInsideIndentedCode() throws {
-        let source = "代码如下：\n    if ready:\n        send()"
-        let segments = try VoicePolishStructurePlan.segments(in: source)
-        for style in ["numbered", "bullet", "paragraph"] {
-            let blocks: [[String: Any]] = [["style": style, "segment_ids": ["c1"]]]
-            if style == "paragraph" {
-                let layout = try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: segments)
-                XCTAssertEqual(try VoicePolishStructurePlan.render(layout, segments: segments), source)
-            } else {
-                XCTAssertThrowsError(try VoicePolishStructurePlan.decodeLayout(from: blocks, segments: segments))
-            }
-        }
-    }
-
     func testExistingBlankLinesDoNotCreateEmptyNumberedItem() async {
         let source = "先检查。\n\n再发布。"
         let structured = "1. 先检查。\n\n2. 再发布。"
@@ -149,7 +85,7 @@ final class VoicePolishStructuredContentPipelineTests: XCTestCase {
         let request = VoicePolishRequest(input: input, context: WritingContext(scene: scene),
             preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: mode)
         let config = LLMConfig(apiKey: "test-only", model: "configured-model", baseURL: "https://example.invalid")
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await VoicePolishEditingPipeline(client: client, config: config).process(request)
         return (result, await client.requests)
     }
 

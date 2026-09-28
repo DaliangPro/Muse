@@ -316,7 +316,6 @@ enum KeychainService {
     // MARK: - Selected LLM Provider (UserDefaults)
 
     private static let selectedLLMProviderKey = DefaultsKeys.selectedLLMProvider
-    private static let selectedAssetExtractionLLMProviderKey = DefaultsKeys.selectedAssetExtractionLLMProvider
 
     static var selectedLLMProvider: LLMProvider {
         get {
@@ -328,22 +327,6 @@ enum KeychainService {
         set {
             setPreference(newValue.rawValue, forKey: selectedLLMProviderKey)
         }
-    }
-
-    static var selectedAssetExtractionLLMProvider: LLMProvider {
-        get {
-            guard let raw = preferenceString(forKey: selectedAssetExtractionLLMProviderKey),
-                  let provider = LLMProvider(rawValue: raw)
-            else { return selectedLLMProvider }
-            return provider
-        }
-        set {
-            setPreference(newValue.rawValue, forKey: selectedAssetExtractionLLMProviderKey)
-        }
-    }
-
-    static func resetAssetExtractionLLMProvider() {
-        removePreference(forKey: selectedAssetExtractionLLMProviderKey)
     }
 
     // MARK: - LLM Credentials (provider-aware)
@@ -409,10 +392,6 @@ enum KeychainService {
         )
         normalized["baseURL"] = baseURL.absoluteString
         return normalized
-    }
-
-    private static func assetExtractionModelOverrideKey(for provider: LLMProvider) -> String {
-        "tf_assetExtractionModelOverride_\(provider.rawValue)"
     }
 
     private static let llmThinkingModesPreferenceKey = "tf_llmThinkingModes"
@@ -613,37 +592,6 @@ enum KeychainService {
     /// Load LLMConfig for the currently selected provider.
     static func loadLLMConfig() -> LLMConfig? {
         resolvedLLMConfig(for: selectedLLMProvider, role: .textProcessing)
-    }
-
-    static func loadAssetExtractionLLMConfig() -> LLMConfig? {
-        let provider = selectedAssetExtractionLLMProvider
-        return resolvedLLMConfig(
-            for: provider,
-            role: .assetExtraction,
-            modelOverride: loadAssetExtractionModelOverride(for: provider)
-        )
-    }
-
-    static func saveAssetExtractionModelOverride(_ model: String?, for provider: LLMProvider) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var dict = loadAll()
-        let key = assetExtractionModelOverrideKey(for: provider)
-        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if trimmed.isEmpty {
-            dict.removeValue(forKey: key)
-        } else {
-            dict[key] = trimmed
-        }
-        try saveAll(dict)
-    }
-
-    static func loadAssetExtractionModelOverride(for provider: LLMProvider) -> String? {
-        let key = assetExtractionModelOverrideKey(for: provider)
-        guard let value = loadAll()[key] as? String else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func resolvedLLMConfig(

@@ -35,6 +35,7 @@ final class VoicePolishHistoryPresentationTests: XCTestCase {
             ("voice_polish_timeout", .timeoutFallback, .caution, "超时回退"),
             ("voice_polish_fallback", .fallback, .failure, "润色回退"),
             ("voice_polish_canonical", .canonical, .caution, "主动原文"),
+            ("voice_polish_cancelled", .cancelled, .caution, "已取消"),
         ]
 
         var labels = Set<String>()

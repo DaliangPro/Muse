@@ -841,14 +841,13 @@ final class RecognitionSessionTests: XCTestCase {
         }
     }
 
-    func testVoicePolishEmitsStageAndCanImmediatelyUseCanonicalText() async throws {
+    func testPolishWaitsForModelAndCancellationProducesNoText() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         try SnippetStorage.saveBuiltin([
             (trigger: "Type less", value: "Typeless"),
         ], context: fixture.context)
         let raw = "我正在使用 Type less。"
-        let canonical = "我正在使用 Typeless。"
         let client = RecognitionSessionBlockingVoicePolishLLM()
         let recorder = RecognitionEventRecorder()
         let session = RecognitionSession(
@@ -870,11 +869,12 @@ final class RecognitionSessionTests: XCTestCase {
             isFinal: true
         )
         let vocabularyContext = fixture.context
-        async let processingResult = session.postProcessVoicePolishForTesting(
-            rawText: raw,
-            transcript: transcript,
-            vocabularyContext: vocabularyContext
-        )
+        let pending = Task {
+            await session.postProcessVoicePolishForTesting(
+                rawText: raw, transcript: transcript,
+                vocabularyContext: vocabularyContext, allowsUserChoice: true
+            )
+        }
 
         for _ in 0..<100 {
             if await client.requestCount() > 0,
@@ -885,19 +885,20 @@ final class RecognitionSessionTests: XCTestCase {
         }
         let requestCount = await client.requestCount()
         XCTAssertEqual(requestCount, 1)
-        let accepted = await session.useCanonicalVoicePolishResult()
-        XCTAssertTrue(accepted)
-        let result = await processingResult
+        try await Task.sleep(for: .milliseconds(1_350))
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("processing:") })
+        await session.abortCurrentSession()
+        let result = await boundedCompletion(pending, session: session) ?? nil
 
-        XCTAssertEqual(result?.finalText, canonical)
-        XCTAssertNil(result?.processedText)
-        XCTAssertFalse(result?.llmFailed ?? true)
-        XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
-        XCTAssertTrue(recorder.values.contains("voicePolishStage:rendering"))
-        XCTAssertTrue(recorder.values.contains("processing:\(canonical)"))
+        XCTAssertNil(result)
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("processing:") })
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("finalized:") })
+        XCTAssertTrue(recorder.values.contains("completed"))
+        let state = await session.state
+        XCTAssertEqual(state, .idle)
     }
 
-    func testVoicePolishCanonicalRequestIsRejectedAfterPipelineResultCommitted() async throws {
+    func testVoicePolishCommitsCompletedPipelineResult() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let polished = "这是已经提交的润色结果。"
@@ -928,11 +929,9 @@ final class RecognitionSessionTests: XCTestCase {
             transcript: transcript,
             vocabularyContext: fixture.context
         )
-        let acceptedAfterCommit = await session.useCanonicalVoicePolishResult()
 
         XCTAssertEqual(result?.finalText, polished)
         XCTAssertTrue(recorder.values.contains("processing:\(polished)"))
-        XCTAssertFalse(acceptedAfterCommit)
     }
 
     func testVoicePolishFallbackUsesCanonicalTextInsteadOfRawTranscript() async throws {
@@ -966,7 +965,7 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.historyStatus, "voice_polish_fallback")
     }
 
-    func testVoicePolishFailureWaitsForExplicitCanonicalChoiceInsteadOfSilentInjection() async throws {
+    func testPolishFailureWaitsAndCancellationProducesNoText() async throws {
         let fixture = try RecognitionSessionVocabularyFixture()
         defer { fixture.cleanup() }
         let vocabularyContext = fixture.context
@@ -974,8 +973,9 @@ final class RecognitionSessionTests: XCTestCase {
         // 结构阶段返回空白正文，必须等待用户选择，不能静默交付原稿。
         let client = RecognitionSessionScriptedVoicePolishLLM(responses: [" \n"])
         let recorder = RecognitionEventRecorder()
+        let historyStore = HistoryStore(path: ":memory:")
         let session = RecognitionSession(
-            historyStore: HistoryStore(path: ":memory:"),
+            historyStore: historyStore,
             llmClientFactory: { client },
             llmConfigLoader: {
                 LLMConfig(
@@ -1026,19 +1026,23 @@ final class RecognitionSessionTests: XCTestCase {
             "events=\(recorder.values) requests=\(requestCount)"
         )
         XCTAssertFalse(recorder.values.contains("processing:\(source)"))
-        let accepted = await session.useCanonicalVoicePolishResult()
-        XCTAssertTrue(accepted)
+        await session.abortCurrentSession()
         let result = await boundedCompletion(pendingTask, session: session) ?? nil
 
-        XCTAssertEqual(result?.finalText, source)
-        XCTAssertNil(result?.processedText)
-        XCTAssertFalse(result?.llmFailed ?? true)
-        XCTAssertEqual(result?.historyStatus, "voice_polish_canonical")
-        XCTAssertTrue(recorder.values.contains("processing:\(source)"))
-        XCTAssertEqual(result?.performance?.firstAutomaticOutcome, .fallback)
-        XCTAssertEqual(result?.performance?.outcome, .canonicalExit)
-        XCTAssertEqual(result?.performance?.llmAttemptCount, 1)
-        XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
+        XCTAssertNil(result)
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("processing:") })
+        XCTAssertFalse(recorder.values.contains { $0.hasPrefix("finalized:") })
+        XCTAssertTrue(recorder.values.contains("completed"))
+        let state = await session.state
+        XCTAssertEqual(state, .idle)
+        // 取消不交付，但原转写必须留在历史里，不能整段丢失。
+        let history = await historyStore.fetchAll()
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history.first?.status, "voice_polish_cancelled")
+        XCTAssertEqual(history.first?.rawText, source)
+        XCTAssertFalse(history.first?.finalText.isEmpty ?? true)
+        XCTAssertEqual(history.first?.characterCount, 0)
+        XCTAssertEqual(history.first?.processingMode, L("润色", "Polish"))
     }
 
     func testVoicePolishExplicitRetryStartsFreshSingleRequestAndReturnsStructuredDraft() async throws {
@@ -1051,8 +1055,9 @@ final class RecognitionSessionTests: XCTestCase {
             " \n", polished,
         ])
         let recorder = RecognitionEventRecorder()
+        let historyStore = HistoryStore(path: ":memory:")
         let session = RecognitionSession(
-            historyStore: HistoryStore(path: ":memory:"),
+            historyStore: historyStore,
             llmClientFactory: { client },
             llmConfigLoader: {
                 LLMConfig(apiKey: "test", model: "mock-model", baseURL: "https://example.com/v1")
@@ -1124,6 +1129,8 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(result?.performance?.userRetryCount, 1)
         XCTAssertEqual(result?.performance?.llmAttemptCount, 2)
         XCTAssertEqual(result?.performance?.repairAttemptCount, 0)
+        let cancelledHistory = await historyStore.fetchAll().filter { $0.status == "voice_polish_cancelled" }
+        XCTAssertTrue(cancelledHistory.isEmpty)
     }
 
     func testPolishPrefetchReusesActualPipelineWithoutSecondRequest() async throws {
@@ -1571,108 +1578,6 @@ private actor RecognitionSessionVoicePolishLLM: LLMClient {
     func generate(_ request: LLMRequest, config: LLMConfig) async throws -> LLMResponse {
         requests.append(request)
         models.append(config.model)
-        if request.options.responseFormat == .jsonObject,
-           let payload = try JSONSerialization.jsonObject(with: Data(request.user.utf8)) as? [String: Any] {
-            let encoder = JSONEncoder()
-            encoder.keyEncodingStrategy = .convertToSnakeCase
-            if payload["draft_document"] != nil {
-                let review = VoicePolishReviewerResult(verdict: "pass", issues: [])
-                return LLMResponse(
-                    text: String(decoding: try encoder.encode(review), as: UTF8.self),
-                    model: config.model
-                )
-            }
-            if let ledgerObject = payload["intent_ledger"] as? [String: Any],
-               payload["current_draft_document"] == nil {
-                let structure = ledgerObject["structure"] as? [String: Any]
-                let unitIds = structure?["ordered_unit_ids"] as? [String] ?? ["u1"]
-                let texts = Self.split(response, count: unitIds.count)
-                let document = VoicePolishLedgerDraftDocument(fragments: zip(unitIds, texts).map {
-                    VoicePolishLedgerDraftFragment(
-                        id: "f_\($0.0)",
-                        unitIds: [$0.0],
-                        text: $0.1
-                    )
-                })
-                return LLMResponse(
-                    text: String(decoding: try encoder.encode(document), as: UTF8.self),
-                    model: config.model
-                )
-            }
-            if let allowedIDs = payload["allowed_fragment_ids"] as? [String] {
-                let texts = Self.split(response, count: allowedIDs.count)
-                let document = VoicePolishLedgerDraftDocument(fragments: zip(allowedIDs, texts).map {
-                    let unitID = String($0.0.dropFirst(2))
-                    return VoicePolishLedgerDraftFragment(
-                        id: $0.0,
-                        unitIds: [unitID],
-                        text: $0.1
-                    )
-                })
-                return LLMResponse(
-                    text: String(decoding: try encoder.encode(document), as: UTF8.self),
-                    model: config.model
-                )
-            }
-            let sourceSpans = payload["source_spans"] as? [[String: Any]] ?? []
-            let sourceLength = sourceSpans.compactMap { $0["text"] as? String }
-                .reduce(0) { $0 + $1.count }
-            let units = sourceSpans.enumerated().compactMap { index, span -> VoicePolishLedgerUnit? in
-                guard let spanID = span["id"] as? String,
-                      let text = span["text"] as? String else { return nil }
-                return VoicePolishLedgerUnit(
-                    id: "u\(index + 1)",
-                    kind: "claim",
-                    deliveryRole: "recipient_content",
-                    finalMeaning: text,
-                    sourceSpanIds: [spanID],
-                    status: "keep",
-                    modality: "confirmed",
-                    exactTokens: [],
-                    surfaceTokens: []
-                )
-            }
-            let cues = payload["required_logic_cues"] as? [[String: Any]] ?? []
-            let conditionals = cues.compactMap { cue -> VoicePolishLedgerConditional? in
-                guard let cueID = cue["id"] as? String,
-                      let cueSpanIDs = cue["source_span_ids"] as? [String],
-                      let operatorKind = cue["operator_kind"] as? String,
-                      !cueSpanIDs.isEmpty else { return nil }
-                return VoicePolishLedgerConditional(
-                    id: "c-\(cueID)",
-                    cueIds: [cueID],
-                    operatorKind: operatorKind,
-                    condition: VoicePolishLedgerCondition(
-                        subject: "来源条件",
-                        predicate: "条件成立",
-                        polarity: true,
-                        sourceSpanIds: cueSpanIDs
-                    ),
-                    consequences: [VoicePolishLedgerConsequence(
-                        action: "执行来源要求",
-                        polarity: true,
-                        sourceSpanIds: cueSpanIDs
-                    )]
-                )
-            }
-            let ledger = VoicePolishIntentLedger(
-                audience: [],
-                units: units,
-                corrections: [],
-                conditionals: conditionals,
-                technicalTokenMappings: [],
-                dictatedSymbolMappings: [],
-                contextMappings: [],
-                structure: VoicePolishLedgerStructure(
-                    kind: sourceLength > 80 ? "paragraphs" : "sentence",
-                    orderedUnitIds: units.map(\.id)
-                )
-            )
-            return LLMResponse(
-                text: String(decoding: try encoder.encode(ledger), as: UTF8.self),
-                model: config.model
-            )
-        }
         return LLMResponse(text: response, model: config.model)
     }
 

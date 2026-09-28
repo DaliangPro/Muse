@@ -8,6 +8,7 @@ import ApplicationServices
 struct SetupWizardView: View {
 
     @Environment(AppState.self) private var appState
+    @Environment(\.openWindow) private var openWindow
     @State private var step = 0
     @State private var keyMonitor: Any?
     // 初始即读真实授权态：避免进授权页时 false→true 的跳变被切页动画捕捉（每次进入动画不一）
@@ -485,7 +486,7 @@ struct SetupWizardView: View {
         appState.hasCompletedSetup = true
         // 先记住引导窗口，打开设置窗口、再关引导——「开始使用」顺势落到设置页，而非凭空消失
         let setupWindow = NSApp.keyWindow
-        AppDelegate.openSettingsAction?()
+        openWindow(id: "settings")
         NSApp.activate(ignoringOtherApps: true)
         setupWindow?.close()
         // 重置到第一步：下次从菜单再点「使用引导」时从欢迎页开始

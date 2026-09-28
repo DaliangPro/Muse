@@ -90,7 +90,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
                                     candidateSource: .authorizedContext, confidence: 1)])
         let client = LightScopeClient([canonical])
         let config = LLMConfig(apiKey: "test-only", model: "configured-model", baseURL: "https://example.invalid")
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await VoicePolishEditingPipeline(client: client, config: config).process(request)
         XCTAssertEqual(request.fallbackText, canonical)
         XCTAssertFalse(result.usedFallback)
         let calls = await client.requests
@@ -103,23 +103,6 @@ final class VoicePolishLightScopeTests: XCTestCase {
         XCTAssertEqual(calls.count, 1)
     }
 
-    // 独立旧编辑器的权限边界继续受测，当前轻度生产管线不再执行补丁。
-    func testLightHardRejectsDirectiveAndContentEvenWithReviewFlagsOrMechanicalDifference() {
-        let source = "给客户回一下：请按装软件"
-        for kind in [VoicePolishTextEdit.Kind.directive, .content] {
-            for flags in [false, true] {
-                for edit in [VoicePolishTextEdit(before: "给客户回一下：", after: "", kind: kind),
-                             .init(before: "请按装软件", after: "请按装软件。", kind: kind)] {
-                    XCTAssertThrowsError(try VoicePolishTextEditor.apply(
-                        [.init(before: "按装", after: "安装", kind: .word), edit],
-                        to: source, source: source, mode: .light,
-                        allowsReviewedInlineDirectives: flags, allowsReviewedSourceCorrections: flags
-                    )) { XCTAssertEqual($0 as? VoicePolishTextEditError, .editOutsideMode) }
-                }
-            }
-        }
-    }
-
     private func run(_ source: String, _ responses: [String]) async -> (VoicePolishResult, [LLMRequest]) {
         let client = LightScopeClient(responses)
         let input = VoiceInputEnvelope(providerFinalText: source,
@@ -128,7 +111,7 @@ final class VoicePolishLightScopeTests: XCTestCase {
         let request = VoicePolishRequest(input: input, context: WritingContext(scene: .workChat),
             preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: .light)
         let config = LLMConfig(apiKey: "test-only", model: "configured-model", baseURL: "https://example.invalid")
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await VoicePolishEditingPipeline(client: client, config: config).process(request)
         return (result, await client.requests)
     }
 

@@ -3,21 +3,16 @@ import XCTest
 
 final class LLMThinkingPersistenceTests: XCTestCase {
 
-    func testThinkingPreferenceIsIsolatedByRoleProviderAndModel() {
+    func testThinkingPreferenceIsIsolatedByProviderAndModel() {
         let provider = LLMProvider.deepseek
         let firstModel = "thinking-pref-first"
         let secondModel = "thinking-pref-second"
         defer {
-            for role in [LLMConfigurationRole.textProcessing, .assetExtraction] {
+            for model in [firstModel, secondModel] {
                 KeychainService.removeLLMThinkingMode(
-                    role: role,
+                    role: .textProcessing,
                     provider: provider,
-                    model: firstModel
-                )
-                KeychainService.removeLLMThinkingMode(
-                    role: role,
-                    provider: provider,
-                    model: secondModel
+                    model: model
                 )
             }
         }
@@ -36,14 +31,6 @@ final class LLMThinkingPersistenceTests: XCTestCase {
                 model: firstModel
             ),
             .enabled
-        )
-        XCTAssertEqual(
-            KeychainService.loadLLMThinkingMode(
-                role: .assetExtraction,
-                provider: provider,
-                model: firstModel
-            ),
-            .disabled
         )
         XCTAssertEqual(
             KeychainService.loadLLMThinkingMode(

@@ -107,9 +107,7 @@ enum ASRProviderRegistry {
         for provider: ASRProvider,
         capabilities: ASRProviderCapabilities
     ) -> Bool {
-        guard capabilities.isAvailable else { return false }
-        if mode.id == ProcessingMode.directId { return true }
-        return true
+        capabilities.isAvailable
     }
 
     static func supportedModes(from modes: [ProcessingMode], for provider: ASRProvider) -> [ProcessingMode] {
