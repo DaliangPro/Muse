@@ -584,6 +584,38 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(statistics.totalDuration, 2.5, accuracy: 0.01)
     }
 
+    func testLegacyCorrectionsTableGainsLearningColumnsOnceAndKeepsRows() throws {
+        let legacyPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("muse-legacy-corrections-\(UUID().uuidString).db").path
+        defer { try? FileManager.default.removeItem(atPath: legacyPath) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(legacyPath, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, """
+        CREATE TABLE voice_polish_corrections (
+            id TEXT PRIMARY KEY, history_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+            scene TEXT NOT NULL, corrected_text TEXT NOT NULL
+        );
+        INSERT INTO voice_polish_corrections VALUES ('c1', 'h1', '2026-01-02T03:04:05Z', 'workChat', '旧纠正');
+        """, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+
+        // 连续打开两次：第二次列已存在，必须跳过而不是重复 ALTER。
+        _ = HistoryStore(path: legacyPath)
+        _ = HistoryStore(path: legacyPath)
+
+        XCTAssertEqual(sqlite3_open(legacyPath, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(
+            db, "SELECT learn_style, learn_terminology, corrected_text FROM voice_polish_corrections;", -1, &stmt, nil
+        ), SQLITE_OK)
+        defer { sqlite3_finalize(stmt) }
+        XCTAssertEqual(sqlite3_step(stmt), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(stmt, 0), 1)
+        XCTAssertEqual(sqlite3_column_int(stmt, 1), 1)
+        XCTAssertEqual(String(cString: sqlite3_column_text(stmt, 2)), "旧纠正")
+    }
+
     private func createLegacyHistoryDatabase(at path: String) throws {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
