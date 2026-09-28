@@ -176,15 +176,12 @@ enum VoicePolishQualityRunner {
         case direct
         case light
         case standard
-        // 缺省参数仅用于旧调用兼容，不冒充标准模式，也不开放为新 CLI 选项。
-        case legacyAutomatic = "legacy_automatic"
 
         var qualityMode: VoicePolishQualityMode? {
             switch self {
             case .direct: return nil
             case .light: return .standard
             case .standard: return .standard
-            case .legacyAutomatic: return .automatic
             }
         }
     }
@@ -319,7 +316,6 @@ enum VoicePolishQualityRunner {
         let hardValidationCodes: [String]
         let diagnosticCodes: [String]
         let failureReason: String?
-        let plannerValidationTrace: VoicePolishPlannerValidationTrace?
         var mode: String? = nil
         var startedAt: Date? = nil
         var finishedAt: Date? = nil
@@ -499,18 +495,13 @@ enum VoicePolishQualityRunner {
         } else {
             limit = nil
         }
-        let mode: Mode
-        if arguments.contains("--mode") {
-            guard arguments.filter({ $0 == "--mode" }).count == 1,
-                  let rawMode = value(after: "--mode"),
-                  let parsed = Mode(rawValue: rawMode),
-                  parsed != .legacyAutomatic else {
-                throw RunnerError.invalidMode(value(after: "--mode") ?? "缺失")
-            }
-            mode = parsed == .light ? .standard : parsed
-        } else {
-            mode = .legacyAutomatic
+        // 旧自动编排已删除，必须显式指定 direct 或 standard（light 为 standard 别名）。
+        guard arguments.filter({ $0 == "--mode" }).count == 1,
+              let rawMode = value(after: "--mode"),
+              let parsed = Mode(rawValue: rawMode) else {
+            throw RunnerError.invalidMode(value(after: "--mode") ?? "缺失")
         }
+        let mode: Mode = parsed == .light ? .standard : parsed
         return Invocation(
             runInputPath: runInputPath,
             reportPath: reportPath,
@@ -557,7 +548,7 @@ enum VoicePolishQualityRunner {
             provider: invocation.mode == .direct ? "none" : "unresolved",
             model: nil,
             endpointURL: nil,
-            promptVersion: VoicePolishPrompts.version,
+            promptVersion: VoicePolishEditingPrompts.version,
             qualityMode: invocation.mode.qualityMode?.rawValue ?? "direct",
             commit: "unverified",
             requestedInputCount: 0,
@@ -696,7 +687,7 @@ enum VoicePolishQualityRunner {
                     successCounter: successCounter,
                     requestProbeBodyPath: requestProbeBodyPath
                 )
-                let pipeline = VoicePolishPipeline(client: auditedClient, config: configured.config)
+                let pipeline = VoicePolishEditingPipeline(client: auditedClient, config: configured.config)
                 let result: VoicePolishResult
                 let elapsed: Duration
                 if let planPath = prefetchBenchmarkPlan(for: invocation.mode) {
@@ -743,11 +734,8 @@ enum VoicePolishQualityRunner {
                     stageResponses: await successCounter.stageResponses(),
                     detectedRoute: result.detectedRoute.rawValue,
                     executedRoute: result.executedRoute.rawValue,
-                    internalChunkCount: internalChunkCount(
-                        for: request.fallbackText,
-                        executedRoute: result.executedRoute,
-                        qualityMode: qualityMode
-                    ),
+                    // 润色整段单次编辑，不再分片。
+                    internalChunkCount: 1,
                     llmCallCount: successfulProviderCallCount,
                     llmAttemptCount: result.llmAttemptCount,
                     latencyMilliseconds: milliseconds(elapsed),
@@ -755,7 +743,6 @@ enum VoicePolishQualityRunner {
                     hardValidationCodes: validationEvidence.hardValidationCodes,
                     diagnosticCodes: validationEvidence.diagnosticCodes,
                     failureReason: result.failureReason?.rawValue,
-                    plannerValidationTrace: result.plannerValidationTrace,
                     mode: invocation.mode.rawValue,
                     startedAt: wallStartedAt,
                     finishedAt: Date(),
@@ -905,7 +892,6 @@ enum VoicePolishQualityRunner {
             hardValidationCodes: [],
             diagnosticCodes: [],
             failureReason: nil,
-            plannerValidationTrace: nil,
             mode: Mode.direct.rawValue,
             startedAt: wallStartedAt,
             finishedAt: Date(),
@@ -1057,24 +1043,6 @@ enum VoicePolishQualityRunner {
         QualityValidationEvidence(
             hardValidationCodes: codes.filter(\.isHardFailure).map(\.rawValue),
             diagnosticCodes: codes.filter { !$0.isHardFailure }.map(\.rawValue)
-        )
-    }
-
-    static func internalChunkCount(
-        for text: String,
-        executedRoute: VoicePolishRoute,
-        qualityMode: VoicePolishQualityMode = .automatic,
-        maximumSourceTokens: Int = VoicePolishPipeline.fastChunkSourceTokenLimit
-    ) -> Int {
-        // 新三档协议整段编辑，不能用历史 fast 的估算切片数冒充真实调用。
-        if qualityMode == .light || qualityMode == .standard { return 1 }
-        guard executedRoute == .fast else { return 1 }
-        return max(
-            1,
-            VoicePolishPipeline.fastChunkTexts(
-                from: text,
-                maximumSourceTokens: maximumSourceTokens
-            ).count
         )
     }
 
@@ -1289,9 +1257,8 @@ enum VoicePolishQualityRunner {
             provider: "unknown",
             model: nil,
             endpointURL: nil,
-            promptVersion: VoicePolishPrompts.version,
-            qualityMode: startupMode(arguments: arguments) == Mode.legacyAutomatic.rawValue
-                ? VoicePolishQualityMode.automatic.rawValue : startupMode(arguments: arguments),
+            promptVersion: VoicePolishEditingPrompts.version,
+            qualityMode: startupMode(arguments: arguments),
             commit: artifactEvidence?.sourceCommit ?? "unknown",
             requestedInputCount: 0,
             completedInputCount: 0,
@@ -1307,11 +1274,9 @@ enum VoicePolishQualityRunner {
     }
 
     private static func startupMode(arguments: [String]) -> String {
-        guard let index = arguments.firstIndex(of: "--mode") else {
-            return Mode.legacyAutomatic.rawValue
-        }
-        guard arguments.indices.contains(index + 1),
-              let mode = Mode(rawValue: arguments[index + 1]), mode != .legacyAutomatic else {
+        guard let index = arguments.firstIndex(of: "--mode"),
+              arguments.indices.contains(index + 1),
+              let mode = Mode(rawValue: arguments[index + 1]) else {
             return "invalid"
         }
         return (mode == .light ? Mode.standard : mode).rawValue

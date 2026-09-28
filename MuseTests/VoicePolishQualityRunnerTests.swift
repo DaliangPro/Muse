@@ -43,7 +43,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
                 receiptPath: "/tmp/quality-probe-context-test/provider-audit.jsonl",
                 requestProbeBodyPath: bodyPath
             )
-            let result = await VoicePolishPipeline(client: client, config: config).process(input)
+            let result = await VoicePolishEditingPipeline(client: client, config: config).process(input)
             XCTAssertFalse(result.usedFallback)
             XCTAssertEqual(result.text, source)
             XCTAssertEqual(result.llmAttemptCount, 1)
@@ -77,38 +77,6 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         XCTAssertEqual(observation.requestProbeBodyPath, existingPath)
         XCTAssertEqual(observation.auditContext, client.context)
         XCTAssertNil(VoicePolishProviderAudit.requestProbeBodyPath)
-    }
-
-    func test显式参数可解析且不需要凭据参数() throws {
-        let invocation = try XCTUnwrap(VoicePolishQualityRunner.parseInvocation(arguments: [
-            "Muse",
-            "--voice-polish-quality-run",
-            "--run-input", "/tmp/runner-input.json",
-            "--report", "/tmp/report.json",
-            "--provider-audit", "/tmp/provider-audit.jsonl",
-            "--run-nonce", runNonce,
-            "--limit", "9",
-        ]))
-
-        XCTAssertEqual(invocation.runInputPath, "/tmp/runner-input.json")
-        XCTAssertEqual(invocation.reportPath, "/tmp/report.json")
-        XCTAssertEqual(invocation.providerAuditPath, "/tmp/provider-audit.jsonl")
-        XCTAssertEqual(invocation.runNonce, runNonce)
-        XCTAssertEqual(invocation.limit, 9)
-        XCTAssertEqual(invocation.mode, .legacyAutomatic)
-    }
-
-    func test三档模式必须显式保留各自的调用语义() throws {
-        for mode in [VoicePolishQualityRunner.Mode.direct, .light, .standard] {
-            let invocation = try XCTUnwrap(VoicePolishQualityRunner.parseInvocation(
-                arguments: runnerArguments + ["--mode", mode.rawValue]
-            ))
-            XCTAssertEqual(invocation.mode, mode == .light ? .standard : mode)
-        }
-        XCTAssertNil(VoicePolishQualityRunner.Mode.direct.qualityMode)
-        XCTAssertEqual(VoicePolishQualityRunner.Mode.light.qualityMode, .standard)
-        XCTAssertEqual(VoicePolishQualityRunner.Mode.standard.qualityMode, .standard)
-        XCTAssertEqual(VoicePolishQualityRunner.Mode.legacyAutomatic.qualityMode, .automatic)
     }
 
     func test非法缺失或重复模式不会静默降为旧自动模式() {
@@ -265,17 +233,6 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         XCTAssertEqual(reports.first?["segment_texts"] as? [String], segments)
     }
 
-    func test轻度千字整段编辑不冒充历史fast分片() {
-        let source = String(repeating: "明天再确认。", count: 150)
-        XCTAssertLessThanOrEqual(source.count, 1_000)
-        XCTAssertEqual(VoicePolishQualityRunner.internalChunkCount(
-            for: source, executedRoute: .fast, qualityMode: .light, maximumSourceTokens: 20
-        ), 1)
-        XCTAssertGreaterThan(VoicePolishQualityRunner.internalChunkCount(
-            for: source, executedRoute: .fast, qualityMode: .automatic, maximumSourceTokens: 20
-        ), 1)
-    }
-
     func test实体映射报告保留来源段置信度且字段可独立解码() throws {
         let entities = [ResolvedEntity(
             surfaceText: "缪斯", canonical: "Muse", sourceSegmentIDs: ["s1"],
@@ -323,7 +280,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
     func test非法数量参数会被拒绝() {
         XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(arguments: [
             "Muse",
-            "--voice-polish-quality-run",
+            "--voice-polish-quality-run", "--mode", "standard",
             "--run-input", "/tmp/runner-input.json",
             "--report", "/tmp/report.json",
             "--provider-audit", "/tmp/provider-audit.jsonl",
@@ -334,13 +291,13 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
 
     func test缺失或非法一次性运行标识会被拒绝() {
         XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(arguments: [
-            "Muse", "--voice-polish-quality-run",
+            "Muse", "--voice-polish-quality-run", "--mode", "standard",
             "--run-input", "/tmp/runner-input.json",
             "--report", "/tmp/report.json",
             "--provider-audit", "/tmp/provider-audit.jsonl",
         ]))
         XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(arguments: [
-            "Muse", "--voice-polish-quality-run",
+            "Muse", "--voice-polish-quality-run", "--mode", "standard",
             "--run-input", "/tmp/runner-input.json",
             "--report", "/tmp/report.json",
             "--provider-audit", "/tmp/provider-audit.jsonl",
@@ -348,10 +305,29 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         ]))
     }
 
-    func test质量跑测必须由Evaluator指定独立Provider回执路径() {
+    func test旧自动编排已删除时必须显式指定模式() {
         XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(arguments: [
             "Muse",
             "--voice-polish-quality-run",
+            "--run-input", "/tmp/runner-input.json",
+            "--report", "/tmp/report.json",
+            "--provider-audit", "/tmp/provider-audit.jsonl",
+            "--run-nonce", runNonce,
+        ]))
+        XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(arguments: [
+            "Muse",
+            "--voice-polish-quality-run", "--mode", "legacy_automatic",
+            "--run-input", "/tmp/runner-input.json",
+            "--report", "/tmp/report.json",
+            "--provider-audit", "/tmp/provider-audit.jsonl",
+            "--run-nonce", runNonce,
+        ]))
+    }
+
+    func test质量跑测必须由Evaluator指定独立Provider回执路径() {
+        XCTAssertThrowsError(try VoicePolishQualityRunner.parseInvocation(arguments: [
+            "Muse",
+            "--voice-polish-quality-run", "--mode", "standard",
             "--run-input", "/tmp/runner-input.json",
             "--report", "/tmp/report.json",
             "--run-nonce", runNonce,
@@ -372,7 +348,7 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
 
         let invocation = try XCTUnwrap(VoicePolishQualityRunner.parseInvocation(arguments: [
             "Muse",
-            "--voice-polish-quality-run",
+            "--voice-polish-quality-run", "--mode", "standard",
             "--run-input", runInputURL.path,
             "--report", fixtureDirectory.appendingPathComponent("report.json").path,
             "--provider-audit", fixtureDirectory.appendingPathComponent("provider-audit.jsonl").path,
@@ -579,57 +555,6 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
         XCTAssertThrowsError(try VoicePolishQualityRunner.validatedInputCount(at: runInputURL.path))
     }
 
-    func test硬校验码与诊断码分开记录() {
-        let evidence = VoicePolishQualityRunner.validationEvidence(for: [
-            .sceneStyleMismatch,
-            .missingProtectedFact,
-            .semanticDecisionUnverified,
-        ])
-
-        XCTAssertEqual(evidence.hardValidationCodes, ["missingProtectedFact"])
-        XCTAssertEqual(
-            evidence.diagnosticCodes,
-            ["sceneStyleMismatch", "semanticDecisionUnverified"]
-        )
-    }
-
-    func testPlanner修复轨迹只编码稳定错误代码() throws {
-        let trace = VoicePolishPlannerValidationTrace(
-            initialCode: "units_empty",
-            repairedCode: "source_spans_without_unit"
-        )
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: encoder.encode(trace)) as? [String: String]
-        )
-
-        XCTAssertEqual(object["initial_code"], "units_empty")
-        XCTAssertEqual(object["repaired_code"], "source_spans_without_unit")
-        XCTAssertFalse(object.values.contains { $0.contains(":") })
-    }
-
-    func test内部切片数按Fast实际分片计算() {
-        let source = "第一句内容。第二句内容。第三句内容。第四句内容。"
-
-        XCTAssertGreaterThan(
-            VoicePolishQualityRunner.internalChunkCount(
-                for: source,
-                executedRoute: .fast,
-                maximumSourceTokens: 6
-            ),
-            1
-        )
-        XCTAssertEqual(
-            VoicePolishQualityRunner.internalChunkCount(
-                for: source,
-                executedRoute: .structured,
-                maximumSourceTokens: 6
-            ),
-            1
-        )
-    }
-
     func test质量报告记录最终ChatCompletions地址() throws {
         XCTAssertEqual(
             try VoicePolishQualityRunner.endpointIdentity(
@@ -645,54 +570,6 @@ final class VoicePolishQualityRunnerTests: XCTestCase {
             ),
             "https://example.com/v1/chat/completions"
         )
-    }
-
-    func testEvaluator只因硬校验失败并要求调用覆盖切片() throws {
-        let scriptPath = repositoryRoot
-            .appendingPathComponent("scripts/evaluate-voice-polish-quality-report.py")
-        let output = try runPython(
-            """
-            import importlib.util, json, pathlib, sys
-            script = pathlib.Path(sys.argv[1])
-            sys.path.insert(0, str(script.parent))
-            spec = importlib.util.spec_from_file_location("voice_polish_evaluator", script)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            base = {
-                "internal_chunk_count": 2,
-                "llm_call_count": 2,
-                "llm_attempt_count": 2,
-                "latency_milliseconds": 1,
-                "hard_validation_codes": [],
-                "diagnostic_codes": ["sceneStyleMismatch"],
-            }
-            diagnostic_only = module.runtime_evidence_failures(base)
-            too_few_calls = module.runtime_evidence_failures({**base, "llm_call_count": 1})
-            impossible_attempts = module.runtime_evidence_failures({**base, "llm_attempt_count": 1})
-            hard_failure = module.runtime_evidence_failures({
-                **base,
-                "hard_validation_codes": ["missingProtectedFact"],
-            })
-            print(json.dumps({
-                "diagnostic_only": diagnostic_only,
-                "too_few_calls": too_few_calls,
-                "impossible_attempts": impossible_attempts,
-                "hard_failure": hard_failure,
-            }, ensure_ascii=False))
-            """,
-            arguments: [scriptPath.path]
-        )
-        let data = try XCTUnwrap(output.data(using: .utf8))
-        let result = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: data) as? [String: [String]]
-        )
-
-        XCTAssertEqual(result["diagnostic_only"], [])
-        XCTAssertTrue(result["too_few_calls", default: []].contains { $0.contains("少于内部切片数") })
-        XCTAssertTrue(result["impossible_attempts", default: []].contains {
-            $0.contains("预算尝试数") && $0.contains("少于成功调用数")
-        })
-        XCTAssertTrue(result["hard_failure", default: []].contains { $0.contains("硬校验错误") })
     }
 
     func testEvaluator只信外部冻结的构建Manifest与Expected值() throws {

@@ -115,115 +115,6 @@ final class VoicePolishLightCandidateTests: XCTestCase {
         }
     }
 
-    func testStrictWholeSourceMechanicalProofPreservesUnicodeParagraphsAndTechnicalTokens() throws {
-        for (source, target) in [
-            ("今天先核对明天发送", "今天先核对，明天发送。"),
-            ("👨‍👩‍👧‍👦先看👍🏽\n再确认", "👨‍👩‍👧‍👦先看👍🏽。\n再确认。"),
-            ("请运行swift test", "请运行 swift test。"),
-            ("打开main点swift", "打开 main.swift。")
-        ] {
-            let result = try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: source, to: target)
-            XCTAssertTrue(result.utf8.elementsEqual(target.utf8))
-        }
-        for (source, target) in [
-            ("我我明天到", "我明天到。"), ("唔，我去。", "我去。"), ("呃，我去。", "我去。"),
-            ("请按装软件", "请安装软件。"), ("先检查\n再发送", "先检查，再发送。"),
-            ("运行 foo_bar", "运行 foobar"), ("连接10:45", "连接1045")
-        ] {
-            XCTAssertThrowsError(try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: source, to: target), source)
-        }
-    }
-
-    func testIterativeLongMatchingPreservesFillerBudgetAndReviewPermission() throws {
-        let prefix = String(repeating: "先核对原始资料，再记录原因和限制。", count: 45)
-        let target = prefix + "请继续核对。"
-        let six = prefix + "嗯嗯嗯嗯嗯嗯，请继续核对。"
-        let seven = prefix + "嗯嗯嗯嗯嗯嗯嗯，请继续核对。"
-        XCTAssertLessThanOrEqual(seven.count, 1_000)
-        XCTAssertEqual(try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: six, to: target), target)
-        XCTAssertThrowsError(try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: seven, to: target))
-        let needsReview = prefix + "呃，请继续核对。"
-        XCTAssertThrowsError(try VoicePolishTextEditor.applyingUnreviewedMechanicalChanges(from: needsReview, to: target))
-        XCTAssertEqual(try VoicePolishTextEditor.apply([
-            .init(before: needsReview, after: target, kind: .punctuation)
-        ], to: needsReview, source: needsReview, mode: .light), target)
-    }
-
-    func testAllThreeResponseSchemasRejectWrongKeysTypesAndEmptyText() {
-        for raw in [#"{"edits":[]}"#, #"{"text":null}"#, #"{"text":""}"#, #"{"text":1}"#,
-                    #"{"text":"正文","edits":[]}"#, "not-json", "[]"] {
-            assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightCandidate(raw) }
-        }
-        for raw in [#"{"text":"正文"}"#, #"{"edits":[]}"#, #"{"text":"","edits":[]}"#,
-                    #"{"text":false,"edits":[]}"#, #"{"text":null,"edits":null}"#,
-                    #"{"text":"正文","edits":[],"approved":true}"#,
-                    #"{"text":null,"edits":[{"before":"甲","after":"乙","kind":"unknown"}]}"#] {
-            assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightCandidateReview(raw) }
-        }
-        for raw in [#"{"approved":1}"#, #"{"approved":"true"}"#, #"{"approved":null}"#,
-                    #"{"approved":true,"edits":[]}"#, "{}"] {
-            assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightConfirmation(raw) }
-        }
-    }
-
-    func testDuplicateRootNestedAndEscapedEquivalentKeysAreRejected() throws {
-        for raw in [#"{"text":"甲","text":"乙"}"#, #"{"text":"甲","te\u0078t":"乙"}"#] {
-            assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightCandidate(raw) }
-        }
-        for raw in [
-            #"{"text":null,"text":"原文","edits":[]}"#,
-            #"{"text":"原文","text":null,"edits":[]}"#,
-            #"{"text":null,"te\u0078t":"原文","edits":[]}"#,
-            #"{"text":"安装","edits":[{"before":"按装","before":"安装","after":"安装","kind":"word"}]}"#,
-            #"{"text":"安装","edits":[{"before":"按装","after":"安装","kind":"word","k\u0069nd":"directive"}]}"#
-        ] {
-            assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightCandidateReview(raw) }
-        }
-        for raw in [#"{"approved":false,"approved":true}"#, #"{"approved":true,"approved":false}"#,
-                    #"{"approved":false,"approv\u0065d":true}"#] {
-            assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightConfirmation(raw) }
-        }
-        let quoted = "引号里的\"text\"、反斜杠\\和 emoji 👍🏽只是正文。"
-        XCTAssertEqual(try VoicePolishEditingReview.decodeLightCandidate(candidate(quoted)), quoted)
-    }
-
-    func testUnpairedSurrogatesRejectAllTextLocationsButValidPairDecodes() throws {
-        for escape in [#"\uD800"#, #"\uDC00"#] {
-            assertDecodeFailure {
-                _ = try VoicePolishEditingReview.decodeLightCandidate("{\"text\":\"" + escape + "\"}")
-            }
-            assertDecodeFailure {
-                _ = try VoicePolishEditingReview.decodeLightCandidateReview("{\"text\":\"" + escape + "\",\"edits\":[]}")
-            }
-            assertDecodeFailure {
-                _ = try VoicePolishEditingReview.decodeLightCandidateReview(
-                    "{\"text\":null,\"edits\":[{\"before\":\"按装\",\"after\":\"" + escape + "\",\"kind\":\"word\"}]}")
-            }
-        }
-        XCTAssertEqual(try VoicePolishEditingReview.decodeLightCandidate(#"{"text":"\uD83D\uDE00正文"}"#), "😀正文")
-        XCTAssertEqual(try VoicePolishEditingReview.decodeLightCandidateReview(
-            #"{"text":"\uD83D\uDE00正文","edits":[]}"#).text, "😀正文")
-    }
-
-    func testLightResponsesKeepByteAndEditCountLimits() throws {
-        let edit = VoicePolishTextEdit(before: "按装", after: "安装", kind: .word)
-        XCTAssertEqual(try VoicePolishEditingReview.decodeLightCandidateReview(
-            review(nil, Array(repeating: edit, count: 128))).edits.count, 128)
-        assertDecodeFailure {
-            _ = try VoicePolishEditingReview.decodeLightCandidateReview(review(nil, Array(repeating: edit, count: 129)))
-        }
-        let padding = String(repeating: " ", count: VoicePolishOutputNormalizer.maximumResponseBytes)
-        assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightCandidate(padding + candidate("正文")) }
-        assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightCandidateReview(padding + review(nil)) }
-        assertDecodeFailure { _ = try VoicePolishEditingReview.decodeLightConfirmation(padding + #"{"approved":true}"#) }
-    }
-
-    private func assertDecodeFailure(_ operation: () throws -> Void, file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertThrowsError(try operation(), file: file, line: line) {
-            XCTAssertTrue($0 is VoicePolishEditingReviewError, file: file, line: line)
-        }
-    }
-
     private func assertFailure(_ result: VoicePolishResult, source: String, calls: [LLMRequest], count: Int,
                                repairs: Int, code: VoicePolishValidationCode,
                                file: StaticString = #filePath, line: UInt = #line) {
@@ -236,10 +127,6 @@ final class VoicePolishLightCandidateTests: XCTestCase {
     }
 
     private func candidate(_ text: String) -> String { json(["text": text]) }
-    private func review(_ text: String?, _ edits: [VoicePolishTextEdit] = []) -> String {
-        let values = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(edits))
-        return json(["text": text as Any? ?? NSNull(), "edits": values])
-    }
     private func json(_ value: [String: Any]) -> String {
         String(decoding: try! JSONSerialization.data(withJSONObject: value), as: UTF8.self)
     }
@@ -250,7 +137,7 @@ final class VoicePolishLightCandidateTests: XCTestCase {
             durationMs: 1_000, provider: .volcano), context: WritingContext(scene: .workChat),
             preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: .light)
         let config = LLMConfig(apiKey: "test-only", model: "configured-model", baseURL: "https://example.invalid")
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await VoicePolishEditingPipeline(client: client, config: config).process(request)
         return (result, await client.requests)
     }
 }

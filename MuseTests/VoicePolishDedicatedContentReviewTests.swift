@@ -31,13 +31,6 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
         XCTAssertEqual(try payload(calls[0]) as? [String: String], ["canonical_text": source])
     }
 
-    // 旧协议解析器单独保留反例，实际标准链不再调用它。
-    func testLegacyContentReviewCannotSmuggleLayoutField() {
-        let source = "先别发送，等我确认。"
-        let wrongReview = #"{"delivery":"direct_reply","editor_spans":[],"edits":[],"layout":[{"style":"paragraph","segment_ids":["c1"]}]}"#
-        XCTAssertThrowsError(try VoicePolishEditingReview.decode(wrongReview, source: source))
-    }
-
     func testStructureReceivesOriginalSentenceBoundaries() async throws {
         let source = "帮我整理一下：先检查，再发送。"
         let structured = "1. 先检查。\n\n2. 再发送。"
@@ -90,14 +83,6 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
         assertFallback(result, calls: calls, source: source, attempts: 1, repairs: 0, code: .unsafeCharacters)
     }
 
-    func testLegacyReviewReportsUnappliedEditorSpanWithoutDeletingIt() throws {
-        let source = "帮我整理一下：资料已备齐。"
-        let contentReview = #"{"delivery":"direct_reply","editor_spans":["帮我整理一下："],"edits":[]}"#
-        let review = try VoicePolishEditingReview.decode(contentReview, source: source)
-        XCTAssertTrue(review.containsUnappliedEditorInstruction(in: source))
-        XCTAssertFalse(review.containsUnappliedEditorInstruction(in: "资料已备齐。"))
-    }
-
     func testLightPreservesProhibitionWithoutRoleReviewOrLayout() async throws {
         let source = "先别发送，等我确认。"
         let (result, calls) = await run(source, [source], mode: .light)
@@ -115,7 +100,7 @@ final class VoicePolishDedicatedContentReviewTests: XCTestCase {
         let request = VoicePolishRequest(input: input, context: WritingContext(scene: .workChat),
             preferences: UserPolishPreferences(additionalRequirements: ""), qualityMode: mode)
         let config = LLMConfig(apiKey: "test-only", model: "configured-model", baseURL: "https://example.invalid")
-        let result = await VoicePolishPipeline(client: client, config: config).process(request)
+        let result = await VoicePolishEditingPipeline(client: client, config: config).process(request)
         return (result, await client.requests)
     }
 

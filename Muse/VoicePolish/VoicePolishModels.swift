@@ -213,9 +213,6 @@ struct VoicePolishResult: Sendable, Equatable {
     let validationCodes: [VoicePolishValidationCode]
     let usedFallback: Bool
     let failureReason: VoicePolishFailureReason?
-    /// 仅供显式质量跑测比较 Planner 修复前后的本地证据门结果；
-    /// 正常用户流程不展示或持久化。
-    let plannerValidationTrace: VoicePolishPlannerValidationTrace?
     /// 仅供显式质量跑测诊断校验拒绝原因；普通成功与请求失败均为空，且不会
     /// 写入用户历史或性能统计。
     let rejectedDraft: String?
@@ -230,7 +227,6 @@ struct VoicePolishResult: Sendable, Equatable {
         validationCodes: [VoicePolishValidationCode],
         usedFallback: Bool,
         failureReason: VoicePolishFailureReason?,
-        plannerValidationTrace: VoicePolishPlannerValidationTrace? = nil,
         rejectedDraft: String? = nil,
         repairAttemptCount: Int? = nil
     ) {
@@ -241,7 +237,6 @@ struct VoicePolishResult: Sendable, Equatable {
         self.validationCodes = validationCodes
         self.usedFallback = usedFallback
         self.failureReason = failureReason
-        self.plannerValidationTrace = plannerValidationTrace
         self.rejectedDraft = rejectedDraft
         self.repairAttemptCount = repairAttemptCount
     }
@@ -252,117 +247,6 @@ enum VoicePolishFailureReason: String, Sendable, Equatable {
     case requestFailed
     case validationFailed
     case setupFailed
-}
-
-struct VoicePolishPlan: Codable, Sendable, Equatable {
-    let version: Int
-    let language: String?
-    let scene: WritingScene
-    let finalIntent: String
-    let orderedBlocks: [VoicePolishBlock]
-    let discardedFragments: [DiscardedFragment]
-    let corrections: [VoiceCorrection]
-    let sideNotes: [String]
-    let facts: [ProtectedFact]
-    let uncertainEntities: [UncertainEntity]
-    let outputFormat: VoiceOutputFormat
-    let confidence: Double
-}
-
-struct VoicePolishBlock: Codable, Sendable, Equatable {
-    let id: String
-    let text: String
-    let sourceSegmentIDs: [String]
-    let kind: BlockKind
-}
-
-enum BlockKind: String, Codable, Sendable {
-    case content
-    case conclusion
-    case question
-    case instruction
-    case listItem
-    case emphasis
-}
-
-struct DiscardedFragment: Codable, Sendable, Equatable {
-    let text: String
-    let sourceSegmentIDs: [String]
-    let reason: DiscardReason
-}
-
-enum DiscardReason: String, Codable, Sendable {
-    case filler
-    case repetition
-    case abandoned
-    case superseded
-    case sideNote
-}
-
-struct VoiceCorrection: Codable, Sendable, Equatable {
-    let previousText: String
-    let finalText: String
-    let sourceSegmentIDs: [String]
-    let isFinal: Bool
-}
-
-struct UncertainEntity: Codable, Sendable, Equatable {
-    let surfaceText: String
-    let sourceSegmentIDs: [String]
-    let description: String?
-    let selectedCandidate: String?
-    let confidence: Double
-}
-
-struct VoiceOutputFormat: Codable, Sendable, Equatable {
-    let kind: OutputKind
-    let expectedListCount: Int?
-}
-
-enum OutputKind: String, Codable, Sendable {
-    case sentence
-    case paragraphs
-    case numberedList
-    case bulletList
-}
-
-struct ProtectedFact: Codable, Sendable, Equatable {
-    let sourceText: String
-    let canonicalValue: String?
-    let kind: ProtectedFactKind
-    let disposition: ProtectedFactDisposition
-    let exclusionReason: DiscardReason?
-    let sourceSegmentIDs: [String]
-}
-
-enum ProtectedFactKind: String, Codable, Sendable, CaseIterable {
-    case number
-    case amount
-    case percentage
-    case date
-    case time
-    case version
-    case url
-    case email
-    case filePath
-    case command
-    case codeIdentifier
-    case lexiconEntity
-    case quotedPhrase
-}
-
-enum ProtectedFactDisposition: String, Codable, Sendable {
-    case mustPreserve
-    case superseded
-    case excluded
-    case uncertain
-}
-
-struct SourceFactCandidate: Sendable, Equatable, Codable {
-    let sourceText: String
-    let canonicalValue: String?
-    let kind: ProtectedFactKind
-    let sourceSegmentIDs: [String]
 }
 
 enum VoicePolishValidationCode: String, Codable, Sendable, Equatable, CaseIterable {
@@ -393,9 +277,4 @@ enum VoicePolishValidationCode: String, Codable, Sendable, Equatable, CaseIterab
             return true
         }
     }
-}
-
-struct StructuredVoicePolishResponse: Codable, Sendable, Equatable {
-    let plan: VoicePolishPlan
-    let finalText: String
 }

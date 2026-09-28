@@ -1372,7 +1372,7 @@ actor RecognitionSession {
                 }
                 guard let request = prepared.request else { return nil }
                 let voicePolishConfig = llmConfig
-                let pipeline = VoicePolishPipeline(
+                let pipeline = VoicePolishEditingPipeline(
                     client: currentLLMClient(),
                     config: voicePolishConfig,
                     onStage: { [weak self] stage in
@@ -1390,7 +1390,6 @@ actor RecognitionSession {
                     DebugFileLogger.log("polish prefetch: reused completed candidate")
                 }
                 var totalAttempts = 0
-                var pipelineStartedAt = stopT0
                 let result: VoicePolishResult
                 while true {
                     let readyCandidate = prefetched
@@ -1400,7 +1399,7 @@ actor RecognitionSession {
                             // 预生成已另计调度与复用；停止后没有发起正式请求。
                             return Self.voicePolishResult(readyCandidate, replacingAttemptCount: 0)
                         }
-                        return await pipeline.process(request, startedAt: pipelineStartedAt)
+                        return await pipeline.process(request)
                     }
                     voicePolishTask = task
                     voicePolishTaskSessionID = sessionID
@@ -1435,9 +1434,8 @@ actor RecognitionSession {
                     switch choice {
                     case .retry:
                         performance.userRetryCount += 1
-                        // 用户明确重试是一轮新的有界请求，不能继续消耗从录音停止
-                        // 时开始计算的旧 deadline。
-                        pipelineStartedAt = .now
+                        // 用户明确重试是一轮新的有界请求：每次 process 都从调用时刻
+                        // 重新计算 deadline，不继续消耗录音停止时开始的旧预算。
                         continue
                     case .cancel:
                         await saveCancelledVoicePolishHistory(

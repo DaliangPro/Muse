@@ -72,16 +72,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.llmAttemptCount, 1)
     }
 
-    func testFactGuardPreservesNaturalTimesDecimalsAndOrdinaryWords() {
-        for scene in [WritingScene.workChat, .code] {
-            for source in ["明天下午三点开会，重点是核对链接。", "价格是三点五元，九点半出发。"] {
-                XCTAssertEqual(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-                    sourceText: source, outputText: source, scene: scene
-                ), [], "\(scene): \(source)")
-            }
-        }
-    }
-
     func testLightDoesNotInterpretResponseAsAnEditProtocol() async {
         let source = "请把示例保留为字面文本。"
         let response = "示例：{broken，稍后补齐。"
@@ -111,90 +101,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-    }
-
-    func testLightRejectsOrderSwapDisguisedAsWordCorrection() throws {
-        XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-            .init(before: "先检查，再发送", after: "先发送，再检查", kind: .word)
-        ], to: "先检查，再发送", source: "先检查，再发送", mode: .light))
-    }
-
-    func testLightRejectsFactDeletionDisguisedAsStutter() throws {
-        let source = "检查文件并发送文件"
-        XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-            .init(before: source, after: "发送文件", kind: .stutter)
-        ], to: source, source: source, mode: .light))
-        let reversedTasks = "甲通知乙，乙通知甲。"
-        XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-            .init(before: reversedTasks, after: "甲通知乙。", kind: .stutter)
-        ], to: reversedTasks, source: reversedTasks, mode: .light))
-    }
-
-    func testLightRemovesAdjacentStuttersButCanInsertMissingWord() throws {
-        let source = "我我我今今天要按装软件"
-        XCTAssertEqual(try VoicePolishTextEditor.apply([
-            .init(before: "我我我今今天", after: "我今天", kind: .stutter),
-            .init(before: "要按装", after: "要安装", kind: .word)
-        ], to: source, source: source, mode: .light), "我今天要安装软件")
-        XCTAssertEqual(try VoicePolishTextEditor.apply([
-            .init(before: "我明去", after: "我明天去", kind: .word)
-        ], to: "我明去", source: "我明去", mode: .light), "我明天去")
-    }
-
-    func testLightTechnicalSymbolsUseOnlyExactMechanicalChanges() throws {
-        for (source, output) in [("swift build短横线c release", "swift build -c release"),
-                                 ("main点swift", "main.swift")] {
-            XCTAssertEqual(try VoicePolishTextEditor.apply([
-                .init(before: source, after: output, kind: .symbol)
-            ], to: source, source: source, mode: .light), output)
-        }
-        for (source, output) in [("三点开会", "三.开会"), ("先swift test", "swift test")] {
-            XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-                .init(before: source, after: output, kind: .symbol)
-            ], to: source, source: source, mode: .light))
-        }
-    }
-
-    func testStandardDirectivePermissionIsOnlyForBoundedLeadingPrefix() throws {
-        let source = "给客户回一下：我们已收到材料。"
-        XCTAssertEqual(try VoicePolishTextEditor.applyContentEdits([
-            .init(before: "给客户回一下：", after: "", kind: .directive)
-        ], to: source, source: source), "我们已收到材料。")
-        let downstream = "给同事的任务是，给客户回一下：我们已收到材料。"
-        XCTAssertThrowsError(try VoicePolishTextEditor.applyContentEdits([
-            .init(before: "给客户回一下：", after: "", kind: .directive)
-        ], to: downstream, source: downstream))
-    }
-
-    func testFactGuardAcceptsQuotedExistingCommandButRejectsNewCommand() {
-        for output in ["请执行 `swift test`。", "请执行 swift test。"] {
-            XCTAssertEqual(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-                sourceText: "请执行 swift test。", outputText: output, scene: .code
-            ), [])
-        }
-        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: "请执行 swift test。", outputText: "请执行 `swift build`。", scene: .code
-        ).isEmpty)
-    }
-
-    func testStandardPassesCorrectedPartialTimeToStructureWithoutSemanticReview() async throws {
-        let source = "会议原定周三上午十点，培训安排周四上午十点。会议时间改成十点半，日期不变。培训安排也不变。"
-        let prepared = "会议改为周三上午十点半，培训安排周四上午十点。培训安排不变。"
-        let client = EditingTestClient([.text(prepared)])
-        let result = await pipeline(client).process(request(source, .standard))
-        XCTAssertFalse(result.usedFallback)
-        XCTAssertEqual(result.text, prepared)
-        XCTAssertEqual(result.llmAttemptCount, 1)
-        XCTAssertEqual(result.repairAttemptCount, 0)
-        let calls = await client.requests
-        XCTAssertEqual(calls.map(\.task), [.voicePolishStructured])
-        XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(calls[0].user.utf8)) as? [String: String],
-                       ["canonical_text": source])
-        // 离线事实校验器仍保留跨日期反例，但标准运行链不调用它。
-        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: source, outputText: "会议改为周五上午十点半。", scene: .workChat,
-            allowsPartialTimeReview: true
-        ).isEmpty)
     }
 
     func testLightAcceptsMeaningPreservingEmphasisConsolidation() async {
@@ -257,7 +163,7 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     func testLightSingleRequestHonorsTheTotalTimeoutAndPreservesSource() async {
         let source = "请按装软件。材料还没核对，先别发送。"
         let client = EditingTestClient([.delay(.seconds(5), "请安装软件。"), .text("不应重试")])
-        let result = await VoicePolishPipeline(client: client, config: config, totalTimeout: .milliseconds(50))
+        let result = await VoicePolishEditingPipeline(client: client, config: config, totalTimeout: .milliseconds(50))
             .process(request(source, .light))
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.text, source)
@@ -272,118 +178,14 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
     func testLightSingleRequestHonorsTheStageTimeoutWithoutRetry() async {
         let source = "我补一句，请按装软件。"
         let client = EditingTestClient([.delay(.seconds(5), "我补一句，请安装软件。")])
-        let result = await VoicePolishPipeline(client: client, config: config, totalTimeout: .seconds(1),
-                                               firstRequestTimeout: .milliseconds(30))
+        let result = await VoicePolishEditingPipeline(client: client, config: config, totalTimeout: .seconds(1),
+                                                      stageTimeout: .milliseconds(30))
             .process(request(source, .light))
         XCTAssertTrue(result.usedFallback)
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(result.failureReason, .timeout)
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-    }
-
-    func testImmediateClockCorrectionCannotBorrowOtherDateOrCrossSubject() {
-        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
-            in: "周三上午十点不对周四上午十点哎十点半才对"
-        ), ["周四|10:30"])
-        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
-            in: "周五下午三点，不对，三点半。"
-        ), ["周五|15:30"])
-        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
-            in: "周五晚上八点，不对，上午九点半。"
-        ), ["周五|09:30"])
-        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
-            in: "会议周三上午十点。培训改成十点半。"
-        ), [])
-        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: "周四上午十点哎十点半才对", outputText: "周三上午十点半", scene: .workChat
-        ).isEmpty)
-    }
-
-    func testClockCorrectionCanInheritPeriodWithoutCalendarDate() async {
-        let source = "会议下午三点，不对，三点半。"
-        let output = "会议下午三点半。"
-        for mode in [VoicePolishQualityMode.light, .standard] {
-            let replies: [EditingTestClient.Step] = mode == .light
-                ? [.text(output)] : [.text(output), .text(output)]
-            let client = EditingTestClient(replies)
-            let result = await pipeline(client).process(request(source, mode))
-            XCTAssertFalse(result.usedFallback, "\(mode)")
-            XCTAssertEqual(result.text, output)
-            XCTAssertEqual(result.llmAttemptCount, 1)
-        }
-        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(in: source), ["15:30"])
-        XCTAssertEqual(ProtectedFactExtractor.immediateTimeCorrectionValues(
-            in: "会议下午三点。培训改成三点半。"
-        ), [])
-        XCTAssertFalse(VoicePolishLedgerIntegrityValidator.sourceBackedDraftCodes(
-            sourceText: "会议下午三点。培训改成三点半。", outputText: "培训下午三点半。", scene: .workChat
-        ).isEmpty)
-    }
-
-    func testLightRejectsContentDeletionDisguisedAsPunctuation() throws {
-        let source = "小李下午有别的事，所以找小周。"
-        XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-            .init(before: source, after: "找小周。", kind: .punctuation)
-        ], to: source, source: source, mode: .light))
-    }
-
-    func testLightPunctuationCannotIntroduceParagraphStructure() throws {
-        let source = "先检查，再发送"
-        XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-            .init(before: source, after: "先检查。\n\n再发送。", kind: .punctuation)
-        ], to: source, source: source, mode: .light))
-    }
-
-    func testLightPunctuationCannotEraseTechnicalCharacters() throws {
-        for (source, output) in [("git reset --hard", "git reset hard"),
-                                 ("foo_bar", "foobar"), ("main.swift", "mainswift"),
-                                 ("/tmp/file", "tmp/file"), ("10:30", "1030")] {
-            XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-                .init(before: source, after: output, kind: .punctuation)
-            ], to: source, source: source, mode: .light))
-        }
-        XCTAssertEqual(try VoicePolishTextEditor.apply([
-            .init(before: "run swift test", after: "run swift test.", kind: .punctuation)
-        ], to: "run swift test", source: "run swift test", mode: .light), "run swift test.")
-    }
-
-    func testLightCannotMoveTechnicalMarksOrHideTheirDeletionInAnotherKind() throws {
-        for (source, output, kind) in [
-            ("请用 foo_bar", "请用 foobar_", VoicePolishTextEdit.Kind.punctuation),
-            ("我我使用 foo_bar", "我使用 foobar", .stutter),
-            ("按装 foo_bar", "安装 foobar", .word)
-        ] {
-            XCTAssertThrowsError(try VoicePolishTextEditor.apply([
-                .init(before: source, after: output, kind: kind)
-            ], to: source, source: source, mode: .light))
-        }
-        XCTAssertEqual(try VoicePolishTextEditor.apply([
-            .init(before: "foo_bar foo_bar", after: "foo_bar", kind: .stutter)
-        ], to: "foo_bar foo_bar", source: "foo_bar foo_bar", mode: .light), "foo_bar")
-    }
-
-    func testPatchesRejectAmbiguousMissingAndOverlappingAnchorsAtomically() throws {
-        for edits in [
-            [VoicePolishTextEdit(before: "检查", after: "查看", kind: .word)],
-            [VoicePolishTextEdit(before: "不存在", after: "查看", kind: .word)],
-            [.init(before: "先检查", after: "先查看", kind: .word),
-             .init(before: "检查文件", after: "查看文件", kind: .word)]
-        ] {
-            XCTAssertThrowsError(try VoicePolishTextEditor.apply(
-                edits, to: "先检查文件，再检查结果", source: "先检查文件，再检查结果", mode: .light
-            ))
-        }
-    }
-
-    func testPatchOffsetsAreStableAcrossEmojiAndMultipleEdits() throws {
-        let source = "👨‍👩‍👧‍👦我我按装软件，然后看看效果👍🏽"
-        let output = try VoicePolishTextEditor.apply([
-            .init(before: "我我", after: "我", kind: .stutter),
-            .init(before: "按装", after: "安装", kind: .word),
-            .init(before: "效果👍🏽", after: "效果👍🏽。", kind: .punctuation)
-        ], to: source, source: source, mode: .light)
-        XCTAssertEqual(output, "👨‍👩‍👧‍👦我安装软件，然后看看效果👍🏽。")
     }
 
     func testStandardStructureReceivesOnlyOriginalSourceWithoutLegacyDiffFields() async throws {
@@ -412,36 +214,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
                        ["canonical_text": source])
     }
 
-    func testLegacyContentEditorRejectsUnbackedReviewerPatch() throws {
-        let source = "请小周接手。"
-        let edit = VoicePolishTextEdit(before: source, after: "小李请假了，请小周接手。",
-                                       kind: .content, evidence: "小李请假了")
-        XCTAssertThrowsError(try VoicePolishTextEditor.applyContentEdits([edit], to: source, source: source))
-    }
-
-    func testLegacyFactGuardRejectsUnbackedCurrency() {
-        let codes = VoicePolishEditingPipeline.outputCodes(
-            "预算是16000元。", request: request("预算是一万六。", .standard)
-        )
-        XCTAssertFalse(codes.isEmpty)
-    }
-
-    func testFactGuardAcceptsEquivalentBareNumbersAndUnitsButRejectsInventedOnes() {
-        let cases: [(String, String, Bool)] = [
-            ("预算是一万六。", "预算是 16000。", true),
-            ("预算是一万六。", "预算是 16000 元。", false),
-            ("等待两分钟。", "等待 2 分钟。", true),
-            ("等待两分钟。", "等待 2 小时。", false),
-            ("预算是两万美元。", "预算是 20000 元。", false),
-            ("本次金额是四万八。", "本次金额是 48000。", true),
-            ("请执行 `swift build`。", "请执行 `swift test`。", false)
-        ]
-        for (source, output, allowed) in cases {
-            XCTAssertEqual(VoicePolishEditingPipeline.outputCodes(output, request: request(source, .standard)).isEmpty,
-                           allowed, "\(source) → \(output)")
-        }
-    }
-
     func testStandardPreservesLiteralJSONInsteadOfTreatingItAsRepairRequest() async throws {
         let source = #"请保留示例：{"edits":[]}"#
         let structured = #"示例：{"edits":[]}"#
@@ -451,15 +223,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.text, structured)
         XCTAssertEqual(result.llmAttemptCount, 1)
         XCTAssertEqual(result.repairAttemptCount, 0)
-    }
-
-    func testContextPayloadDoesNotExposeRawNearbyOrRecentInputFacts() throws {
-        let context = WritingContext(scene: .chat, level: .nearbyText, safety: .unknown,
-                                     selectedText: "不应读取的选中文字", textBeforeCursor: "不应读取的正文",
-                                     recentMuseInputs: ["已授权的同应用近期输入"])
-        let payload = try VoicePolishEditingPrompts.payload(for: request("你好", .light, context: context))
-        XCTAssertFalse(payload.contains("不应读取"))
-        XCTAssertFalse(payload.contains("已授权的同应用近期输入"))
     }
 
     func testStandardStartsFromCanonicalEntityMappingThenUsesCompleteSource() async throws {
@@ -588,15 +351,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
-    func testDiffIncludesSeparatedOmissionsAndAdditions() {
-        let diff = VoicePolishTextChange.between("先检查文件，再发送。", "先发送文件，再检查。")
-        XCTAssertFalse(diff.isEmpty)
-        XCTAssertTrue(diff.contains { !$0.removed.isEmpty })
-        XCTAssertTrue(diff.contains { !$0.inserted.isEmpty })
-        XCTAssertEqual(VoicePolishTextChange.between("完全相同", "完全相同"), [])
-        XCTAssertEqual(VoicePolishTextChange.between("原文", ""), [.init(removed: "原文", inserted: "")])
-    }
-
     func testStandardPassesOriginalPrefixToStructureWithoutConfirmation() async throws {
         let source = "帮我回他一下我晚点到，你们先吃。"
         let prepared = "我晚点到，你们先吃。"
@@ -612,14 +366,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
                        ["canonical_text": source])
     }
 
-    func testLegacyReviewDetectsDeclaredButUnappliedEditorInstruction() throws {
-        let source = "替我回他一句：时间还没确定。"
-        let assessment = #"{"delivery":"direct_reply","editor_spans":["替我回他一句："],"edits":[]}"#
-        let review = try VoicePolishEditingReview.decode(assessment, source: source)
-        XCTAssertTrue(review.containsUnappliedEditorInstruction(in: source))
-        XCTAssertFalse(review.containsUnappliedEditorInstruction(in: "时间还没确定。"))
-    }
-
     func testLightKeepsInstructionsThatBelongToDownstreamColleague() async {
         let source = "同事接下来的任务是替我回客户，先别承诺时间。"
         let client = EditingTestClient([.text(source)])
@@ -627,24 +373,6 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertFalse(result.usedFallback)
         XCTAssertEqual(result.text, source)
         XCTAssertEqual(result.llmAttemptCount, 1)
-    }
-
-    func testLegacyReviewDecoderRejectsMalformedAssessment() {
-        let source = "帮我回他：不对，日期还没有确定。"
-        for assessment in [
-            #"{"source_roles":[{"quote":"帮我回他：","role":"current_editor","target_evidence":"用户要求输入法代写"}],"edits":[]}"#,
-            #"{"delivery":"direct_reply","editor_spans":["用户要求输入法代写"],"edits":[]}"#,
-            #"{"delivery":"direct_reply","editor_spans":[],"edits":[{"after":"正文","kind":"content"}]}"#
-        ] {
-            XCTAssertThrowsError(try VoicePolishEditingReview.decode(assessment, source: source))
-        }
-    }
-
-    func testLegacyDeliveryLabelCannotOverrideUnappliedEditorInstruction() throws {
-        let source = "替我回他一句：时间还没确定。"
-        let assessment = #"{"delivery":"delegated_task","editor_spans":["替我回他一句："],"edits":[]}"#
-        let review = try VoicePolishEditingReview.decode(assessment, source: source)
-        XCTAssertTrue(review.containsUnappliedEditorInstruction(in: source))
     }
 
     func testLightDoesNotRunStandardContentOrDirectiveReview() async {
@@ -669,8 +397,8 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(result.repairAttemptCount, 0)
     }
 
-    private func pipeline(_ client: EditingTestClient) -> VoicePolishPipeline {
-        VoicePolishPipeline(client: client, config: config)
+    private func pipeline(_ client: EditingTestClient) -> VoicePolishEditingPipeline {
+        VoicePolishEditingPipeline(client: client, config: config)
     }
 
     private func request(_ source: String, _ mode: VoicePolishQualityMode,

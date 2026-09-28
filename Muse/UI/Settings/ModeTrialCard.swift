@@ -395,7 +395,7 @@ private extension ModeTrialCard {
                 resolvedEntities: resolvedEntities
             )
             guard activeTrialID == trialID else { return }
-            let result = await VoicePolishPipeline(
+            let result = await VoicePolishEditingPipeline(
                 client: client,
                 config: voicePolishConfig
             ).process(voicePolishRequest)
