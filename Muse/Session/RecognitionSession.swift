@@ -1722,7 +1722,7 @@ actor RecognitionSession {
             ? defaults.bool(forKey: DefaultsKeys.preserveClipboard)
             : true
 
-        DebugFileLogger.log("stop: injecting method=clipboard len=\(finalText.count) +\(ContinuousClock.now - stopT0)")
+        DebugFileLogger.log("stop: injecting len=\(finalText.count) +\(ContinuousClock.now - stopT0)")
         return injectionEngine.inject(finalText)
     }
 
@@ -2250,7 +2250,6 @@ actor RecognitionSession {
             await firePolishPrefetch(sessionID: sessionID)
             return
         }
-        guard currentMode.kind != .voicePolish else { return }
         let rawText = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let text = canonicalText(for: rawText, sessionID: sessionID)

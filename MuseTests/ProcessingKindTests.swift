@@ -37,7 +37,6 @@ final class ProcessingKindTests: XCTestCase {
 
         XCTAssertEqual(mode.kind, .custom)
         XCTAssertFalse(mode.requiresLLM)
-        XCTAssertFalse(mode.isFormalWritingMode)
         XCTAssertFalse(mode.isPromptOptimizeMode)
         XCTAssertFalse(mode.isTranslateMode)
     }
@@ -47,7 +46,6 @@ final class ProcessingKindTests: XCTestCase {
         mode.name = "随手整理"
 
         XCTAssertEqual(mode.kind, .voicePolish)
-        XCTAssertTrue(mode.isFormalWritingMode)
         XCTAssertTrue(mode.requiresLLM)
     }
 
