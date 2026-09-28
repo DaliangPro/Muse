@@ -663,9 +663,9 @@ final class HistoryStoreTests: XCTestCase {
 
     /// REPAIR_PLAN J3：库被第二连接短暂锁住（<busy_timeout 3s）时，
     /// insert 必须等待锁释放后成功落库，而非静默丢记录。
-    /// 场景还原：语料提炼事务（LanguageAssetStore 连接）持写锁时来了一条识别记录。
+    /// 场景还原：另一连接的事务持写锁时来了一条识别记录。
     func testInsertWaitsOutShortLockAndStillPersists() async throws {
-        // 第二连接锁库（模拟提炼事务持写锁）
+        // 第二连接锁库（模拟其他事务持写锁）
         var rival: OpaquePointer?
         XCTAssertEqual(sqlite3_open(testPath, &rival), SQLITE_OK)
         defer { sqlite3_close(rival) }

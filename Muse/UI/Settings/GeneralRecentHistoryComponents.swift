@@ -212,7 +212,7 @@ struct RecentHistoryRowView: View {
 
 }
 
-// 供其他行式列表复用（提炼页最近提炼行的删除键与本页同款,2026-07）
+// 最近记录行的图标按钮，可供其他行式列表复用
 struct RecentHistoryActionIconButton: View {
     let systemName: String
     let accessibilityLabel: String

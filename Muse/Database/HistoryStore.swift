@@ -89,7 +89,7 @@ actor HistoryStore {
 
             // REPAIR_PLAN B5：WAL 降低写阻塞；created_at 建索引，
             // 列表按时间倒序查询不再随数据量增长全表排序。
-            // busy_timeout：与 LanguageAssetStore 连接并发写同库，撞锁等待而非立刻失败
+            // busy_timeout：同库并发连接撞锁时等待而非立刻失败
             sqlite3_busy_timeout(db, 3000)
             sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
             sqlite3_exec(
@@ -113,8 +113,8 @@ actor HistoryStore {
         }
     }
 
-    // 关闭连接，防止每次 new HistoryStore() 泄漏 sqlite 连接（2026-06-24 修：GeneralSettingsTab/
-    // AssetLibraryTab 每次重建都 new，泄漏连接的读锁会钉住 WAL 不 checkpoint → 越用越卡，对齐 LanguageAssetStore）
+    // 关闭连接，防止每次 new HistoryStore() 泄漏 sqlite 连接（2026-06-24 修：设置页每次重建都 new，
+    // 泄漏连接的读锁会钉住 WAL 不 checkpoint → 越用越卡）
     deinit {
         sqlite3_close(db)
     }
@@ -726,38 +726,6 @@ actor HistoryStore {
     }
 
     /// 获取全部记录的统计信息（使用数据库聚合查询，高效）
-    /// 可提炼语料计数：与提炼管线输入口径一致(status=completed 且有正文)——
-    /// 语料池卡片显示这个数才「准确」，全表 COUNT 会把失败/中断记录也算进去（2026-07）
-    func extractableRecordCount(since: Date? = nil) -> Int {
-        do {
-            return try extractableRecordCountOrThrow(since: since)
-        } catch {
-            AppLogger.log("[HistoryStore] 可提炼语料计数失败: \(error.localizedDescription)")
-            return 0
-        }
-    }
-
-    func extractableRecordCountOrThrow(since: Date? = nil) throws -> Int {
-        let db = try requireDB()
-        var sql = "SELECT COUNT(*) FROM recognition_history WHERE status = 'completed' AND TRIM(final_text) != ''"
-        if since != nil {
-            sql += " AND created_at >= ?"
-        }
-        sql += ";"
-
-        var stmt: OpaquePointer?
-        try prepare(sql, in: db, statement: &stmt)
-        defer { sqlite3_finalize(stmt) }
-
-        if let since {
-            SQL.bind(stmt, 1, ISO8601DateFormatter().string(from: since))
-        }
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            throw HistoryStoreError.sqlite(sqliteMessage(in: db))
-        }
-        return Int(sqlite3_column_int(stmt, 0))
-    }
-
     func getStatistics() async -> Statistics {
         do {
             return try getStatisticsOrThrow()

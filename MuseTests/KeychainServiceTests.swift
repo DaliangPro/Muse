@@ -5,23 +5,17 @@ final class KeychainServiceTests: XCTestCase {
 
     private var originalProvider: ASRProvider!
     private var originalLLMProvider: LLMProvider!
-    private var originalAssetExtractionLLMProvider: LLMProvider!
-    private var originalDoubaoOverride: String?
 
     override func setUp() {
         super.setUp()
         originalProvider = KeychainService.selectedASRProvider
         originalLLMProvider = KeychainService.selectedLLMProvider
-        originalAssetExtractionLLMProvider = KeychainService.selectedAssetExtractionLLMProvider
-        originalDoubaoOverride = KeychainService.loadAssetExtractionModelOverride(for: .doubao)
     }
 
     override func tearDown() {
         KeychainService.delete(key: "test_key")
         KeychainService.selectedASRProvider = originalProvider
         KeychainService.selectedLLMProvider = originalLLMProvider
-        KeychainService.selectedAssetExtractionLLMProvider = originalAssetExtractionLLMProvider
-        try? KeychainService.saveAssetExtractionModelOverride(originalDoubaoOverride, for: .doubao)
         super.tearDown()
     }
 
@@ -91,23 +85,5 @@ final class KeychainServiceTests: XCTestCase {
         KeychainService.selectedASRProvider = targetProvider
 
         wait(for: [expectation], timeout: 1.0)
-    }
-
-    func testAssetExtractionProviderFallsBackToGeneralProvider() {
-        KeychainService.selectedLLMProvider = .gemini
-        KeychainService.resetAssetExtractionLLMProvider()
-
-        XCTAssertEqual(KeychainService.selectedAssetExtractionLLMProvider, .gemini)
-    }
-
-    func testSaveAndLoadAssetExtractionModelOverride() throws {
-        try KeychainService.saveAssetExtractionModelOverride("custom-extract-model", for: .doubao)
-        XCTAssertEqual(
-            KeychainService.loadAssetExtractionModelOverride(for: .doubao),
-            "custom-extract-model"
-        )
-
-        try KeychainService.saveAssetExtractionModelOverride(nil, for: .doubao)
-        XCTAssertNil(KeychainService.loadAssetExtractionModelOverride(for: .doubao))
     }
 }

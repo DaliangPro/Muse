@@ -1,7 +1,7 @@
 import Foundation
 
 /// LLM 请求用途必须由调用点显式声明，避免输入模式绕过统一边界，
-/// 同时保持语料提炼和模型连通性探测的既有线协议。
+/// 同时保持结构化任务和模型连通性探测的既有线协议。
 enum LLMRequestContext: Equatable, Sendable {
     case processingMode
     case structuredTask

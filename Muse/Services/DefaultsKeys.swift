@@ -38,5 +38,4 @@ enum DefaultsKeys {
     // MARK: - Provider 选择（此前在 ModesSettingsTab 与 KeychainService 各定义一遍，易漂移）
     static let selectedASRProvider = "tf_selectedASRProvider"
     static let selectedLLMProvider = "tf_selectedLLMProvider"
-    static let selectedAssetExtractionLLMProvider = "tf_selectedAssetExtractionLLMProvider"
 }
