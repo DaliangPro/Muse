@@ -23,6 +23,17 @@ private final class VoicePolishEditingAttempts: Sendable {
     }
 }
 
+/// 润色请求的可比较变体。生产入口固定使用 `.production`；其他取值只由质量
+/// Runner 的显式实验开关启用，用于同一输入集上的对照。
+struct VoicePolishEditingVariant: Sendable, Equatable {
+    var reasoningPolicy: ReasoningPolicy = .disabled
+    var maxOutputTokens = 2_048
+    /// 要求模型先列出未写入正文的原话及原因，再给正文（JSON 输出）。
+    var explainsDeletions = false
+
+    static let production = VoicePolishEditingVariant()
+}
+
 /// 润色直接从完整来源一次生成纠错与结构整理后的正文。
 /// 请求失败保留完整来源，成功正文不再经过程序改写。
 struct VoicePolishEditingPipeline: Sendable {
@@ -30,6 +41,7 @@ struct VoicePolishEditingPipeline: Sendable {
     private let config: LLMConfig
     private let totalTimeout: Duration?
     private let stageTimeout: Duration?
+    private let variant: VoicePolishEditingVariant
     private let onStage: (@Sendable (VoicePolishStage) -> Void)?
 
     init(
@@ -37,12 +49,14 @@ struct VoicePolishEditingPipeline: Sendable {
         config: LLMConfig,
         totalTimeout: Duration? = nil,
         stageTimeout: Duration? = nil,
+        variant: VoicePolishEditingVariant = .production,
         onStage: (@Sendable (VoicePolishStage) -> Void)? = nil
     ) {
         self.client = client
         self.config = config
         self.totalTimeout = totalTimeout
         self.stageTimeout = stageTimeout
+        self.variant = variant
         self.onStage = onStage
     }
 
@@ -78,16 +92,27 @@ struct VoicePolishEditingPipeline: Sendable {
         }
         do {
             try Task.checkCancellation()
-            let output = try await generate(
+            let response = try await generate(
                 task: .voicePolishStructured,
-                system: VoicePolishEditingPrompts.standard,
+                system: variant.explainsDeletions
+                    ? VoicePolishEditingPrompts.standard + VoicePolishEditingPrompts.explainedDeletionsFormat
+                    : VoicePolishEditingPrompts.standard,
                 payload: VoicePolishEditingPrompts.fullTextPayload(
                     source,
                     additionalRequirements: requirements
                 ),
                 deadline: deadline, attempts: attempts
             )
-            draft = output
+            draft = response
+            let output: String
+            if variant.explainsDeletions {
+                guard let decoded = VoicePolishEditingPrompts.decodeExplainedDeletions(response) else {
+                    return result(nil, codes: [.invalidStructuredResponse])
+                }
+                output = decoded
+            } else {
+                output = response
+            }
             if let code = Self.deliveryFailureCode(output) { return result(nil, codes: [code]) }
             return result(output)
         } catch is VoicePolishEditingTimeout {
@@ -126,9 +151,9 @@ struct VoicePolishEditingPipeline: Sendable {
             user: payload,
             options: LLMGenerationOptions(
                 temperature: 0,
-                maxOutputTokens: 2_048,
-                reasoningPolicy: .disabled,
-                responseFormat: .text
+                maxOutputTokens: variant.maxOutputTokens,
+                reasoningPolicy: variant.reasoningPolicy,
+                responseFormat: variant.explainsDeletions ? .jsonObject : .text
             )
         )
         let response = try await AsyncTimeout.throwingValue(

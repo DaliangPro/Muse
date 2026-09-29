@@ -18,6 +18,23 @@ enum VoicePolishEditingPrompts {
     最后核对成稿：明确改口已落实为最终说法；人物、动作、数量、原因、条件、否定、未完成或待确认状态等有效细节全部保留；后补内容已归回所属事项；枚举有逐项换行。保持原来日常说话的口吻，不改成会议纪要或公文。只返回完整正文，不加新标题、编辑说明或代码围栏。
     """
 
+    /// 质量实验变体：让模型先交代没写进正文的原话，再给正文。只由 Runner 实验开关启用。
+    static let explainedDeletionsFormat = """
+
+    输出格式（覆盖前文“只输出最后正文”的要求）：只输出一个 JSON 对象，先写 removed，再写 text：
+    {"removed":[{"source":"canonical_text 中没写进正文的原话","reason":"edit_instruction|self_correction|filler|repetition"}],"text":"最终正文"}
+    removed 逐条列出你删掉的原话片段：edit_instruction 是说给你的编辑要求，self_correction 是被改口替换的旧说法和改口过程，filler 是口头禅和过渡语，repetition 是口吃重复。只有这四类可以删；事实、原因、条件、给收件人或未来 AI 的要求都不能出现在 removed 里，必须写进 text。text 是完整正文，换行用 \\n。
+    """
+
+    /// 解析实验变体输出，只取 text；格式不符返回 nil。
+    static func decodeExplainedDeletions(_ response: String) -> String? {
+        guard let data = response.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let text = object["text"] as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return text
+    }
+
     /// 润色使用完整来源正文封装，字符串不裁剪、不重写。
     static func fullTextPayload(_ text: String, additionalRequirements: String = "") throws -> String {
         let encoder = JSONEncoder()

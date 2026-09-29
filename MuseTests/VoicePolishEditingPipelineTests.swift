@@ -51,6 +51,46 @@ final class VoicePolishEditingPipelineTests: XCTestCase {
         XCTAssertEqual(payload, ["canonical_text": source])
     }
 
+    func testExplainedDeletionsVariantDeliversOnlyTextAndRequestsJSON() async throws {
+        let source = "帮我整理一下，周四开会"
+        let client = EditingTestClient([.text(#"{"removed":[{"source":"帮我整理一下","reason":"edit_instruction"}],"text":"周四开会。"}"#)])
+        var variant = VoicePolishEditingVariant.production
+        variant.explainsDeletions = true
+        let result = await VoicePolishEditingPipeline(client: client, config: config, variant: variant)
+            .process(request(source, .standard))
+        XCTAssertFalse(result.usedFallback)
+        XCTAssertEqual(result.text, "周四开会。")
+        let calls = await client.requests
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.options.responseFormat, .jsonObject)
+        XCTAssertEqual(call.system, VoicePolishEditingPrompts.standard + VoicePolishEditingPrompts.explainedDeletionsFormat)
+    }
+
+    func testExplainedDeletionsVariantFallsBackOnMalformedJSON() async {
+        let source = "周四开会"
+        var variant = VoicePolishEditingVariant.production
+        variant.explainsDeletions = true
+        for response in ["周四开会。", #"{"removed":[]}"#, #"{"text":"  "}"#] {
+            let client = EditingTestClient([.text(response)])
+            let result = await VoicePolishEditingPipeline(client: client, config: config, variant: variant)
+                .process(request(source, .standard))
+            XCTAssertTrue(result.usedFallback, response)
+            XCTAssertEqual(result.text, source)
+            XCTAssertEqual(result.validationCodes, [.invalidStructuredResponse], response)
+        }
+    }
+
+    func testRunnerExperimentSwitchDefaultsToProduction() {
+        XCTAssertEqual(VoicePolishQualityRunner.experimentVariant(environment: [:]), .production)
+        let reasoning = VoicePolishQualityRunner.experimentVariant(environment: ["MUSE_POLISH_EXPERIMENT": "reasoning"])
+        XCTAssertEqual(reasoning.reasoningPolicy, .low)
+        XCTAssertFalse(reasoning.explainsDeletions)
+        let both = VoicePolishQualityRunner.experimentVariant(environment: ["MUSE_POLISH_EXPERIMENT": "reasoning, explain"])
+        XCTAssertEqual(both.reasoningPolicy, .low)
+        XCTAssertTrue(both.explainsDeletions)
+        XCTAssertEqual(both.maxOutputTokens, 8_192)
+    }
+
     func testLightTrialRequirementsReachTheSingleRequest() async throws {
         let client = EditingTestClient([.text("明天见。")])
         let input = request("明天见", .light, requirements: "使用中文标点")
