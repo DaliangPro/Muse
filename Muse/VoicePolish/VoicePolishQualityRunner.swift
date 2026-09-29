@@ -163,25 +163,6 @@ struct VoicePolishProviderAuditedLLMClient: LLMClient {
 enum VoicePolishQualityRunner {
     private static let reportSchemaVersion = 5
 
-    /// 质量对照实验开关：`MUSE_POLISH_EXPERIMENT` 取 `reasoning`、`explain` 或二者以逗号组合。
-    /// 未设置时与生产请求完全一致。
-    static func experimentVariant(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> VoicePolishEditingVariant {
-        let flags = Set((environment["MUSE_POLISH_EXPERIMENT"] ?? "")
-            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
-        var variant = VoicePolishEditingVariant.production
-        if flags.contains("reasoning") {
-            variant.reasoningPolicy = .low
-            variant.maxOutputTokens = 8_192
-        }
-        if flags.contains("explain") {
-            variant.explainsDeletions = true
-            variant.maxOutputTokens = max(variant.maxOutputTokens, 4_096)
-        }
-        return variant
-    }
-
     /// 计时范围和执行分支共用一个判定，兼容旧环境变量但优先使用当前名称。
     static func prefetchBenchmarkPlan(
         for mode: Mode, environment: [String: String] = ProcessInfo.processInfo.environment
@@ -638,7 +619,6 @@ enum VoicePolishQualityRunner {
 
             var caseReports: [QualityCaseReport] = []
             var expectedProviderReceiptCount = 0
-            print("VOICE_POLISH_QUALITY_EXPERIMENT \(experimentVariant())")
             for (index, input) in inputs.enumerated() {
                 if invocation.mode == .direct {
                     caseReports.append(makeDirectCaseReport(for: input))
@@ -707,14 +687,7 @@ enum VoicePolishQualityRunner {
                     successCounter: successCounter,
                     requestProbeBodyPath: requestProbeBodyPath
                 )
-                let experiment = experimentVariant()
-                let pipeline = VoicePolishEditingPipeline(
-                    client: auditedClient, config: configured.config,
-                    // 深度思考实验放宽时限以测出真实耗时；超过 30 秒的比例由报告延迟判断。
-                    totalTimeout: experiment.reasoningPolicy == .disabled ? nil : .seconds(120),
-                    stageTimeout: experiment.reasoningPolicy == .disabled ? nil : .seconds(120),
-                    variant: experiment
-                )
+                let pipeline = VoicePolishEditingPipeline(client: auditedClient, config: configured.config)
                 let result: VoicePolishResult
                 let elapsed: Duration
                 if let planPath = prefetchBenchmarkPlan(for: invocation.mode) {
