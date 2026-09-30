@@ -72,6 +72,13 @@ final class AppState {
     @ObservationIgnored var onCopyFallbackVisibilityChange: ((Bool) -> Void)?
     @ObservationIgnored var onRetryVoicePolish: (() async -> Bool)?
 
+    // MARK: Live Transcript (HUD only)
+
+    @ObservationIgnored private var lastLiveTranscript: RecognitionTranscript?
+    /// 服务端偶发在切句时让尚未确认的上一句从新帧中消失（09-29 实测火山 partial 28→4 字，
+    /// 结束时才回归）。此处暂存已显示的那句，仅用于 HUD，不参与注入。
+    @ObservationIgnored private var heldLiveText = ""
+
     // MARK: Update Check
 
     var availableUpdates: [UpdateInfo] = []
@@ -100,6 +107,7 @@ final class AppState {
 
     func startRecording() {
         segments = []
+        resetLiveTranscriptTracking()
         audioLevel.current = 0
         recordingStartDate = nil
         feedbackMessage = L("已完成", "Done")
@@ -167,6 +175,9 @@ final class AppState {
     }
 
     func setLiveTranscript(_ transcript: RecognitionTranscript) {
+        updateHeldLiveText(previous: lastLiveTranscript, next: transcript)
+        lastLiveTranscript = transcript
+
         if transcript.isFinal,
            !transcript.authoritativeText.isEmpty,
            transcript.authoritativeText != transcript.composedText {
@@ -176,6 +187,9 @@ final class AppState {
 
         segments = transcript.confirmedSegments.map {
             TranscriptionSegment(text: $0, isConfirmed: true)
+        }
+        if !heldLiveText.isEmpty {
+            segments.append(TranscriptionSegment(text: heldLiveText, isConfirmed: false))
         }
         if !transcript.partialText.isEmpty {
             segments.append(TranscriptionSegment(text: transcript.partialText, isConfirmed: false))
@@ -291,6 +305,7 @@ final class AppState {
     func cancel() {
         barPhase = .hidden
         segments = []
+        resetLiveTranscriptTracking()
         audioLevel.current = 0
         copyFallbackWasCopied = false
         preserveProcessingWidthForCopyFallback = false
@@ -341,6 +356,28 @@ final class AppState {
     // MARK: Private
 
     private var hideGeneration = 0
+
+    private func resetLiveTranscriptTracking() {
+        lastLiveTranscript = nil
+        heldLiveText = ""
+    }
+
+    /// 确认段不变、partial 被一段更短且无关的新文本替换时，视为上一句被服务端暂时丢掉；
+    /// 服务端新增确认段或给出最终结果后，一律以服务端文本为准。
+    private func updateHeldLiveText(previous: RecognitionTranscript?, next: RecognitionTranscript) {
+        guard let previous else { return }
+        if next.isFinal || next.confirmedSegments.count > previous.confirmedSegments.count {
+            heldLiveText = ""
+            return
+        }
+        let dropped = previous.partialText
+        guard next.confirmedSegments == previous.confirmedSegments,
+              !dropped.isEmpty,
+              next.partialText.count * 2 <= dropped.count,
+              !dropped.contains(next.partialText)
+        else { return }
+        heldLiveText += dropped
+    }
 
     private func resetVoicePolishProcessingState() {
         voicePolishStage = nil
