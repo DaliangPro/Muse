@@ -103,7 +103,7 @@ final class HotkeyManager: NSObject {
             stopCarbonHotkeys()
         }
 
-        bindings = newBindings
+        bindings = newBindings.map(Self.runtimeBinding)
         holdState = [:]
         toggleState = [:]
         wasModifierDown = [:]
@@ -495,6 +495,23 @@ final class HotkeyManager: NSObject {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
 
         for binding in bindings {
+            if isModifierComboBinding(binding) {
+                // 修饰键组合（如 fn+⌃）与按键顺序无关：按住的修饰键恰好等于绑定集合即触发，
+                // 集合中任一键松开即释放。事件照常放行。
+                guard type == .flagsChanged, isModifierKeyCode(keyCode) else { continue }
+                let required = comboFlags(for: binding)
+                let current = modifierComboFlags(event.flags)
+                if isModifierPressed(keyCode: keyCode, flags: event.flags) {
+                    guard current == required else { continue }
+                    handleBindingEvent(binding: binding, pressed: true)
+                    return Unmanaged.passUnretained(event)
+                } else if isModifierBindingActive(binding), !current.isSuperset(of: required) {
+                    handleBindingEvent(binding: binding, pressed: false)
+                    return Unmanaged.passUnretained(event)
+                }
+                continue
+            }
+
             guard binding.keyCode == keyCode else { continue }
 
             // Normal key combinations are handled by Carbon when available.
@@ -506,15 +523,13 @@ final class HotkeyManager: NSObject {
             }
 
             if isModifierKeyCode(keyCode) {
-                // Modifier keys: handle via flagsChanged only, don't swallow.
-                // For combos like Ctrl+Shift, binding.modifiers stores "other modifiers".
+                // Single modifier keys: handle via flagsChanged only, don't swallow.
                 guard type == .flagsChanged else { continue }
                 let pressed = isModifierPressed(keyCode: keyCode, flags: event.flags)
 
                 if pressed {
-                    let requiredMods = normalizedModifierFlags(binding.modifiers)
                     let currentMods = otherModifierFlags(for: keyCode, flags: event.flags)
-                    guard currentMods == requiredMods else { continue }
+                    guard currentMods.isEmpty else { continue }
                     handleBindingEvent(binding: binding, pressed: true)
                     return Unmanaged.passUnretained(event)
                 } else if isModifierBindingActive(binding) {
@@ -694,8 +709,34 @@ final class HotkeyManager: NSObject {
         }
     }
 
+    /// 修饰键组合匹配用的标志集合：在常规修饰键之外计入 fn。
+    private func modifierComboFlags(_ flags: CGEventFlags) -> CGEventFlags {
+        flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl, .maskSecondaryFn])
+    }
+
+    private func isModifierComboBinding(_ binding: ModeBinding) -> Bool {
+        isModifierKeyCode(binding.keyCode) && !modifierComboFlags(binding.modifiers).isEmpty
+    }
+
+    /// 组合的完整修饰键集合：录制时的主键加其余修饰键，左右键不区分。
+    private func comboFlags(for binding: ModeBinding) -> CGEventFlags {
+        var flags = modifierComboFlags(binding.modifiers)
+        if let ownFlag = modifierEventFlag(for: binding.keyCode) {
+            flags.insert(ownFlag)
+        }
+        return flags
+    }
+
+    /// 单按 fn 在 🌐 键盘上存为 179（松开时补发，Carbon 可注册且不与 fn 组合冲突）；
+    /// 但 179 的按下与松开同时到达，按住式改由 fn 本身的 flagsChanged 驱动。
+    private static func runtimeBinding(_ binding: ModeBinding) -> ModeBinding {
+        guard binding.keyCode == CGKeyCode(HotkeyDisplay.globeKeyCode), binding.style == .hold else { return binding }
+        return ModeBinding(modeId: binding.modeId, keyCode: 63, modifiers: binding.modifiers,
+                           style: binding.style, onStart: binding.onStart, onStop: binding.onStop)
+    }
+
     private func otherModifierFlags(for keyCode: CGKeyCode, flags: CGEventFlags) -> CGEventFlags {
-        var mods = normalizedModifierFlags(flags)
+        var mods = modifierComboFlags(flags)
         if let ownFlag = modifierEventFlag(for: keyCode) {
             mods.remove(ownFlag)
         }

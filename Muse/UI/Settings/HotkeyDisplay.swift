@@ -7,18 +7,39 @@ enum HotkeyDisplay {
 
     static let modifierKeyCodes: Set<Int> = [54, 55, 56, 58, 59, 60, 61, 62, 63]
 
-    static func keyDisplayName(keyCode: Int, modifiers: UInt64?) -> String {
-        let mods = modifiers ?? 0
-        var parts: [String] = []
-        if mods != 0 {
-            let flags = NSEvent.ModifierFlags(rawValue: UInt(mods))
-            if flags.contains(.control) { parts.append("⌃") }
-            if flags.contains(.option) { parts.append("⌥") }
-            if flags.contains(.shift) { parts.append("⇧") }
-            if flags.contains(.command) { parts.append("⌘") }
+    /// 带 🌐 键的键盘单按 fn 松开时，系统在 fn 的 flagsChanged 之后补发该键码。
+    static let globeKeyCode = 179
+
+    /// 修饰键对应的标志位；fn 也计入，供修饰键组合（如 fn+⌃）录制与显示。
+    static func modifierFlag(for keyCode: Int) -> NSEvent.ModifierFlags? {
+        switch keyCode {
+        case 54, 55: return .command
+        case 56, 60: return .shift
+        case 58, 61: return .option
+        case 59, 62: return .control
+        case 63: return .function
+        default: return nil
         }
-        parts.append(singleKeyName(keyCode))
-        return parts.joined(separator: "+")
+    }
+
+    static func keyDisplayName(keyCode: Int, modifiers: UInt64?) -> String {
+        var flags = NSEvent.ModifierFlags(rawValue: UInt(modifiers ?? 0))
+        // 修饰键组合与按键顺序无关，按固定顺序显示整组，不区分主键。
+        if !flags.isEmpty, let ownFlag = modifierFlag(for: keyCode) {
+            flags.insert(ownFlag)
+            return modifierNames(flags).joined(separator: "+")
+        }
+        return (modifierNames(flags) + [singleKeyName(keyCode)]).joined(separator: "+")
+    }
+
+    private static func modifierNames(_ flags: NSEvent.ModifierFlags) -> [String] {
+        var parts: [String] = []
+        if flags.contains(.function) { parts.append("fn") }
+        if flags.contains(.control) { parts.append("⌃") }
+        if flags.contains(.option) { parts.append("⌥") }
+        if flags.contains(.shift) { parts.append("⇧") }
+        if flags.contains(.command) { parts.append("⌘") }
+        return parts
     }
 
     static func singleKeyName(_ keyCode: Int) -> String {
@@ -28,7 +49,7 @@ enum HotkeyDisplay {
         case 56, 60: return "⇧"
         case 58, 61: return "⌥"
         case 59, 62: return "⌃"
-        case 63: return "fn"
+        case 63, globeKeyCode: return "fn"
 
         // Special keys
         case 36: return "Return"

@@ -290,6 +290,28 @@ final class PersonalLexiconTests: XCTestCase {
         XCTAssertEqual(EntityResolver.applying(resolutions, to: source), source)
     }
 
+    func testWrittenFormNameDeclarationDoesNotAuthorizeRejectedOrUnconfirmedNames() {
+        for context in [
+            "错误名称为“成川计划”，不要使用。",
+            "正式名称为“成川计划”还没确认。",
+        ] {
+            let resolutions = EntityResolver.resolve(
+                segments: [segment("澄川计划今天上线。")],
+                lexicon: .empty,
+                snippets: [],
+                hotwords: [],
+                context: WritingContext(
+                    scene: .workChat, level: .metadataOnly, safety: .safe,
+                    recentMuseInputs: [context]
+                )
+            )
+            XCTAssertFalse(
+                resolutions.contains { $0.canonical == "成川计划" },
+                "context=\(context), resolutions=\(resolutions)"
+            )
+        }
+    }
+
     func testResolverUsesOnlySafeAuthorizedContextForUniqueEntityCorrections() {
         let cases: [(String, String, WritingContext)] = [
             (
@@ -340,6 +362,17 @@ final class PersonalLexiconTests: XCTestCase {
                     level: .metadataOnly,
                     safety: .safe,
                     recentMuseInputs: ["Muse 的长语音测试刚刚结束。"]
+                )
+            ),
+            (
+                // 书面“正式名称为”与“是”同义；确认语在逗号后的下一分句也不影响。
+                "项目名字我口述成成川计划，刚才已经输入过正式写法，按那个名称写。",
+                "项目名字我口述成澄川计划，刚才已经输入过正式写法，按那个名称写。",
+                WritingContext(
+                    scene: .workChat,
+                    level: .metadataOnly,
+                    safety: .safe,
+                    recentMuseInputs: ["本次服务项目正式名称为“澄川计划”，已确认此写法。"]
                 )
             ),
             (

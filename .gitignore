@@ -51,6 +51,7 @@ test*.txt
 backups/
 prototypes/
 tmp/
+/build/
 findings.md
 progress.md
 task_plan.md

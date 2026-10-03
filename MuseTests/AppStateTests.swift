@@ -89,6 +89,54 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.transcriptionText, "我想买咖啡")
     }
 
+    func testLiveTranscriptKeepsSentenceDroppedByServerUntilConfirmed() {
+        let appState = AppState(initialModes: ProcessingMode.defaults)
+        appState.startRecording()
+        appState.setLiveTranscript(live(partial: "这是前面已经显示出来的一整句话"))
+        // 服务端切句时新帧只剩下一句的开头，前一句既未确认也不在帧内。
+        appState.setLiveTranscript(live(partial: "然后"))
+        XCTAssertEqual(appState.transcriptionText, "这是前面已经显示出来的一整句话然后")
+
+        appState.setLiveTranscript(live(partial: "然后我们"))
+        XCTAssertEqual(appState.transcriptionText, "这是前面已经显示出来的一整句话然后我们")
+
+        appState.setLiveTranscript(live(confirmed: ["这是前面已经显示出来的一整句话，然后我们"]))
+        XCTAssertEqual(appState.transcriptionText, "这是前面已经显示出来的一整句话，然后我们")
+    }
+
+    func testLiveTranscriptRevisionIsNotHeld() {
+        let appState = AppState(initialModes: ProcessingMode.defaults)
+        appState.startRecording()
+        appState.setLiveTranscript(live(partial: "那个我想"))
+        appState.setLiveTranscript(live(partial: "我想"))
+        XCTAssertEqual(appState.transcriptionText, "我想")
+
+        appState.setLiveTranscript(live(partial: "今天天气不错"))
+        appState.setLiveTranscript(live(partial: "今天天气"))
+        XCTAssertEqual(appState.transcriptionText, "今天天气")
+    }
+
+    func testLiveTranscriptHeldTextResetsForNewRecording() {
+        let appState = AppState(initialModes: ProcessingMode.defaults)
+        appState.startRecording()
+        appState.setLiveTranscript(live(partial: "这是前面已经显示出来的一整句话"))
+        appState.setLiveTranscript(live(partial: "然后"))
+        appState.cancel()
+
+        appState.startRecording()
+        appState.setLiveTranscript(live(partial: "新的"))
+        XCTAssertEqual(appState.transcriptionText, "新的")
+    }
+
+    private func live(confirmed: [String] = [], partial: String = "") -> RecognitionTranscript {
+        RecognitionTranscript(
+            confirmedSegments: confirmed,
+            partialText: partial,
+            authoritativeText: (confirmed + [partial]).joined(),
+            isFinal: false
+        )
+    }
+
     func testSetLiveTranscriptUsesAuthoritativeFinalTextWhenDifferent() {
         let appState = AppState(initialModes: ProcessingMode.defaults)
         appState.setLiveTranscript(

@@ -19,6 +19,7 @@ struct ModeSettingsSheet: View, SettingsCardHelpers {
     @State private var captureTap = ModeHotkeyCaptureTap()
     @State private var pendingModifierCode: Int?
     @State private var pendingModifierModifiers: UInt64 = 0
+    @State private var pendingGlobeFallback: DispatchWorkItem?
     @State private var contextRaw = VoicePolishSettings.contextLevel().rawValue
     @State private var recentInput = VoicePolishSettings.recentInputContextEnabled()
 
@@ -349,11 +350,23 @@ private extension ModeSettingsSheet {
                     pendingModifierCode = keyCode
                     pendingModifierModifiers = modifierComboModifiers(for: keyCode, flags: event.modifierFlags)
                 } else if let pendingModifierCode {
-                    hotkeyCode = pendingModifierCode
-                    hotkeyModifiers = pendingModifierModifiers
+                    let modifiers = pendingModifierModifiers
                     self.pendingModifierCode = nil
                     pendingModifierModifiers = 0
-                    stopListening()
+                    if pendingModifierCode == 63, modifiers == 0 {
+                        // 单按 fn：🌐 键盘紧接着补发 179，由 keyDown 或事件 tap 收下；
+                        // 没有 🌐 键的键盘等不到 179，短暂等待后按 fn 本身记录。
+                        pendingGlobeFallback = DispatchWorkItem {
+                            hotkeyCode = 63
+                            hotkeyModifiers = 0
+                            stopListening()
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: pendingGlobeFallback!)
+                    } else {
+                        hotkeyCode = pendingModifierCode
+                        hotkeyModifiers = modifiers
+                        stopListening()
+                    }
                 }
                 return event
             }
@@ -385,6 +398,8 @@ private extension ModeSettingsSheet {
     func stopListening() {
         pendingModifierCode = nil
         pendingModifierModifiers = 0
+        pendingGlobeFallback?.cancel()
+        pendingGlobeFallback = nil
         captureTap.stop()
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
@@ -400,29 +415,17 @@ private extension ModeSettingsSheet {
         flags.intersection([.command, .shift, .option, .control])
     }
 
-    func modifierFlag(for keyCode: Int) -> NSEvent.ModifierFlags? {
-        switch keyCode {
-        case 54, 55: return .command
-        case 56, 60: return .shift
-        case 58, 61: return .option
-        case 59, 62: return .control
-        default: return nil
-        }
-    }
-
+    /// 修饰键组合（如 fn+⌃）：除本键外按住的修饰键，fn 也计入。
     func modifierComboModifiers(for keyCode: Int, flags: NSEvent.ModifierFlags) -> UInt64 {
-        var clean = sanitizedModifierFlags(flags)
-        if let ownFlag = modifierFlag(for: keyCode) {
+        var clean = flags.intersection([.command, .shift, .option, .control, .function])
+        if let ownFlag = HotkeyDisplay.modifierFlag(for: keyCode) {
             clean.remove(ownFlag)
         }
         return UInt64(clean.rawValue)
     }
 
     func isModifierPressed(keyCode: Int, flags: NSEvent.ModifierFlags) -> Bool {
-        if keyCode == 63 {
-            return flags.contains(.function)
-        }
-        guard let modifierFlag = modifierFlag(for: keyCode) else { return false }
+        guard let modifierFlag = HotkeyDisplay.modifierFlag(for: keyCode) else { return false }
         return flags.contains(modifierFlag)
     }
 }
@@ -434,6 +437,7 @@ private final class ModeHotkeyCaptureTap {
     private var onCancel: (() -> Void)?
     private var pendingModifierCode: Int?
     private var pendingModifierModifiers: UInt64 = 0
+    private var pendingGlobeFallback: DispatchWorkItem?
 
     func start(
         onCapture: @escaping (Int, UInt64?) -> Void,
@@ -469,6 +473,8 @@ private final class ModeHotkeyCaptureTap {
     func stop() {
         pendingModifierCode = nil
         pendingModifierModifiers = 0
+        pendingGlobeFallback?.cancel()
+        pendingGlobeFallback = nil
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
@@ -511,13 +517,24 @@ private final class ModeHotkeyCaptureTap {
             let modifiers = pendingModifierModifiers
             self.pendingModifierCode = nil
             pendingModifierModifiers = 0
-            onCapture?(pendingModifierCode, modifiers)
+            if pendingModifierCode == 63, modifiers == 0 {
+                // 单按 fn：等 🌐 键盘补发的 179（见 handleKeyDown），等不到再记 fn 本身。
+                let fallback = DispatchWorkItem { [weak self] in
+                    self?.onCapture?(63, 0)
+                }
+                pendingGlobeFallback = fallback
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: fallback)
+            } else {
+                onCapture?(pendingModifierCode, modifiers)
+            }
         }
     }
 
     private func handleKeyDown(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         let keyCode = Int(event.getIntegerValueField(.keyboardEventKeycode))
         pendingModifierCode = nil
+        pendingGlobeFallback?.cancel()
+        pendingGlobeFallback = nil
 
         let clean = Self.sanitizedModifierFlags(event.flags)
         if keyCode == 53, clean.isEmpty {
@@ -539,12 +556,14 @@ private final class ModeHotkeyCaptureTap {
         case 56, 60: return .maskShift
         case 58, 61: return .maskAlternate
         case 59, 62: return .maskControl
+        case 63: return .maskSecondaryFn
         default: return nil
         }
     }
 
+    /// 修饰键组合（如 fn+⌃）：除本键外按住的修饰键，fn 也计入。
     private static func modifierComboModifiers(for keyCode: Int, flags: CGEventFlags) -> UInt64 {
-        var clean = sanitizedModifierFlags(flags)
+        var clean = flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl, .maskSecondaryFn])
         if let ownFlag = modifierEventFlag(for: keyCode) {
             clean.remove(ownFlag)
         }
@@ -552,14 +571,8 @@ private final class ModeHotkeyCaptureTap {
     }
 
     private static func isModifierPressed(keyCode: Int, flags: CGEventFlags) -> Bool {
-        switch keyCode {
-        case 54, 55: return flags.contains(.maskCommand)
-        case 56, 60: return flags.contains(.maskShift)
-        case 58, 61: return flags.contains(.maskAlternate)
-        case 59, 62: return flags.contains(.maskControl)
-        case 63: return flags.contains(.maskSecondaryFn)
-        default: return false
-        }
+        guard let modifierFlag = modifierEventFlag(for: keyCode) else { return false }
+        return flags.contains(modifierFlag)
     }
 }
 
